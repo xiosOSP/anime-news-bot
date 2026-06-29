@@ -1,0 +1,35 @@
+# Данные бота (генерируются при работе, не нужны в репозитории)
+sent_links.json
+post_queue.json
+bot_settings.json
+bot_stats.json
+anilist_cache.json
+bot.log
+bot.log.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Видео (если вдруг скачивались локально)
+*.mp4
+*.webm
+anime_news_bot_videos/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Тестовые артефакты
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
