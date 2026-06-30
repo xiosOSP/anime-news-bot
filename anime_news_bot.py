@@ -55,8 +55,34 @@ except ImportError:
 
 # ============== НАСТРОЙКИ ==============
 # Чувствительные значения читаются из переменных окружения (env).
-# Это нужно для хостинга (Bothost и др.), где токен задаётся в панели, а не в коде.
-# Если переменной окружения нет — используется fallback (для локального запуска на ПК).
+# Токен ОБЯЗАТЕЛЬНО задаётся через env (BOT_TOKEN) — в коде его нет (репозиторий публичный).
+# Для локального запуска на ПК создайте файл .env рядом с этим скриптом (см. .env.example).
+# Файл .env в репозиторий не попадает (он в .gitignore).
+
+def _load_dotenv(path: str = '.env') -> None:
+    """Простой загрузчик .env без внешних зависимостей.
+    Читает строки вида KEY=VALUE и кладёт в окружение (не перезаписывая уже заданные).
+    Если файла нет — молча пропускает (на хостинге переменные задаются в панели)."""
+    p = Path(path)
+    if not p.exists():
+        return
+    try:
+        for line in p.read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, _, value = line.partition('=')
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        pass
+
+
+# Загружаем .env (для локального запуска). На хостинге файла нет — переменные из панели.
+_load_dotenv()
+
 
 def _env(key: str, default: str) -> str:
     """Читает строковую переменную окружения с fallback на дефолт."""
@@ -74,8 +100,12 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
-# Токен бота. В Bothost задаётся переменной окружения BOT_TOKEN (или TELEGRAM_BOT_TOKEN).
-TOKEN = _env('BOT_TOKEN', '') or _env('TELEGRAM_BOT_TOKEN', '') or '8773585577:AAEk0TNLoqDoI6elkkFXfKEu0hYx7tjECkY'
+# Токен бота — ТОЛЬКО из переменной окружения (в коде не хранится).
+# Локально: задайте в .env. На хостинге: в панели переменных окружения.
+TOKEN = _env('BOT_TOKEN', '') or _env('TELEGRAM_BOT_TOKEN', '')
+
+# Эти значения не секретны (ID публичного канала и т.п.), поэтому fallback допустим.
+# При желании их тоже можно переопределить через env.
 CHANNEL_ID = _env('CHANNEL_ID', '@Doyentor88777999777279')
 ADMIN_ID = _env_int('ADMIN_ID', 5056873937)
 
@@ -3855,13 +3885,25 @@ def _init_globals() -> None:
 
 
 def main():
-    _setup_file_logging()
+    # Самый первый вывод — чтобы в логах хостинга было видно что процесс стартовал
+    print("=== Запуск anime_news_bot ===", flush=True)
+    print(f"DATA_DIR = {DATA_DIR}", flush=True)
+    print(f"TOKEN задан: {'да' if TOKEN else 'НЕТ'}", flush=True)
+
+    try:
+        _setup_file_logging()
+    except Exception as e:
+        print(f"Файловый лог не настроен (не критично): {e}", flush=True)
+
     # Проверка токена — на хостинге переменная окружения BOT_TOKEN обязательна
     if not TOKEN or TOKEN == '':
-        logger.error("❌ Токен бота не задан! Установите переменную окружения BOT_TOKEN.")
+        print("❌ Токен бота не задан! Установите переменную окружения BOT_TOKEN.", flush=True)
         raise SystemExit("BOT_TOKEN не задан")
+
     _init_globals()
     check_video_deps()
+
+    print("Создаю Application...", flush=True)
     app = Application.builder().token(TOKEN).job_queue(JobQueue()).post_init(setup_bot_commands).build()
 
     # Команды
@@ -3887,9 +3929,16 @@ def main():
     )
     app.add_handler(MessageHandler(reply_filter, reply_button_handler))
 
+    print("✅ Бот запущен, начинаю polling...", flush=True)
     logger.info("✅ Бот запущен...")
     app.run_polling()
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print("❌ КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ:", flush=True)
+        traceback.print_exc()
+        raise
