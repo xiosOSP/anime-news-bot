@@ -1717,9 +1717,36 @@ def extract_image_from_entry(entry, summary_html: Optional[str] = None) -> Optio
     return images[0] if images else None
 
 
-def extract_all_images_from_entry(entry, summary_html: Optional[str] = None) -> list[str]:
+def _normalize_image_url(url: str, base_url: Optional[str] = None) -> Optional[str]:
+    """Приводит URL картинки к абсолютному виду и проверяет валидность.
+    Возвращает нормализованный URL или None если URL битый/невалидный."""
+    if not url:
+        return None
+    url = url.strip()
+    # Протокол-относительный: //example.com/pic.jpg → https://example.com/pic.jpg
+    if url.startswith('//'):
+        url = 'https:' + url
+    # Относительный путь (/images/pic.jpg или images/pic.jpg) → добавляем домен из base_url
+    if base_url and not url.startswith(('http://', 'https://')):
+        from urllib.parse import urljoin
+        url = urljoin(base_url, url)
+    # Проверяем что получился валидный абсолютный URL с хостом
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    if parsed.scheme not in ('http', 'https'):
+        return None
+    if not parsed.netloc:  # пустой хост — битый URL (та самая ошибка "url host is empty")
+        return None
+    return url
+
+
+def extract_all_images_from_entry(entry, summary_html: Optional[str] = None,
+                                  base_url: Optional[str] = None) -> list[str]:
     """Собирает все картинки из RSS-записи и HTML-описания, с дедупликацией.
-    Применяет upgrade_image_url для замены thumbnail на полное разрешение."""
+    Применяет upgrade_image_url для замены thumbnail на полное разрешение.
+    base_url (ссылка на статью) нужен чтобы превращать относительные URL в абсолютные."""
     seen: set[str] = set()
     images: list[str] = []
 
@@ -1730,6 +1757,11 @@ def extract_all_images_from_entry(entry, summary_html: Optional[str] = None) -> 
         # Игнорируем иконки/спиннеры (мелкие декоративные)
         if re.search(r'/(?:icon|avatar|favicon|emoji|spinner)[/_-]', url, re.IGNORECASE):
             return
+        # Нормализуем: относительный → абсолютный, проверяем валидность
+        normalized = _normalize_image_url(url, base_url)
+        if not normalized:
+            return
+        url = normalized
         # Пытаемся получить полноразмерную версию
         url = upgrade_image_url(url)
         if url in seen:
@@ -1951,7 +1983,7 @@ def _parse_rss_with_fallback(
             if _is_too_old(published_parsed):
                 continue
             summary_html = entry.get('summary', '')
-            images = extract_all_images_from_entry(entry, summary_html)
+            images = extract_all_images_from_entry(entry, summary_html, base_url=link)
             # Решаем нужно ли лезть за og:image
             need_og = fetch_og and (
                 force_og  # для известно-проблемных лент
@@ -2374,8 +2406,10 @@ SOURCES = [
     ('AnimeHunch', get_animehunch),
     ('Kotaku', get_kotaku_anime),
     ('Yatta-Tachi', get_yatta_tachi),
-    # Reddit — с автоматическим fallback на RSS если JSON 403
-    ('Reddit', get_reddit_anime),
+    # Reddit отключён: банит серверные IP (403 на все запросы с хостинга).
+    # Функция get_reddit_anime оставлена в коде — при наличии рабочего прокси
+    # (REDDIT_PROXY) можно вернуть строку ниже.
+    # ('Reddit', get_reddit_anime),
 ]
 
 
@@ -2824,9 +2858,9 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     # --- Шаг 1: отправляем медиа БЕЗ подписи ---
     media_sent = False
     if media_count > 0:
-        try:
-            if has_inline_video and media_count == 1:
-                # одно видео
+        # Видео (если есть и включено)
+        if has_inline_video:
+            try:
                 if video_file:
                     with open(video_file, 'rb') as f:
                         await bot.send_video(chat_id=target, video=f,
@@ -2835,43 +2869,48 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
                     await bot.send_video(chat_id=target, video=video_url,
                                          supports_streaming=True, **thread_kw)
                 media_sent = True
-            elif media_count == 1:
-                # одно фото
-                await bot.send_photo(chat_id=target, photo=photos[0], **thread_kw)
-                media_sent = True
-            else:
-                # альбом (фото + опционально видео), без подписи
-                media: list = []
-                opened: list = []
+            except TelegramError as e:
+                logger.warning(f"Видео в ветку не отправилось ({e})")
+
+        # Фото: пробуем альбомом, при неудаче — по одному, перебирая битые
+        if photos and not media_sent:
+            # Сначала пытаемся альбомом (быстро, если все картинки валидны)
+            if len(photos) > 1:
                 try:
-                    if has_inline_video:
-                        if video_file:
-                            f = open(video_file, 'rb')
-                            opened.append(f)
-                            media.append(InputMediaVideo(media=f, supports_streaming=True))
-                        else:
-                            media.append(InputMediaVideo(media=video_url, supports_streaming=True))
-                        for ph in photos[:9]:
-                            media.append(InputMediaPhoto(media=ph))
-                    else:
-                        for ph in photos[:10]:
-                            media.append(InputMediaPhoto(media=ph))
+                    media = [InputMediaPhoto(media=ph) for ph in photos[:10]]
                     await bot.send_media_group(chat_id=target, media=media, **thread_kw)
                     media_sent = True
-                finally:
-                    for f in opened:
-                        try:
-                            f.close()
-                        except Exception:
-                            pass
-        except TelegramError as e:
-            if settings.require_image:
-                logger.warning(f"⊘ Медиа не отправилось в ветку ({e}), require_image — пост пропущен")
-                return False
-            logger.warning(f"Медиа не отправилось в ветку ({e}), шлю только текст")
+                except TelegramError as e:
+                    logger.debug(f"Альбом в ветку не прошёл ({e}), пробую по одной картинке")
 
-    # Если require_image и медиа не ушло — не шлём текст вообще
+            # Если альбом не прошёл (или одна картинка) — перебираем по одной,
+            # пока какая-нибудь не отправится успешно
+            if not media_sent:
+                for ph in photos[:MAX_PHOTOS_PER_POST]:
+                    try:
+                        await bot.send_photo(chat_id=target, photo=ph, **thread_kw)
+                        media_sent = True
+                        break  # одна успешная картинка — достаточно
+                    except TelegramError as e:
+                        logger.debug(f"Картинка не отправилась ({e}): {ph[:80]}")
+                        continue
+
+            # Все картинки из RSS битые — пробуем og:image со страницы статьи
+            if not media_sent and news.get('link'):
+                og = await asyncio.to_thread(fetch_og_image, news['link'])
+                if og:
+                    og_norm = _normalize_image_url(og, news['link'])
+                    if og_norm:
+                        try:
+                            await bot.send_photo(chat_id=target, photo=og_norm, **thread_kw)
+                            media_sent = True
+                            logger.info(f"Картинка взята со страницы (og:image): {news['title'][:50]}")
+                        except TelegramError as e:
+                            logger.debug(f"og:image тоже не отправился ({e})")
+
+    # Если require_image и медиа так и не ушло — пост пропускаем
     if settings.require_image and not media_sent:
+        logger.info(f"⊘ Все картинки битые, пост пропущен (require_image): {news['title'][:60]}")
         return False
 
     # --- Шаг 2: отправляем текст отдельным сообщением ---
