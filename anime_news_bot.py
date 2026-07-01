@@ -114,6 +114,11 @@ ADMIN_ID = _env_int('ADMIN_ID', 5056873937)
 DISCUSSION_CHAT_ID = _env_int('DISCUSSION_CHAT_ID', -1003178917488)   # ID супергруппы обсуждения
 DISCUSSION_THREAD_ID = _env_int('DISCUSSION_THREAD_ID', 10138)        # ID темы "бот-новостник"
 
+# DeepL API-ключ (опционально). Если задан — перевод идёт через DeepL (качество выше),
+# иначе через Google Translate. Ключ бесплатного тира заканчивается на ':fx'.
+# Получить: https://www.deepl.com/pro-api  →  переменная окружения DEEPL_API_KEY.
+DEEPL_API_KEY = _env('DEEPL_API_KEY', '')
+
 # --- Фильтрация постов ---
 # Whitelist: если задан, пост обязан содержать хотя бы одно из этих слов
 KEYWORDS: list[str] = []
@@ -894,60 +899,163 @@ stats: Optional['BotStats'] = None
 # ============== СЛОВАРИ ЗАМЕН ==============
 # Защищённые термины — не переводятся вовсе. Подставляются плейсхолдеры на время перевода.
 PROTECTED_TERMS = [
-    # Платформы и компании
+    # --- Стриминговые платформы и сервисы ---
     'Crunchyroll', 'Netflix', 'Disney+', 'HIDIVE', 'Funimation', 'Aniplex',
-    'MAPPA', 'Bones', 'Madhouse', 'Wit Studio', 'Studio Ghibli', 'Sunrise',
+    'Amazon Prime Video', 'Prime Video', 'Hulu', 'Bilibili', 'Ani-One',
+    'Muse Asia', 'YouTube', 'Max', 'HBO Max',
+    # --- Студии анимации ---
+    'MAPPA', 'Bones', 'Bones Film', 'Madhouse', 'Wit Studio', 'Studio Ghibli', 'Sunrise',
     'Toei Animation', 'Kyoto Animation', 'Trigger', 'Ufotable', 'CloverWorks',
     'A-1 Pictures', 'Production I.G', 'Shaft', 'David Production', 'P.A. Works',
-    'J.C. Staff', 'OLM', 'TMS Entertainment', 'Studio Pierrot', 'White Fox',
-    'MAHO FILM', 'Shogakukan', 'Kodansha', 'Shueisha',
-    # Издания/сервисы
-    'Manga UP!', 'MangaPlus', 'MyAnimeList', 'AnimeCorner',
-    'Honey\'s Anime', 'Anime News Network', 'AnimeJapan',
-    # Жанры/термины
-    'ONE PIECE', 'BanG Dream', 'YUMEMITA',
+    'J.C. Staff', 'OLM', 'TMS Entertainment', 'Studio Pierrot', 'Pierrot', 'White Fox',
+    'MAHO FILM', 'Doga Kobo', 'Gainax', 'Khara', 'Science SARU', 'Studio Bind',
+    'Lerche', 'Silver Link', 'Passione', 'Studio Deen', 'Brain\'s Base',
+    'Kinema Citrus', 'Orange', 'Polygon Pictures', 'GoHands', 'Feel', 'Zexcs',
+    'Bibury Animation Studios', 'Nut', 'Encourage Films', 'Tatsunoko',
+    'Wawayu Animation', 'Yokohama Animation Lab', 'EMT Squared', 'Drive',
+    # --- Издатели / манга-платформы ---
+    'Shogakukan', 'Kodansha', 'Shueisha', 'Kadokawa', 'Square Enix', 'ASCII Media Works',
+    'Manga UP!', 'MangaPlus', 'Manga Plus', 'K Manga', 'Comikey', 'Azuki',
+    'Yen Press', 'Seven Seas', 'Viz Media', 'VIZ', 'Dark Horse',
+    'Weekly Shonen Jump', 'Shonen Jump', 'Young Jump', 'Weekly Shonen Magazine',
+    'Shonen Sunday', 'Comic Yuri Hime', 'Dengeki', 'Gangan', 'Afternoon',
+    # --- Издания/сервисы новостей ---
+    'MyAnimeList', 'AnimeCorner', 'Anime Corner',
+    'Honey\'s Anime', 'Anime News Network', 'AnimeJapan', 'Anime Expo',
+    # --- Тайтлы которые Google часто коверкает ---
+    'ONE PIECE', 'BanG Dream', 'YUMEMITA', 'Kaiju No. 8', 'Kaiju No.8',
+    'Solo Leveling', 'Frieren', 'Sousou no Frieren', 'Dandadan', 'Dan Da Dan',
+    'Chainsaw Man', 'Jujutsu Kaisen', 'Spy x Family', 'Oshi no Ko',
+    'Blue Lock', 'Blue Box', 'Wind Breaker', 'Sakamoto Days',
+    'Demon Slayer', 'Kimetsu no Yaiba', 'My Hero Academia', 'Boku no Hero Academia',
+    'Attack on Titan', 'Shingeki no Kyojin', 'Hunter x Hunter',
+    'Re:Zero', 'Mushoku Tensei', 'Overlord', 'Konosuba',
+    'Fate/stay night', 'Fate/Grand Order', 'Fate/Zero',
+    'Gundam', 'Mobile Suit Gundam', 'Evangelion', 'Neon Genesis Evangelion',
+    'Vinland Saga', 'Golden Kamuy', 'Dr. Stone', 'Dr. STONE',
+    'Tokyo Revengers', 'Bleach', 'Naruto', 'Boruto', 'Dragon Ball',
+    'Dragon Ball Super', 'Dragon Ball Daima', 'Undead Unluck',
+    'The Apothecary Diaries', 'Kusuriya no Hitorigoto',
+    'Delicious in Dungeon', 'Dungeon Meshi',
+    'Zenshu', 'Medalist', 'Rurouni Kenshin', 'Bakemonogatari', 'Monogatari',
 ]
+
+# Названия-заглушки для случаев когда Google переводит имя собственное дословно.
+# Ключ — как Google перевёл (в нижнем регистре), значение — правильная форма.
+# Применяется в POST_TRANSLATION_REPLACEMENTS ниже.
 
 # Замены терминов после перевода (формальный → литературный анимешный сленг)
 POST_TRANSLATION_REPLACEMENTS = [
-    # Опенинги/эндинги
+    # --- Опенинги/эндинги ---
     (r'\bвступительная музыкальная тема\b', 'опенинг', re.IGNORECASE),
     (r'\bвступительная тема\b', 'опенинг', re.IGNORECASE),
     (r'\bтематическая песня открытия\b', 'опенинг', re.IGNORECASE),
     (r'\bпесня открытия\b', 'опенинг', re.IGNORECASE),
     (r'\bоткрывающая тема\b', 'опенинг', re.IGNORECASE),
+    (r'\bоткрывающая песня\b', 'опенинг', re.IGNORECASE),
     (r'\bопенинг тема\b', 'опенинг', re.IGNORECASE),
     (r'\bopening тема\b', 'опенинг', re.IGNORECASE),
+    (r'\bглавная тема\b', 'опенинг', re.IGNORECASE),
     (r'\bзаключительная тема\b', 'эндинг', re.IGNORECASE),
     (r'\bзакрывающая тема\b', 'эндинг', re.IGNORECASE),
+    (r'\bзакрывающая песня\b', 'эндинг', re.IGNORECASE),
+    (r'\bфинальная песня\b', 'эндинг', re.IGNORECASE),
     (r'\bending тема\b', 'эндинг', re.IGNORECASE),
-    # Релиз-форматы
+    (r'\bтематическая песня\b', 'музыкальная тема', re.IGNORECASE),
+
+    # --- Демографические жанры (Google переводит громоздко) ---
+    (r'\bсёнэн[- ]демографическ\w+\b', 'сёнэн', re.IGNORECASE),
+    (r'\bсёдзё[- ]демографическ\w+\b', 'сёдзё', re.IGNORECASE),
+    (r'\bсэйнэн[- ]демографическ\w+\b', 'сэйнэн', re.IGNORECASE),
+    (r'\bдзёсэй[- ]демографическ\w+\b', 'дзёсэй', re.IGNORECASE),
+    (r'\bдемографи\w+ сёнэн\b', 'сёнэн', re.IGNORECASE),
+    (r'\bцелевая аудитория сёнэн\b', 'сёнэн', re.IGNORECASE),
+
+    # --- Форматы релизов ---
     (r'\bкомпакт-диск\b', 'CD', re.IGNORECASE),
     (r'\bна компакт-диске\b', 'на CD', re.IGNORECASE),
     (r'\bDVD-релиз\b', 'релиз на DVD', re.IGNORECASE),
-    # ТВ-аниме
+    (r'\bБлю-рей\b', 'Blu-ray', re.IGNORECASE),
+    (r'\bблю-рей\b', 'Blu-ray', re.IGNORECASE),
+    (r'\bБлюрей\b', 'Blu-ray', re.IGNORECASE),
+    (r'\bкоробочный набор\b', 'бокс-сет', re.IGNORECASE),
+
+    # --- ТВ-аниме и форматы ---
     (r'\bТелевизионное аниме\b', 'ТВ-аниме', re.IGNORECASE),
+    (r'\bтелевизионный аниме-сериал\b', 'ТВ-аниме', re.IGNORECASE),
+    (r'\bтелесериал аниме\b', 'ТВ-аниме', re.IGNORECASE),
     (r'\bТВ аниме\b', 'ТВ-аниме', re.IGNORECASE),
-    # Дубляжи
-    (r'\bанглийский дубляж\b', 'английский дубляж', re.IGNORECASE),
-    (r'\bнемецкий дубляж\b', 'немецкий дубляж', re.IGNORECASE),
-    # Прочее
-    (r'\bпразднование мамы\b', 'День матери', re.IGNORECASE),
-    (r'\bглавных героев\b', 'главных героев', re.IGNORECASE),
     (r'\bаниме сериал\b', 'аниме-сериал', re.IGNORECASE),
     (r'\bаниме фильм\b', 'аниме-фильм', re.IGNORECASE),
-    (r'\bманга серия\b', 'манга-сериал', re.IGNORECASE),
+    (r'\bаниме-телесериал\b', 'ТВ-аниме', re.IGNORECASE),
+    (r'\bманга серия\b', 'манга', re.IGNORECASE),
+    (r'\bсерия манги\b', 'манга', re.IGNORECASE),
+    (r'\bлайт-новелла\b', 'ранобэ', re.IGNORECASE),
+    (r'\bлёгкая новелла\b', 'ранобэ', re.IGNORECASE),
+    (r'\bлёгкий роман\b', 'ранобэ', re.IGNORECASE),
+    (r'\bлегкий роман\b', 'ранобэ', re.IGNORECASE),
+    (r'\bвизуальная новелла\b', 'визуальная новелла', re.IGNORECASE),
+    (r'\bграфический роман\b', 'манга', re.IGNORECASE),
+
+    # --- Производство/сезоны ---
+    (r'\bвторой сезон\b', '2 сезон', re.IGNORECASE),
+    (r'\bтретий сезон\b', '3 сезон', re.IGNORECASE),
+    (r'\bпервый сезон\b', '1 сезон', re.IGNORECASE),
+    (r'\bчетвёртый сезон\b', '4 сезон', re.IGNORECASE),
+    (r'\bфинальный сезон\b', 'финальный сезон', re.IGNORECASE),
+    (r'\bновый сезон\b', 'новый сезон', re.IGNORECASE),
+    (r'\bзеленый свет\b', 'анонсирован', re.IGNORECASE),
+    (r'\bдали зелёный свет\b', 'анонсировали', re.IGNORECASE),
+    (r'\bполучил зелёный свет\b', 'анонсирован', re.IGNORECASE),
+    (r'\bбыл подтверждён\b', 'подтверждён', re.IGNORECASE),
+    (r'\bбыло подтверждено\b', 'подтверждено', re.IGNORECASE),
+
+    # --- Персонажи/сюжет ---
+    (r'\bглавный герой\b', 'главный герой', re.IGNORECASE),
+    (r'\bозвучивает\b', 'озвучивает', re.IGNORECASE),
+    (r'\bактёр озвучивания\b', 'сэйю', re.IGNORECASE),
+    (r'\bактриса озвучивания\b', 'сэйю', re.IGNORECASE),
+    (r'\bактёр озвучки\b', 'сэйю', re.IGNORECASE),
+    (r'\bголосовой актёр\b', 'сэйю', re.IGNORECASE),
+    (r'\bголосовой состав\b', 'актёры озвучки', re.IGNORECASE),
+    (r'\bприквел\b', 'приквел', re.IGNORECASE),
+    (r'\bспин-офф\b', 'спин-офф', re.IGNORECASE),
+
+    # --- Дубляжи ---
+    (r'\bанглийский дубляж\b', 'английский дубляж', re.IGNORECASE),
+    (r'\bнемецкий дубляж\b', 'немецкий дубляж', re.IGNORECASE),
+
+    # --- Даты и события ---
+    (r'\bпразднование мамы\b', 'День матери', re.IGNORECASE),
+    (r'\bдень благодарения\b', 'День благодарения', re.IGNORECASE),
+
+    # --- Пунктуация ---
     (r' - ', ' — ', 0),  # короткие тире → длинные
-    # Часто встречающиеся косяки
+
+    # --- Часто встречающиеся косяки с названиями ---
     (r'\bАНИ-МОЖЕТ\b', 'ANI-MAY', 0),
+    (r'\bАни-Мэй\b', 'ANI-MAY', 0),
     (r'\bманга ВВЕРХ\b', 'Manga UP', re.IGNORECASE),
+    (r'\bМанга Вверх\b', 'Manga UP', re.IGNORECASE),
     (r'\bЗолотого Камуи\b', 'Golden Kamuy', 0),
     (r'\bЗолотой Камуи\b', 'Golden Kamuy', 0),
-    (r'\bДетектив Конан\b', 'Детектив Конан', 0),
     (r'\bВосхождение книжного червя\b', 'Восхождение в Тени Книжного Червя', 0),
     (r'\bКласс убийц\b', 'Класс убийств', 0),
     (r'\bбанГ-мечта\b', 'BanG Dream', re.IGNORECASE),
     (r'\bбанг-мечта\b', 'BanG Dream', re.IGNORECASE),
+    (r'\bатака титанов\b', 'Атака Титанов', re.IGNORECASE),
+    (r'\bубийца демонов\b', 'Demon Slayer', re.IGNORECASE),
+    (r'\bмоя геройская академия\b', 'Моя геройская академия', re.IGNORECASE),
+    (r'\bчеловек бензопила\b', 'Chainsaw Man', re.IGNORECASE),
+    (r'\bсемья шпионов\b', 'Spy x Family', re.IGNORECASE),
+    (r'\bшпион х семья\b', 'Spy x Family', re.IGNORECASE),
+    (r'\bодиночное повышение уровня\b', 'Solo Leveling', re.IGNORECASE),
+    (r'\bповышение уровня в одиночку\b', 'Solo Leveling', re.IGNORECASE),
+    (r'\bсиняя тюрьма\b', 'Blue Lock', re.IGNORECASE),
+    (r'\bсиняя коробка\b', 'Blue Box', re.IGNORECASE),
+    (r'\bкайдзю №8\b', 'Kaiju No. 8', re.IGNORECASE),
+    (r'\bмагическая битва\b', 'Jujutsu Kaisen', re.IGNORECASE),
+    (r'\bдневник аптекаря\b', 'The Apothecary Diaries', re.IGNORECASE),
 ]
 
 
@@ -1490,10 +1598,74 @@ def anilist_protect_titles(text: str, start_index: int = 2000) -> tuple[str, dic
     return result, placeholders
 
 
+def _deepl_translate(text: str) -> Optional[str]:
+    """Переводит текст на русский через DeepL API.
+    Возвращает перевод или None (если ключа нет / ошибка / лимит) — тогда вызывающий
+    код откатывается на Google Translate.
+
+    Определяет endpoint по типу ключа: ':fx' → бесплатный тир, иначе Pro."""
+    if not DEEPL_API_KEY:
+        return None
+
+    endpoint = (
+        'https://api-free.deepl.com/v2/translate'
+        if DEEPL_API_KEY.endswith(':fx')
+        else 'https://api.deepl.com/v2/translate'
+    )
+
+    # 2 попытки на временные ошибки
+    for attempt in range(2):
+        try:
+            r = requests.post(
+                endpoint,
+                data={
+                    'text': text,
+                    'target_lang': 'RU',
+                    # source_lang не указываем — DeepL определит сам
+                },
+                headers={'Authorization': f'DeepL-Auth-Key {DEEPL_API_KEY}'},
+                timeout=HTTP_TIMEOUT,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                translations = data.get('translations') or []
+                if translations:
+                    return translations[0].get('text') or None
+                return None
+            elif r.status_code == 456:
+                logger.warning("DeepL: исчерпан месячный лимit символов — откат на Google")
+                return None
+            elif r.status_code == 403:
+                logger.warning("DeepL: неверный ключ (403) — откат на Google")
+                return None
+            elif r.status_code == 429 or r.status_code >= 500:
+                # временная ошибка — повторим
+                logger.debug(f"DeepL: временная ошибка {r.status_code}, попытка {attempt + 1}")
+                if attempt == 0:
+                    time.sleep(1)
+                    continue
+                return None
+            else:
+                logger.debug(f"DeepL: HTTP {r.status_code}")
+                return None
+        except (requests.ConnectionError, requests.Timeout) as e:
+            logger.debug(f"DeepL сетевая ошибка ({type(e).__name__}), попытка {attempt + 1}")
+            if attempt == 0:
+                time.sleep(1)
+                continue
+            return None
+        except Exception as e:
+            logger.debug(f"DeepL error: {e}")
+            return None
+    return None
+
+
 def translate_text(text: str, input_limit: int = TRANSLATION_INPUT_LIMIT) -> str:
     """Переводит на русский с защитой терминов и пост-обработкой.
     input_limit — сколько символов исходного текста максимум переводить
-    (для режима ветки передаём больший лимит, чтобы текст не обрезался)."""
+    (для режима ветки передаём больший лимит, чтобы текст не обрезался).
+
+    Переводчик: DeepL (если задан DEEPL_API_KEY), иначе/при ошибке — Google Translate."""
     if not text:
         return text
     text = text[:input_limit]
@@ -1513,12 +1685,14 @@ def translate_text(text: str, input_limit: int = TRANSLATION_INPUT_LIMIT) -> str
     # Объединяем словари плейсхолдеров
     all_placeholders = {**term_placeholders, **auto_placeholders, **anilist_placeholders}
 
-    # 4. Перевод
-    try:
-        translated = translator.translate(protected_text)
-    except Exception as e:
-        logger.warning(f"Ошибка перевода: {e}")
-        return text
+    # 4. Перевод: сначала DeepL (если ключ задан), при неудаче — Google Translate
+    translated = _deepl_translate(protected_text)
+    if translated is None:
+        try:
+            translated = translator.translate(protected_text)
+        except Exception as e:
+            logger.warning(f"Ошибка перевода: {e}")
+            return text
 
     if not translated:
         return text
@@ -3697,11 +3871,13 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
     yt_status = '🟢 готов' if YT_DLP_AVAILABLE else '🔴 не установлен'
     ffmpeg_status = '🟢 найден' if shutil.which('ffmpeg') else '🟡 не найден'
     video_state = '🟢 включено' if settings.video_enabled else '🔴 выключено'
+    translator_name = 'DeepL 🟢' if DEEPL_API_KEY else 'Google Translate'
     queue_size = await post_queue.peek_size()
     await update.message.reply_text(
         f"Авторассылка: {'🟢 включена' if is_running else '🔴 выключена'}\n"
         f"Интервал: {settings.check_interval_min} мин (1 пост за интервал)\n"
         f"🧵 Режим ветки: {'ВКЛ (всё в ветку)' if settings.thread_mode else 'ВЫКЛ (по 1 в канал)'}\n"
+        f"🌐 Переводчик: {translator_name}\n"
         f"⏰ Свежесть постов: {settings.post_max_age_hours} ч\n"
         f"🖼 Только с картинками: {'ВКЛ' if settings.require_image else 'ВЫКЛ'}\n"
         f"📦 В очереди: {queue_size}\n"
@@ -3928,6 +4104,7 @@ def main():
     print("=== Запуск anime_news_bot ===", flush=True)
     print(f"DATA_DIR = {DATA_DIR}", flush=True)
     print(f"TOKEN задан: {'да' if TOKEN else 'НЕТ'}", flush=True)
+    print(f"Переводчик: {'DeepL' if DEEPL_API_KEY else 'Google Translate'}", flush=True)
 
     try:
         _setup_file_logging()
