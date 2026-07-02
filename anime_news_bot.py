@@ -1021,7 +1021,11 @@ POST_TRANSLATION_REPLACEMENTS = [
     (r'\bманга серия\b', 'манга', re.IGNORECASE),
     (r'\bсерия манги\b', 'манга', re.IGNORECASE),
     (r'\bлайт-новелла\b', 'ранобэ', re.IGNORECASE),
+    (r'\bлайт-новелл[ыеу]?\b', 'ранобэ', re.IGNORECASE),
     (r'\bлёгкая новелла\b', 'ранобэ', re.IGNORECASE),
+    (r'\bл[её]гкие новеллы\b', 'ранобэ', re.IGNORECASE),
+    (r'\bл[её]гкие романы\b', 'ранобэ', re.IGNORECASE),
+    (r'\bл[её]гких романов\b', 'ранобэ', re.IGNORECASE),
     (r'\bлёгкий роман\b', 'ранобэ', re.IGNORECASE),
     (r'\bлегкий роман\b', 'ранобэ', re.IGNORECASE),
     (r'\bвизуальная новелла\b', 'визуальная новелла', re.IGNORECASE),
@@ -1650,7 +1654,22 @@ def restore_terms(text: str, placeholders: dict) -> str:
             if ph == _make_token(int(idx_str)):
                 return value
         return m.group(0)  # не нашли — оставляем как было
-    return _TOKEN_PATTERN.sub(replace_token, text)
+    result = _TOKEN_PATTERN.sub(replace_token, text)
+
+    # Fallback: переводчик мог исковеркать скобки токена (например, DeepL без
+    # XML-режима превращал 〖2000〗 в «2000»). Для каждого невосстановленного
+    # плейсхолдера ищем его индекс в кавычках/скобках и возвращаем значение.
+    for ph, value in placeholders.items():
+        m = _TOKEN_PATTERN.fullmatch(ph)
+        if not m:
+            continue
+        idx = m.group(1)
+        if _make_token(int(idx)) in result:
+            continue  # обычный токен остался — его уже обработали выше
+        broken = re.compile(r'[«"„‹<\[〈]\s*' + re.escape(idx) + r'\s*[»"“›>\]〉]')
+        if broken.search(result):
+            result = broken.sub(value, result)
+    return result
 
 
 def apply_replacements(text: str) -> str:
@@ -1705,6 +1724,12 @@ def anilist_protect_titles(text: str, start_index: int = 2000) -> tuple[str, dic
         first = candidate.split()[0]
         if first.lower() in _COMMON_FIRST:
             continue
+        # Пропускаем если кандидат покрывает большую часть текста: это скорее
+        # газетный Title-Case заголовок целиком ("PlayStation to End Physical
+        # Disc Production"), а не название внутри него. Защита такого «кандидата»
+        # блокирует перевод всего заголовка.
+        if len(candidate) >= 0.55 * len(text.strip()):
+            continue
         candidates.append((m.start(), m.end(), candidate))
 
     # Сортируем по длине убывающе, чтобы длинные имена защищались первыми
@@ -1741,28 +1766,46 @@ def anilist_protect_titles(text: str, start_index: int = 2000) -> tuple[str, dic
     return result, placeholders
 
 
-def _deepl_usage() -> Optional[dict]:
+def _deepl_usage() -> tuple[Optional[dict], str]:
     """Запрашивает у DeepL использование лимита.
-    Возвращает {'character_count': N, 'character_limit': M} или None при ошибке/без ключа."""
+    Возвращает (данные, '') при успехе или (None, описание_ошибки) при неудаче.
+    При 403 пробует второй endpoint (вдруг тип ключа не совпал с эвристикой ':fx')."""
     if not DEEPL_API_KEY:
-        return None
-    endpoint = (
+        return None, 'ключ не задан'
+    primary = (
         'https://api-free.deepl.com/v2/usage'
         if DEEPL_API_KEY.endswith(':fx')
         else 'https://api.deepl.com/v2/usage'
     )
-    try:
-        r = requests.get(
-            endpoint,
-            headers={'Authorization': f'DeepL-Auth-Key {DEEPL_API_KEY}'},
-            timeout=HTTP_TIMEOUT,
-        )
-        if r.status_code == 200:
-            return r.json()
-        logger.debug(f"DeepL usage: HTTP {r.status_code}")
-    except Exception as e:
-        logger.debug(f"DeepL usage error: {e}")
-    return None
+    fallback = (
+        'https://api.deepl.com/v2/usage'
+        if 'api-free' in primary
+        else 'https://api-free.deepl.com/v2/usage'
+    )
+    last_err = 'неизвестная ошибка'
+    for endpoint in (primary, fallback):
+        try:
+            r = requests.get(
+                endpoint,
+                headers={'Authorization': f'DeepL-Auth-Key {DEEPL_API_KEY}'},
+                timeout=HTTP_TIMEOUT,
+            )
+            if r.status_code == 200:
+                return r.json(), ''
+            host = endpoint.split('/')[2]
+            last_err = f'HTTP {r.status_code} от {host}'
+            logger.warning(f"DeepL usage: {last_err}")
+            if r.status_code != 403:
+                break  # только при 403 есть смысл пробовать другой endpoint
+        except requests.Timeout:
+            last_err = 'таймаут соединения'
+            logger.warning(f"DeepL usage: таймаут {endpoint}")
+            break
+        except Exception as e:
+            last_err = f'{type(e).__name__}'
+            logger.warning(f"DeepL usage error: {type(e).__name__}: {e}")
+            break
+    return None, last_err
 
 
 def _deepl_translate(text: str) -> Optional[str]:
@@ -1780,14 +1823,22 @@ def _deepl_translate(text: str) -> Optional[str]:
         else 'https://api.deepl.com/v2/translate'
     )
 
+    # КРИТИЧНО: DeepL коверкает наши плейсхолдеры 〖N〗 (превращает скобки в кавычки
+    # «N»), из-за чего restore_terms не может вернуть названия — в постах появлялись
+    # голые числа «2000». Официальное решение DeepL — XML-теги с ignore_tags:
+    # содержимое <x>N</x> DeepL гарантированно не трогает.
+    text_xml = re.sub(r'〖\s*(\d+)\s*〗', r'<x>\1</x>', text)
+
     # 2 попытки на временные ошибки
     for attempt in range(2):
         try:
             r = requests.post(
                 endpoint,
                 data={
-                    'text': text,
+                    'text': text_xml,
                     'target_lang': 'RU',
+                    'tag_handling': 'xml',
+                    'ignore_tags': 'x',
                     # source_lang не указываем — DeepL определит сам
                 },
                 headers={'Authorization': f'DeepL-Auth-Key {DEEPL_API_KEY}'},
@@ -1797,7 +1848,11 @@ def _deepl_translate(text: str) -> Optional[str]:
                 data = r.json()
                 translations = data.get('translations') or []
                 if translations:
-                    return translations[0].get('text') or None
+                    out = translations[0].get('text') or None
+                    if out:
+                        # Возвращаем XML-теги обратно в наш формат плейсхолдеров
+                        out = re.sub(r'<\s*x\s*>\s*(\d+)\s*<\s*/\s*x\s*>', r'〖\1〗', out)
+                    return out
                 return None
             elif r.status_code == 456:
                 logger.warning("DeepL: исчерпан месячный лимит символов — откат на Google")
@@ -2794,6 +2849,19 @@ def matches_blacklist(news: dict) -> Optional[str]:
     return m.group(0) if m else None
 
 
+# Дайджесты и самореклама источников — не новости, отсеиваем по заголовку/началу текста.
+# Проверяется на ОРИГИНАЛЬНОМ английском тексте до перевода.
+DIGEST_SKIP_PATTERNS = [
+    re.compile(r'north american anime,?\s*manga releases', re.IGNORECASE),
+    re.compile(r'this week in (anime|manga|games)', re.IGNORECASE),
+    re.compile(r'weekly (anime|manga|news) (round-?up|digest|recap)', re.IGNORECASE),
+    re.compile(r'come (visit|see) us at', re.IGNORECASE),
+    re.compile(r'our panels?,? events?,? and booth', re.IGNORECASE),
+    re.compile(r'(anime expo|comic-?con|ax) \d{4}\s+(news|coverage|guide|preview)', re.IGNORECASE),
+    re.compile(r'all (of )?our .{0,30}(news|coverage|reviews)', re.IGNORECASE),
+]
+
+
 def matches_keywords(news: dict) -> bool:
     """Применяет whitelist (KEYWORDS) и blacklist. Возвращает True если пост подходит."""
     # 1) Blacklist — жёсткий отказ
@@ -2801,6 +2869,12 @@ def matches_keywords(news: dict) -> bool:
     if blocked:
         logger.info(f"⊘ Blacklist: пост содержит '{blocked}': {news.get('title', '')[:60]}")
         return False
+    # 1b) Дайджесты и промо источников — не новости
+    check_text = (news.get('title') or '') + ' ' + (news.get('summary') or '')[:300]
+    for pattern in DIGEST_SKIP_PATTERNS:
+        if pattern.search(check_text):
+            logger.info(f"⊘ Дайджест/промо: {news.get('title', '')[:60]}")
+            return False
     # 2) Whitelist — если задан
     if not KEYWORDS:
         return True
@@ -2822,9 +2896,10 @@ def _extract_first_sentence(text: str, max_len: int = 300) -> str:
     text = re.sub(r'\s*\(?(?:read more|continue reading|подробнее)\)?\s*$', '', text, flags=re.IGNORECASE)
 
     # Ищем конец первого предложения. Точка/!/? за которыми пробел+заглавная или конец строки.
-    # Избегаем ложных срабатываний на сокращениях (No. 8, Dr. Stone, vol. 2 и т.п.)
-    # Простой подход: ищем [.!?] после которого пробел и заглавная буква (лат/кир) или конец.
-    match = re.search(r'[.!?](?:\s+[«"A-ZА-ЯЁ]|\s*$)', text)
+    # Избегаем ложных срабатываний на сокращениях (No. 8, Dr. Stone, vol. 2 и т.п.):
+    # lookbehind (?<!\s\d) не даёт считать границей точку сразу после одиночной цифры
+    # («Akuma de Sourou 4. Doctor…» — не граница; «…в 2026. Новый…» — граница, т.к. 4 цифры).
+    match = re.search(r'(?<!\s\d)[.!?](?:\s+[«"A-ZА-ЯЁ]|\s*$)', text)
     if match:
         sentence = text[:match.start() + 1].strip()
     else:
@@ -2834,6 +2909,12 @@ def _extract_first_sentence(text: str, max_len: int = 300) -> str:
     # Если предложение всё ещё длиннее лимита — укорачиваем аккуратно
     if len(sentence) > max_len:
         sentence = smart_truncate(sentence, max_len)
+
+    # Чистим мусорные хвосты, оставшиеся от обрезки источником/переводом:
+    # «…с Naruto,…» → «…с Naruto»; «студии TriF.(с» → «студии TriF.»
+    sentence = re.sub(r'\s*,\s*(?:…|\.{2,3})\s*$', '', sentence)   # висящее «,…» / «, ...»
+    sentence = re.sub(r'\s*\([^)]{0,6}$', '', sentence)            # незакрытая скобка с обрывком
+    sentence = re.sub(r'[\s,;:—–-]+$', '', sentence)               # висящие знаки в конце
 
     return sentence.strip()
 
@@ -4258,9 +4339,26 @@ async def deepl_command(update, context: ContextTypes.DEFAULT_TYPE):
             "Перевод работает через Google Translate."
         )
         return
-    usage = await asyncio.to_thread(_deepl_usage)
+    usage, err = await asyncio.to_thread(_deepl_usage)
     if not usage:
-        await update.message.reply_text("⚠️ Не удалось получить данные от DeepL (ошибка сети или неверный ключ).")
+        # Статистика не пришла — проверяем живым тестовым переводом, работает ли ключ вообще
+        test = await asyncio.to_thread(_deepl_translate, 'Hello')
+        if test:
+            await update.message.reply_text(
+                f"⚠️ Статистика лимита недоступна: {err}.\n"
+                f"Но сам перевод через DeepL РАБОТАЕТ (тест прошёл) — "
+                f"вероятно, временный сбой usage-эндпоинта. Попробуй позже."
+            )
+        else:
+            await update.message.reply_text(
+                f"🔴 DeepL не отвечает: {err}. Тестовый перевод тоже не прошёл.\n\n"
+                f"Скорее всего ключ неверный. Частые причины:\n"
+                f"• ключ пересоздавался (после утечки), а в Bothost остался старый — "
+                f"обнови DEEPL_API_KEY и перезапусти бота\n"
+                f"• пробел/кавычки в значении переменной\n\n"
+                f"Пока DeepL недоступен, перевод тихо идёт через Google Translate. "
+                f"Подробности: /logs"
+            )
         return
     used = usage.get('character_count', 0)
     limit = usage.get('character_limit', 0)
