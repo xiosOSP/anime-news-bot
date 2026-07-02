@@ -636,6 +636,9 @@ class BotSettings:
         'post_max_age_hours': POST_MAX_AGE_HOURS,
         'disabled_sources': [],
         'thread_mode': False,    # True = слать все новости пачкой в ветку обсуждения
+        'translator_engine': 'deepl',  # 'deepl' (если ключ задан, с fallback) или 'google' (принудительно)
+        'quiet_mode': True,      # True = уведомлять админа только при ошибках + сводка раз в день
+        'last_daily_summary': '',  # дата (YYYY-MM-DD) последней ежедневной сводки
     }
 
     def __init__(self, path: Path):
@@ -710,6 +713,33 @@ class BotSettings:
     @thread_mode.setter
     def thread_mode(self, value: bool) -> None:
         self._data['thread_mode'] = bool(value)
+        self.save()
+
+    @property
+    def translator_engine(self) -> str:
+        return self._data.get('translator_engine', 'deepl')
+
+    @translator_engine.setter
+    def translator_engine(self, value: str) -> None:
+        self._data['translator_engine'] = 'google' if value == 'google' else 'deepl'
+        self.save()
+
+    @property
+    def quiet_mode(self) -> bool:
+        return self._data.get('quiet_mode', True)
+
+    @quiet_mode.setter
+    def quiet_mode(self, value: bool) -> None:
+        self._data['quiet_mode'] = bool(value)
+        self.save()
+
+    @property
+    def last_daily_summary(self) -> str:
+        return self._data.get('last_daily_summary', '')
+
+    @last_daily_summary.setter
+    def last_daily_summary(self, value: str) -> None:
+        self._data['last_daily_summary'] = str(value)
         self.save()
 
     def is_source_enabled(self, source_name: str) -> bool:
@@ -1115,6 +1145,115 @@ RU_MONTHS = {
     9: 'сентября', 10: 'октября', 11: 'ноября', 12: 'декабря',
 }
 
+# Именительный падеж — для «май 2027» (без дня)
+RU_MONTHS_NOM = {
+    1: 'январь', 2: 'февраль', 3: 'март', 4: 'апрель',
+    5: 'май', 6: 'июнь', 7: 'июль', 8: 'август',
+    9: 'сентябрь', 10: 'октябрь', 11: 'ноябрь', 12: 'декабрь',
+}
+
+_EN_MONTHS = {
+    'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,
+    'july': 7, 'august': 8, 'september': 9, 'october': 10, 'november': 11, 'december': 12,
+    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'jun': 6, 'jul': 7,
+    'aug': 8, 'sep': 9, 'sept': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+}
+
+_EN_SEASONS = {'spring': 'весна', 'summer': 'лето', 'fall': 'осень', 'autumn': 'осень', 'winter': 'зима'}
+
+_MONTH_RE = (
+    r'(?:January|February|March|April|May|June|July|August|September|October|November|December'
+    r'|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)'
+)
+
+# Паттерны дат в английском тексте, в порядке проверки.
+# Каждый: (compiled_regex, kind), где kind определяет формат вывода.
+_DATE_PATTERNS = [
+    # August 12, 2026 / Aug. 12 2026 / August 12th, 2026
+    (re.compile(rf'\b({_MONTH_RE})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})\b', re.IGNORECASE), 'mdy'),
+    # 12 August 2026 / 12th August, 2026
+    (re.compile(rf'\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_RE})\.?,?\s+(\d{{4}})\b', re.IGNORECASE), 'dmy'),
+    # May 2027
+    (re.compile(rf'\b({_MONTH_RE})\.?\s+(\d{{4}})\b', re.IGNORECASE), 'my'),
+    # Spring 2027 / Fall 2026
+    (re.compile(r'\b(Spring|Summer|Fall|Autumn|Winter)\s+(\d{4})\b', re.IGNORECASE), 'sy'),
+    # August 12 (без года; не должно быть года следом — это уже поймал mdy)
+    (re.compile(rf'\b({_MONTH_RE})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?\b(?!\s*,?\s*\d{{4}})', re.IGNORECASE), 'md'),
+    # 12 August (без года)
+    (re.compile(rf'\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_RE})\b(?!\.?,?\s+\d{{4}})', re.IGNORECASE), 'dm'),
+]
+
+# Приоритет конкретности (меньше = конкретнее) — для сортировки при равных позициях
+_KIND_PRIORITY = {'mdy': 0, 'dmy': 0, 'my': 1, 'sy': 2, 'md': 3, 'dm': 3}
+
+
+def extract_release_date_from_text(text: str) -> str:
+    """Ищет дату выхода/события в английском тексте новости.
+    Возвращает русскую строку («12 августа 2026», «май 2027», «весна 2027», «12 августа»)
+    или '' если конкретной даты в тексте нет.
+
+    Берётся ПЕРВАЯ дата по позиции в тексте (обычно она относится к главному событию).
+    Годы вне разумного диапазона отбрасываются."""
+    if not text:
+        return ''
+
+    year_now = datetime.now().year
+    year_min, year_max = year_now - 1, year_now + 6
+
+    candidates: list[tuple[int, int, str]] = []  # (позиция, приоритет, готовая строка)
+
+    for pattern, kind in _DATE_PATTERNS:
+        for m in pattern.finditer(text):
+            try:
+                if kind == 'mdy':
+                    month = _EN_MONTHS.get(m.group(1).lower().rstrip('.'))
+                    day, year = int(m.group(2)), int(m.group(3))
+                    if not month or not (1 <= day <= 31) or not (year_min <= year <= year_max):
+                        continue
+                    formatted = f'{day} {RU_MONTHS[month]} {year}'
+                elif kind == 'dmy':
+                    day = int(m.group(1))
+                    month = _EN_MONTHS.get(m.group(2).lower().rstrip('.'))
+                    year = int(m.group(3))
+                    if not month or not (1 <= day <= 31) or not (year_min <= year <= year_max):
+                        continue
+                    formatted = f'{day} {RU_MONTHS[month]} {year}'
+                elif kind == 'my':
+                    month = _EN_MONTHS.get(m.group(1).lower().rstrip('.'))
+                    year = int(m.group(2))
+                    if not month or not (year_min <= year <= year_max):
+                        continue
+                    formatted = f'{RU_MONTHS_NOM[month]} {year}'
+                elif kind == 'sy':
+                    season = _EN_SEASONS.get(m.group(1).lower())
+                    year = int(m.group(2))
+                    if not season or not (year_min <= year <= year_max):
+                        continue
+                    formatted = f'{season} {year}'
+                elif kind == 'md':
+                    month = _EN_MONTHS.get(m.group(1).lower().rstrip('.'))
+                    day = int(m.group(2))
+                    if not month or not (1 <= day <= 31):
+                        continue
+                    formatted = f'{day} {RU_MONTHS[month]}'
+                elif kind == 'dm':
+                    day = int(m.group(1))
+                    month = _EN_MONTHS.get(m.group(2).lower().rstrip('.'))
+                    if not month or not (1 <= day <= 31):
+                        continue
+                    formatted = f'{day} {RU_MONTHS[month]}'
+                else:
+                    continue
+                candidates.append((m.start(), _KIND_PRIORITY[kind], formatted))
+            except (ValueError, IndexError, KeyError):
+                continue
+
+    if not candidates:
+        return ''
+    # Первая по позиции; при равной позиции — конкретнее
+    candidates.sort(key=lambda c: (c[0], c[1]))
+    return candidates[0][2]
+
 
 def parse_episode(title: str) -> Optional[dict]:
     """Если заголовок описывает эпизод — возвращает dict с полями. Иначе None."""
@@ -1333,6 +1472,10 @@ anilist: Optional['AniListClient'] = None
 
 # ============== ПЕРЕВОД С ЗАЩИТОЙ ТЕРМИНОВ ==============
 _translation_cache: dict[str, str] = {}
+# Лимит кэша переводов в памяти: при переполнении выкидываем старейшую треть
+# (dict в Python сохраняет порядок вставки). Без лимита за месяцы работы
+# кэш растёт бесконечно и подъедает RAM.
+TRANSLATION_CACHE_MAX = 4000
 
 # Кавычки разных видов, в которых могут быть названия
 _QUOTE_PATTERNS = [
@@ -1598,6 +1741,30 @@ def anilist_protect_titles(text: str, start_index: int = 2000) -> tuple[str, dic
     return result, placeholders
 
 
+def _deepl_usage() -> Optional[dict]:
+    """Запрашивает у DeepL использование лимита.
+    Возвращает {'character_count': N, 'character_limit': M} или None при ошибке/без ключа."""
+    if not DEEPL_API_KEY:
+        return None
+    endpoint = (
+        'https://api-free.deepl.com/v2/usage'
+        if DEEPL_API_KEY.endswith(':fx')
+        else 'https://api.deepl.com/v2/usage'
+    )
+    try:
+        r = requests.get(
+            endpoint,
+            headers={'Authorization': f'DeepL-Auth-Key {DEEPL_API_KEY}'},
+            timeout=HTTP_TIMEOUT,
+        )
+        if r.status_code == 200:
+            return r.json()
+        logger.debug(f"DeepL usage: HTTP {r.status_code}")
+    except Exception as e:
+        logger.debug(f"DeepL usage error: {e}")
+    return None
+
+
 def _deepl_translate(text: str) -> Optional[str]:
     """Переводит текст на русский через DeepL API.
     Возвращает перевод или None (если ключа нет / ошибка / лимит) — тогда вызывающий
@@ -1633,7 +1800,7 @@ def _deepl_translate(text: str) -> Optional[str]:
                     return translations[0].get('text') or None
                 return None
             elif r.status_code == 456:
-                logger.warning("DeepL: исчерпан месячный лимit символов — откат на Google")
+                logger.warning("DeepL: исчерпан месячный лимит символов — откат на Google")
                 return None
             elif r.status_code == 403:
                 logger.warning("DeepL: неверный ключ (403) — откат на Google")
@@ -1685,8 +1852,14 @@ def translate_text(text: str, input_limit: int = TRANSLATION_INPUT_LIMIT) -> str
     # Объединяем словари плейсхолдеров
     all_placeholders = {**term_placeholders, **auto_placeholders, **anilist_placeholders}
 
-    # 4. Перевод: сначала DeepL (если ключ задан), при неудаче — Google Translate
-    translated = _deepl_translate(protected_text)
+    # 4. Перевод. Движок выбирается настройкой translator_engine:
+    #    'deepl'  — DeepL (если ключ задан), при ошибке fallback на Google
+    #    'google' — принудительно Google Translate
+    # getattr с default — на случай если settings ещё не инициализирован (тесты, импорт).
+    engine = getattr(settings, 'translator_engine', 'deepl')
+    translated = None
+    if engine != 'google':
+        translated = _deepl_translate(protected_text)
     if translated is None:
         try:
             translated = translator.translate(protected_text)
@@ -1706,6 +1879,9 @@ def translate_text(text: str, input_limit: int = TRANSLATION_INPUT_LIMIT) -> str
     # 7. Финальная очистка
     translated = re.sub(r'\s+', ' ', translated).strip()
 
+    if len(_translation_cache) >= TRANSLATION_CACHE_MAX:
+        for old_key in list(_translation_cache.keys())[:TRANSLATION_CACHE_MAX // 3]:
+            del _translation_cache[old_key]
     _translation_cache[text] = translated
     return translated
 
@@ -2578,8 +2754,11 @@ SOURCES = [
     ('Crunchyroll', get_crunchyroll_news),
     ("Honey's Anime", get_honeys_anime),
     ('AnimeHunch', get_animehunch),
-    ('Kotaku', get_kotaku_anime),
-    ('Yatta-Tachi', get_yatta_tachi),
+    # Kotaku и Yatta-Tachi отключены: за 18+ часов работы на сервере — 0 собранных
+    # новостей (RSS пустой или недоступен). Функции оставлены — можно вернуть
+    # раскомментировав, если ленты оживут.
+    # ('Kotaku', get_kotaku_anime),
+    # ('Yatta-Tachi', get_yatta_tachi),
     # Reddit отключён: банит серверные IP (403 на все запросы с хостинга).
     # Функция get_reddit_anime оставлена в коде — при наличии рабочего прокси
     # (REDDIT_PROXY) можно вернуть строку ниже.
@@ -2629,76 +2808,99 @@ def matches_keywords(news: dict) -> bool:
     return any(kw.lower() in text for kw in KEYWORDS)
 
 
-def format_news_text_long(news: dict) -> str:
-    """Форматирует текст новости для режима ВЕТКИ — отдельным сообщением до 4096 символов.
-    Заголовок + полное описание единым блоком (вариант B)."""
-    # Эпизоды форматируем как обычно (они короткие)
+def _extract_first_sentence(text: str, max_len: int = 300) -> str:
+    """Извлекает первое предложение из текста.
+    Обрезает на границе предложения (. ! ?). Если предложение слишком длинное —
+    аккуратно укорачивает. Убирает хвост '[...]' от обрезанных RSS-превью."""
+    if not text:
+        return ''
+    text = text.strip()
+
+    # Убираем '[...]', '[…]', 'Read more' и подобные хвосты обрезки
+    text = re.sub(r'\s*\[\.{2,3}\]\s*$', '', text)
+    text = re.sub(r'\s*\[…\]\s*$', '', text)
+    text = re.sub(r'\s*\(?(?:read more|continue reading|подробнее)\)?\s*$', '', text, flags=re.IGNORECASE)
+
+    # Ищем конец первого предложения. Точка/!/? за которыми пробел+заглавная или конец строки.
+    # Избегаем ложных срабатываний на сокращениях (No. 8, Dr. Stone, vol. 2 и т.п.)
+    # Простой подход: ищем [.!?] после которого пробел и заглавная буква (лат/кир) или конец.
+    match = re.search(r'[.!?](?:\s+[«"A-ZА-ЯЁ]|\s*$)', text)
+    if match:
+        sentence = text[:match.start() + 1].strip()
+    else:
+        # Нет явной границы — берём весь текст
+        sentence = text
+
+    # Если предложение всё ещё длиннее лимита — укорачиваем аккуратно
+    if len(sentence) > max_len:
+        sentence = smart_truncate(sentence, max_len)
+
+    return sentence.strip()
+
+
+def _format_post_date(published_struct) -> str:
+    """Форматирует дату новости как 'D месяца' (напр. '1 июля').
+    Возвращает пустую строку если даты нет или она невалидна."""
+    if not published_struct:
+        return ''
+    try:
+        pub = datetime(*published_struct[:6])
+    except (TypeError, ValueError):
+        return ''
+    return f'{pub.day} {RU_MONTHS.get(pub.month, "")}'.strip()
+
+
+def format_news_short(news: dict) -> str:
+    """Короткий формат поста: заголовок + одно предложение сути + дата.
+    Используется и для канала, и для ветки. Без воды."""
+    # Эпизоды форматируем отдельно (они и так короткие)
     ep = parse_episode(news['title'])
     if ep:
         return format_episode_post(ep, news.get('published_parsed'))
 
+    # Заголовок
     ru_title = translate_text(news['title']).rstrip('.')
-    summary = news['summary'] or ''
-    # Переводим с большим лимитом входа
-    ru_summary = translate_text(summary, input_limit=TRANSLATION_INPUT_LIMIT_THREAD) if summary else ''
-
     if ru_title and not ru_title.endswith(('.', '!', '?', '…', ':')):
         ru_title += '.'
 
-    # Обрезаем summary под большой лимит (с запасом на заголовок и html.escape)
-    title_len = len(ru_title)
-    available = TG_TEXT_LIMIT - title_len - 2 - 100  # \n\n + запас на escape
-    summary_budget = min(SUMMARY_MAX_CHARS_THREAD, max(100, available))
-    if ru_summary:
-        ru_summary = smart_truncate(ru_summary, summary_budget)
+    # Одно предложение из описания
+    summary = news.get('summary') or ''
+    ru_summary = ''
+    if summary:
+        first = _extract_first_sentence(summary)
+        if first:
+            ru_summary = translate_text(first)
+            # На случай если перевод вернул несколько предложений — берём первое снова
+            ru_summary = _extract_first_sentence(ru_summary, max_len=350)
 
-    # Если summary дублирует заголовок — не показываем
-    if ru_summary and ru_title.rstrip('.') in ru_summary:
+    # Если предложение дублирует заголовок — не показываем
+    if ru_summary and ru_title.rstrip('.').lower() in ru_summary.lower():
         ru_summary = ''
 
+    # Дата СОБЫТИЯ из текста новости (не дата публикации RSS!).
+    # Ищем в оригинальном английском тексте — там форматы дат предсказуемы.
+    # Если конкретной даты в тексте нет — строка даты не показывается вообще.
+    search_text = (news.get('title') or '') + ' ' + (news.get('summary') or '')[:600]
+    date_str = extract_release_date_from_text(search_text)
+
+    # Собираем: заголовок / предложение / дата
+    parts = [ru_title]
     if ru_summary:
-        return f'{ru_title}\n\n{ru_summary}'
-    return ru_title
+        parts.append(ru_summary)
+    body = '\n\n'.join(parts)
+    if date_str:
+        body += f'\n\n📅 {date_str}'
+    return body
+
+
+def format_news_text_long(news: dict) -> str:
+    """Формат текста для ветки — теперь тоже короткий (заголовок + предложение + дата)."""
+    return format_news_short(news)
 
 
 def format_news_post(news: dict) -> str:
-    """Главная функция: превращает новость в текст в стиле Fubuki61.
-    Динамически распределяет место: чем короче заголовок, тем больше summary."""
-    # 1. Это эпизод?
-    ep = parse_episode(news['title'])
-    if ep:
-        return format_episode_post(ep, news.get('published_parsed'))
-
-    # 2. Обычная новость
-    ru_title = translate_text(news['title']).rstrip('.')
-    summary = news['summary'] or ''
-    ru_summary = translate_text(summary) if summary else ''
-
-    # Заголовок завершаем точкой если её нет
-    if ru_title and not ru_title.endswith(('.', '!', '?', '…', ':')):
-        ru_title += '.'
-
-    # Рассчитываем место под summary динамически.
-    # Caption Telegram = 1024 символа. После html.escape некоторые символы вырастают
-    # (& → &amp;, " → &quot; и т.д.), поэтому закладываем запас 10%.
-    # Структура: <ЗАГОЛОВОК>\n\n<SUMMARY>
-    title_len = len(ru_title)
-    separator_len = 2  # \n\n
-    safety = 80  # запас на html.escape, эмодзи (которые 2-4 байта) и round-up
-    available_for_summary = TG_CAPTION_LIMIT - title_len - separator_len - safety
-    summary_budget = min(SUMMARY_MAX_CHARS, max(100, available_for_summary))
-
-    # Обрезаем summary
-    if ru_summary:
-        ru_summary = smart_truncate(ru_summary, summary_budget)
-
-    # Если summary дублирует заголовок — не показываем
-    if ru_summary and ru_title.rstrip('.') in ru_summary:
-        ru_summary = ''
-
-    if ru_summary:
-        return f'{ru_title}\n\n{ru_summary}'
-    return ru_title
+    """Формат поста для канала — короткий: заголовок + предложение + дата."""
+    return format_news_short(news)
 
 
 # ============== ОТПРАВКА ==============
@@ -2973,10 +3175,8 @@ async def send_news(bot: Bot, news: dict, chat_id=None) -> str:
 
     target = chat_id or CHANNEL_ID
 
-    # Догружаем полный текст со страницы если RSS-превью короткое
-    # (только для отправки в канал; для /news и /preview в личку — пропускаем ради скорости)
-    if is_channel:
-        await asyncio.to_thread(enrich_summary_from_page, news)
+    # Догрузка полного текста отключена: посты теперь короткие (заголовок + 1 предложение),
+    # полный текст статьи не нужен. Функция enrich_summary_from_page оставлена в коде.
 
     video_file = None
     if news.get('video'):
@@ -3116,8 +3316,7 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
         await stats.record_skipped('duplicate', source)
         return 'skipped_dup'
 
-    # Догружаем полный текст со страницы если RSS-превью короткое
-    await asyncio.to_thread(enrich_summary_from_page, news)
+    # Догрузка полного текста отключена: посты короткие (заголовок + 1 предложение).
 
     video_file = None
     if news.get('video'):
@@ -3249,11 +3448,20 @@ def build_settings_menu() -> InlineKeyboardMarkup:
     img_label = "🖼 Только с картинками: ВКЛ" if settings.require_image else "🖼 Только с картинками: ВЫКЛ"
     age_label = f"⏰ Свежесть постов: {settings.post_max_age_hours} ч"
     thread_label = "🧵 Режим ветки: ВКЛ" if settings.thread_mode else "🧵 Режим ветки: ВЫКЛ"
+    if settings.translator_engine == 'google':
+        tr_label = "🌐 Переводчик: Google"
+    elif DEEPL_API_KEY:
+        tr_label = "🌐 Переводчик: DeepL"
+    else:
+        tr_label = "🌐 Переводчик: DeepL (нет ключа → Google)"
+    quiet_label = "🔕 Тихий режим: ВКЛ" if settings.quiet_mode else "🔔 Тихий режим: ВЫКЛ"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📡 Источники", callback_data="settings:sources")],
         [InlineKeyboardButton("🔁 Интервал автопроверки", callback_data="settings:interval")],
         [InlineKeyboardButton(age_label, callback_data="settings:age")],
         [InlineKeyboardButton(thread_label, callback_data="settings:toggle_thread")],
+        [InlineKeyboardButton(tr_label, callback_data="settings:toggle_translator")],
+        [InlineKeyboardButton(quiet_label, callback_data="settings:toggle_quiet")],
         [InlineKeyboardButton("🎬 Видео", callback_data="settings:video")],
         [InlineKeyboardButton(img_label, callback_data="settings:toggle_require_image")],
         [InlineKeyboardButton("📦 Очередь постов", callback_data="settings:queue")],
@@ -3445,6 +3653,61 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🧵 Режим ветки ВЫКЛЮЧЕН.\n"
                 "Бот снова публикует по одному посту в канал за интервал."
             )
+        await query.edit_message_text(text, reply_markup=build_settings_menu())
+        return
+
+    if data == "settings:toggle_quiet":
+        settings.quiet_mode = not settings.quiet_mode
+        if settings.quiet_mode:
+            await query.answer("Тихий режим включён 🔕")
+            text = (
+                "⚙️ Настройки\n\n"
+                "🔕 Тихий режим ВКЛЮЧЁН.\n"
+                "Уведомления о каждой проверке отключены. Бот напишет только "
+                "при ошибках + пришлёт одну сводку в день.\n"
+                "Всегда доступны: /stats /status /logs"
+            )
+        else:
+            await query.answer("Тихий режим выключен 🔔")
+            text = (
+                "⚙️ Настройки\n\n"
+                "🔔 Тихий режим ВЫКЛЮЧЕН.\n"
+                "Бот снова уведомляет о каждой проверке (каждые "
+                f"{settings.check_interval_min} мин)."
+            )
+        await query.edit_message_text(text, reply_markup=build_settings_menu())
+        return
+
+    if data == "settings:toggle_translator":
+        if settings.translator_engine == 'deepl':
+            settings.translator_engine = 'google'
+            await query.answer("Переводчик: Google Translate")
+            text = (
+                "⚙️ Настройки\n\n"
+                "🌐 Переводчик переключён на Google Translate.\n"
+                "DeepL не используется, даже если ключ задан "
+                "(полезно для экономии лимита DeepL)."
+            )
+        else:
+            settings.translator_engine = 'deepl'
+            if DEEPL_API_KEY:
+                await query.answer("Переводчик: DeepL 🟢")
+                text = (
+                    "⚙️ Настройки\n\n"
+                    "🌐 Переводчик переключён на DeepL.\n"
+                    "При ошибке или исчерпании лимита бот автоматически "
+                    "откатится на Google Translate."
+                )
+            else:
+                await query.answer("Ключ DeepL не задан!", show_alert=True)
+                text = (
+                    "⚙️ Настройки\n\n"
+                    "🌐 Выбран DeepL, но ключ DEEPL_API_KEY не задан — "
+                    "фактически будет работать Google Translate.\n"
+                    "Добавь переменную окружения DEEPL_API_KEY и перезапусти бота."
+                )
+        # Переводы кешируются — очищаем кеш чтобы новый движок применился сразу
+        _translation_cache.clear()
         await query.edit_message_text(text, reply_markup=build_settings_menu())
         return
 
@@ -3706,6 +3969,28 @@ async def preview_command(update, context: ContextTypes.DEFAULT_TYPE):
 _check_news_lock = asyncio.Lock()
 
 
+async def _maybe_send_daily_summary(bot: Bot) -> None:
+    """В тихом режиме шлёт админу одну сводку в день (при первой проверке нового дня)."""
+    if not settings.quiet_mode:
+        return
+    today = datetime.now().strftime('%Y-%m-%d')
+    if settings.last_daily_summary == today:
+        return
+    settings.last_daily_summary = today
+    day_ago = datetime.now() - timedelta(days=1)
+    published = stats.count_events_since(day_ago, 'published')
+    failed = stats.count_events_since(day_ago, 'failed_send')
+    queue_size = await post_queue.peek_size()
+    await notify_admin(
+        bot,
+        f"📅 Ежедневная сводка\n"
+        f"📤 Опубликовано за 24ч: {published}\n"
+        f"⚠️ Ошибок отправки: {failed}\n"
+        f"📦 В очереди: {queue_size}\n\n"
+        f"Подробнее: /stats  •  Настройки: /settings",
+    )
+
+
 async def check_news(context: ContextTypes.DEFAULT_TYPE):
     if _check_news_lock.locked():
         logger.info("⏭ Пропускаю автопроверку — предыдущая ещё идёт")
@@ -3713,7 +3998,9 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
     async with _check_news_lock:
         logger.info("🔁 Автопроверка новостей...")
         cleanup_video_dir()
-        await notify_admin(context.bot, "🔍 Начинаю проверку новостей...")
+        # В тихом режиме не спамим "начинаю проверку" каждые полчаса
+        if not settings.quiet_mode:
+            await notify_admin(context.bot, "🔍 Начинаю проверку новостей...")
 
         # 1) Собираем свежие новости с источников
         all_news, stats_lines, errors = await collect_all_news()
@@ -3741,16 +4028,20 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
                 # Пауза между отправками чтобы не словить флуд-лимит Telegram
                 await asyncio.sleep(PAUSE_BETWEEN_SENDS)
 
-            message = (
-                f"✅ Проверка завершена (режим ветки).\n"
-                f"📊 Источники: {' | '.join(stats_lines)}\n"
-                f"🧵 Отправлено в ветку: {sent_count}\n"
-            )
-            if failed_count:
-                message += f"⚠️ Не удалось отправить: {failed_count}\n"
-            if errors:
-                message += "⚠️ Ошибки источников:\n" + "\n".join(errors)
-            await notify_admin(context.bot, message)
+            has_problems = bool(errors) or failed_count > 0
+            # В тихом режиме отчёт — только если были проблемы
+            if not settings.quiet_mode or has_problems:
+                message = (
+                    f"✅ Проверка завершена (режим ветки).\n"
+                    f"📊 Источники: {' | '.join(stats_lines)}\n"
+                    f"🧵 Отправлено в ветку: {sent_count}\n"
+                )
+                if failed_count:
+                    message += f"⚠️ Не удалось отправить: {failed_count}\n"
+                if errors:
+                    message += "⚠️ Ошибки источников:\n" + "\n".join(errors)
+                await notify_admin(context.bot, message)
+            await _maybe_send_daily_summary(context.bot)
             return
 
         # === РЕЖИМ КАНАЛА (старый): по 1 посту за интервал через очередь ===
@@ -3782,16 +4073,20 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
         sent_ok = (sent_result == 'sent')
         queue_size = await post_queue.peek_size()
 
-        message = (
-            f"✅ Проверка завершена.\n"
-            f"📊 Источники: {' | '.join(stats_lines)}\n"
-            f"➕ Новых в очереди: {added_to_queue}\n"
-            f"📤 Отправлено в канал: {1 if sent_ok else 0}\n"
-            f"📦 Осталось в очереди: {queue_size}"
-        )
-        if errors:
-            message += "\n⚠️ Ошибки:\n" + "\n".join(errors)
-        await notify_admin(context.bot, message)
+        has_problems = bool(errors) or sent_result == 'failed'
+        # В тихом режиме отчёт — только если были проблемы
+        if not settings.quiet_mode or has_problems:
+            message = (
+                f"✅ Проверка завершена.\n"
+                f"📊 Источники: {' | '.join(stats_lines)}\n"
+                f"➕ Новых в очереди: {added_to_queue}\n"
+                f"📤 Отправлено в канал: {1 if sent_ok else 0}\n"
+                f"📦 Осталось в очереди: {queue_size}"
+            )
+            if errors:
+                message += "\n⚠️ Ошибки:\n" + "\n".join(errors)
+            await notify_admin(context.bot, message)
+        await _maybe_send_daily_summary(context.bot)
 
 
 @admin_only
@@ -3871,7 +4166,12 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
     yt_status = '🟢 готов' if YT_DLP_AVAILABLE else '🔴 не установлен'
     ffmpeg_status = '🟢 найден' if shutil.which('ffmpeg') else '🟡 не найден'
     video_state = '🟢 включено' if settings.video_enabled else '🔴 выключено'
-    translator_name = 'DeepL 🟢' if DEEPL_API_KEY else 'Google Translate'
+    if settings.translator_engine == 'google':
+        translator_name = 'Google Translate (выбран вручную)'
+    elif DEEPL_API_KEY:
+        translator_name = 'DeepL 🟢'
+    else:
+        translator_name = 'Google Translate (ключ DeepL не задан)'
     queue_size = await post_queue.peek_size()
     await update.message.reply_text(
         f"Авторассылка: {'🟢 включена' if is_running else '🔴 выключена'}\n"
@@ -3947,6 +4247,72 @@ def _format_age(ts_iso: Optional[str]) -> str:
     if seconds < 86400:
         return f'{seconds // 3600}ч назад'
     return f'{seconds // 86400}д назад'
+
+
+@admin_only
+async def deepl_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает использование месячного лимита DeepL."""
+    if not DEEPL_API_KEY:
+        await update.message.reply_text(
+            "🌐 Ключ DeepL не задан (переменная DEEPL_API_KEY).\n"
+            "Перевод работает через Google Translate."
+        )
+        return
+    usage = await asyncio.to_thread(_deepl_usage)
+    if not usage:
+        await update.message.reply_text("⚠️ Не удалось получить данные от DeepL (ошибка сети или неверный ключ).")
+        return
+    used = usage.get('character_count', 0)
+    limit = usage.get('character_limit', 0)
+    pct = (used / limit * 100) if limit else 0
+    left = limit - used
+    # Простой прогресс-бар из 10 клеток
+    filled = min(10, round(pct / 10))
+    bar = '█' * filled + '░' * (10 - filled)
+    engine = settings.translator_engine
+    lines = [
+        '🌐 <b>DeepL — месячный лимит</b>',
+        '',
+        f'{bar} {pct:.1f}%',
+        f'Использовано: {used:,} из {limit:,} символов'.replace(',', ' '),
+        f'Осталось: {left:,} символов'.replace(',', ' '),
+        '',
+        f'Выбранный движок: {"DeepL" if engine == "deepl" else "Google (вручную)"}',
+    ]
+    if pct >= 90:
+        lines.append('')
+        lines.append('⚠️ Лимит почти исчерпан! Скоро бот перейдёт на Google Translate.')
+    elif pct >= 100:
+        lines.append('')
+        lines.append('🔴 Лимит исчерпан — работает Google Translate (до сброса лимита).')
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def backup_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Присылает админу все файлы данных бота (страховка на случай проблем с хостингом)."""
+    files = [SENT_LINKS_FILE, QUEUE_FILE, SETTINGS_FILE, STATS_FILE, ANILIST_CACHE_FILE]
+    await update.message.reply_text("📦 Собираю бэкап...")
+    sent, skipped = 0, []
+    for path in files:
+        try:
+            if not path.exists() or path.stat().st_size == 0:
+                skipped.append(path.name)
+                continue
+            with path.open('rb') as f:
+                await context.bot.send_document(
+                    chat_id=ADMIN_ID, document=f, filename=path.name,
+                )
+            sent += 1
+            await asyncio.sleep(0.3)
+        except (TelegramError, OSError) as e:
+            logger.warning(f"Бэкап {path.name} не отправился: {e}")
+            skipped.append(path.name)
+    msg = f"✅ Бэкап готов: отправлено {sent} файлов."
+    if skipped:
+        msg += f"\nПропущено (нет/пусто/ошибка): {', '.join(skipped)}"
+    msg += "\n\nСохрани файлы — при переезде или сбросе данных их можно будет вернуть."
+    await update.message.reply_text(msg)
 
 
 @admin_only
@@ -4067,6 +4433,8 @@ async def setup_bot_commands(app: Application) -> None:
         BotCommand("stop_auto", "⏸ Выключить авторассылку"),
         BotCommand("status", "📊 Статус бота"),
         BotCommand("stats", "📈 Метрики и статистика"),
+        BotCommand("deepl", "🌐 Лимит DeepL"),
+        BotCommand("backup", "📦 Бэкап данных"),
         BotCommand("logs", "📝 Последние строки лога"),
         BotCommand("blacklist", "📛 Список стоп-слов"),
         BotCommand("settings", "⚙️ Настройки"),
@@ -4131,6 +4499,8 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("chatinfo", chatinfo_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("deepl", deepl_command))
+    app.add_handler(CommandHandler("backup", backup_command))
     app.add_handler(CommandHandler("logs", logs_command))
     app.add_handler(CommandHandler("blacklist", blacklist_command))
     app.add_handler(CommandHandler("settings", settings_command))
