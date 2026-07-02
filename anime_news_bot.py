@@ -1769,7 +1769,12 @@ def anilist_protect_titles(text: str, start_index: int = 2000) -> tuple[str, dic
 def _deepl_usage() -> tuple[Optional[dict], str]:
     """Запрашивает у DeepL использование лимита.
     Возвращает (данные, '') при успехе или (None, описание_ошибки) при неудаче.
-    При 403 пробует второй endpoint (вдруг тип ключа не совпал с эвристикой ':fx')."""
+
+    Особенности:
+    - Передаём нормальный User-Agent: WAF DeepL может отдавать 403 на GET
+      с дефолтным python-requests с серверных IP (перевод при этом работает).
+    - Usage-эндпоинт принимает и GET, и POST — при 403 на GET пробуем POST.
+    - При 403 пробуем второй endpoint (вдруг тип ключа не совпал с эвристикой ':fx')."""
     if not DEEPL_API_KEY:
         return None, 'ключ не задан'
     primary = (
@@ -1782,30 +1787,45 @@ def _deepl_usage() -> tuple[Optional[dict], str]:
         if 'api-free' in primary
         else 'https://api-free.deepl.com/v2/usage'
     )
-    last_err = 'неизвестная ошибка'
+    headers = {
+        'Authorization': f'DeepL-Auth-Key {DEEPL_API_KEY}',
+        'User-Agent': USER_AGENT,
+    }
+    first_err = ''
+
+    def _remember(err: str) -> None:
+        nonlocal first_err
+        if not first_err:
+            first_err = err
+
     for endpoint in (primary, fallback):
-        try:
-            r = requests.get(
-                endpoint,
-                headers={'Authorization': f'DeepL-Auth-Key {DEEPL_API_KEY}'},
-                timeout=HTTP_TIMEOUT,
-            )
+        host = endpoint.split('/')[2]
+        last_status = None
+        for method, method_name in ((requests.get, 'GET'), (requests.post, 'POST')):
+            try:
+                r = method(endpoint, headers=headers, timeout=HTTP_TIMEOUT)
+            except requests.Timeout:
+                _remember('таймаут соединения')
+                logger.warning(f"DeepL usage: таймаут {endpoint}")
+                return None, first_err
+            except Exception as e:
+                _remember(f'{type(e).__name__}')
+                logger.warning(f"DeepL usage error: {type(e).__name__}: {e}")
+                return None, first_err
             if r.status_code == 200:
-                return r.json(), ''
-            host = endpoint.split('/')[2]
-            last_err = f'HTTP {r.status_code} от {host}'
-            logger.warning(f"DeepL usage: {last_err}")
+                try:
+                    return r.json(), ''
+                except Exception:
+                    _remember('невалидный ответ')
+                    return None, first_err
+            last_status = r.status_code
+            logger.warning(f"DeepL usage: HTTP {r.status_code} от {host} ({method_name})")
             if r.status_code != 403:
-                break  # только при 403 есть смысл пробовать другой endpoint
-        except requests.Timeout:
-            last_err = 'таймаут соединения'
-            logger.warning(f"DeepL usage: таймаут {endpoint}")
-            break
-        except Exception as e:
-            last_err = f'{type(e).__name__}'
-            logger.warning(f"DeepL usage error: {type(e).__name__}: {e}")
-            break
-    return None, last_err
+                break  # не-403 повторять POST'ом бессмысленно
+        _remember(f'HTTP {last_status} от {host}')
+        if last_status != 403:
+            break  # только при 403 есть смысл пробовать другой endpoint
+    return None, first_err or 'неизвестная ошибка'
 
 
 def _deepl_translate(text: str) -> Optional[str]:
@@ -4346,8 +4366,11 @@ async def deepl_command(update, context: ContextTypes.DEFAULT_TYPE):
         if test:
             await update.message.reply_text(
                 f"⚠️ Статистика лимита недоступна: {err}.\n"
-                f"Но сам перевод через DeepL РАБОТАЕТ (тест прошёл) — "
-                f"вероятно, временный сбой usage-эндпоинта. Попробуй позже."
+                f"Но сам перевод через DeepL РАБОТАЕТ (тест прошёл).\n\n"
+                f"Похоже, WAF DeepL блокирует usage-запросы с IP хостинга — "
+                f"на работу перевода это не влияет.\n"
+                f"Лимит можно посмотреть в личном кабинете:\n"
+                f"https://www.deepl.com/account/usage"
             )
         else:
             await update.message.reply_text(
