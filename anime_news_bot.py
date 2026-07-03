@@ -14,6 +14,8 @@ import re
 import shutil
 import tempfile
 import time
+import difflib
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -383,6 +385,24 @@ def http_post_with_retry(
 
 
 # ============== ХРАНИЛИЩЕ ССЫЛОК ==============
+# Стоп-слова заголовков: для fuzzy-сравнения выкидываем только «воду» (глаголы анонсов,
+# служебные). Типы контента (movie/manga/season/trailer/cast...) ОСТАВЛЯЕМ — они
+# различают разные новости одной франшизы ("X Movie" vs "X Manga Spinoff").
+_TITLE_STOPWORDS = frozenset({
+    'the', 'and', 'for', 'with', 'from', 'its', 'this', 'that',
+    'gets', 'get', 'new', 'more', 'will', 'has', 'have',
+    'reveals', 'reveal', 'revealed', 'announces', 'announced', 'announcement',
+    'confirms', 'confirmed', 'launches', 'launch', 'debuts', 'debut',
+    'additional', 'coming', 'official',
+})
+
+
+def _title_tokens(title: str) -> frozenset:
+    """Значимые токены заголовка для сравнения похожести."""
+    words = re.findall(r'[\w]+', (title or '').lower())
+    return frozenset(w for w in words if len(w) >= 3 and w not in _TITLE_STOPWORDS)
+
+
 class SentLinksStore:
     """Хранит нормализованные URL и нормализованные заголовки уже отправленных постов.
     Защищает от дублей трёх видов:
@@ -396,6 +416,10 @@ class SentLinksStore:
         self._urls: list[str] = []          # нормализованные URL (для обрезки старых)
         self._url_set: set[str] = set()      # быстрая проверка
         self._title_set: set[str] = set()    # нормализованные заголовки
+        # Недавние заголовки для fuzzy-дедупа «одна новость с разных источников»:
+        # (timestamp, склейка normalize_title, значимые токены). Не персистентно —
+        # окно 48ч копится с запуска, при рестарте начинается заново.
+        self._recent_titles: deque = deque(maxlen=500)
         self._lock = asyncio.Lock()
         self._load()
 
@@ -440,6 +464,35 @@ class SentLinksStore:
     def has_title(self, title: str) -> bool:
         return normalize_title(title) in self._title_set
 
+    def has_similar_title(self, title: str, window_hours: int = 48) -> bool:
+        """Fuzzy-проверка: публиковалась ли недавно ПОХОЖАЯ новость (та же новость
+        с другого источника, с иной формулировкой заголовка).
+
+        Дубль, если с одним из недавних заголовков (окно window_hours):
+        - Жаккар значимых токенов ≥ 0.6 (почти одинаковые формулировки), ИЛИ
+        - общая подстрока склеек ≥ 16 символов (длинное уникальное название тайтла,
+          напр. 'mamonotsukainomusume' — ловит разные формулировки одного анонса;
+          короткие франшизы типа 'attackontitan' (13) порог не проходят — их разные
+          новости не склеиваются ложно)."""
+        if not title:
+            return False
+        norm = normalize_title(title)
+        tokens = _title_tokens(title)
+        now = time.time()
+        for ts, old_norm, old_tokens in self._recent_titles:
+            if now - ts > window_hours * 3600:
+                continue
+            if tokens and old_tokens:
+                union = len(tokens | old_tokens)
+                if union and len(tokens & old_tokens) / union >= 0.6:
+                    return True
+            if len(norm) >= 16 and len(old_norm) >= 16:
+                m = difflib.SequenceMatcher(None, norm, old_norm).find_longest_match(
+                    0, len(norm), 0, len(old_norm))
+                if m.size >= 16:
+                    return True
+        return False
+
     async def claim(self, link: str, title: str = '') -> bool:
         """Атомарно: если ни URL, ни заголовка ещё не было — записывает и возвращает True.
         Если уже было — возвращает False (это дубликат)."""
@@ -453,6 +506,8 @@ class SentLinksStore:
                 logger.info(f"Дубль по заголовку, пропускаю: {title[:60]}")
                 return False
             self._add_unlocked(norm_url, norm_title)
+            if norm_title:
+                self._recent_titles.append((time.time(), norm_title, _title_tokens(title)))
             return True
 
     async def release(self, link: str, title: str = '') -> None:
@@ -968,6 +1023,13 @@ PROTECTED_TERMS = [
     'The Apothecary Diaries', 'Kusuriya no Hitorigoto',
     'Delicious in Dungeon', 'Dungeon Meshi',
     'Zenshu', 'Medalist', 'Rurouni Kenshin', 'Bakemonogatari', 'Monogatari',
+    # --- Кино / сериалы / гик (канал расширен) ---
+    'Marvel Studios', 'Marvel', 'DC Studios', 'Warner Bros.', 'Warner Bros',
+    'Paramount', 'Lucasfilm', 'Pixar', 'A24', 'Sony Pictures', 'Universal Pictures',
+    'Star Wars', 'Star Trek', 'The Witcher', 'Stranger Things',
+    'House of the Dragon', 'Game of Thrones', 'The Boys', 'The Mandalorian',
+    'Mission: Impossible', 'Jurassic World', 'James Bond', 'Blade Runner',
+    'The Last of Us', 'Fallout', 'Cyberpunk 2077', 'Cyberpunk',
 ]
 
 # Названия-заглушки для случаев когда Google переводит имя собственное дословно.
@@ -2142,6 +2204,68 @@ def extract_image_from_entry(entry, summary_html: Optional[str] = None) -> Optio
     return images[0] if images else None
 
 
+# Размерные query-параметры: вся разница вариантов картинки часто только в них
+_IMG_SIZE_QUERY_KEYS = {'w', 'h', 'width', 'height', 'size', 'resize', 'fit',
+                        'quality', 'q', 'dpr', 'crop', 'auto', 'fm', 'zoom'}
+
+
+def _image_variant_key(url: str) -> str:
+    """Ключ группировки: варианты ОДНОЙ картинки в разных размерах дают один ключ.
+    Срезает размерные суффиксы имени файла (-1280x720, _large, @2x)
+    и размерные query-параметры (?width=640)."""
+    try:
+        p = urlparse(url)
+    except Exception:
+        return url
+    path = p.path.lower()
+    path = re.sub(r'[-_]\d{2,4}x\d{2,4}(?=\.\w{2,5}$)', '', path)      # -1280x720.jpg
+    path = re.sub(r'[-_]\d{2,4}w(?=\.\w{2,5}$)', '', path)              # _640w.jpg
+    path = re.sub(r'@\dx(?=\.\w{2,5}$)', '', path)                      # @2x.jpg
+    path = re.sub(
+        r'[-_](?:large|medium|small|thumb(?:nail)?|full|scaled|mini|big|orig(?:inal)?|wide)'
+        r'(?=\.\w{2,5}$)', '', path)                                    # _thumb.jpg / _full.jpg
+    # Query без размерных ключей
+    kept = [kv for kv in p.query.split('&')
+            if kv and kv.split('=', 1)[0].lower() not in _IMG_SIZE_QUERY_KEYS]
+    return f'{p.netloc.lower()}{path}?{"&".join(sorted(kept))}'
+
+
+def _image_size_score(url: str) -> int:
+    """Оценка «крупности» варианта по URL: больше — лучше."""
+    score = 0
+    low = url.lower()
+    for m in re.finditer(r'(\d{2,4})x(\d{2,4})', low):
+        score = max(score, int(m.group(1)) * int(m.group(2)))
+    for m in re.finditer(r'[?&](?:w|width)=(\d{2,4})', low):
+        score = max(score, int(m.group(1)) * 720)
+    if re.search(r'[-_](?:full|orig(?:inal)?|large|big)\b|[-_](?:full|orig(?:inal)?|large|big)\.', low):
+        score += 10_000_000
+    if re.search(r'[-_](?:thumb(?:nail)?|mini|small)\b|[-_](?:thumb(?:nail)?|mini|small)\.', low):
+        score -= 10_000_000
+    return score
+
+
+def _dedup_image_variants(urls: list[str]) -> list[str]:
+    """Схлопывает размерные варианты одной картинки, оставляя лучший (крупнейший).
+    Источники (Crunchyroll и др.) отдают одну картинку в 3-5 размерах с разными URL —
+    без этого в пост уходят 5 одинаковых фото убывающего качества.
+    Порядок групп — по первому появлению."""
+    if len(urls) <= 1:
+        return urls
+    order: list[str] = []                       # ключи в порядке появления
+    best: dict[str, str] = {}                   # ключ → лучший URL
+    best_score: dict[str, int] = {}
+    for u in urls:
+        key = _image_variant_key(u)
+        s = _image_size_score(u)
+        if key not in best:
+            order.append(key)
+            best[key], best_score[key] = u, s
+        elif s > best_score[key]:
+            best[key], best_score[key] = u, s
+    return [best[k] for k in order]
+
+
 def _normalize_image_url(url: str, base_url: Optional[str] = None) -> Optional[str]:
     """Приводит URL картинки к абсолютному виду и проверяет валидность.
     Возвращает нормализованный URL или None если URL битый/невалидный."""
@@ -2213,6 +2337,8 @@ def extract_all_images_from_entry(entry, summary_html: Optional[str] = None,
     for thumb in (getattr(entry, 'media_thumbnail', None) or []):
         add(thumb.get('url'))
 
+    # Схлопываем размерные варианты одной картинки (оставляем лучший)
+    images = _dedup_image_variants(images)
     return images[:MAX_PHOTOS_PER_POST]
 
 
@@ -2814,6 +2940,96 @@ def get_reddit_anime():
     return news_list
 
 
+# ============== TELEGRAM-КАНАЛЫ КАК ИСТОЧНИКИ ==============
+# Читаем ПУБЛИЧНЫЕ каналы через веб-превью t.me/s/<канал> — без API, авторизации
+# и telethon. Отдаёт последние ~20 постов с текстом, фото и датами.
+# Посты на русском — помечаются lang='ru' и НЕ переводятся.
+# Состав каналов легко менять: (имя_канала_без_@, метка_в_статистике)
+TELEGRAM_CHANNELS = [
+    ('nexvlsz', 'TG: Nexvlsz'),
+    ('currentanimenews', 'TG: CurrentAnime'),
+    ('ytkanews', 'TG: YtkaNews'),
+    ('advance_emp', 'TG: Advance'),
+]
+
+
+def get_telegram_channel(channel: str, label: str) -> list[dict]:
+    """Парсит публичный Telegram-канал через t.me/s/. Возвращает список news-словарей."""
+    url = f'https://t.me/s/{channel}'
+    r = http_get_with_retry(url, headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT)
+    if not r or r.status_code != 200:
+        logger.warning(f"TG {channel}: HTTP {r.status_code if r else 'нет ответа'}")
+        return []
+    soup = BeautifulSoup(r.text, 'html.parser')
+    news_list: list[dict] = []
+    for msg in soup.select('div.tgme_widget_message'):
+        post_id = msg.get('data-post')          # вида 'channel/123'
+        text_el = msg.select_one('div.tgme_widget_message_text')
+        if not post_id or not text_el:
+            continue                             # пост без текста — пропускаем
+        full_text = text_el.get_text('\n', strip=True)
+        if len(full_text) < 15:
+            continue
+        lines = [ln.strip() for ln in full_text.split('\n') if ln.strip()]
+        title = lines[0][:200]
+        summary = ' '.join(lines[1:])[:1000] if len(lines) > 1 else ''
+        # Дата поста
+        published_parsed = None
+        t = msg.select_one('time[datetime]')
+        if t and t.get('datetime'):
+            try:
+                dt = datetime.fromisoformat(t['datetime'].replace('Z', '+00:00'))
+                published_parsed = dt.timetuple()
+            except ValueError:
+                pass
+        if published_parsed and _is_too_old(published_parsed):
+            continue
+        # Фото: обёртки со style="background-image:url('...')"
+        images: list[str] = []
+        for wrap in msg.select('a.tgme_widget_message_photo_wrap[style]'):
+            m = re.search(r"background-image:url\('([^']+)'\)", wrap.get('style', ''))
+            if m:
+                images.append(m.group(1))
+        news_list.append({
+            'title': title,
+            'link': f'https://t.me/{post_id}',
+            'summary': summary,
+            'images': images[:MAX_PHOTOS_PER_POST],
+            'video': None,
+            'published_parsed': published_parsed,
+            'source': label,
+            'lang': 'ru',                        # русский — перевод не нужен
+        })
+    # На странице свежие посты ВНИЗУ — берём последние
+    return news_list[-NEWS_PER_SOURCE:]
+
+
+# ============== КИНО / СЕРИАЛЫ / ГИК ==============
+def get_collider():
+    """Collider — кино и сериалы."""
+    return _parse_rss_with_fallback('https://collider.com/feed/', 'Collider')
+
+
+def get_slashfilm():
+    """/Film — кино-новости и обзоры."""
+    return _parse_rss_with_fallback('https://www.slashfilm.com/feed/', '/Film')
+
+
+def get_variety():
+    """Variety — индустрия кино и ТВ."""
+    return _parse_rss_with_fallback('https://variety.com/feed/', 'Variety')
+
+
+def get_polygon():
+    """Polygon — гик-культура: игры, кино, сериалы."""
+    return _parse_rss_with_fallback('https://www.polygon.com/rss/index.xml', 'Polygon')
+
+
+def get_comingsoon():
+    """ComingSoon — анонсы фильмов и сериалов."""
+    return _parse_rss_with_fallback('https://www.comingsoon.net/feed', 'ComingSoon')
+
+
 SOURCES = [
     # 🟢 Топ-3 — основные продуктивные
     ('ComicBook Anime', get_comicbook_anime),
@@ -2829,6 +3045,13 @@ SOURCES = [
     ('Crunchyroll', get_crunchyroll_news),
     ("Honey's Anime", get_honeys_anime),
     ('AnimeHunch', get_animehunch),
+    # 🎬 Кино / сериалы / гик (канал расширен до гик-тематики).
+    # Мёртвые ленты можно отключить в /settings → Источники.
+    ('Collider', get_collider),
+    ('/Film', get_slashfilm),
+    ('Variety', get_variety),
+    ('Polygon', get_polygon),
+    ('ComingSoon', get_comingsoon),
     # Kotaku и Yatta-Tachi отключены: за 18+ часов работы на сервере — 0 собранных
     # новостей (RSS пустой или недоступен). Функции оставлены — можно вернуть
     # раскомментировав, если ленты оживут.
@@ -2839,6 +3062,11 @@ SOURCES = [
     # (REDDIT_PROXY) можно вернуть строку ниже.
     # ('Reddit', get_reddit_anime),
 ]
+
+# Telegram-каналы подключаются из TELEGRAM_CHANNELS (см. выше).
+# lambda с default-аргументами фиксирует канал для каждой записи.
+for _tg_ch, _tg_label in TELEGRAM_CHANNELS:
+    SOURCES.append((_tg_label, (lambda _c=_tg_ch, _l=_tg_label: get_telegram_channel(_c, _l))))
 
 
 # ============== ФИЛЬТР И ФОРМАТИРОВАНИЕ ==============
@@ -2953,14 +3181,19 @@ def _format_post_date(published_struct) -> str:
 
 def format_news_short(news: dict) -> str:
     """Короткий формат поста: заголовок + одно предложение сути + дата.
-    Используется и для канала, и для ветки. Без воды."""
-    # Эпизоды форматируем отдельно (они и так короткие)
-    ep = parse_episode(news['title'])
-    if ep:
-        return format_episode_post(ep, news.get('published_parsed'))
+    Используется и для канала, и для ветки. Без воды.
+    Посты с lang='ru' (русские Telegram-каналы) не переводятся."""
+    is_ru = news.get('lang') == 'ru'
+
+    # Эпизоды форматируем отдельно (они и так короткие); парсер английский
+    if not is_ru:
+        ep = parse_episode(news['title'])
+        if ep:
+            return format_episode_post(ep, news.get('published_parsed'))
 
     # Заголовок
-    ru_title = translate_text(news['title']).rstrip('.')
+    raw_title = news['title']
+    ru_title = (raw_title if is_ru else translate_text(raw_title)).rstrip('.')
     if ru_title and not ru_title.endswith(('.', '!', '?', '…', ':')):
         ru_title += '.'
 
@@ -2970,7 +3203,7 @@ def format_news_short(news: dict) -> str:
     if summary:
         first = _extract_first_sentence(summary)
         if first:
-            ru_summary = translate_text(first)
+            ru_summary = first if is_ru else translate_text(first)
             # На случай если перевод вернул несколько предложений — берём первое снова
             ru_summary = _extract_first_sentence(ru_summary, max_len=350)
 
@@ -3056,7 +3289,7 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
     safe_text = html.escape(text)
     caption = fit_to_limit(safe_text, TG_CAPTION_LIMIT)
 
-    photos = news.get('images') or []
+    photos = _dedup_image_variants(news.get('images') or [])
     media_count = len(photos) + (1 if has_inline_video else 0)
 
     # ЖЁСТКОЕ ПРАВИЛО: если включено "Только с картинками" и медиа нет — НЕ публикуем
@@ -3269,6 +3502,11 @@ async def send_news(bot: Bot, news: dict, chat_id=None) -> str:
 
     if not matches_keywords(news):
         return 'skipped_filter'
+    # Fuzzy-дедуп: та же новость с другого источника с иной формулировкой
+    if sent_links.has_similar_title(news.get('title', '')):
+        logger.info(f"⊘ Похожая новость уже публиковалась: {news.get('title', '')[:60]}")
+        await stats.record_skipped('duplicate', news.get('source', 'unknown'))
+        return 'skipped_dup'
     if not await sent_links.claim(news['link'], news.get('title', '')):
         if is_channel:
             await stats.record_skipped('duplicate', source)
@@ -3320,7 +3558,7 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     if video_url and not has_inline_video:
         text = _add_video_link_to_text(text, video_url)
 
-    photos = news.get('images') or []
+    photos = _dedup_image_variants(news.get('images') or [])
     media_count = len(photos) + (1 if has_inline_video else 0)
 
     # require_image: без медиа не публикуем
@@ -3413,6 +3651,11 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
 
     if not matches_keywords(news):
         return 'skipped_filter'
+    # Fuzzy-дедуп: та же новость с другого источника с иной формулировкой
+    if sent_links.has_similar_title(news.get('title', '')):
+        logger.info(f"⊘ Похожая новость уже публиковалась: {news.get('title', '')[:60]}")
+        await stats.record_skipped('duplicate', news.get('source', 'unknown'))
+        return 'skipped_dup'
     if not await sent_links.claim(news['link'], news.get('title', '')):
         await stats.record_skipped('duplicate', source)
         return 'skipped_dup'
