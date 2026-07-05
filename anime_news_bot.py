@@ -37,7 +37,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -440,6 +440,12 @@ class SentLinksStore:
                 self._urls = data.get('urls', [])
                 self._url_set = set(self._urls)
                 self._title_set = set(data.get('titles', []))
+                for item in data.get('recent', []):
+                    try:
+                        ts, norm, tokens = item
+                        self._recent_titles.append((float(ts), str(norm), frozenset(tokens)))
+                    except (ValueError, TypeError):
+                        continue
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"Не удалось прочитать {self.path}: {e}")
 
@@ -449,6 +455,8 @@ class SentLinksStore:
                 json.dump({
                     'urls': self._urls,
                     'titles': list(self._title_set),
+                    # окно fuzzy-дедупа переживает рестарты
+                    'recent': [[ts, norm, sorted(tokens)] for ts, norm, tokens in self._recent_titles],
                 }, f, ensure_ascii=False)
         except OSError as e:
             logger.error(f"Не удалось сохранить {self.path}: {e}")
@@ -505,9 +513,9 @@ class SentLinksStore:
                 # Заголовок уже был — это дубликат с другого источника
                 logger.info(f"Дубль по заголовку, пропускаю: {title[:60]}")
                 return False
-            self._add_unlocked(norm_url, norm_title)
             if norm_title:
                 self._recent_titles.append((time.time(), norm_title, _title_tokens(title)))
+            self._add_unlocked(norm_url, norm_title)
             return True
 
     async def release(self, link: str, title: str = '') -> None:
@@ -3540,6 +3548,84 @@ async def send_news(bot: Bot, news: dict, chat_id=None) -> str:
                 pass
 
 
+PENDING_POSTS_FILE = DATA_DIR / 'pending_posts.json'
+
+
+class PendingPosts:
+    """Посты, отправленные в ветку и ждущие решения админа (кнопки под постом).
+    Хранится на диске: кнопки работают и после перезапуска бота."""
+    MAX_ITEMS = 300
+    TTL_DAYS = 7
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._counter = 0
+        self._items: dict[str, dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if self.path.exists():
+                data = json.loads(self.path.read_text(encoding='utf-8'))
+                self._counter = int(data.get('counter', 0))
+                self._items = data.get('items', {})
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning(f"pending_posts не загружен: {e}")
+
+    def _save(self) -> None:
+        try:
+            self.path.write_text(
+                json.dumps({'counter': self._counter, 'items': self._items},
+                           ensure_ascii=False),
+                encoding='utf-8')
+        except OSError as e:
+            logger.error(f"pending_posts не сохранён: {e}")
+
+    def _cleanup(self) -> None:
+        cutoff = time.time() - self.TTL_DAYS * 86400
+        self._items = {k: v for k, v in self._items.items() if v.get('ts', 0) >= cutoff}
+        if len(self._items) > self.MAX_ITEMS:
+            oldest = sorted(self._items, key=lambda k: self._items[k].get('ts', 0))
+            for k in oldest[:len(self._items) - self.MAX_ITEMS]:
+                del self._items[k]
+
+    def add(self, news: dict) -> str:
+        """Сохраняет пост, возвращает короткий ключ для callback-кнопок."""
+        self._counter += 1
+        key = str(self._counter)
+        clean = {k: v for k, v in news.items() if k != 'published_parsed'}
+        self._items[key] = {'news': clean, 'ts': time.time()}
+        self._cleanup()
+        self._save()
+        return key
+
+    def get(self, key: str) -> Optional[dict]:
+        item = self._items.get(key)
+        return item.get('news') if item else None
+
+    def pop(self, key: str) -> Optional[dict]:
+        item = self._items.pop(key, None)
+        if item is not None:
+            self._save()
+            return item.get('news')
+        return None
+
+
+pending_posts: Optional['PendingPosts'] = None
+
+
+async def _tg_call_flood_safe(coro_factory):
+    """Вызывает Telegram-метод; при флуд-лимите (RetryAfter) честно ждёт
+    указанное Telegram время и повторяет один раз вместо провала отправки."""
+    try:
+        return await coro_factory()
+    except RetryAfter as e:
+        wait = int(getattr(e, 'retry_after', 5)) + 1
+        logger.warning(f"Flood-лимит Telegram: жду {wait}с и повторяю отправку")
+        await asyncio.sleep(wait)
+        return await coro_factory()
+
+
 async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Path]) -> bool:
     """Отправка в ветку ДВУМЯ сообщениями (вариант B):
     1) фото/альбом/видео БЕЗ подписи
@@ -3591,7 +3677,8 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
             if len(photos) > 1:
                 try:
                     media = [InputMediaPhoto(media=ph) for ph in photos[:10]]
-                    await bot.send_media_group(chat_id=target, media=media, **thread_kw)
+                    await _tg_call_flood_safe(lambda: bot.send_media_group(
+                        chat_id=target, media=media, **thread_kw))
                     media_sent = True
                 except TelegramError as e:
                     logger.debug(f"Альбом в ветку не прошёл ({e}), пробую по одной картинке")
@@ -3627,14 +3714,23 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
         return False
 
     # --- Шаг 2: отправляем текст отдельным сообщением ---
+    # Под текстом — кнопки модерации: опубликовать в канал одним тапом / скрыть.
+    reply_markup = None
+    if pending_posts is not None:
+        key = pending_posts.add(news)
+        reply_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton('📢 В канал', callback_data=f'pub:{key}'),
+            InlineKeyboardButton('✖ Скрыть', callback_data=f'dis:{key}'),
+        ]])
     try:
-        await bot.send_message(
+        await _tg_call_flood_safe(lambda: bot.send_message(
             chat_id=target,
             text=safe_text,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,  # превью не нужно, фото уже выше
+            reply_markup=reply_markup,
             **thread_kw,
-        )
+        ))
         logger.info(f"🧵 {news['source']}: {news['title'][:60]} (фото+текст раздельно)")
         return True
     except TelegramError as e:
@@ -3912,8 +4008,49 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     query = update.callback_query
-    await query.answer()
     data = query.data or ""
+
+    # === Кнопки модерации под постами в ветке (📢 В канал / ✖ Скрыть) ===
+    # Обрабатываем ДО общего query.answer(): ответ callback даётся один раз,
+    # и здесь он зависит от результата.
+    if data.startswith(('pub:', 'dis:')):
+        key = data.split(':', 1)[1]
+        if data.startswith('dis:'):
+            if pending_posts is not None:
+                pending_posts.pop(key)
+            await query.answer('Скрыто')
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
+            return
+        news = pending_posts.get(key) if pending_posts is not None else None
+        if not news:
+            await query.answer('Пост устарел или уже опубликован', show_alert=True)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
+            return
+        ok = await _send_post(context.bot, news, CHANNEL_ID, None)
+        if ok:
+            pending_posts.pop(key)
+            await query.answer('📢 Опубликовано в канал!')
+            try:
+                await query.edit_message_text(
+                    (query.message.text or '') + '\n\n✅ Опубликовано в канал',
+                    reply_markup=None,
+                )
+            except TelegramError:
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except TelegramError:
+                    pass
+        else:
+            await query.answer('❌ Не удалось опубликовать — см. /logs', show_alert=True)
+        return
+
+    await query.answer()
 
     # === Главное меню ===
     if data == "settings:back":
@@ -4313,6 +4450,30 @@ async def preview_command(update, context: ContextTypes.DEFAULT_TYPE):
 _check_news_lock = asyncio.Lock()
 
 
+def _find_silent_sources(hours: int = 72) -> list[str]:
+    """Включённые источники, которые давно (hours+) ничего не отдавали.
+    Источники без единой записи в статистике не трогаем (новые, не шумим)."""
+    silent: list[str] = []
+    cutoff = datetime.now() - timedelta(hours=hours)
+    by_source = stats.get_by_source()
+    for name, _fn in SOURCES:
+        if not settings.is_source_enabled(name):
+            continue
+        entry = by_source.get(name)
+        if not entry:
+            continue
+        last = entry.get('last_success_at')
+        if not last:
+            silent.append(name)
+            continue
+        try:
+            if datetime.fromisoformat(last) < cutoff:
+                silent.append(name)
+        except (ValueError, TypeError):
+            continue
+    return silent
+
+
 async def _maybe_send_daily_summary(bot: Bot) -> None:
     """В тихом режиме шлёт админу одну сводку в день (при первой проверке нового дня)."""
     if not settings.quiet_mode:
@@ -4325,12 +4486,14 @@ async def _maybe_send_daily_summary(bot: Bot) -> None:
     published = stats.count_events_since(day_ago, 'published')
     failed = stats.count_events_since(day_ago, 'failed_send')
     queue_size = await post_queue.peek_size()
+    silent = _find_silent_sources(hours=72)
+    silent_line = f"\n🔇 Молчат 3+ дня: {', '.join(silent)}" if silent else ""
     await notify_admin(
         bot,
         f"📅 Ежедневная сводка\n"
         f"📤 Опубликовано за 24ч: {published}\n"
         f"⚠️ Ошибок отправки: {failed}\n"
-        f"📦 В очереди: {queue_size}\n\n"
+        f"📦 В очереди: {queue_size}{silent_line}\n\n"
         f"Подробнее: /stats  •  Настройки: /settings",
     )
 
@@ -4816,9 +4979,11 @@ def _init_globals() -> None:
     Вызывается из main() при запуске бота. В тестах не вызывается —
     позволяет тестам создавать свои инстансы с временными файлами,
     не затрагивая реальные данные пользователя."""
-    global sent_links, translator, post_queue, settings, stats, anilist
+    global sent_links, translator, post_queue, settings, stats, anilist, pending_posts
     if sent_links is None:
         sent_links = SentLinksStore(SENT_LINKS_FILE)
+    if pending_posts is None:
+        pending_posts = PendingPosts(PENDING_POSTS_FILE)
     if translator is None:
         translator = GoogleTranslator(source='auto', target='ru')
     if post_queue is None:
