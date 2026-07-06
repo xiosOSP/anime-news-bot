@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import tempfile
+import copy
 import time
 import difflib
 from collections import deque
@@ -702,11 +703,14 @@ class BotSettings:
         'translator_engine': 'deepl',  # 'deepl' (если ключ задан, с fallback) или 'google' (принудительно)
         'quiet_mode': True,      # True = уведомлять админа только при ошибках + сводка раз в день
         'last_daily_summary': '',  # дата (YYYY-MM-DD) последней ежедневной сводки
+        'extra_admins': [],      # дополнительные Telegram ID с правами админа
     }
 
     def __init__(self, path: Path):
         self.path = path
-        self._data: dict = dict(self.DEFAULTS)
+        # deepcopy: в DEFAULTS есть списки (extra_admins, disabled_sources) —
+        # поверхностная копия шарила бы их между инстансами (mutable default bug)
+        self._data: dict = copy.deepcopy(self.DEFAULTS)
         self._load()
 
     def _load(self) -> None:
@@ -804,6 +808,27 @@ class BotSettings:
     def last_daily_summary(self, value: str) -> None:
         self._data['last_daily_summary'] = str(value)
         self.save()
+
+    @property
+    def extra_admins(self) -> list[int]:
+        return [int(x) for x in self._data.get('extra_admins', [])]
+
+    def add_admin(self, user_id: int) -> bool:
+        ids = self._data.setdefault('extra_admins', [])
+        if int(user_id) in [int(x) for x in ids] or int(user_id) == ADMIN_ID:
+            return False
+        ids.append(int(user_id))
+        self.save()
+        return True
+
+    def remove_admin(self, user_id: int) -> bool:
+        ids = self._data.get('extra_admins', [])
+        new = [x for x in ids if int(x) != int(user_id)]
+        if len(new) == len(ids):
+            return False
+        self._data['extra_admins'] = new
+        self.save()
+        return True
 
     def is_source_enabled(self, source_name: str) -> bool:
         return source_name.lower() not in [s.lower() for s in self._data['disabled_sources']]
@@ -3700,6 +3725,96 @@ async def send_news(bot: Bot, news: dict, chat_id=None) -> str:
                 pass
 
 
+CUSTOM_SOURCES_FILE = DATA_DIR / 'custom_sources.json'
+
+
+class CustomSources:
+    """Динамические источники, добавляемые командами через чат (/addsource).
+    Типы: 'rss' (любая RSS/Atom-лента) и 'tg' (публичный Telegram-канал через t.me/s/).
+    Хранятся на диске и подключаются к SOURCES при старте и при добавлении."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._items: list[dict] = []   # {'type': 'rss'|'tg', 'value': str, 'label': str}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if self.path.exists():
+                self._items = json.loads(self.path.read_text(encoding='utf-8'))
+        except (OSError, ValueError) as e:
+            logger.warning(f"custom_sources не загружен: {e}")
+
+    def _save(self) -> None:
+        try:
+            self.path.write_text(json.dumps(self._items, ensure_ascii=False), encoding='utf-8')
+        except OSError as e:
+            logger.error(f"custom_sources не сохранён: {e}")
+
+    def all(self) -> list[dict]:
+        return list(self._items)
+
+    def add(self, src_type: str, value: str, label: str) -> bool:
+        if any(it['label'].lower() == label.lower() for it in self._items):
+            return False
+        self._items.append({'type': src_type, 'value': value, 'label': label})
+        self._save()
+        return True
+
+    def remove(self, label: str):
+        for it in self._items:
+            if it['label'].lower() == label.lower():
+                self._items.remove(it)
+                self._save()
+                return it
+        return None
+
+
+custom_sources: Optional['CustomSources'] = None
+
+
+def _make_source_fn(src_type: str, value: str, label: str):
+    """Фабрика функции-источника для динамических записей."""
+    if src_type == 'tg':
+        return lambda: get_telegram_channel(value, label)
+    return lambda: _parse_rss_with_fallback(value, label)
+
+
+def _attach_custom_source(item: dict) -> None:
+    """Подключает динамический источник в общий список SOURCES (если ещё нет)."""
+    if any(name == item['label'] for name, _ in SOURCES):
+        return
+    SOURCES.append((item['label'], _make_source_fn(item['type'], item['value'], item['label'])))
+
+
+def _parse_addsource_args(args: list) :
+    """Разбирает аргументы /addsource → (type, value, label) или None.
+    Форматы:
+      /addsource https://site.com/feed/ [Название]
+      /addsource @channel  |  /addsource t.me/channel [Название]"""
+    if not args:
+        return None
+    first = args[0].strip()
+    rest_label = ' '.join(args[1:]).strip()
+    m = re.match(r'^@([A-Za-z0-9_]{4,})$', first)
+    if not m:
+        m = re.match(r'^(?:https?://)?t\.me/(?:s/)?([A-Za-z0-9_]{4,})/?$', first)
+    if m:
+        ch = m.group(1)
+        label = rest_label or f'TG: {ch}'
+        if not label.lower().startswith('tg'):
+            label = f'TG: {label}'
+        return 'tg', ch, label
+    if first.startswith(('http://', 'https://')):
+        try:
+            host = urlparse(first).netloc.replace('www.', '')
+        except Exception:
+            host = 'RSS'
+        label = rest_label or host or 'RSS'
+        return 'rss', first, label
+    return None
+
+
 PENDING_POSTS_FILE = DATA_DIR / 'pending_posts.json'
 
 
@@ -3953,10 +4068,12 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
 
 
 async def notify_admin(bot: Bot, text: str) -> None:
-    try:
-        await bot.send_message(chat_id=ADMIN_ID, text=text)
-    except TelegramError as e:
-        logger.error(f"Не удалось уведомить админа: {e}")
+    """Шлёт сообщение всем админам (главному и дополнительным)."""
+    for uid in _all_admin_ids():
+        try:
+            await bot.send_message(chat_id=uid, text=text)
+        except TelegramError as e:
+            logger.error(f"Не удалось уведомить админа {uid}: {e}")
 
 
 # ============== СБОР ==============
@@ -4037,12 +4154,18 @@ REPLY_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 
+def _all_admin_ids() -> set[int]:
+    """Главный админ (из env) + дополнительные (из настроек)."""
+    extra = list(getattr(settings, 'extra_admins', []) or [])
+    return {ADMIN_ID, *extra}
+
+
 def is_admin(update: Update) -> bool:
-    """Проверяет, что отправитель — админ. Возвращает False если кто угодно ещё."""
+    """Проверяет, что отправитель — админ (главный или дополнительный)."""
     user = update.effective_user
     if not user:
         return False
-    return user.id == ADMIN_ID
+    return user.id in _all_admin_ids()
 
 
 async def deny_access(update: Update) -> None:
@@ -4990,6 +5113,142 @@ async def deepl_command(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def sources_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Список динамических источников (добавленных через /addsource)."""
+    items = custom_sources.all() if custom_sources else []
+    if not items:
+        await update.message.reply_text(
+            "Динамических источников нет.\n\n"
+            "Добавить:\n"
+            "/addsource https://site.com/feed/ Название\n"
+            "/addsource @канал — Telegram-канал\n\n"
+            "Встроенные источники включаются/выключаются в /settings → Источники."
+        )
+        return
+    lines = ['📡 Динамические источники:', '']
+    for it in items:
+        kind = 'TG' if it['type'] == 'tg' else 'RSS'
+        lines.append(f"• {it['label']} [{kind}] — {it['value']}")
+    lines.append('')
+    lines.append('Удалить: /delsource Название')
+    await update.message.reply_text('\n'.join(lines))
+
+
+@admin_only
+async def addsource_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавляет источник: RSS-ленту или публичный Telegram-канал."""
+    parsed = _parse_addsource_args(context.args or [])
+    if not parsed:
+        await update.message.reply_text(
+            "Форматы:\n"
+            "/addsource https://site.com/feed/ Название — RSS-лента\n"
+            "/addsource @канал — Telegram-канал\n"
+            "/addsource t.me/канал Название"
+        )
+        return
+    src_type, value, label = parsed
+    if any(name.lower() == label.lower() for name, _ in SOURCES):
+        await update.message.reply_text(f"⚠️ Источник с именем «{label}» уже есть.")
+        return
+    await update.message.reply_text(f"Проверяю «{label}»…")
+    # Живая проверка: сколько записей отдаёт прямо сейчас
+    fn = _make_source_fn(src_type, value, label)
+    try:
+        found = await asyncio.to_thread(fn)
+        count = len(found or [])
+    except Exception as e:
+        logger.warning(f"Проверка источника {label}: {e}")
+        count = -1
+    custom_sources.add(src_type, value, label)
+    _attach_custom_source({'type': src_type, 'value': value, 'label': label})
+    if count > 0:
+        msg = f"✅ «{label}» добавлен — прямо сейчас отдаёт {count} записей.\nУчаствует со следующей проверки."
+    elif count == 0:
+        msg = (f"⚠️ «{label}» добавлен, но сейчас отдал 0 записей "
+               f"(возможно, пусто или фильтры всё отсеяли). Следи за /stats.")
+    else:
+        msg = f"⚠️ «{label}» добавлен, но проверка не удалась (см. /logs). Следи за /stats."
+    await update.message.reply_text(msg)
+
+
+@admin_only
+async def delsource_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет динамический источник по имени."""
+    name = ' '.join(context.args or []).strip()
+    if not name:
+        await update.message.reply_text("Формат: /delsource Название\nСписок: /sources")
+        return
+    removed = custom_sources.remove(name) if custom_sources else None
+    if not removed:
+        builtin = any(n.lower() == name.lower() for n, _ in SOURCES)
+        if builtin:
+            await update.message.reply_text(
+                f"«{name}» — встроенный источник, удалить нельзя.\n"
+                f"Отключи его: /settings → 📡 Источники."
+            )
+        else:
+            await update.message.reply_text(f"Источник «{name}» не найден. Список: /sources")
+        return
+    for i, (n, _fn) in enumerate(SOURCES):
+        if n.lower() == name.lower():
+            SOURCES.pop(i)
+            break
+    await update.message.reply_text(f"🗑 «{removed['label']}» удалён.")
+
+
+async def admins_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Список админов. Управление — только у главного админа."""
+    if update.effective_user.id != ADMIN_ID:
+        await deny_access(update)
+        return
+    extra = settings.extra_admins
+    lines = [f"👑 Главный: {ADMIN_ID}"]
+    lines += [f"• {uid}" for uid in extra] or []
+    if not extra:
+        lines.append("Дополнительных админов нет.")
+    lines.append("")
+    lines.append("Добавить: /addadmin <telegram_id>\nУдалить: /deladmin <telegram_id>")
+    lines.append("ID можно узнать у @userinfobot")
+    await update.message.reply_text('\n'.join(lines))
+
+
+async def addadmin_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавляет дополнительного админа. Только для главного админа."""
+    if update.effective_user.id != ADMIN_ID:
+        await deny_access(update)
+        return
+    args = context.args or []
+    if not args or not args[0].lstrip('-').isdigit():
+        await update.message.reply_text("Формат: /addadmin <telegram_id>\nID узнать: @userinfobot")
+        return
+    uid = int(args[0])
+    if settings.add_admin(uid):
+        await update.message.reply_text(
+            f"✅ {uid} добавлен в админы.\n"
+            f"Ему доступны команды бота и кнопки модерации в ветке.\n"
+            f"Пусть напишет боту /start."
+        )
+    else:
+        await update.message.reply_text(f"{uid} уже админ.")
+
+
+async def deladmin_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет дополнительного админа. Только для главного админа."""
+    if update.effective_user.id != ADMIN_ID:
+        await deny_access(update)
+        return
+    args = context.args or []
+    if not args or not args[0].lstrip('-').isdigit():
+        await update.message.reply_text("Формат: /deladmin <telegram_id>\nСписок: /admins")
+        return
+    uid = int(args[0])
+    if settings.remove_admin(uid):
+        await update.message.reply_text(f"🗑 {uid} больше не админ.")
+    else:
+        await update.message.reply_text(f"{uid} не был дополнительным админом.")
+
+
+@admin_only
 async def backup_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Присылает админу все файлы данных бота (страховка на случай проблем с хостингом)."""
     files = [SENT_LINKS_FILE, QUEUE_FILE, SETTINGS_FILE, STATS_FILE, ANILIST_CACHE_FILE]
@@ -5136,6 +5395,9 @@ async def setup_bot_commands(app: Application) -> None:
         BotCommand("stats", "📈 Метрики и статистика"),
         BotCommand("deepl", "🌐 Лимит DeepL"),
         BotCommand("backup", "📦 Бэкап данных"),
+        BotCommand("sources", "📡 Динамические источники"),
+        BotCommand("addsource", "➕ Добавить источник"),
+        BotCommand("delsource", "➖ Удалить источник"),
         BotCommand("logs", "📝 Последние строки лога"),
         BotCommand("blacklist", "📛 Список стоп-слов"),
         BotCommand("settings", "⚙️ Настройки"),
@@ -5158,6 +5420,13 @@ def _init_globals() -> None:
         sent_links = SentLinksStore(SENT_LINKS_FILE)
     if pending_posts is None:
         pending_posts = PendingPosts(PENDING_POSTS_FILE)
+    global custom_sources
+    if custom_sources is None:
+        custom_sources = CustomSources(CUSTOM_SOURCES_FILE)
+        for _item in custom_sources.all():
+            _attach_custom_source(_item)
+        if custom_sources.all():
+            logger.info(f"Динамических источников подключено: {len(custom_sources.all())}")
     if translator is None:
         translator = GoogleTranslator(source='auto', target='ru')
     if post_queue is None:
@@ -5204,6 +5473,12 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("deepl", deepl_command))
     app.add_handler(CommandHandler("backup", backup_command))
+    app.add_handler(CommandHandler("sources", sources_command))
+    app.add_handler(CommandHandler("addsource", addsource_command))
+    app.add_handler(CommandHandler("delsource", delsource_command))
+    app.add_handler(CommandHandler("admins", admins_command))
+    app.add_handler(CommandHandler("addadmin", addadmin_command))
+    app.add_handler(CommandHandler("deladmin", deladmin_command))
     app.add_handler(CommandHandler("logs", logs_command))
     app.add_handler(CommandHandler("blacklist", blacklist_command))
     app.add_handler(CommandHandler("settings", settings_command))
