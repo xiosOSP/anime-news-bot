@@ -1098,7 +1098,6 @@ POST_TRANSLATION_REPLACEMENTS = [
     (r'\bл[её]гких романов\b', 'ранобэ', re.IGNORECASE),
     (r'\bлёгкий роман\b', 'ранобэ', re.IGNORECASE),
     (r'\bлегкий роман\b', 'ранобэ', re.IGNORECASE),
-    (r'\bвизуальная новелла\b', 'визуальная новелла', re.IGNORECASE),
     (r'\bграфический роман\b', 'манга', re.IGNORECASE),
 
     # --- Производство/сезоны ---
@@ -1106,8 +1105,6 @@ POST_TRANSLATION_REPLACEMENTS = [
     (r'\bтретий сезон\b', '3 сезон', re.IGNORECASE),
     (r'\bпервый сезон\b', '1 сезон', re.IGNORECASE),
     (r'\bчетвёртый сезон\b', '4 сезон', re.IGNORECASE),
-    (r'\bфинальный сезон\b', 'финальный сезон', re.IGNORECASE),
-    (r'\bновый сезон\b', 'новый сезон', re.IGNORECASE),
     (r'\bзеленый свет\b', 'анонсирован', re.IGNORECASE),
     (r'\bдали зелёный свет\b', 'анонсировали', re.IGNORECASE),
     (r'\bполучил зелёный свет\b', 'анонсирован', re.IGNORECASE),
@@ -1115,23 +1112,16 @@ POST_TRANSLATION_REPLACEMENTS = [
     (r'\bбыло подтверждено\b', 'подтверждено', re.IGNORECASE),
 
     # --- Персонажи/сюжет ---
-    (r'\bглавный герой\b', 'главный герой', re.IGNORECASE),
-    (r'\bозвучивает\b', 'озвучивает', re.IGNORECASE),
     (r'\bактёр озвучивания\b', 'сэйю', re.IGNORECASE),
     (r'\bактриса озвучивания\b', 'сэйю', re.IGNORECASE),
     (r'\bактёр озвучки\b', 'сэйю', re.IGNORECASE),
     (r'\bголосовой актёр\b', 'сэйю', re.IGNORECASE),
     (r'\bголосовой состав\b', 'актёры озвучки', re.IGNORECASE),
-    (r'\bприквел\b', 'приквел', re.IGNORECASE),
-    (r'\bспин-офф\b', 'спин-офф', re.IGNORECASE),
 
     # --- Дубляжи ---
-    (r'\bанглийский дубляж\b', 'английский дубляж', re.IGNORECASE),
-    (r'\bнемецкий дубляж\b', 'немецкий дубляж', re.IGNORECASE),
 
     # --- Даты и события ---
     (r'\bпразднование мамы\b', 'День матери', re.IGNORECASE),
-    (r'\bдень благодарения\b', 'День благодарения', re.IGNORECASE),
 
     # --- Пунктуация ---
     (r' - ', ' — ', 0),  # короткие тире → длинные
@@ -1243,6 +1233,10 @@ _MONTH_RE = (
 # Паттерны дат в английском тексте, в порядке проверки.
 # Каждый: (compiled_regex, kind), где kind определяет формат вывода.
 _DATE_PATTERNS = [
+    # Японские: 2026年11月6日 / 11月6日 / 2026年10月
+    (re.compile(r'(\d{4})年(\d{1,2})月(\d{1,2})日'), 'jymd'),
+    (re.compile(r'(?<!年)(?<!\d)(\d{1,2})月(\d{1,2})日'), 'jmd'),
+    (re.compile(r'(\d{4})年(\d{1,2})月(?!\d{0,2}日)'), 'jym'),
     # August 12, 2026 / Aug. 12 2026 / August 12th, 2026
     (re.compile(rf'\b({_MONTH_RE})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})\b', re.IGNORECASE), 'mdy'),
     # 12 August 2026 / 12th August, 2026
@@ -1258,7 +1252,7 @@ _DATE_PATTERNS = [
 ]
 
 # Приоритет конкретности (меньше = конкретнее) — для сортировки при равных позициях
-_KIND_PRIORITY = {'mdy': 0, 'dmy': 0, 'my': 1, 'sy': 2, 'md': 3, 'dm': 3}
+_KIND_PRIORITY = {'mdy': 0, 'dmy': 0, 'jymd': 0, 'my': 1, 'jym': 1, 'sy': 2, 'md': 3, 'dm': 3, 'jmd': 3}
 
 
 def extract_release_date_from_text(text: str) -> str:
@@ -1279,7 +1273,22 @@ def extract_release_date_from_text(text: str) -> str:
     for pattern, kind in _DATE_PATTERNS:
         for m in pattern.finditer(text):
             try:
-                if kind == 'mdy':
+                if kind == 'jymd':
+                    year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                    if not (1 <= month <= 12) or not (1 <= day <= 31) or not (year_min <= year <= year_max):
+                        continue
+                    formatted = f'{day} {RU_MONTHS[month]} {year}'
+                elif kind == 'jmd':
+                    month, day = int(m.group(1)), int(m.group(2))
+                    if not (1 <= month <= 12) or not (1 <= day <= 31):
+                        continue
+                    formatted = f'{day} {RU_MONTHS[month]}'
+                elif kind == 'jym':
+                    year, month = int(m.group(1)), int(m.group(2))
+                    if not (1 <= month <= 12) or not (year_min <= year <= year_max):
+                        continue
+                    formatted = f'{RU_MONTHS_NOM[month]} {year}'
+                elif kind == 'mdy':
                     month = _EN_MONTHS.get(m.group(1).lower().rstrip('.'))
                     day, year = int(m.group(2)), int(m.group(3))
                     if not month or not (1 <= day <= 31) or not (year_min <= year <= year_max):
@@ -1917,7 +1926,12 @@ def _deepl_translate(text: str) -> Optional[str]:
     # «N»), из-за чего restore_terms не может вернуть названия — в постах появлялись
     # голые числа «2000». Официальное решение DeepL — XML-теги с ignore_tags:
     # содержимое <x>N</x> DeepL гарантированно не трогает.
-    text_xml = re.sub(r'〖\s*(\d+)\s*〗', r'<x>\1</x>', text)
+    # Сырые &, <, > ломают XML-парсер DeepL (tag_handling=xml) — вывод
+    # усекается до обрывков вроде «Netflix.». Экранируем до, возвращаем после.
+    safe_in = (text.replace('&', '&amp;')
+                   .replace('<', '&lt;')
+                   .replace('>', '&gt;'))
+    text_xml = re.sub(r'〖\s*(\d+)\s*〗', r'<x>\1</x>', safe_in)
 
     # 2 попытки на временные ошибки
     for attempt in range(2):
@@ -1942,6 +1956,10 @@ def _deepl_translate(text: str) -> Optional[str]:
                     if out:
                         # Возвращаем XML-теги обратно в наш формат плейсхолдеров
                         out = re.sub(r'<\s*x\s*>\s*(\d+)\s*<\s*/\s*x\s*>', r'〖\1〗', out)
+                        # Разэкранируем entity (порядок важен: &amp; — последним)
+                        out = (out.replace('&lt;', '<')
+                                  .replace('&gt;', '>')
+                                  .replace('&amp;', '&'))
                     return out
                 return None
             elif r.status_code == 456:
@@ -2210,6 +2228,25 @@ def extract_image_from_entry(entry, summary_html: Optional[str] = None) -> Optio
     """Возвращает первую найденную картинку (для совместимости)."""
     images = extract_all_images_from_entry(entry, summary_html)
     return images[0] if images else None
+
+
+def _download_image_bytes(url: str) -> Optional[bytes]:
+    """Скачивает картинку сами (для случаев, когда Bot API не может забрать её
+    по URL — например, cdn-telegram.org из t.me/s/-постов). До 9 МБ."""
+    try:
+        r = http_get_with_retry(url, headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT)
+        if not r or r.status_code != 200:
+            return None
+        ctype = (r.headers.get('Content-Type') or '').lower()
+        if not ctype.startswith('image/'):
+            return None
+        data = r.content
+        if not data or len(data) > 9 * 1024 * 1024:
+            return None
+        return data
+    except Exception as e:
+        logger.debug(f"download image fail {url[:80]}: {e}")
+        return None
 
 
 # Размерные query-параметры: вся разница вариантов картинки часто только в них
@@ -3009,10 +3046,116 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
             'lang': 'ru',                        # русский — перевод не нужен
         })
     # На странице свежие посты ВНИЗУ — берём последние
-    return news_list[-NEWS_PER_SOURCE:]
+    result = news_list[-NEWS_PER_SOURCE:]
+    logger.info(f"TG {channel}: собрано {len(result)} постов (на странице {len(news_list)})")
+    return result
 
 
 # ============== КИНО / СЕРИАЛЫ / ГИК ==============
+def get_animatetimes() -> list[dict]:
+    """AnimateTimes — крупный японский аниме-портал. Публичного RSS нет,
+    парсим свежие новости с главной (/news/details.php?id=N).
+    Заголовки японские — переводятся DeepL (JA→RU он умеет).
+    Превью в списке нет — картинку подтянет og:image-fallback при отправке."""
+    r = http_get_with_retry('https://www.animatetimes.com/',
+                            headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT)
+    if not r or r.status_code != 200:
+        logger.warning(f"AnimateTimes: HTTP {r.status_code if r else 'нет ответа'}")
+        return []
+    soup = BeautifulSoup(r.text, 'html.parser')
+    news_list: list[dict] = []
+    seen: set[str] = set()
+    for a in soup.select('a[href*="/news/details.php?id="]'):
+        href = a.get('href', '')
+        m = re.search(r'/news/details\.php\?id=(\d+)', href)
+        if not m:
+            continue
+        link = f'https://www.animatetimes.com/news/details.php?id={m.group(1)}'
+        if link in seen:
+            continue
+        title = a.get_text(' ', strip=True)
+        if not title or len(title) < 10:
+            continue
+        # В разметке заголовок часто задвоен (alt картинки + текст): «X X» → «X»
+        half = len(title) // 2
+        if len(title) % 2 == 1 and title[:half] == title[half + 1:]:
+            title = title[:half]
+        seen.add(link)
+        # Картинка-превью внутри ссылки, если есть
+        images: list[str] = []
+        img = a.select_one('img[src]')
+        if img:
+            norm = _normalize_image_url(img['src'], link)
+            if norm:
+                images.append(norm)
+        news_list.append({
+            'title': title[:250],
+            'link': link,
+            'summary': '',
+            'images': images,
+            'video': None,
+            'published_parsed': None,
+            'source': 'AnimateTimes(JP)',
+        })
+        if len(news_list) >= NEWS_PER_SOURCE:
+            break
+    return news_list
+
+
+def get_filmix() -> list[dict]:
+    """Filmix — русские новости кино и сериалов (/mnews/).
+    Контент на русском — lang='ru', перевод не нужен."""
+    r = http_get_with_retry('https://filmix.gg/mnews/',
+                            headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT)
+    if not r or r.status_code != 200:
+        logger.warning(f"Filmix: HTTP {r.status_code if r else 'нет ответа'}")
+        return []
+    soup = BeautifulSoup(r.text, 'html.parser')
+    news_list: list[dict] = []
+    seen: set[str] = set()
+    for a in soup.select('h2 a[href*="/mnews/"], h3 a[href*="/mnews/"]'):
+        href = a.get('href', '')
+        if not re.search(r'/mnews/\d+-', href):
+            continue
+        link = href if href.startswith('http') else f'https://filmix.gg{href}'
+        title = a.get_text(' ', strip=True)
+        if link in seen or len(title) < 10:
+            continue
+        seen.add(link)
+        # Превью: другая ссылка на тот же адрес с <img> внутри
+        images: list[str] = []
+        img = soup.select_one(f'a[href="{href}"] img[src]')
+        if img:
+            norm = _normalize_image_url(img['src'], link)
+            if norm:
+                images.append(norm)
+        # Сниппет: первый содержательный блок после заголовка
+        summary = ''
+        holder = a.find_parent(['h2', 'h3'])
+        sib = holder.find_next_sibling() if holder else None
+        hops = 0
+        while sib is not None and hops < 4:
+            text = sib.get_text(' ', strip=True) if hasattr(sib, 'get_text') else ''
+            if len(text) > 40:
+                summary = text[:600]
+                break
+            sib = sib.find_next_sibling()
+            hops += 1
+        news_list.append({
+            'title': title[:250],
+            'link': link,
+            'summary': summary,
+            'images': images,
+            'video': None,
+            'published_parsed': None,
+            'source': 'Filmix',
+            'lang': 'ru',
+        })
+        if len(news_list) >= NEWS_PER_SOURCE:
+            break
+    return news_list
+
+
 def get_collider():
     """Collider — кино и сериалы."""
     return _parse_rss_with_fallback('https://collider.com/feed/', 'Collider')
@@ -3053,6 +3196,7 @@ SOURCES = [
     ('Crunchyroll', get_crunchyroll_news),
     ("Honey's Anime", get_honeys_anime),
     ('AnimeHunch', get_animehunch),
+    ('AnimateTimes(JP)', get_animatetimes),
     # 🎬 Кино / сериалы / гик (канал расширен до гик-тематики).
     # Мёртвые ленты можно отключить в /settings → Источники.
     ('Collider', get_collider),
@@ -3060,6 +3204,7 @@ SOURCES = [
     ('Variety', get_variety),
     ('Polygon', get_polygon),
     ('ComingSoon', get_comingsoon),
+    ('Filmix', get_filmix),
     # Kotaku и Yatta-Tachi отключены: за 18+ часов работы на сервере — 0 собранных
     # новостей (RSS пустой или недоступен). Функции оставлены — можно вернуть
     # раскомментировав, если ленты оживут.
@@ -3155,7 +3300,7 @@ def _extract_first_sentence(text: str, max_len: int = 300) -> str:
     # Избегаем ложных срабатываний на сокращениях (No. 8, Dr. Stone, vol. 2 и т.п.):
     # lookbehind (?<!\s\d) не даёт считать границей точку сразу после одиночной цифры
     # («Akuma de Sourou 4. Doctor…» — не граница; «…в 2026. Новый…» — граница, т.к. 4 цифры).
-    match = re.search(r'(?<!\s\d)[.!?](?:\s+[«"A-ZА-ЯЁ]|\s*$)', text)
+    match = re.search(r'(?<!\s\d)[.!?](?:\s+[«"A-ZА-ЯЁ]|\s*$)|[。！？]', text)
     if match:
         sentence = text[:match.start() + 1].strip()
     else:
@@ -3202,6 +3347,13 @@ def format_news_short(news: dict) -> str:
     # Заголовок
     raw_title = news['title']
     ru_title = (raw_title if is_ru else translate_text(raw_title)).rstrip('.')
+    # Санити-чек: если перевод «съел» заголовок до огрызка («Netflix.») —
+    # лучше показать оригинал целиком, чем обрывок.
+    if (not is_ru and len(ru_title) < 15
+            and len(raw_title.rstrip('.')) > len(ru_title) * 2.5):
+        logger.warning(f"Перевод заголовка подозрительно короткий "
+                       f"({ru_title!r} из {raw_title!r}) — использую оригинал")
+        ru_title = raw_title.rstrip('.')
     if ru_title and not ru_title.endswith(('.', '!', '?', '…', ':')):
         ru_title += '.'
 
@@ -3647,6 +3799,17 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     photos = _dedup_image_variants(news.get('images') or [])
     media_count = len(photos) + (1 if has_inline_video else 0)
 
+    # Если картинок нет вообще — прежде чем отбрасывать пост, пробуем взять
+    # og:image со страницы статьи (важно для источников без превью в ленте,
+    # например AnimateTimes).
+    if media_count == 0 and settings.require_image and news.get('link'):
+        og = await asyncio.to_thread(fetch_og_image, news['link'])
+        og_norm = _normalize_image_url(og, news['link']) if og else None
+        if og_norm:
+            photos = [og_norm]
+            media_count = 1
+            logger.info(f"Картинка взята со страницы (og:image): {news['title'][:50]}")
+
     # require_image: без медиа не публикуем
     if settings.require_image and media_count == 0:
         logger.info(f"⊘ Пропускаю пост без медиа (require_image): {news['title'][:60]}")
@@ -3692,7 +3855,18 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
                         media_sent = True
                         break  # одна успешная картинка — достаточно
                     except TelegramError as e:
-                        logger.debug(f"Картинка не отправилась ({e}): {ph[:80]}")
+                        logger.debug(f"Картинка по URL не отправилась ({e}): {ph[:80]}")
+                        # Bot API не смог скачать по URL (типично для cdn-telegram.org
+                        # из t.me/s/) — скачиваем сами и шлём байтами
+                        data = await asyncio.to_thread(_download_image_bytes, ph)
+                        if data:
+                            try:
+                                await bot.send_photo(chat_id=target, photo=data, **thread_kw)
+                                media_sent = True
+                                logger.info(f"Картинка отправлена байтами (URL не принят): {ph[:60]}")
+                                break
+                            except TelegramError as e2:
+                                logger.debug(f"И байтами не ушло ({e2})")
                         continue
 
             # Все картинки из RSS битые — пробуем og:image со страницы статьи
