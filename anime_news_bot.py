@@ -3066,13 +3066,19 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
             m = re.search(r"background-image:url\('([^']+)'\)", wrap.get('style', ''))
             if m:
                 images.append(m.group(1))
-        # Видео: прямой mp4 в <video src=...>. Берём только короткие (≤60с),
-        # чтобы уложиться в лимиты Bot API и RAM хостинга.
+        # Видео: t.me/s/ отдаёт его в разных формах. Прямой mp4 бывает в <video src>,
+        # но часто — только превью-обёртка (.._video_thumb / .._video_player) с фоновым
+        # изображением, а сам файл подгружается по клику. Берём mp4 если он доступен
+        # напрямую и короткий (≤60с); иначе достаём превью-кадр в images, чтобы пост
+        # не остался без картинки.
         video_url = None
-        vid = msg.select_one('video[src]')
-        if vid and vid.get('src'):
+        dur_el = msg.select_one('.tgme_widget_message_video_duration')
+        has_video_marker = dur_el is not None or msg.select_one(
+            '.tgme_widget_message_video_player, .tgme_widget_message_video_thumb, '
+            '.tgme_widget_message_roundvideo') is not None
+        if has_video_marker:
+            # Длительность (если есть) — фильтр по ≤60с
             dur_s = None
-            dur_el = msg.select_one('.tgme_widget_message_video_duration')
             if dur_el:
                 try:
                     parts = [int(x) for x in dur_el.get_text(strip=True).split(':')]
@@ -3080,8 +3086,25 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
                         + (parts[-3] * 3600 if len(parts) > 2 else 0)
                 except (ValueError, IndexError):
                     dur_s = None
-            if dur_s is None or dur_s <= TG_VIDEO_MAX_SECONDS:
-                video_url = vid['src']
+            # Ищем прямой mp4 в разных атрибутах
+            vid = msg.select_one('video[src]')
+            direct = vid.get('src') if vid else None
+            if not direct:
+                src_el = msg.select_one('video source[src]')
+                direct = src_el.get('src') if src_el else None
+            if direct and (dur_s is None or dur_s <= TG_VIDEO_MAX_SECONDS):
+                video_url = direct
+            elif direct is None:
+                # Прямого mp4 нет (ленивая загрузка) — вытащим превью-кадр видео
+                for sel in ('.tgme_widget_message_video_thumb[style]',
+                            'a.tgme_widget_message_video_player[style]'):
+                    thumb = msg.select_one(sel)
+                    if thumb:
+                        mm = re.search(r"background-image:url\('([^']+)'\)", thumb.get('style', ''))
+                        if mm and mm.group(1) not in images:
+                            images.append(mm.group(1))
+                        break
+                logger.debug(f"TG {channel}/{post_id.split('/')[-1]}: видео без прямого mp4 — взял превью-кадр")
         news_list.append({
             'title': title,
             'link': f'https://t.me/{post_id}',
@@ -3367,6 +3390,44 @@ def _extract_first_sentence(text: str, max_len: int = 300) -> str:
     return sentence.strip()
 
 
+def _extract_sentences(text: str, max_sentences: int = 3, max_len: int = 700) -> str:
+    """Извлекает до max_sentences первых предложений (для более полного текста поста).
+    Границы предложений — латинские/кириллические . ! ? и японские 。！？.
+    Общая длина ограничена max_len. Хвосты-обрывки чистятся как в _extract_first_sentence."""
+    if not text:
+        return ''
+    text = text.strip()
+    # Чистим хвосты обрезки источником
+    text = re.sub(r'\s*\[\.{2,3}\]\s*$', '', text)
+    text = re.sub(r'\s*\[…\]\s*$', '', text)
+    text = re.sub(r'\s*\(?(?:read more|continue reading|подробнее)\)?\s*$', '', text, flags=re.IGNORECASE)
+
+    sentences: list[str] = []
+    pos = 0
+    # Тот же паттерн границы, что и для одного предложения (учитывает сокращения и цифры)
+    pattern = re.compile(r'(?<!\s\d)[.!?](?:\s+[«"A-ZА-ЯЁ]|\s*$)|[。！？]')
+    for m in pattern.finditer(text):
+        end = m.start() + 1
+        chunk = text[pos:end].strip()
+        if chunk:
+            sentences.append(chunk)
+        pos = end
+        if len(sentences) >= max_sentences:
+            break
+    # Если границ не нашлось совсем — берём весь текст как одно «предложение»
+    if not sentences:
+        sentences = [text]
+
+    result = ' '.join(sentences).strip()
+    if len(result) > max_len:
+        result = smart_truncate(result, max_len)
+    # Финальная чистка висящих знаков
+    result = re.sub(r'\s*,\s*(?:…|\.{2,3})\s*$', '', result)
+    result = re.sub(r'\s*\([^)]{0,6}$', '', result)
+    result = re.sub(r'[\s,;:—–-]+$', '', result)
+    return result.strip()
+
+
 def _format_post_date(published_struct) -> str:
     """Форматирует дату новости как 'D месяца' (напр. '1 июля').
     Возвращает пустую строку если даты нет или она невалидна."""
@@ -3404,15 +3465,15 @@ def format_news_short(news: dict) -> str:
     if ru_title and not ru_title.endswith(('.', '!', '?', '…', ':')):
         ru_title += '.'
 
-    # Одно предложение из описания
+    # До трёх предложений из описания (более полный текст, влезает в caption 1024)
     summary = news.get('summary') or ''
     ru_summary = ''
     if summary:
-        first = _extract_first_sentence(summary)
-        if first:
-            ru_summary = first if is_ru else translate_text(first)
-            # На случай если перевод вернул несколько предложений — берём первое снова
-            ru_summary = _extract_first_sentence(ru_summary, max_len=350)
+        excerpt = _extract_sentences(summary, max_sentences=3, max_len=700)
+        if excerpt:
+            ru_summary = excerpt if is_ru else translate_text(excerpt, input_limit=1200)
+            # После перевода приводим к <=3 предложениям и разумной длине
+            ru_summary = _extract_sentences(ru_summary, max_sentences=3, max_len=850)
 
     # Если предложение дублирует заголовок — не показываем
     if ru_summary and ru_title.rstrip('.').lower() in ru_summary.lower():
