@@ -199,6 +199,7 @@ VIDEO_DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # --- Медиа ---
 MAX_PHOTOS_PER_POST = 6               # сколько фото максимум собирать в media group
+TG_VIDEO_MAX_SECONDS = 60             # видео из TG-каналов берём только до минуты
 # Хосты, для которых пробуем yt-dlp
 VIDEO_HOSTS = (
     'youtube.com', 'youtu.be', 'm.youtube.com',
@@ -2425,9 +2426,14 @@ def _is_video_host(url: str) -> bool:
 def _is_direct_video(url: str) -> bool:
     """Проверяет, что URL — прямая ссылка на видеофайл."""
     try:
-        path = urlparse(url).path.lower()
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        host = parsed.netloc.lower()
     except Exception:
         return False
+    # Видео из t.me/s/ живут на cdn-telegram/telesco без расширения в пути
+    if 'cdn-telegram.org' in host or 'telesco.pe' in host:
+        return True
     return path.endswith(DIRECT_VIDEO_EXTENSIONS)
 
 
@@ -3060,12 +3066,28 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
             m = re.search(r"background-image:url\('([^']+)'\)", wrap.get('style', ''))
             if m:
                 images.append(m.group(1))
+        # Видео: прямой mp4 в <video src=...>. Берём только короткие (≤60с),
+        # чтобы уложиться в лимиты Bot API и RAM хостинга.
+        video_url = None
+        vid = msg.select_one('video[src]')
+        if vid and vid.get('src'):
+            dur_s = None
+            dur_el = msg.select_one('.tgme_widget_message_video_duration')
+            if dur_el:
+                try:
+                    parts = [int(x) for x in dur_el.get_text(strip=True).split(':')]
+                    dur_s = parts[-1] + (parts[-2] * 60 if len(parts) > 1 else 0) \
+                        + (parts[-3] * 3600 if len(parts) > 2 else 0)
+                except (ValueError, IndexError):
+                    dur_s = None
+            if dur_s is None or dur_s <= TG_VIDEO_MAX_SECONDS:
+                video_url = vid['src']
         news_list.append({
             'title': title,
             'link': f'https://t.me/{post_id}',
             'summary': summary,
             'images': images[:MAX_PHOTOS_PER_POST],
-            'video': None,
+            'video': video_url,
             'published_parsed': published_parsed,
             'source': label,
             'lang': 'ru',                        # русский — перевод не нужен
@@ -3893,12 +3915,56 @@ async def _tg_call_flood_safe(coro_factory):
         return await coro_factory()
 
 
-async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Path]) -> bool:
-    """Отправка в ветку ДВУМЯ сообщениями (вариант B):
-    1) фото/альбом/видео БЕЗ подписи
-    2) полный текст (заголовок + описание) до 4096 символов
+def _download_media_bytes(url: str, max_mb: int = 45) -> Optional[bytes]:
+    """Скачивает медиа (фото/видео) для отправки байтами, когда Bot API не берёт URL.
+    Проверяет, что это image/* или video/*, и что размер в пределах max_mb."""
+    try:
+        r = http_get_with_retry(url, headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT)
+        if not r or r.status_code != 200:
+            return None
+        ctype = (r.headers.get('Content-Type') or '').lower()
+        if not (ctype.startswith('image/') or ctype.startswith('video/')):
+            return None
+        data = r.content
+        if not data or len(data) > max_mb * 1024 * 1024:
+            return None
+        return data
+    except Exception as e:
+        logger.debug(f"download media fail {url[:80]}: {e}")
+        return None
 
-    Это позволяет показать полный текст без обрезания caption-лимитом 1024."""
+
+async def _resolve_photos_for_album(photos: list[str]) -> list:
+    """Готовит список картинок к отправке альбомом. Каждую, что Telegram не сможет
+    забрать по URL (cdn-telegram.org и пр.), заменяем скачанными байтами.
+    Возвращает список пригодных к отправке значений (URL-строки или bytes)."""
+    resolved: list = []
+    for ph in photos[:MAX_PHOTOS_PER_POST]:
+        if _download_needed_host(ph):
+            data = await asyncio.to_thread(_download_image_bytes, ph)
+            resolved.append(data if data else ph)
+        else:
+            resolved.append(ph)
+    return resolved
+
+
+def _download_needed_host(url: str) -> bool:
+    """Хосты, с которых Bot API обычно не может скачать картинку по URL —
+    их качаем сами заранее."""
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return 'cdn-telegram.org' in host or 'telesco.pe' in host
+
+
+async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Path]) -> bool:
+    """Отправка поста в ветку ЦЕЛЬНЫМ сообщением: медиа + текст в подписи (caption).
+
+    Посты короткие (заголовок + предложение + дата), всегда влезают в caption-лимит
+    1024. Поэтому фото/видео и текст идут ОДНИМ сообщением, а не двумя.
+    Все картинки источника сохраняются (альбомом), а не только первая.
+    Если текст внезапно длиннее 1024 — откат на старый режим (медиа + отдельный текст)."""
     thread_kw = {'message_thread_id': DISCUSSION_THREAD_ID}
     target = DISCUSSION_CHAT_ID
 
@@ -3907,17 +3973,14 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     has_inline_video = settings.video_enabled and (
         video_file is not None or (video_url and _is_direct_video(video_url))
     )
-    # Если видео не встроено, добавим ссылку в текст
     if video_url and not has_inline_video:
         text = _add_video_link_to_text(text, video_url)
 
     photos = _dedup_image_variants(news.get('images') or [])
     media_count = len(photos) + (1 if has_inline_video else 0)
 
-    # Если картинок нет вообще — прежде чем отбрасывать пост, пробуем взять
-    # og:image со страницы статьи (важно для источников без превью в ленте,
-    # например AnimateTimes).
-    if media_count == 0 and settings.require_image and news.get('link'):
+    # Нет медиа — пробуем og:image со страницы, иначе (при require_image) пропуск
+    if media_count == 0 and news.get('link'):
         og = await asyncio.to_thread(fetch_og_image, news['link'])
         og_norm = _normalize_image_url(og, news['link']) if og else None
         if og_norm:
@@ -3925,85 +3988,15 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
             media_count = 1
             logger.info(f"Картинка взята со страницы (og:image): {news['title'][:50]}")
 
-    # require_image: без медиа не публикуем
     if settings.require_image and media_count == 0:
         logger.info(f"⊘ Пропускаю пост без медиа (require_image): {news['title'][:60]}")
         return False
 
-    safe_text = fit_to_limit(html.escape(text), TG_TEXT_LIMIT)
+    # Caption для медиа. Telegram-лимит подписи — 1024 символа.
+    caption = fit_to_limit(html.escape(text), TG_CAPTION_LIMIT)
+    caption_kw = {'caption': caption, 'parse_mode': ParseMode.HTML}
 
-    # --- Шаг 1: отправляем медиа БЕЗ подписи ---
-    media_sent = False
-    if media_count > 0:
-        # Видео (если есть и включено)
-        if has_inline_video:
-            try:
-                if video_file:
-                    with open(video_file, 'rb') as f:
-                        await bot.send_video(chat_id=target, video=f,
-                                             supports_streaming=True, **thread_kw)
-                else:
-                    await bot.send_video(chat_id=target, video=video_url,
-                                         supports_streaming=True, **thread_kw)
-                media_sent = True
-            except TelegramError as e:
-                logger.warning(f"Видео в ветку не отправилось ({e})")
-
-        # Фото: пробуем альбомом, при неудаче — по одному, перебирая битые
-        if photos and not media_sent:
-            # Сначала пытаемся альбомом (быстро, если все картинки валидны)
-            if len(photos) > 1:
-                try:
-                    media = [InputMediaPhoto(media=ph) for ph in photos[:10]]
-                    await _tg_call_flood_safe(lambda: bot.send_media_group(
-                        chat_id=target, media=media, **thread_kw))
-                    media_sent = True
-                except TelegramError as e:
-                    logger.debug(f"Альбом в ветку не прошёл ({e}), пробую по одной картинке")
-
-            # Если альбом не прошёл (или одна картинка) — перебираем по одной,
-            # пока какая-нибудь не отправится успешно
-            if not media_sent:
-                for ph in photos[:MAX_PHOTOS_PER_POST]:
-                    try:
-                        await bot.send_photo(chat_id=target, photo=ph, **thread_kw)
-                        media_sent = True
-                        break  # одна успешная картинка — достаточно
-                    except TelegramError as e:
-                        logger.debug(f"Картинка по URL не отправилась ({e}): {ph[:80]}")
-                        # Bot API не смог скачать по URL (типично для cdn-telegram.org
-                        # из t.me/s/) — скачиваем сами и шлём байтами
-                        data = await asyncio.to_thread(_download_image_bytes, ph)
-                        if data:
-                            try:
-                                await bot.send_photo(chat_id=target, photo=data, **thread_kw)
-                                media_sent = True
-                                logger.info(f"Картинка отправлена байтами (URL не принят): {ph[:60]}")
-                                break
-                            except TelegramError as e2:
-                                logger.debug(f"И байтами не ушло ({e2})")
-                        continue
-
-            # Все картинки из RSS битые — пробуем og:image со страницы статьи
-            if not media_sent and news.get('link'):
-                og = await asyncio.to_thread(fetch_og_image, news['link'])
-                if og:
-                    og_norm = _normalize_image_url(og, news['link'])
-                    if og_norm:
-                        try:
-                            await bot.send_photo(chat_id=target, photo=og_norm, **thread_kw)
-                            media_sent = True
-                            logger.info(f"Картинка взята со страницы (og:image): {news['title'][:50]}")
-                        except TelegramError as e:
-                            logger.debug(f"og:image тоже не отправился ({e})")
-
-    # Если require_image и медиа так и не ушло — пост пропускаем
-    if settings.require_image and not media_sent:
-        logger.info(f"⊘ Все картинки битые, пост пропущен (require_image): {news['title'][:60]}")
-        return False
-
-    # --- Шаг 2: отправляем текст отдельным сообщением ---
-    # Под текстом — кнопки модерации: опубликовать в канал одним тапом / скрыть.
+    # Кнопки модерации (📢 В канал / ✖ Скрыть)
     reply_markup = None
     if pending_posts is not None:
         key = pending_posts.add(news)
@@ -4011,20 +4004,176 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
             InlineKeyboardButton('📢 В канал', callback_data=f'pub:{key}'),
             InlineKeyboardButton('✖ Скрыть', callback_data=f'dis:{key}'),
         ]])
+
+    # Если медиа нет вовсе (require_image выключен) — просто текст
+    if media_count == 0:
+        try:
+            await _tg_call_flood_safe(lambda: bot.send_message(
+                chat_id=target, text=caption, parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True, reply_markup=reply_markup, **thread_kw))
+            logger.info(f"🧵 {news['source']}: {news['title'][:60]} (только текст)")
+            return True
+        except TelegramError as e:
+            logger.error(f"Текст в ветку не отправился: {e}")
+            return False
+
+    # Текст не влез в caption — откатываемся на раздельную отправку
+    if len(text) > TG_CAPTION_LIMIT:
+        return await _send_thread_media_then_text(
+            bot, news, photos, has_inline_video, video_file, video_url,
+            text, reply_markup, thread_kw, target)
+
+    # === ЦЕЛЬНЫЙ РЕЖИМ: одно сообщение с медиа и подписью ===
+
+    # 1) Одно фото + (нет видео): фото с подписью и кнопками — идеально цельно
+    if len(photos) == 1 and not has_inline_video:
+        if await _send_single_photo_caption(
+                bot, target, photos[0], caption_kw, reply_markup, thread_kw, news):
+            return True
+        # не удалось даже байтами — на всякий случай откат
+        return await _send_thread_media_then_text(
+            bot, news, photos, has_inline_video, video_file, video_url,
+            text, reply_markup, thread_kw, target)
+
+    # 2) Только видео (без фото): видео с подписью и кнопками
+    if has_inline_video and not photos:
+        try:
+            if video_file:
+                with open(video_file, 'rb') as f:
+                    await bot.send_video(chat_id=target, video=f, supports_streaming=True,
+                                         reply_markup=reply_markup, **caption_kw, **thread_kw)
+            else:
+                await bot.send_video(chat_id=target, video=video_url, supports_streaming=True,
+                                     reply_markup=reply_markup, **caption_kw, **thread_kw)
+            logger.info(f"🧵 {news['source']}: {news['title'][:60]} (видео+подпись)")
+            return True
+        except TelegramError as e:
+            logger.warning(f"Видео с подписью не ушло ({e}) — откат")
+            return await _send_thread_media_then_text(
+                bot, news, photos, has_inline_video, video_file, video_url,
+                text, reply_markup, thread_kw, target)
+
+    # 3) Альбом (2+ фото и/или видео+фото): подпись на первом элементе.
+    #    У media_group нет reply_markup — поэтому кнопки шлём отдельным
+    #    маленьким сообщением-«хвостом» сразу после альбома.
+    media: list = []
+    opened: list = []
     try:
-        await _tg_call_flood_safe(lambda: bot.send_message(
-            chat_id=target,
-            text=safe_text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,  # превью не нужно, фото уже выше
-            reply_markup=reply_markup,
-            **thread_kw,
-        ))
-        logger.info(f"🧵 {news['source']}: {news['title'][:60]} (фото+текст раздельно)")
+        if has_inline_video:
+            if video_file:
+                f = open(video_file, 'rb'); opened.append(f)
+                media.append(InputMediaVideo(media=f, supports_streaming=True,
+                                             caption=caption, parse_mode=ParseMode.HTML))
+            elif video_url:
+                media.append(InputMediaVideo(media=video_url, supports_streaming=True,
+                                             caption=caption, parse_mode=ParseMode.HTML))
+            for ph in (await _resolve_photos_for_album(photos))[:9]:
+                media.append(InputMediaPhoto(media=ph))
+        else:
+            resolved = await _resolve_photos_for_album(photos)
+            for i, ph in enumerate(resolved[:10]):
+                if i == 0:
+                    media.append(InputMediaPhoto(media=ph, caption=caption,
+                                                 parse_mode=ParseMode.HTML))
+                else:
+                    media.append(InputMediaPhoto(media=ph))
+        await _tg_call_flood_safe(lambda: bot.send_media_group(
+            chat_id=target, media=media, **thread_kw))
+        # Хвост с кнопками (media_group не поддерживает inline-кнопки)
+        if reply_markup is not None:
+            try:
+                await bot.send_message(chat_id=target, text='👆 Опубликовать этот пост?',
+                                       reply_markup=reply_markup, **thread_kw)
+            except TelegramError:
+                pass
+        logger.info(f"🧵 {news['source']}: {news['title'][:60]} (альбом {len(media)}+подпись)")
         return True
     except TelegramError as e:
-        logger.error(f"Не удалось отправить текст в ветку: {e}")
-        # Медиа уже ушло, но текст нет — считаем частичной неудачей
+        logger.warning(f"Альбом с подписью не прошёл ({e}) — откат на раздельную отправку")
+        return await _send_thread_media_then_text(
+            bot, news, photos, has_inline_video, video_file, video_url,
+            text, reply_markup, thread_kw, target)
+    finally:
+        for f in opened:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+
+async def _send_single_photo_caption(bot, target, photo, caption_kw, reply_markup,
+                                     thread_kw, news) -> bool:
+    """Одно фото с подписью. При отказе URL — скачиваем байтами и повторяем."""
+    try:
+        await bot.send_photo(chat_id=target, photo=photo, reply_markup=reply_markup,
+                             **caption_kw, **thread_kw)
+        logger.info(f"🧵 {news['source']}: {news['title'][:60]} (фото+подпись)")
+        return True
+    except TelegramError as e:
+        logger.debug(f"Фото по URL не ушло ({e}), пробую байтами: {photo[:80]}")
+        data = await asyncio.to_thread(_download_image_bytes, photo)
+        if data:
+            try:
+                await bot.send_photo(chat_id=target, photo=data, reply_markup=reply_markup,
+                                     **caption_kw, **thread_kw)
+                logger.info(f"🧵 {news['source']}: {news['title'][:60]} (фото байтами+подпись)")
+                return True
+            except TelegramError as e2:
+                logger.debug(f"И байтами фото не ушло ({e2})")
+    return False
+
+
+async def _send_thread_media_then_text(bot, news, photos, has_inline_video, video_file,
+                                       video_url, text, reply_markup, thread_kw, target) -> bool:
+    """Резервный режим (текст >1024 или сбой цельной отправки): медиа отдельно,
+    затем текст отдельным сообщением. Сохраняет все картинки альбомом."""
+    safe_text = fit_to_limit(html.escape(text), TG_TEXT_LIMIT)
+    media_sent = False
+
+    if has_inline_video:
+        try:
+            if video_file:
+                with open(video_file, 'rb') as f:
+                    await bot.send_video(chat_id=target, video=f,
+                                         supports_streaming=True, **thread_kw)
+            else:
+                await bot.send_video(chat_id=target, video=video_url,
+                                     supports_streaming=True, **thread_kw)
+            media_sent = True
+        except TelegramError as e:
+            logger.warning(f"Видео в ветку не отправилось ({e})")
+
+    if photos:
+        resolved = await _resolve_photos_for_album(photos)
+        if len(resolved) > 1:
+            try:
+                media = [InputMediaPhoto(media=ph) for ph in resolved[:10]]
+                await _tg_call_flood_safe(lambda: bot.send_media_group(
+                    chat_id=target, media=media, **thread_kw))
+                media_sent = True
+            except TelegramError as e:
+                logger.debug(f"Альбом не прошёл ({e}), по одной")
+        if not media_sent:
+            for ph in resolved:
+                try:
+                    await bot.send_photo(chat_id=target, photo=ph, **thread_kw)
+                    media_sent = True
+                    break
+                except TelegramError:
+                    continue
+
+    if settings.require_image and not media_sent:
+        logger.info(f"⊘ Медиа не ушло, пост пропущен (require_image): {news['title'][:60]}")
+        return False
+
+    try:
+        await _tg_call_flood_safe(lambda: bot.send_message(
+            chat_id=target, text=safe_text, parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True, reply_markup=reply_markup, **thread_kw))
+        logger.info(f"🧵 {news['source']}: {news['title'][:60]} (медиа+текст раздельно)")
+        return True
+    except TelegramError as e:
+        logger.error(f"Текст в ветку не отправился: {e}")
         return media_sent
 
 
