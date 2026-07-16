@@ -17,7 +17,7 @@ import copy
 import time
 import difflib
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -41,6 +41,7 @@ from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -705,6 +706,7 @@ class BotSettings:
         'quiet_mode': True,      # True = уведомлять админа только при ошибках + сводка раз в день
         'last_daily_summary': '',  # дата (YYYY-MM-DD) последней ежедневной сводки
         'extra_admins': [],      # дополнительные Telegram ID с правами админа
+        'tz_offset': 3,          # часовой пояс админа относительно UTC (МСК = +3)
     }
 
     def __init__(self, path: Path):
@@ -808,6 +810,18 @@ class BotSettings:
     @last_daily_summary.setter
     def last_daily_summary(self, value: str) -> None:
         self._data['last_daily_summary'] = str(value)
+        self.save()
+
+    @property
+    def tz_offset(self) -> int:
+        try:
+            return int(self._data.get('tz_offset', 3))
+        except (TypeError, ValueError):
+            return 3
+
+    @tz_offset.setter
+    def tz_offset(self, value: int) -> None:
+        self._data['tz_offset'] = max(-12, min(14, int(value)))
         self.save()
 
     @property
@@ -3443,7 +3457,11 @@ def _format_post_date(published_struct) -> str:
 def format_news_short(news: dict) -> str:
     """Короткий формат поста: заголовок + одно предложение сути + дата.
     Используется и для канала, и для ветки. Без воды.
-    Посты с lang='ru' (русские Telegram-каналы) не переводятся."""
+    Посты с lang='ru' (русские Telegram-каналы) не переводятся.
+    Если админ правил текст вручную (_edited_text) — отдаём его как есть."""
+    edited = news.get('_edited_text')
+    if edited:
+        return edited
     is_ru = news.get('lang') == 'ru'
 
     # Эпизоды форматируем отдельно (они и так короткие); парсер английский
@@ -3898,6 +3916,219 @@ def _parse_addsource_args(args: list) :
     return None
 
 
+# ============== ОТЛОЖЕННАЯ ПУБЛИКАЦИЯ ==============
+# Bot API не умеет нативную отложку Telegram (параметра schedule_date нет),
+# поэтому планировщик свой: бот хранит посты на диске и публикует их сам.
+# Время считаем через UTC явно — не зависим от часового пояса сервера.
+
+def _tz_offset() -> int:
+    """Часовой пояс админа относительно UTC (по умолчанию МСК = +3)."""
+    return getattr(settings, 'tz_offset', 3) if settings is not None else 3
+
+
+def _local_now() -> datetime:
+    """Текущее время в часовом поясе админа (naive)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=_tz_offset())
+
+
+def _local_to_utc(local_naive: datetime) -> datetime:
+    """Локальное время админа (naive) → aware UTC."""
+    return (local_naive - timedelta(hours=_tz_offset())).replace(tzinfo=timezone.utc)
+
+
+def _utc_to_local(dt_utc: datetime) -> datetime:
+    """Aware/naive UTC → локальное время админа (naive)."""
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    return dt_utc.astimezone(timezone.utc).replace(tzinfo=None) + timedelta(hours=_tz_offset())
+
+
+def _fmt_local(dt_utc: datetime) -> str:
+    """Человекочитаемое время публикации в поясе админа."""
+    return _utc_to_local(dt_utc).strftime('%d.%m в %H:%M')
+
+
+_REL_TIME_RE = re.compile(
+    r'^\+\s*(\d{1,4})\s*(мин\w*|м|min|m|час\w*|ч|h|дн\w*|д|d)$', re.IGNORECASE)
+_DAY_WORD_RE = re.compile(r'^(сегодня|завтра|послезавтра)\s+(.+)$', re.IGNORECASE)
+_DATE_TIME_RE = re.compile(
+    r'^(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?\s+(\d{1,2})[:.](\d{2})$')
+_TIME_RE = re.compile(r'^(\d{1,2})[:.](\d{2})$')
+
+
+def _parse_schedule_time(text: str) -> Optional[datetime]:
+    """Разбирает время публикации, введённое админом вручную.
+    Возвращает aware UTC datetime в будущем или None если формат не понят
+    либо время уже прошло.
+
+    Понимает: '18:30', '12.07 18:30', '12.07.2026 18:30',
+              'завтра 10:00', '+2ч', '+30м', '+1д'."""
+    if not text:
+        return None
+    t = re.sub(r'\s+', ' ', text.strip().lower().replace(',', ' ')).strip()
+    now_local = _local_now()
+
+    # Относительное смещение: +2ч / +30м / +1д
+    m = _REL_TIME_RE.match(t)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2).lower()
+        if unit.startswith(('м', 'm')):
+            delta = timedelta(minutes=n)
+        elif unit.startswith(('ч', 'h')):
+            delta = timedelta(hours=n)
+        else:
+            delta = timedelta(days=n)
+        if delta.total_seconds() < 60:
+            return None
+        return _local_to_utc(now_local + delta)
+
+    # Словесный сдвиг дня: 'завтра 10:00'
+    day_shift = 0
+    m = _DAY_WORD_RE.match(t)
+    if m:
+        day_shift = {'сегодня': 0, 'завтра': 1, 'послезавтра': 2}[m.group(1).lower()]
+        t = m.group(2).strip()
+
+    # Дата со временем: 12.07 18:30 / 12.07.2026 18:30
+    m = _DATE_TIME_RE.match(t)
+    if m:
+        day, month = int(m.group(1)), int(m.group(2))
+        year_raw, hh, mi = m.group(3), int(m.group(4)), int(m.group(5))
+        if not (0 <= hh <= 23 and 0 <= mi <= 59):
+            return None
+        year = now_local.year
+        if year_raw:
+            year = int(year_raw)
+            if year < 100:
+                year += 2000
+        try:
+            local = datetime(year, month, day, hh, mi)
+        except ValueError:
+            return None
+        # Без года и дата уже прошла — значит имелся в виду следующий год
+        if not year_raw and local <= now_local:
+            try:
+                local = local.replace(year=year + 1)
+            except ValueError:
+                return None
+        return _local_to_utc(local) if local > now_local else None
+
+    # Просто время: 18:30
+    m = _TIME_RE.match(t)
+    if m:
+        hh, mi = int(m.group(1)), int(m.group(2))
+        if not (0 <= hh <= 23 and 0 <= mi <= 59):
+            return None
+        local = now_local.replace(hour=hh, minute=mi, second=0, microsecond=0)
+        if day_shift:
+            local += timedelta(days=day_shift)
+        elif local <= now_local:
+            local += timedelta(days=1)   # время на сегодня прошло — значит завтра
+        return _local_to_utc(local) if local > now_local else None
+
+    return None
+
+
+SCHEDULED_POSTS_FILE = DATA_DIR / 'scheduled_posts.json'
+
+
+class ScheduledPosts:
+    """Посты, отложенные админом на конкретное время. Публикует сам бот.
+    Хранится на диске — отложка переживает перезапуски."""
+    MAX_ITEMS = 500
+    MAX_TRIES = 3
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._counter = 0
+        self._items: dict[str, dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if self.path.exists():
+                data = json.loads(self.path.read_text(encoding='utf-8'))
+                self._counter = int(data.get('counter', 0))
+                self._items = data.get('items', {})
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning(f"scheduled_posts не загружен: {e}")
+
+    def _save(self) -> None:
+        try:
+            self.path.write_text(
+                json.dumps({'counter': self._counter, 'items': self._items}, ensure_ascii=False),
+                encoding='utf-8')
+        except OSError as e:
+            logger.error(f"scheduled_posts не сохранён: {e}")
+
+    @staticmethod
+    def _at(item: dict) -> Optional[datetime]:
+        try:
+            dt = datetime.fromisoformat(item['at'])
+        except (KeyError, ValueError, TypeError):
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    def add(self, news: dict, when_utc: datetime) -> str:
+        self._counter += 1
+        key = str(self._counter)
+        clean = {k: v for k, v in news.items() if k != 'published_parsed'}
+        self._items[key] = {
+            'news': clean,
+            'at': when_utc.astimezone(timezone.utc).isoformat(),
+            'tries': 0,
+        }
+        if len(self._items) > self.MAX_ITEMS:
+            oldest = sorted(self._items, key=lambda k: self._items[k].get('at', ''))
+            for k in oldest[:len(self._items) - self.MAX_ITEMS]:
+                del self._items[k]
+        self._save()
+        return key
+
+    def all(self) -> list:
+        """Список (key, news, when_utc), отсортированный по времени публикации."""
+        out = []
+        for k, item in self._items.items():
+            dt = self._at(item)
+            if dt:
+                out.append((k, item.get('news', {}), dt))
+        out.sort(key=lambda x: x[2])
+        return out
+
+    def due(self, now_utc: Optional[datetime] = None) -> list:
+        """Посты, время которых уже наступило."""
+        now = now_utc or datetime.now(timezone.utc)
+        return [(k, news) for k, news, dt in self.all() if dt <= now]
+
+    def get(self, key: str) -> Optional[dict]:
+        item = self._items.get(key)
+        return item.get('news') if item else None
+
+    def when(self, key: str) -> Optional[datetime]:
+        item = self._items.get(key)
+        return self._at(item) if item else None
+
+    def pop(self, key: str) -> Optional[dict]:
+        item = self._items.pop(key, None)
+        if item is not None:
+            self._save()
+            return item.get('news')
+        return None
+
+    def mark_try(self, key: str) -> int:
+        """Считает неудачные попытки публикации. Возвращает их количество."""
+        item = self._items.get(key)
+        if not item:
+            return 0
+        item['tries'] = int(item.get('tries', 0)) + 1
+        self._save()
+        return item['tries']
+
+
+scheduled_posts: Optional['ScheduledPosts'] = None
+
+
 PENDING_POSTS_FILE = DATA_DIR / 'pending_posts.json'
 
 
@@ -3960,8 +4191,38 @@ class PendingPosts:
             return item.get('news')
         return None
 
+    def update_news(self, key: str, news: dict) -> bool:
+        """Заменяет сохранённый пост (используется при ручном редактировании текста)."""
+        item = self._items.get(key)
+        if not item:
+            return False
+        item['news'] = {k: v for k, v in news.items() if k != 'published_parsed'}
+        self._save()
+        return True
+
+    def set_preview(self, key: str, chat_id: int, message_id: int) -> None:
+        """Запоминает сообщение-превью в ветке, чтобы обновлять его при правках."""
+        item = self._items.get(key)
+        if item:
+            item['preview'] = {'chat_id': chat_id, 'message_id': message_id}
+            self._save()
+
+    def get_preview(self, key: str) -> Optional[dict]:
+        item = self._items.get(key)
+        return item.get('preview') if item else None
+
 
 pending_posts: Optional['PendingPosts'] = None
+
+
+def _moderation_markup(key: str) -> InlineKeyboardMarkup:
+    """Кнопки модерации под постом в ветке."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('📢 В канал', callback_data=f'pub:{key}'),
+         InlineKeyboardButton('📅 В отложку', callback_data=f'sch:{key}')],
+        [InlineKeyboardButton('✏️ Изменить', callback_data=f'edit:{key}'),
+         InlineKeyboardButton('✖ Скрыть', callback_data=f'dis:{key}')],
+    ])
 
 
 async def _tg_call_flood_safe(coro_factory):
@@ -4057,21 +4318,20 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     caption = fit_to_limit(html.escape(text), TG_CAPTION_LIMIT)
     caption_kw = {'caption': caption, 'parse_mode': ParseMode.HTML}
 
-    # Кнопки модерации (📢 В канал / ✖ Скрыть)
+    # Кнопки модерации: 📢 В канал / 📅 В отложку / ✏️ Изменить / ✖ Скрыть
     reply_markup = None
+    pending_key = None
     if pending_posts is not None:
-        key = pending_posts.add(news)
-        reply_markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton('📢 В канал', callback_data=f'pub:{key}'),
-            InlineKeyboardButton('✖ Скрыть', callback_data=f'dis:{key}'),
-        ]])
+        pending_key = pending_posts.add(news)
+        reply_markup = _moderation_markup(pending_key)
 
     # Если медиа нет вовсе (require_image выключен) — просто текст
     if media_count == 0:
         try:
-            await _tg_call_flood_safe(lambda: bot.send_message(
+            msg = await _tg_call_flood_safe(lambda: bot.send_message(
                 chat_id=target, text=caption, parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True, reply_markup=reply_markup, **thread_kw))
+            _remember_preview(pending_key, msg)
             logger.info(f"🧵 {news['source']}: {news['title'][:60]} (только текст)")
             return True
         except TelegramError as e:
@@ -4089,7 +4349,8 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     # 1) Одно фото + (нет видео): фото с подписью и кнопками — идеально цельно
     if len(photos) == 1 and not has_inline_video:
         if await _send_single_photo_caption(
-                bot, target, photos[0], caption_kw, reply_markup, thread_kw, news):
+                bot, target, photos[0], caption_kw, reply_markup, thread_kw, news,
+                pending_key):
             return True
         # не удалось даже байтами — на всякий случай откат
         return await _send_thread_media_then_text(
@@ -4101,11 +4362,12 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
         try:
             if video_file:
                 with open(video_file, 'rb') as f:
-                    await bot.send_video(chat_id=target, video=f, supports_streaming=True,
-                                         reply_markup=reply_markup, **caption_kw, **thread_kw)
+                    msg = await bot.send_video(chat_id=target, video=f, supports_streaming=True,
+                                               reply_markup=reply_markup, **caption_kw, **thread_kw)
             else:
-                await bot.send_video(chat_id=target, video=video_url, supports_streaming=True,
-                                     reply_markup=reply_markup, **caption_kw, **thread_kw)
+                msg = await bot.send_video(chat_id=target, video=video_url, supports_streaming=True,
+                                           reply_markup=reply_markup, **caption_kw, **thread_kw)
+            _remember_preview(pending_key, msg)
             logger.info(f"🧵 {news['source']}: {news['title'][:60]} (видео+подпись)")
             return True
         except TelegramError as e:
@@ -4138,8 +4400,10 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
                                                  parse_mode=ParseMode.HTML))
                 else:
                     media.append(InputMediaPhoto(media=ph))
-        await _tg_call_flood_safe(lambda: bot.send_media_group(
+        msgs = await _tg_call_flood_safe(lambda: bot.send_media_group(
             chat_id=target, media=media, **thread_kw))
+        if isinstance(msgs, (list, tuple)) and msgs:
+            _remember_preview(pending_key, msgs[0])   # подпись живёт на первом элементе
         # Хвост с кнопками (media_group не поддерживает inline-кнопки)
         if reply_markup is not None:
             try:
@@ -4162,12 +4426,27 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
                 pass
 
 
+def _remember_preview(pending_key, msg) -> None:
+    """Запоминает сообщение, в котором виден текст поста, чтобы правки
+    (кнопка ✏️ Изменить) могли обновить его прямо в ветке."""
+    if not pending_key or pending_posts is None or msg is None:
+        return
+    try:
+        mid = getattr(msg, 'message_id', None)
+        cid = getattr(msg, 'chat_id', None)
+        if isinstance(mid, int) and isinstance(cid, int):
+            pending_posts.set_preview(pending_key, cid, mid)
+    except Exception as e:
+        logger.debug(f"preview не запомнен: {e}")
+
+
 async def _send_single_photo_caption(bot, target, photo, caption_kw, reply_markup,
-                                     thread_kw, news) -> bool:
+                                     thread_kw, news, pending_key=None) -> bool:
     """Одно фото с подписью. При отказе URL — скачиваем байтами и повторяем."""
     try:
-        await bot.send_photo(chat_id=target, photo=photo, reply_markup=reply_markup,
-                             **caption_kw, **thread_kw)
+        msg = await bot.send_photo(chat_id=target, photo=photo, reply_markup=reply_markup,
+                                   **caption_kw, **thread_kw)
+        _remember_preview(pending_key, msg)
         logger.info(f"🧵 {news['source']}: {news['title'][:60]} (фото+подпись)")
         return True
     except TelegramError as e:
@@ -4175,8 +4454,9 @@ async def _send_single_photo_caption(bot, target, photo, caption_kw, reply_marku
         data = await asyncio.to_thread(_download_image_bytes, photo)
         if data:
             try:
-                await bot.send_photo(chat_id=target, photo=data, reply_markup=reply_markup,
-                                     **caption_kw, **thread_kw)
+                msg = await bot.send_photo(chat_id=target, photo=data, reply_markup=reply_markup,
+                                           **caption_kw, **thread_kw)
+                _remember_preview(pending_key, msg)
                 logger.info(f"🧵 {news['source']}: {news['title'][:60]} (фото байтами+подпись)")
                 return True
             except TelegramError as e2:
@@ -4508,6 +4788,113 @@ def build_queue_clear_confirm_menu() -> InlineKeyboardMarkup:
 
 
 # ============== ОБРАБОТЧИКИ INLINE-КНОПОК ==============
+_SCHEDULE_HINT = (
+    '📅 <b>Во сколько опубликовать?</b>\n'
+    'Ответь сообщением, например:\n'
+    '• <code>18:30</code> — сегодня (если прошло — завтра)\n'
+    '• <code>12.07 18:30</code> — конкретная дата\n'
+    '• <code>завтра 10:00</code>\n'
+    '• <code>+2ч</code> или <code>+30м</code>\n\n'
+    'Сейчас у тебя {now} (UTC{off:+d}). Не тот пояс — /tz\n'
+    'Отмена — /cancel'
+)
+
+_EDIT_HINT = (
+    '✏️ <b>Пришли новый текст поста</b> одним сообщением.\n'
+    'Он полностью заменит текущий — и в канал/отложку уйдёт именно он.\n\n'
+    'Сейчас:\n<code>{current}</code>\n\n'
+    'Отмена — /cancel'
+)
+
+
+async def _ask_in_thread(bot: Bot, message, text: str) -> None:
+    """Задаёт админу вопрос ответом на пост в ветке (чтобы было видно, к чему он)."""
+    kw = {}
+    thread_id = getattr(message, 'message_thread_id', None)
+    if thread_id:
+        kw['message_thread_id'] = thread_id
+    try:
+        await bot.send_message(
+            chat_id=message.chat_id, text=text, parse_mode=ParseMode.HTML,
+            reply_to_message_id=message.message_id, **kw)
+    except TelegramError as e:
+        logger.debug(f"подсказка не отправилась: {e}")
+
+
+async def _mark_post_done(query, suffix: str) -> None:
+    """Дописывает пометку к посту в ветке и убирает кнопки.
+    Пост бывает и текстом, и медиа с подписью — пробуем оба варианта."""
+    try:
+        if getattr(query.message, 'text', None) is not None:
+            await query.edit_message_text((query.message.text or '') + suffix, reply_markup=None)
+            return
+    except TelegramError:
+        pass
+    try:
+        if getattr(query.message, 'caption', None) is not None:
+            await query.edit_message_caption(
+                caption=(query.message.caption or '') + suffix, reply_markup=None)
+            return
+    except TelegramError:
+        pass
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass
+
+
+def _human_delta(when_utc: datetime) -> str:
+    """'2 ч 15 мин' — понятная задержка до публикации.
+    Округляем до ближайшей минуты, иначе на '+2ч' ответим 'через 1 ч 59 мин'."""
+    raw = (when_utc - datetime.now(timezone.utc)).total_seconds()
+    secs = int(round(raw / 60.0)) * 60
+    if secs < 60:
+        return 'меньше минуты'
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins = rem // 60
+    parts = []
+    if days:
+        parts.append(f'{days} д')
+    if hours:
+        parts.append(f'{hours} ч')
+    if mins and not days:
+        parts.append(f'{mins} мин')
+    return ' '.join(parts) or 'меньше минуты'
+
+
+async def _update_preview_text(bot: Bot, key: str, new_text: str) -> bool:
+    """Обновляет текст поста в ветке после правки (best-effort).
+    Пост может быть фото с подписью, альбомом или текстом — пробуем по очереди."""
+    if pending_posts is None:
+        return False
+    prev = pending_posts.get_preview(key)
+    if not prev:
+        return False
+    chat_id, message_id = prev.get('chat_id'), prev.get('message_id')
+    caption = fit_to_limit(html.escape(new_text), TG_CAPTION_LIMIT)
+    markup = _moderation_markup(key)
+    attempts = (
+        lambda: bot.edit_message_caption(chat_id=chat_id, message_id=message_id,
+                                         caption=caption, parse_mode=ParseMode.HTML,
+                                         reply_markup=markup),
+        # у элементов альбома inline-кнопки не поддерживаются — пробуем без них
+        lambda: bot.edit_message_caption(chat_id=chat_id, message_id=message_id,
+                                         caption=caption, parse_mode=ParseMode.HTML),
+        lambda: bot.edit_message_text(chat_id=chat_id, message_id=message_id,
+                                      text=fit_to_limit(html.escape(new_text), TG_TEXT_LIMIT),
+                                      parse_mode=ParseMode.HTML, reply_markup=markup),
+    )
+    for attempt in attempts:
+        try:
+            await attempt()
+            return True
+        except TelegramError:
+            continue
+    logger.debug(f"превью поста {key} не обновилось — текст всё равно сохранён")
+    return False
+
+
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главный обработчик всех callback_data из inline-меню."""
     if not is_admin(update):
@@ -4517,12 +4904,14 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data or ""
 
-    # === Кнопки модерации под постами в ветке (📢 В канал / ✖ Скрыть) ===
+    # === Кнопки модерации под постами в ветке ===
+    # 📢 В канал / 📅 В отложку / ✏️ Изменить / ✖ Скрыть
     # Обрабатываем ДО общего query.answer(): ответ callback даётся один раз,
     # и здесь он зависит от результата.
-    if data.startswith(('pub:', 'dis:')):
-        key = data.split(':', 1)[1]
-        if data.startswith('dis:'):
+    if data.startswith(('pub:', 'sch:', 'edit:', 'dis:')):
+        action, key = data.split(':', 1)
+
+        if action == 'dis':
             if pending_posts is not None:
                 pending_posts.pop(key)
             await query.answer('Скрыто')
@@ -4531,6 +4920,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except TelegramError:
                 pass
             return
+
         news = pending_posts.get(key) if pending_posts is not None else None
         if not news:
             await query.answer('Пост устарел или уже опубликован', show_alert=True)
@@ -4539,20 +4929,55 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except TelegramError:
                 pass
             return
+
+        # 📅 В отложку — просим время текстом, ответ поймает awaiting_input_handler
+        if action == 'sch':
+            context.user_data['await_input'] = {'mode': 'schedule', 'key': key}
+            await query.answer('Пришли время публикации')
+            await _ask_in_thread(context.bot, query.message, _SCHEDULE_HINT.format(
+                now=_local_now().strftime('%d.%m %H:%M'), off=_tz_offset()))
+            return
+
+        # ✏️ Изменить — просим новый текст поста
+        if action == 'edit':
+            context.user_data['await_input'] = {'mode': 'edit', 'key': key}
+            await query.answer('Пришли новый текст')
+            current = fit_to_limit(format_news_short(news), 700)
+            await _ask_in_thread(context.bot, query.message, _EDIT_HINT.format(
+                current=html.escape(current)))
+            return
+
+        # 📢 В канал — публикуем сразу
         ok = await _send_post(context.bot, news, CHANNEL_ID, None)
         if ok:
             pending_posts.pop(key)
             await query.answer('📢 Опубликовано в канал!')
+            await _mark_post_done(query, '\n\n✅ Опубликовано в канал')
+        else:
+            await query.answer('❌ Не удалось опубликовать — см. /logs', show_alert=True)
+        return
+
+    # === Кнопки под списком /scheduled ===
+    if data.startswith(('snow:', 'scan:')):
+        action, key = data.split(':', 1)
+        news = scheduled_posts.get(key) if scheduled_posts is not None else None
+        if not news:
+            await query.answer('Этого поста уже нет в отложке', show_alert=True)
             try:
-                await query.edit_message_text(
-                    (query.message.text or '') + '\n\n✅ Опубликовано в канал',
-                    reply_markup=None,
-                )
+                await query.edit_message_reply_markup(reply_markup=None)
             except TelegramError:
-                try:
-                    await query.edit_message_reply_markup(reply_markup=None)
-                except TelegramError:
-                    pass
+                pass
+            return
+        if action == 'scan':
+            scheduled_posts.pop(key)
+            await query.answer('Отложка отменена')
+            await _mark_post_done(query, '\n\n🗑 Снято с отложки')
+            return
+        ok = await _send_post(context.bot, news, CHANNEL_ID, None)
+        if ok:
+            scheduled_posts.pop(key)
+            await query.answer('📢 Опубликовано!')
+            await _mark_post_done(query, '\n\n✅ Опубликовано досрочно')
         else:
             await query.answer('❌ Не удалось опубликовать — см. /logs', show_alert=True)
         return
@@ -4869,6 +5294,181 @@ def admin_only(handler):
         return await handler(update, context)
     wrapper.__name__ = handler.__name__
     return wrapper
+
+
+async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит текст, который админ прислал после нажатия 📅 (время) или ✏️ (новый текст).
+    Если бот ничего не ждёт — молча пропускает сообщение дальше другим обработчикам."""
+    pending = context.user_data.get('await_input') if context.user_data else None
+    if not pending or not is_admin(update):
+        return
+    text = (update.message.text or '').strip()
+    if not text:
+        return
+
+    key = pending.get('key')
+    mode = pending.get('mode')
+    news = pending_posts.get(key) if pending_posts is not None else None
+    if not news:
+        context.user_data.pop('await_input', None)
+        await update.message.reply_text('Пост уже обработан или устарел.')
+        raise ApplicationHandlerStop
+
+    # === 📅 Отложка: разбираем введённое время ===
+    if mode == 'schedule':
+        when = _parse_schedule_time(text)
+        if when is None:
+            # состояние не сбрасываем — ждём корректный ввод
+            await update.message.reply_text(
+                '⏰ Не понял время. Примеры: 18:30 • 12.07 18:30 • завтра 10:00 • +2ч\n'
+                'Время должно быть в будущем. Отмена — /cancel')
+            raise ApplicationHandlerStop
+        if scheduled_posts is None:
+            await update.message.reply_text('Отложка недоступна (хранилище не готово).')
+            context.user_data.pop('await_input', None)
+            raise ApplicationHandlerStop
+        scheduled_posts.add(news, when)
+        context.user_data.pop('await_input', None)
+        # Пометку ставим ДО pop: после удаления записи превью уже не найти
+        await _update_moderation_done(context.bot, key,
+                                      f'\n\n📅 В отложке на {_fmt_local(when)}')
+        pending_posts.pop(key)
+        await update.message.reply_text(
+            f'📅 Опубликую {_fmt_local(when)} — через {_human_delta(when)}.\n'
+            f'Список: /scheduled')
+        raise ApplicationHandlerStop
+
+    # === ✏️ Правка текста ===
+    if mode == 'edit':
+        news['_edited_text'] = text
+        pending_posts.update_news(key, news)
+        context.user_data.pop('await_input', None)
+        updated = await _update_preview_text(context.bot, key, text)
+        msg = '✏️ Текст обновлён — в канал уйдёт именно он.'
+        if not updated:
+            msg += '\n(Сообщение в ветке обновить не вышло, но текст сохранён.)'
+        await update.message.reply_text(msg)
+        raise ApplicationHandlerStop
+
+    context.user_data.pop('await_input', None)
+
+
+async def _update_moderation_done(bot: Bot, key: str, suffix: str) -> None:
+    """Дописывает пометку к посту в ветке и снимает кнопки (например, после отложки).
+    Вызывать ДО удаления записи из pending_posts — иначе превью уже не найти."""
+    if pending_posts is None:
+        return
+    prev = pending_posts.get_preview(key)
+    news = pending_posts.get(key)
+    if not prev or not news:
+        return
+    chat_id, message_id = prev.get('chat_id'), prev.get('message_id')
+    body = fit_to_limit(html.escape(format_news_short(news) + suffix), TG_CAPTION_LIMIT)
+    attempts = (
+        lambda: bot.edit_message_caption(chat_id=chat_id, message_id=message_id,
+                                         caption=body, parse_mode=ParseMode.HTML,
+                                         reply_markup=None),
+        lambda: bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=body,
+                                      parse_mode=ParseMode.HTML, reply_markup=None),
+        # Крайний случай: хотя бы убрать кнопки, чтобы их нельзя было нажать повторно
+        lambda: bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id,
+                                              reply_markup=None),
+    )
+    for attempt in attempts:
+        try:
+            await attempt()
+            return
+        except Exception as e:      # best-effort: пометка не критична для отложки
+            logger.debug(f"пометка на посте {key} не поставлена: {e}")
+            continue
+
+
+async def cancel_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Отменяет ожидание ввода (времени отложки или нового текста)."""
+    if not is_admin(update):
+        await deny_access(update)
+        return
+    if context.user_data and context.user_data.pop('await_input', None):
+        await update.message.reply_text('Отменил. Пост остался в ветке с кнопками.')
+    else:
+        await update.message.reply_text('Нечего отменять.')
+
+
+@admin_only
+async def tz_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает/меняет часовой пояс для отложки."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            f'🕒 Часовой пояс: UTC{_tz_offset():+d}\n'
+            f'Сейчас у тебя: {_local_now().strftime("%d.%m %H:%M")}\n\n'
+            f'Если время неверное — задай смещение: /tz 3 (Москва), /tz 5 (Екатеринбург)')
+        return
+    raw = args[0].replace('UTC', '').replace('utc', '').strip()
+    try:
+        off = int(raw)
+    except ValueError:
+        await update.message.reply_text('Формат: /tz 3 (смещение от UTC в часах)')
+        return
+    if not (-12 <= off <= 14):
+        await update.message.reply_text('Смещение должно быть от -12 до +14.')
+        return
+    settings.tz_offset = off
+    await update.message.reply_text(
+        f'🕒 Часовой пояс: UTC{off:+d}\nСейчас у тебя: {_local_now().strftime("%d.%m %H:%M")}')
+
+
+@admin_only
+async def scheduled_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Список отложенных постов с кнопками управления."""
+    items = scheduled_posts.all() if scheduled_posts is not None else []
+    if not items:
+        await update.message.reply_text(
+            '📅 Отложенных постов нет.\n\n'
+            'Отложить: кнопка «📅 В отложку» под постом в ветке.')
+        return
+    await update.message.reply_text(
+        f'📅 В отложке: {len(items)} (время в UTC{_tz_offset():+d})')
+    for key, news, when in items[:20]:
+        title = (news.get('_edited_text') or news.get('title') or '')
+        title = re.sub(r'\s+', ' ', title).strip()[:90]
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton('📢 Сейчас', callback_data=f'snow:{key}'),
+            InlineKeyboardButton('🗑 Отменить', callback_data=f'scan:{key}'),
+        ]])
+        await update.message.reply_text(
+            f'🕒 {_fmt_local(when)} — через {_human_delta(when)}\n{title}',
+            reply_markup=markup)
+        await asyncio.sleep(0.2)
+    if len(items) > 20:
+        await update.message.reply_text(f'…и ещё {len(items) - 20}.')
+
+
+async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
+    """Публикует отложенные посты, время которых наступило. Работает раз в минуту."""
+    if scheduled_posts is None:
+        return
+    due = scheduled_posts.due()
+    if not due:
+        return
+    for key, news in due:
+        ok = await _send_post(context.bot, news, CHANNEL_ID, None)
+        title = re.sub(r'\s+', ' ', news.get('title', ''))[:80]
+        if ok:
+            scheduled_posts.pop(key)
+            logger.info(f"📅 Отложенный пост опубликован: {title}")
+            await notify_admin(context.bot, f'📅 Опубликован отложенный пост:\n{title}')
+        else:
+            tries = scheduled_posts.mark_try(key)
+            if tries >= ScheduledPosts.MAX_TRIES:
+                scheduled_posts.pop(key)
+                await notify_admin(
+                    context.bot,
+                    f'⚠️ Отложенный пост не удалось опубликовать ({tries} попытки) — '
+                    f'убрал из отложки:\n{title}')
+            else:
+                logger.warning(f"Отложенный пост не ушёл (попытка {tries}), повторю через минуту")
+        await asyncio.sleep(PAUSE_BETWEEN_SENDS)
 
 
 @admin_only
@@ -5605,6 +6205,8 @@ async def setup_bot_commands(app: Application) -> None:
         BotCommand("stats", "📈 Метрики и статистика"),
         BotCommand("deepl", "🌐 Лимит DeepL"),
         BotCommand("backup", "📦 Бэкап данных"),
+        BotCommand("scheduled", "📅 Отложенные посты"),
+        BotCommand("tz", "🕒 Часовой пояс"),
         BotCommand("sources", "📡 Динамические источники"),
         BotCommand("addsource", "➕ Добавить источник"),
         BotCommand("delsource", "➖ Удалить источник"),
@@ -5630,6 +6232,11 @@ def _init_globals() -> None:
         sent_links = SentLinksStore(SENT_LINKS_FILE)
     if pending_posts is None:
         pending_posts = PendingPosts(PENDING_POSTS_FILE)
+    global scheduled_posts
+    if scheduled_posts is None:
+        scheduled_posts = ScheduledPosts(SCHEDULED_POSTS_FILE)
+        if scheduled_posts.all():
+            logger.info(f"Отложенных постов в очереди: {len(scheduled_posts.all())}")
     global custom_sources
     if custom_sources is None:
         custom_sources = CustomSources(CUSTOM_SOURCES_FILE)
@@ -5683,6 +6290,9 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("deepl", deepl_command))
     app.add_handler(CommandHandler("backup", backup_command))
+    app.add_handler(CommandHandler("scheduled", scheduled_command))
+    app.add_handler(CommandHandler("tz", tz_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("sources", sources_command))
     app.add_handler(CommandHandler("addsource", addsource_command))
     app.add_handler(CommandHandler("delsource", delsource_command))
@@ -5701,7 +6311,18 @@ def main():
     reply_filter = filters.TEXT & filters.Regex(
         f"^({'|'.join(re.escape(t) for t in reply_button_texts)})$"
     )
+    # Ввод времени отложки / нового текста поста. Группа -1 = проверяется раньше
+    # остальных; когда бот ничего не ждёт, сообщение уходит дальше по цепочке.
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, awaiting_input_handler),
+        group=-1,
+    )
     app.add_handler(MessageHandler(reply_filter, reply_button_handler))
+
+    # Публикация отложенных постов: проверяем раз в минуту
+    app.job_queue.run_repeating(
+        publish_scheduled, interval=60, first=20, name='scheduled_publish',
+    )
 
     print("✅ Бот запущен, начинаю polling...", flush=True)
     logger.info("✅ Бот запущен...")
