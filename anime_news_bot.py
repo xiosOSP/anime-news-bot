@@ -167,6 +167,10 @@ TRANSLATION_INPUT_LIMIT = 1500
 TRANSLATION_INPUT_LIMIT_THREAD = 4000
 NEWS_PER_SOURCE = 5
 PAUSE_BETWEEN_SENDS = 2.0
+# APScheduler по умолчанию ставит misfire_grace_time=1с: если тик джоба опоздал
+# больше чем на секунду (цикл занят сбором новостей/отправкой), запуск МОЛЧА
+# выбрасывается. Для нас это означало «отложка не публикуется». Даём час запаса.
+JOB_KWARGS = {'misfire_grace_time': 3600}
 
 # --- AniList API ---
 ANILIST_CACHE_FILE = DATA_DIR / 'anilist_cache.json'
@@ -3043,6 +3047,20 @@ TELEGRAM_CHANNELS = [
 ]
 
 
+def _detect_lang(text: str) -> Optional[str]:
+    """Грубое определение языка поста: 'ru' если текст преимущественно кириллица,
+    иначе None (значит переводим). Нужно потому, что TG-каналы бывают не только
+    русские — итальянские/английские посты раньше уходили без перевода."""
+    if not text:
+        return None
+    cyrillic = len(re.findall(r'[а-яёА-ЯЁ]', text))
+    latin = len(re.findall(r'[a-zA-Z]', text))
+    if cyrillic == 0:
+        return None
+    # Русский пост может содержать латинские названия тайтлов — важна пропорция
+    return 'ru' if cyrillic >= latin else None
+
+
 def get_telegram_channel(channel: str, label: str) -> list[dict]:
     """Парсит публичный Telegram-канал через t.me/s/. Возвращает список news-словарей."""
     url = f'https://t.me/s/{channel}'
@@ -3127,7 +3145,9 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
             'video': video_url,
             'published_parsed': published_parsed,
             'source': label,
-            'lang': 'ru',                        # русский — перевод не нужен
+            # Язык определяем по тексту: TG-каналы бывают не только русские
+            # (напр. итальянский @VanitasNews) — их надо переводить.
+            'lang': _detect_lang(full_text),
         })
     # На странице свежие посты ВНИЗУ — берём последние
     result = news_list[-NEWS_PER_SOURCE:]
@@ -4070,7 +4090,8 @@ class ScheduledPosts:
             return None
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-    def add(self, news: dict, when_utc: datetime) -> str:
+    def add(self, news: dict, when_utc: datetime, by: Optional[dict] = None) -> str:
+        """by — кто отложил: {'id': int, 'name': str}. Нужен для внятных уведомлений."""
         self._counter += 1
         key = str(self._counter)
         clean = {k: v for k, v in news.items() if k != 'published_parsed'}
@@ -4078,6 +4099,8 @@ class ScheduledPosts:
             'news': clean,
             'at': when_utc.astimezone(timezone.utc).isoformat(),
             'tries': 0,
+            'by': by,
+            'created': datetime.now(timezone.utc).isoformat(),
         }
         if len(self._items) > self.MAX_ITEMS:
             oldest = sorted(self._items, key=lambda k: self._items[k].get('at', ''))
@@ -4108,6 +4131,16 @@ class ScheduledPosts:
     def when(self, key: str) -> Optional[datetime]:
         item = self._items.get(key)
         return self._at(item) if item else None
+
+    def meta(self, key: str) -> dict:
+        """Служебные данные поста: кто отложил, на какое время, сколько попыток.
+        Вызывать ДО pop — после удаления записи их уже не будет."""
+        item = self._items.get(key) or {}
+        return {
+            'by': item.get('by') or {},
+            'at': self._at(item),
+            'tries': int(item.get('tries', 0)),
+        }
 
     def pop(self, key: str) -> Optional[dict]:
         item = self._items.pop(key, None)
@@ -4932,7 +4965,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 📅 В отложку — просим время текстом, ответ поймает awaiting_input_handler
         if action == 'sch':
-            context.user_data['await_input'] = {'mode': 'schedule', 'key': key}
+            context.user_data['await_input'] = _await_ctx('schedule', key, query.message)
             await query.answer('Пришли время публикации')
             await _ask_in_thread(context.bot, query.message, _SCHEDULE_HINT.format(
                 now=_local_now().strftime('%d.%m %H:%M'), off=_tz_offset()))
@@ -4940,7 +4973,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ✏️ Изменить — просим новый текст поста
         if action == 'edit':
-            context.user_data['await_input'] = {'mode': 'edit', 'key': key}
+            context.user_data['await_input'] = _await_ctx('edit', key, query.message)
             await query.answer('Пришли новый текст')
             current = fit_to_limit(format_news_short(news), 700)
             await _ask_in_thread(context.bot, query.message, _EDIT_HINT.format(
@@ -5146,7 +5179,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 job.schedule_removal()
             job_queue.run_repeating(
                 check_news, interval=settings.check_interval_sec,
-                first=5, name='anime_news_check',
+                first=5, name='anime_news_check', job_kwargs=JOB_KWARGS,
             )
             extra = " (автопроверка перезапущена)"
         else:
@@ -5296,11 +5329,35 @@ def admin_only(handler):
     return wrapper
 
 
+def _await_ctx(mode: str, key: str, message) -> dict:
+    """Запоминает, где именно бот ждёт ответ: чат + ветка форума.
+    Без этого бот принимал за ответ любое сообщение админа в любой ветке."""
+    return {
+        'mode': mode,
+        'key': key,
+        'chat_id': message.chat_id,
+        'thread_id': getattr(message, 'message_thread_id', None),
+    }
+
+
+def _same_place(pending: dict, update: Update) -> bool:
+    """True, если сообщение пришло из того же чата и той же ветки, где нажали кнопку."""
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    thread_id = getattr(update.message, 'message_thread_id', None)
+    return (pending.get('chat_id') == chat_id
+            and pending.get('thread_id') == thread_id)
+
+
 async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ловит текст, который админ прислал после нажатия 📅 (время) или ✏️ (новый текст).
     Если бот ничего не ждёт — молча пропускает сообщение дальше другим обработчикам."""
     pending = context.user_data.get('await_input') if context.user_data else None
     if not pending or not is_admin(update):
+        return
+    # Отвечаем только там, где нажали кнопку: сообщения из других веток/чатов
+    # пропускаем дальше, чтобы бот не влезал в чужие разговоры.
+    if not _same_place(pending, update):
         return
     text = (update.message.text or '').strip()
     if not text:
@@ -5327,12 +5384,17 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text('Отложка недоступна (хранилище не готово).')
             context.user_data.pop('await_input', None)
             raise ApplicationHandlerStop
-        scheduled_posts.add(news, when)
+        user = update.effective_user
+        by = {'id': user.id,
+              'name': (user.full_name or user.username or str(user.id))} if user else None
+        scheduled_posts.add(news, when, by=by)
         context.user_data.pop('await_input', None)
         # Пометку ставим ДО pop: после удаления записи превью уже не найти
         await _update_moderation_done(context.bot, key,
                                       f'\n\n📅 В отложке на {_fmt_local(when)}')
         pending_posts.pop(key)
+        logger.info(f"📅 Отложен пост «{news.get('title', '')[:60]}» на {_fmt_local(when)} "
+                    f"(отложил: {(by or {}).get('name', '?')})")
         await update.message.reply_text(
             f'📅 Опубликую {_fmt_local(when)} — через {_human_delta(when)}.\n'
             f'Список: /scheduled')
@@ -5444,30 +5506,76 @@ async def scheduled_command(update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f'…и ещё {len(items) - 20}.')
 
 
+def _post_card(news: dict, meta: dict) -> str:
+    """Подробная карточка поста для уведомлений: кто, что, откуда, когда."""
+    title = re.sub(r'\s+', ' ', (news.get('_edited_text') or news.get('title') or '')).strip()
+    lines = [f'📝 {title[:120]}']
+    if news.get('source'):
+        lines.append(f'📡 Источник: {news["source"]}')
+    who = (meta.get('by') or {}).get('name')
+    if who:
+        lines.append(f'👤 Отложил: {who}')
+    at = meta.get('at')
+    if at:
+        lines.append(f'🕒 Время отложки: {_fmt_local(at)}')
+    if news.get('link'):
+        lines.append(f'🔗 {news["link"]}')
+    if news.get('_edited_text'):
+        lines.append('✏️ Текст правился вручную')
+    return '\n'.join(lines)
+
+
 async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
-    """Публикует отложенные посты, время которых наступило. Работает раз в минуту."""
+    """Публикует отложенные посты, время которых наступило. Работает раз в минуту.
+
+    Любая ошибка внутри ловится и уходит админу: раньше исключение молча убивало
+    джоб, и посты навсегда зависали в отложке без единого сообщения."""
     if scheduled_posts is None:
+        logger.warning("Отложка: хранилище не инициализировано, пропускаю тик")
         return
+    total = len(scheduled_posts.all())
     due = scheduled_posts.due()
     if not due:
+        if total:
+            logger.debug(f"Отложка: {total} постов, ни один ещё не созрел")
         return
+    logger.info(f"📅 Отложка: {len(due)} из {total} постов пора публиковать")
+
     for key, news in due:
-        ok = await _send_post(context.bot, news, CHANNEL_ID, None)
-        title = re.sub(r'\s+', ' ', news.get('title', ''))[:80]
+        meta = scheduled_posts.meta(key)      # ДО pop — потом данных не будет
+        card = _post_card(news, meta)
+        try:
+            ok = await _send_post(context.bot, news, CHANNEL_ID, None)
+            err = None
+        except Exception as e:                # не даём джобу умереть молча
+            ok = False
+            err = f'{type(e).__name__}: {e}'
+            logger.exception(f"Отложенный пост упал с ошибкой: {news.get('title', '')[:60]}")
+
         if ok:
             scheduled_posts.pop(key)
-            logger.info(f"📅 Отложенный пост опубликован: {title}")
-            await notify_admin(context.bot, f'📅 Опубликован отложенный пост:\n{title}')
+            logger.info(f"📅 Опубликован отложенный пост: {news.get('title', '')[:60]}")
+            await notify_admin(
+                context.bot,
+                f'📅 Опубликован отложенный пост\n\n{card}\n\n'
+                f'✅ Ушёл в канал {_fmt_local(datetime.now(timezone.utc))}')
         else:
             tries = scheduled_posts.mark_try(key)
+            reason = err or 'отправка вернула отказ (см. /logs)'
             if tries >= ScheduledPosts.MAX_TRIES:
                 scheduled_posts.pop(key)
                 await notify_admin(
                     context.bot,
-                    f'⚠️ Отложенный пост не удалось опубликовать ({tries} попытки) — '
-                    f'убрал из отложки:\n{title}')
+                    f'⚠️ Отложенный пост снят после {tries} неудачных попыток\n\n'
+                    f'{card}\n\n❌ Причина: {reason}')
             else:
-                logger.warning(f"Отложенный пост не ушёл (попытка {tries}), повторю через минуту")
+                logger.warning(f"Отложенный пост не ушёл (попытка {tries}/"
+                               f"{ScheduledPosts.MAX_TRIES}): {reason}")
+                await notify_admin(
+                    context.bot,
+                    f'⚠️ Отложенный пост не опубликовался '
+                    f'(попытка {tries}/{ScheduledPosts.MAX_TRIES}, повторю через минуту)\n\n'
+                    f'{card}\n\n❌ Причина: {reason}')
         await asyncio.sleep(PAUSE_BETWEEN_SENDS)
 
 
@@ -5711,7 +5819,8 @@ async def start_auto(update, context: ContextTypes.DEFAULT_TYPE):
         return
     interval = settings.check_interval_sec
     job_queue.run_repeating(
-        check_news, interval=interval, first=5, name='anime_news_check'
+        check_news, interval=interval, first=5, name='anime_news_check',
+        job_kwargs=JOB_KWARGS,
     )
     await update.message.reply_text(
         f"✅ Авторассылка включена (каждые {settings.check_interval_min} минут)."
@@ -6322,6 +6431,7 @@ def main():
     # Публикация отложенных постов: проверяем раз в минуту
     app.job_queue.run_repeating(
         publish_scheduled, interval=60, first=20, name='scheduled_publish',
+        job_kwargs=JOB_KWARGS,
     )
 
     print("✅ Бот запущен, начинаю polling...", flush=True)
