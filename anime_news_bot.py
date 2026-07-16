@@ -5482,7 +5482,8 @@ async def tz_command(update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def scheduled_command(update, context: ContextTypes.DEFAULT_TYPE):
-    """Список отложенных постов с кнопками управления."""
+    """Список отложенных постов: полная карточка каждого ДО публикации —
+    текст, который уйдёт, источник, кто отложил, медиа, время и отсчёт."""
     items = scheduled_posts.all() if scheduled_posts is not None else []
     if not items:
         await update.message.reply_text(
@@ -5492,24 +5493,52 @@ async def scheduled_command(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f'📅 В отложке: {len(items)} (время в UTC{_tz_offset():+d})')
     for key, news, when in items[:20]:
-        title = (news.get('_edited_text') or news.get('title') or '')
-        title = re.sub(r'\s+', ' ', title).strip()[:90]
+        meta = scheduled_posts.meta(key)
+        card = _post_card(news, meta, countdown=True, with_body=True)
         markup = InlineKeyboardMarkup([[
             InlineKeyboardButton('📢 Сейчас', callback_data=f'snow:{key}'),
             InlineKeyboardButton('🗑 Отменить', callback_data=f'scan:{key}'),
         ]])
         await update.message.reply_text(
-            f'🕒 {_fmt_local(when)} — через {_human_delta(when)}\n{title}',
-            reply_markup=markup)
+            fit_to_limit(card, TG_TEXT_LIMIT), reply_markup=markup,
+            disable_web_page_preview=True)
         await asyncio.sleep(0.2)
     if len(items) > 20:
         await update.message.reply_text(f'…и ещё {len(items) - 20}.')
 
 
-def _post_card(news: dict, meta: dict) -> str:
-    """Подробная карточка поста для уведомлений: кто, что, откуда, когда."""
-    title = re.sub(r'\s+', ' ', (news.get('_edited_text') or news.get('title') or '')).strip()
-    lines = [f'📝 {title[:120]}']
+def _media_summary(news: dict) -> str:
+    """Что уйдёт вместе с текстом: '4 фото + видео'.
+    Считаем после дедупа размерных вариантов — как при реальной отправке."""
+    photos = len(_dedup_image_variants(news.get('images') or []))
+    bits = []
+    if photos:
+        bits.append(f'{photos} фото')
+    if news.get('video'):
+        bits.append('видео')
+    return ' + '.join(bits) if bits else 'нет'
+
+
+def _post_card(news: dict, meta: dict, *, countdown: bool = False,
+               with_body: bool = False) -> str:
+    """Карточка поста: что уйдёт, откуда, кто отложил, когда, с каким медиа.
+
+    with_body — показать текст, который реально уйдёт в канал (для /scheduled:
+                там подробности нужны ДО публикации, а не после).
+    countdown — добавить «через N» к времени публикации."""
+    lines = []
+    if with_body:
+        try:
+            body = format_news_short(news).strip()
+        except Exception as e:
+            logger.debug(f"карточка: текст не собрался ({e})")
+            body = (news.get('_edited_text') or news.get('title') or '')
+        lines.append(fit_to_limit(body, 600))
+        lines.append('')
+    else:
+        title = re.sub(r'\s+', ' ',
+                       (news.get('_edited_text') or news.get('title') or '')).strip()
+        lines.append(f'📝 {title[:200]}')
     if news.get('source'):
         lines.append(f'📡 Источник: {news["source"]}')
     who = (meta.get('by') or {}).get('name')
@@ -5517,12 +5546,25 @@ def _post_card(news: dict, meta: dict) -> str:
         lines.append(f'👤 Отложил: {who}')
     at = meta.get('at')
     if at:
-        lines.append(f'🕒 Время отложки: {_fmt_local(at)}')
+        line = f'🕒 Публикация: {_fmt_local(at)}'
+        if countdown:
+            if at <= datetime.now(timezone.utc):
+                line += ' — ⏳ время наступило, публикуется'
+            else:
+                line += f' — через {_human_delta(at)}'
+        lines.append(line)
+    lines.append(f'📎 Медиа: {_media_summary(news)}')
     if news.get('link'):
         lines.append(f'🔗 {news["link"]}')
     if news.get('_edited_text'):
         lines.append('✏️ Текст правился вручную')
+    tries = meta.get('tries') or 0
+    if tries:
+        lines.append(f'⚠️ Неудачных попыток: {tries}')
     return '\n'.join(lines)
+
+
+_sched_tick_count = 0
 
 
 async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
@@ -5530,6 +5572,12 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
 
     Любая ошибка внутри ловится и уходит админу: раньше исключение молча убивало
     джоб, и посты навсегда зависали в отложке без единого сообщения."""
+    global _sched_tick_count
+    _sched_tick_count += 1
+    # Пульс в лог: первый тик и далее каждые полчаса — видно, что джоб живёт
+    if _sched_tick_count == 1 or _sched_tick_count % 30 == 0:
+        total = len(scheduled_posts.all()) if scheduled_posts is not None else -1
+        logger.info(f"🕰 Джоб отложки: тик #{_sched_tick_count}, постов в очереди: {total}")
     if scheduled_posts is None:
         logger.warning("Отложка: хранилище не инициализировано, пропускаю тик")
         return
@@ -5904,6 +5952,7 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
         f"⏰ Свежесть постов: {settings.post_max_age_hours} ч\n"
         f"🖼 Только с картинками: {'ВКЛ' if settings.require_image else 'ВЫКЛ'}\n"
         f"📦 В очереди: {queue_size}\n"
+        f"{_scheduled_status_block(context)}"
         f"В истории ссылок: {len(sent_links._set)}\n"
         f"Канал: {CHANNEL_ID}\n"
         f"Скачивание видео: {video_state}\n"
@@ -5911,6 +5960,27 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
         f"ffmpeg: {ffmpeg_status}\n\n"
         f"📡 Источники:\n{sources_list}"
     )
+
+
+def _scheduled_status_block(context) -> str:
+    """Строки про отложку для /status: жив ли джоб, когда следующий тик, очередь.
+    Главный инструмент самодиагностики «почему отложка молчит»."""
+    try:
+        jobs = context.application.job_queue.get_jobs_by_name('scheduled_publish')
+    except Exception:
+        jobs = []
+    if jobs:
+        nxt = getattr(jobs[0], 'next_t', None)
+        when = f", следующий тик {_fmt_local(nxt)}" if nxt else ""
+        job_line = f"🕰 Джоб отложки: РАБОТАЕТ (тик #{_sched_tick_count}{when})"
+    else:
+        job_line = "🕰 Джоб отложки: ⚠️ НЕ ЗАРЕГИСТРИРОВАН — отложка публиковаться не будет!"
+    total = len(scheduled_posts.all()) if scheduled_posts is not None else 0
+    ripe = len(scheduled_posts.due()) if scheduled_posts is not None else 0
+    sched_line = f"📅 В отложке: {total}"
+    if ripe:
+        sched_line += f" (созрело и ждёт публикации: {ripe})"
+    return f"{job_line}\n{sched_line}\n"
 
 
 @admin_only
@@ -6304,7 +6374,18 @@ def check_video_deps():
 
 
 async def setup_bot_commands(app: Application) -> None:
-    """Устанавливает список команд, который виден в синем меню Telegram-клиента."""
+    """post_init: меню команд + джоб отложки. Джоб регистрируем здесь (после
+    initialize) — канонично для PTB и сразу видно в логах, что он поднялся."""
+    # Публикация отложенных постов: проверяем раз в минуту
+    app.job_queue.run_repeating(
+        publish_scheduled, interval=60, first=15, name='scheduled_publish',
+        job_kwargs=JOB_KWARGS,
+    )
+    total = len(scheduled_posts.all()) if scheduled_posts is not None else 0
+    ripe = len(scheduled_posts.due()) if scheduled_posts is not None else 0
+    logger.info(f"🕰 Джоб отложки зарегистрирован (тик раз в 60с). "
+                f"В отложке: {total}, из них созрело: {ripe}")
+    print(f"Джоб отложки: зарегистрирован | постов в отложке: {total}", flush=True)
     commands = [
         BotCommand("news", "🔍 Свежие новости"),
         BotCommand("preview", "👁 Превью постов в личку"),
@@ -6427,12 +6508,6 @@ def main():
         group=-1,
     )
     app.add_handler(MessageHandler(reply_filter, reply_button_handler))
-
-    # Публикация отложенных постов: проверяем раз в минуту
-    app.job_queue.run_repeating(
-        publish_scheduled, interval=60, first=20, name='scheduled_publish',
-        job_kwargs=JOB_KWARGS,
-    )
 
     print("✅ Бот запущен, начинаю polling...", flush=True)
     logger.info("✅ Бот запущен...")
