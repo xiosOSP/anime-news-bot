@@ -3596,6 +3596,11 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
     caption = fit_to_limit(safe_text, TG_CAPTION_LIMIT)
 
     photos = _dedup_image_variants(news.get('images') or [])
+    # Картинки с хостов, которые Bot API не может скачать по URL (cdn-telegram.org
+    # из t.me/s/-постов), заранее качаем байтами — иначе публикация в канал падала
+    # с webpage_curl_failed / "Wrong type of the web page content" все 3 попытки.
+    if photos:
+        photos = await _resolve_photos_for_album(photos)
     media_count = len(photos) + (1 if has_inline_video else 0)
 
     # ЖЁСТКОЕ ПРАВИЛО: если включено "Только с картинками" и медиа нет — НЕ публикуем
@@ -3668,6 +3673,19 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
                 logger.info(f"📷 {news['source']}: {news['title'][:60]}")
                 return True
             except TelegramError as e:
+                # URL не принят Bot API — скачиваем сами и шлём байтами
+                if isinstance(photos[0], str):
+                    data = await asyncio.to_thread(_download_image_bytes, photos[0])
+                    if data:
+                        try:
+                            await bot.send_photo(
+                                chat_id=target, photo=data, caption=caption,
+                                parse_mode=ParseMode.HTML, **thread_kw,
+                            )
+                            logger.info(f"📷 {news['source']}: {news['title'][:60]} (байтами)")
+                            return True
+                        except TelegramError as e2:
+                            e = e2
                 if settings.require_image:
                     logger.warning(f"⊘ Фото не отправилось ({e}), require_image включено — пост пропущен")
                     return False
@@ -3768,11 +3786,24 @@ async def _send_post_fallback(
                     pass
                 await asyncio.sleep(0.3)
         elif photos:
-            await bot.send_photo(
-                chat_id=target, photo=photos[0], caption=caption,
-                parse_mode=ParseMode.HTML,
-                **thread_kw,
-            )
+            try:
+                await bot.send_photo(
+                    chat_id=target, photo=photos[0], caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    **thread_kw,
+                )
+            except TelegramError:
+                # URL не принят — качаем байтами (типично для cdn-telegram.org)
+                data = None
+                if isinstance(photos[0], str):
+                    data = await asyncio.to_thread(_download_image_bytes, photos[0])
+                if not data:
+                    raise
+                await bot.send_photo(
+                    chat_id=target, photo=data, caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    **thread_kw,
+                )
             sent_first = True
             for ph in photos[1:10]:
                 try:
@@ -4590,13 +4621,26 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
                 pass
 
 
+# Админы, которым бот не может писать (не нажали /start) — предупреждаем один раз
+_unreachable_admins: set[int] = set()
+
+
 async def notify_admin(bot: Bot, text: str) -> None:
     """Шлёт сообщение всем админам (главному и дополнительным)."""
     for uid in _all_admin_ids():
         try:
             await bot.send_message(chat_id=uid, text=text)
+            _unreachable_admins.discard(uid)   # снова доступен — сняли метку
         except TelegramError as e:
-            logger.error(f"Не удалось уведомить админа {uid}: {e}")
+            if 'initiate conversation' in str(e) or 'blocked' in str(e).lower():
+                if uid not in _unreachable_admins:
+                    _unreachable_admins.add(uid)
+                    logger.warning(
+                        f"Админ {uid} недоступен: он ещё не написал боту /start "
+                        f"(или заблокировал его). Уведомления ему копиться не будут — "
+                        f"пусть откроет бота и нажмёт /start.")
+            else:
+                logger.error(f"Не удалось уведомить админа {uid}: {e}")
 
 
 # ============== СБОР ==============
