@@ -711,6 +711,7 @@ class BotSettings:
         'last_daily_summary': '',  # дата (YYYY-MM-DD) последней ежедневной сводки
         'extra_admins': [],      # дополнительные Telegram ID с правами админа
         'tz_offset': 3,          # часовой пояс админа относительно UTC (МСК = +3)
+        'open_moderation': True, # кнопки под постами в ветке доступны всем участникам
     }
 
     def __init__(self, path: Path):
@@ -826,6 +827,15 @@ class BotSettings:
     @tz_offset.setter
     def tz_offset(self, value: int) -> None:
         self._data['tz_offset'] = max(-12, min(14, int(value)))
+        self.save()
+
+    @property
+    def open_moderation(self) -> bool:
+        return bool(self._data.get('open_moderation', True))
+
+    @open_moderation.setter
+    def open_moderation(self, value: bool) -> None:
+        self._data['open_moderation'] = bool(value)
         self.save()
 
     @property
@@ -4759,6 +4769,8 @@ def build_settings_menu() -> InlineKeyboardMarkup:
     else:
         tr_label = "🌐 Переводчик: DeepL (нет ключа → Google)"
     quiet_label = "🔕 Тихий режим: ВКЛ" if settings.quiet_mode else "🔔 Тихий режим: ВЫКЛ"
+    open_label = ("👥 Кнопки в ветке: ВСЕ" if settings.open_moderation
+                  else "👤 Кнопки в ветке: ТОЛЬКО АДМИНЫ")
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📡 Источники", callback_data="settings:sources")],
         [InlineKeyboardButton("🔁 Интервал автопроверки", callback_data="settings:interval")],
@@ -4766,6 +4778,7 @@ def build_settings_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(thread_label, callback_data="settings:toggle_thread")],
         [InlineKeyboardButton(tr_label, callback_data="settings:toggle_translator")],
         [InlineKeyboardButton(quiet_label, callback_data="settings:toggle_quiet")],
+        [InlineKeyboardButton(open_label, callback_data="settings:toggle_open")],
         [InlineKeyboardButton("🎬 Видео", callback_data="settings:video")],
         [InlineKeyboardButton(img_label, callback_data="settings:toggle_require_image")],
         [InlineKeyboardButton("📦 Очередь постов", callback_data="settings:queue")],
@@ -4972,12 +4985,33 @@ async def _update_preview_text(bot: Bot, key: str, new_text: str) -> bool:
     return False
 
 
-async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Главный обработчик всех callback_data из inline-меню."""
-    if not is_admin(update):
-        await deny_access(update)
-        return
+def _in_moderation_thread(message) -> bool:
+    """Нажатие произошло в предназначенной ветке модерации?
+    Жёсткая защита: кнопки под постами работают ТОЛЬКО в нашей супергруппе
+    и только в нашей теме — пересланное сообщение с кнопками в другом чате
+    (или другая ветка) получит отказ."""
+    if message is None:
+        return False
+    chat = getattr(message, 'chat_id', None)
+    thread = getattr(message, 'message_thread_id', None)
+    return chat == DISCUSSION_CHAT_ID and thread == DISCUSSION_THREAD_ID
 
+
+def _actor(update: Update) -> tuple[bool, str]:
+    """(является_ли_админом, имя_для_уведомлений)."""
+    user = update.effective_user
+    if not user:
+        return False, '?'
+    name = user.full_name or user.username or str(user.id)
+    return user.id in _all_admin_ids(), name
+
+
+async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Главный обработчик всех callback_data из inline-меню.
+
+    Кнопки модерации под постами (pub/sch/edit/dis) доступны всем участникам
+    ветки при open_moderation (по умолчанию ВКЛ) — но строго только в самой
+    ветке. Всё остальное (настройки, /scheduled-кнопки) — только админам."""
     query = update.callback_query
     data = query.data or ""
 
@@ -4986,16 +5020,28 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Обрабатываем ДО общего query.answer(): ответ callback даётся один раз,
     # и здесь он зависит от результата.
     if data.startswith(('pub:', 'sch:', 'edit:', 'dis:')):
+        # Жёсткая защита места: только наша супергруппа и наша тема
+        if not _in_moderation_thread(query.message):
+            await query.answer('Эти кнопки работают только в ветке модерации.',
+                               show_alert=True)
+            return
+        actor_is_admin, actor_name = _actor(update)
+        if not settings.open_moderation and not actor_is_admin:
+            await query.answer('Кнопки доступны только админам.', show_alert=True)
+            return
         action, key = data.split(':', 1)
 
         if action == 'dis':
-            if pending_posts is not None:
-                pending_posts.pop(key)
+            hidden = pending_posts.pop(key) if pending_posts is not None else None
             await query.answer('Скрыто')
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
             except TelegramError:
                 pass
+            if hidden and not actor_is_admin:
+                title = re.sub(r'\s+', ' ', hidden.get('title', ''))[:80]
+                await notify_admin(context.bot,
+                                   f'👥 {actor_name} скрыл пост в ветке:\n{title}')
             return
 
         news = pending_posts.get(key) if pending_posts is not None else None
@@ -5030,12 +5076,20 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pending_posts.pop(key)
             await query.answer('📢 Опубликовано в канал!')
             await _mark_post_done(query, '\n\n✅ Опубликовано в канал')
+            if not actor_is_admin:
+                await notify_admin(
+                    context.bot,
+                    f'👥 {actor_name} опубликовал в канал пост из ветки:\n\n'
+                    f'{_post_card(news, {})}')
         else:
             await query.answer('❌ Не удалось опубликовать — см. /logs', show_alert=True)
         return
 
     # === Кнопки под списком /scheduled ===
     if data.startswith(('snow:', 'scan:')):
+        if not is_admin(update):
+            await deny_access(update)
+            return
         action, key = data.split(':', 1)
         news = scheduled_posts.get(key) if scheduled_posts is not None else None
         if not news:
@@ -5057,6 +5111,11 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _mark_post_done(query, '\n\n✅ Опубликовано досрочно')
         else:
             await query.answer('❌ Не удалось опубликовать — см. /logs', show_alert=True)
+        return
+
+    # Всё остальное (настройки, кнопки /scheduled) — только для админов
+    if not is_admin(update):
+        await deny_access(update)
         return
 
     await query.answer()
@@ -5143,6 +5202,21 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🧵 Режим ветки ВЫКЛЮЧЕН.\n"
                 "Бот снова публикует по одному посту в канал за интервал."
             )
+        await query.edit_message_text(text, reply_markup=build_settings_menu())
+        return
+
+    if data == "settings:toggle_open":
+        settings.open_moderation = not settings.open_moderation
+        if settings.open_moderation:
+            await query.answer('Кнопки в ветке доступны всем 👥')
+            text = ("⚙️ Настройки\n\n"
+                    "👥 Кнопки под постами в ветке теперь доступны ВСЕМ участникам.\n"
+                    "О действиях гостей (публикация/отложка/правка/скрытие) "
+                    "админам приходят уведомления.")
+        else:
+            await query.answer('Кнопки в ветке — только админам 👤')
+            text = ("⚙️ Настройки\n\n"
+                    "👤 Кнопки под постами теперь работают только у админов.")
         await query.edit_message_text(text, reply_markup=build_settings_menu())
         return
 
@@ -5393,12 +5467,40 @@ def _same_place(pending: dict, update: Update) -> bool:
             and pending.get('thread_id') == thread_id)
 
 
+# Посторонние, уже получившие подсказку в ЛС (чтобы не спамить отказом)
+_private_denied: set[int] = set()
+
+
+async def private_gate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Личка бота — только для админов. Посторонний в ЛС получает одну короткую
+    подсказку и дальше игнорируется. Кнопки в ветке при этом работают для всех
+    (open_moderation) — это единственная точка входа для обычных участников."""
+    chat = update.effective_chat
+    if chat is None or chat.type != 'private':
+        return                       # группы и ветки — не наша зона
+    if is_admin(update):
+        return                       # админам ЛС полностью доступна
+    uid = update.effective_user.id if update.effective_user else 0
+    if uid not in _private_denied:
+        _private_denied.add(uid)
+        try:
+            await update.message.reply_text(
+                '⛔ Этот бот в личке доступен только администраторам.\n'
+                'Кнопки под постами в ветке обсуждения работают для всех.')
+        except TelegramError:
+            pass
+    raise ApplicationHandlerStop
+
+
 async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ловит текст, который админ прислал после нажатия 📅 (время) или ✏️ (новый текст).
     Если бот ничего не ждёт — молча пропускает сообщение дальше другим обработчикам."""
     pending = context.user_data.get('await_input') if context.user_data else None
-    if not pending or not is_admin(update):
+    if not pending:
         return
+    # Права не проверяем: состояние await_input появляется только у того, кто
+    # нажал кнопку в ветке (гейт места и open_moderation — там). Ввод принимаем
+    # от того же пользователя в том же месте (_same_place ниже).
     # Отвечаем только там, где нажали кнопку: сообщения из других веток/чатов
     # пропускаем дальше, чтобы бот не влезал в чужие разговоры.
     if not _same_place(pending, update):
@@ -5439,6 +5541,11 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
         pending_posts.pop(key)
         logger.info(f"📅 Отложен пост «{news.get('title', '')[:60]}» на {_fmt_local(when)} "
                     f"(отложил: {(by or {}).get('name', '?')})")
+        if user and user.id not in _all_admin_ids():
+            await notify_admin(
+                context.bot,
+                f'👥 {(by or {}).get("name", "?")} отложил пост на {_fmt_local(when)}:\n\n'
+                f'{_post_card(news, {"by": by, "at": when})}')
         await update.message.reply_text(
             f'📅 Опубликую {_fmt_local(when)} — через {_human_delta(when)}.\n'
             f'Список: /scheduled')
@@ -5449,6 +5556,12 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
         news['_edited_text'] = text
         pending_posts.update_news(key, news)
         context.user_data.pop('await_input', None)
+        editor = update.effective_user
+        if editor and editor.id not in _all_admin_ids():
+            ed_name = editor.full_name or editor.username or str(editor.id)
+            await notify_admin(
+                context.bot,
+                f'👥 {ed_name} изменил текст поста в ветке:\n\n{fit_to_limit(text, 500)}')
         updated = await _update_preview_text(context.bot, key, text)
         msg = '✏️ Текст обновлён — в канал уйдёт именно он.'
         if not updated:
@@ -5490,10 +5603,8 @@ async def _update_moderation_done(bot: Bot, key: str, suffix: str) -> None:
 
 
 async def cancel_command(update, context: ContextTypes.DEFAULT_TYPE):
-    """Отменяет ожидание ввода (времени отложки или нового текста)."""
-    if not is_admin(update):
-        await deny_access(update)
-        return
+    """Отменяет ожидание ввода (времени отложки или нового текста).
+    Доступна всем: гость отменяет только своё собственное состояние."""
     if context.user_data and context.user_data.pop('await_input', None):
         await update.message.reply_text('Отменил. Пост остался в ветке с кнопками.')
     else:
@@ -6545,6 +6656,8 @@ def main():
     reply_filter = filters.TEXT & filters.Regex(
         f"^({'|'.join(re.escape(t) for t in reply_button_texts)})$"
     )
+    # ЛС-гейт: посторонним в личке бот не отвечает (group=-2 — самый первый)
+    app.add_handler(MessageHandler(filters.ALL, private_gate_handler), group=-2)
     # Ввод времени отложки / нового текста поста. Группа -1 = проверяется раньше
     # остальных; когда бот ничего не ждёт, сообщение уходит дальше по цепочке.
     app.add_handler(
