@@ -3579,7 +3579,11 @@ async def _prepare_video_file(news: dict) -> Optional[Path]:
 
 
 def _add_video_link_to_text(text: str, video_url: str) -> str:
-    """Добавляет ссылку на видео в текст поста (когда не смогли скачать)."""
+    """Добавляет ссылку на видео в текст поста (когда не встраиваем его).
+    Для cdn-telegram/telesco ссылку НЕ добавляем: она гигантская, нечитаемая
+    и быстро протухает — читателю бесполезна."""
+    if _download_needed_host(video_url):
+        return text
     return f'{text}\n\n🎬 Смотреть: {video_url}'
 
 
@@ -3593,11 +3597,14 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
     # Доп. kwargs для отправки в тему форума
     thread_kw = {'message_thread_id': thread_id} if thread_id is not None else {}
 
-    # Видео считаем «встроенным» только если:
-    # - видео включено в настройках И
-    # - есть скачанный файл ИЛИ прямой mp4 (который Telegram качает сам)
+    # Что реально отправим как видео: файл | bytes | url.
+    # cdn-telegram Bot API по URL не принимает — качаем сами (как и фото).
+    video_media = None
+    if settings.video_enabled and video_file is None and video_url \
+            and _is_direct_video(video_url):
+        video_media = await _resolve_video(video_url)
     has_inline_video = settings.video_enabled and (
-        video_file is not None or (video_url and _is_direct_video(video_url))
+        video_file is not None or video_media is not None
     )
     if video_url and not has_inline_video:
         text = _add_video_link_to_text(text, video_url)
@@ -3648,7 +3655,7 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
                 else:
                     # Прямой видео-URL
                     await bot.send_video(
-                        chat_id=target, video=video_url, caption=caption,
+                        chat_id=target, video=video_media, caption=caption,
                         parse_mode=ParseMode.HTML, supports_streaming=True,
                         **thread_kw,
                     )
@@ -3730,7 +3737,7 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
             else:
                 # Прямой видео-URL
                 media.append(InputMediaVideo(
-                    media=video_url, caption=caption, parse_mode=ParseMode.HTML,
+                    media=video_media, caption=caption, parse_mode=ParseMode.HTML,
                     supports_streaming=True,
                 ))
             # Дальше фото без caption
@@ -3784,7 +3791,7 @@ async def _send_post_fallback(
                     )
             else:
                 await bot.send_video(
-                    chat_id=target, video=video_url, caption=caption,
+                    chat_id=target, video=video_media, caption=caption,
                     parse_mode=ParseMode.HTML, supports_streaming=True,
                     **thread_kw,
                 )
@@ -4330,6 +4337,22 @@ def _download_media_bytes(url: str, max_mb: int = 45) -> Optional[bytes]:
         return None
 
 
+async def _resolve_video(url: Optional[str]):
+    """Готовит видео к отправке. cdn-telegram/telesco Bot API по URL не принимает
+    (та же болезнь, что у фото) — качаем сами и шлём байтами (до 45 МБ).
+    Возвращает: bytes | url | None (недоступно — пост пойдёт без видео)."""
+    if not url:
+        return None
+    if not _download_needed_host(url):
+        return url
+    data = await asyncio.to_thread(_download_media_bytes, url, 45)
+    if data:
+        logger.info(f"🎬 Видео скачано байтами ({len(data) // (1024 * 1024)} МБ): {url[:60]}")
+        return data
+    logger.warning(f"🎬 Видео недоступно для скачивания — пост пойдёт без него: {url[:80]}")
+    return None
+
+
 async def _resolve_photos_for_album(photos: list[str]) -> list:
     """Готовит список картинок к отправке альбомом. Каждую, что Telegram не сможет
     забрать по URL (cdn-telegram.org и пр.), заменяем скачанными байтами.
@@ -4366,8 +4389,13 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
 
     text = format_news_text_long(news)
     video_url = news.get('video')
+    # Что реально отправим как видео: файл | bytes | url. cdn-telegram качаем сами.
+    video_media = None
+    if settings.video_enabled and video_file is None and video_url \
+            and _is_direct_video(video_url):
+        video_media = await _resolve_video(video_url)
     has_inline_video = settings.video_enabled and (
-        video_file is not None or (video_url and _is_direct_video(video_url))
+        video_file is not None or video_media is not None
     )
     if video_url and not has_inline_video:
         text = _add_video_link_to_text(text, video_url)
@@ -4415,7 +4443,7 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     # Текст не влез в caption — откатываемся на раздельную отправку
     if len(text) > TG_CAPTION_LIMIT:
         return await _send_thread_media_then_text(
-            bot, news, photos, has_inline_video, video_file, video_url,
+            bot, news, photos, has_inline_video, video_file, video_media,
             text, reply_markup, thread_kw, target)
 
     # === ЦЕЛЬНЫЙ РЕЖИМ: одно сообщение с медиа и подписью ===
@@ -4428,7 +4456,7 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
             return True
         # не удалось даже байтами — на всякий случай откат
         return await _send_thread_media_then_text(
-            bot, news, photos, has_inline_video, video_file, video_url,
+            bot, news, photos, has_inline_video, video_file, video_media,
             text, reply_markup, thread_kw, target)
 
     # 2) Только видео (без фото): видео с подписью и кнопками
@@ -4439,7 +4467,7 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
                     msg = await bot.send_video(chat_id=target, video=f, supports_streaming=True,
                                                reply_markup=reply_markup, **caption_kw, **thread_kw)
             else:
-                msg = await bot.send_video(chat_id=target, video=video_url, supports_streaming=True,
+                msg = await bot.send_video(chat_id=target, video=video_media, supports_streaming=True,
                                            reply_markup=reply_markup, **caption_kw, **thread_kw)
             _remember_preview(pending_key, msg)
             logger.info(f"🧵 {news['source']}: {news['title'][:60]} (видео+подпись)")
@@ -4461,8 +4489,8 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
                 f = open(video_file, 'rb'); opened.append(f)
                 media.append(InputMediaVideo(media=f, supports_streaming=True,
                                              caption=caption, parse_mode=ParseMode.HTML))
-            elif video_url:
-                media.append(InputMediaVideo(media=video_url, supports_streaming=True,
+            elif video_media is not None:
+                media.append(InputMediaVideo(media=video_media, supports_streaming=True,
                                              caption=caption, parse_mode=ParseMode.HTML))
             for ph in (await _resolve_photos_for_album(photos))[:9]:
                 media.append(InputMediaPhoto(media=ph))
@@ -4490,7 +4518,7 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     except TelegramError as e:
         logger.warning(f"Альбом с подписью не прошёл ({e}) — откат на раздельную отправку")
         return await _send_thread_media_then_text(
-            bot, news, photos, has_inline_video, video_file, video_url,
+            bot, news, photos, has_inline_video, video_file, video_media,
             text, reply_markup, thread_kw, target)
     finally:
         for f in opened:
