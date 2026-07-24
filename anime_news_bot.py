@@ -5,7 +5,9 @@
 """
 
 import asyncio
+import hashlib
 import html
+import io
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -13,6 +15,7 @@ import os
 import re
 import shutil
 import tempfile
+import zipfile
 import copy
 import time
 import difflib
@@ -49,6 +52,13 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+# Опциональная зависимость: без Pillow дедуп картинок работает по точному
+# совпадению файла (md5), с Pillow — по перцептивному хешу.
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 # Опциональная зависимость — если yt-dlp нет, скачивание видео отключится
 try:
@@ -167,6 +177,7 @@ TRANSLATION_INPUT_LIMIT = 1500
 TRANSLATION_INPUT_LIMIT_THREAD = 4000
 NEWS_PER_SOURCE = 5
 PAUSE_BETWEEN_SENDS = 2.0
+SOURCE_FETCH_CONCURRENCY = 5          # столько источников качаем одновременно
 # APScheduler по умолчанию ставит misfire_grace_time=1с: если тик джоба опоздал
 # больше чем на секунду (цикл занят сбором новостей/отправкой), запуск МОЛЧА
 # выбрасывается. Для нас это означало «отложка не публикуется». Даём час запаса.
@@ -204,7 +215,8 @@ VIDEO_DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # --- Медиа ---
 MAX_PHOTOS_PER_POST = 6               # сколько фото максимум собирать в media group
-TG_VIDEO_MAX_SECONDS = 60             # видео из TG-каналов берём только до минуты
+TG_VIDEO_MAX_SECONDS = 300            # видео из TG-каналов: до 5 минут
+TG_VIDEO_MAX_MB = 48                  # Bot API не принимает файлы больше ~50 МБ
 # Хосты, для которых пробуем yt-dlp
 VIDEO_HOSTS = (
     'youtube.com', 'youtu.be', 'm.youtube.com',
@@ -712,6 +724,14 @@ class BotSettings:
         'extra_admins': [],      # дополнительные Telegram ID с правами админа
         'tz_offset': 3,          # часовой пояс админа относительно UTC (МСК = +3)
         'open_moderation': True, # кнопки под постами в ветке доступны всем участникам
+        'auto_disable_sources': True,  # сам ставить на паузу умершие источники
+        'image_dedup': True,     # отсеивать посты с уже публиковавшейся картинкой
+        'daily_backup': True,    # ежедневный бэкап данных в личку админу
+        'last_backup_date': '',  # дата последнего бэкапа (YYYY-MM-DD)
+        'startup_report': True,  # отчёт админам при запуске бота
+        'last_publish_at': '',   # когда последний раз что-то опубликовали
+        'deepl_month': '',       # месяц, за который считаем символы DeepL
+        'deepl_chars': 0,        # израсходовано символов DeepL за месяц
     }
 
     def __init__(self, path: Path):
@@ -830,6 +850,81 @@ class BotSettings:
         self.save()
 
     @property
+    def auto_disable_sources(self) -> bool:
+        return bool(self._data.get('auto_disable_sources', True))
+
+    @auto_disable_sources.setter
+    def auto_disable_sources(self, value: bool) -> None:
+        self._data['auto_disable_sources'] = bool(value)
+        self.save()
+
+    @property
+    def image_dedup(self) -> bool:
+        return bool(self._data.get('image_dedup', True))
+
+    @image_dedup.setter
+    def image_dedup(self, value: bool) -> None:
+        self._data['image_dedup'] = bool(value)
+        self.save()
+
+    @property
+    def startup_report(self) -> bool:
+        return bool(self._data.get('startup_report', True))
+
+    @startup_report.setter
+    def startup_report(self, value: bool) -> None:
+        self._data['startup_report'] = bool(value)
+        self.save()
+
+    @property
+    def last_publish_at(self) -> str:
+        return str(self._data.get('last_publish_at', ''))
+
+    @last_publish_at.setter
+    def last_publish_at(self, value: str) -> None:
+        self._data['last_publish_at'] = str(value)
+        self.save()
+
+    @property
+    def deepl_month(self) -> str:
+        return str(self._data.get('deepl_month', ''))
+
+    @deepl_month.setter
+    def deepl_month(self, value: str) -> None:
+        self._data['deepl_month'] = str(value)
+        self.save()
+
+    @property
+    def deepl_chars(self) -> int:
+        try:
+            return int(self._data.get('deepl_chars', 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @deepl_chars.setter
+    def deepl_chars(self, value: int) -> None:
+        self._data['deepl_chars'] = max(0, int(value))
+        self.save()
+
+    @property
+    def daily_backup(self) -> bool:
+        return bool(self._data.get('daily_backup', True))
+
+    @daily_backup.setter
+    def daily_backup(self, value: bool) -> None:
+        self._data['daily_backup'] = bool(value)
+        self.save()
+
+    @property
+    def last_backup_date(self) -> str:
+        return str(self._data.get('last_backup_date', ''))
+
+    @last_backup_date.setter
+    def last_backup_date(self, value: str) -> None:
+        self._data['last_backup_date'] = str(value)
+        self.save()
+
+    @property
     def open_moderation(self) -> bool:
         return bool(self._data.get('open_moderation', True))
 
@@ -869,6 +964,8 @@ class BotSettings:
         if key in disabled:
             self._data['disabled_sources'] = [s for s in self._data['disabled_sources'] if s.lower() != key]
             new_state = True
+            if source_health is not None:
+                source_health.reset(source_name)   # включили руками — даём чистый старт
         else:
             self._data['disabled_sources'].append(source_name)
             new_state = False
@@ -2003,6 +2100,7 @@ def _deepl_translate(text: str) -> Optional[str]:
                 timeout=HTTP_TIMEOUT,
             )
             if r.status_code == 200:
+                _count_deepl_chars(text)       # расход считаем по исходному тексту
                 data = r.json()
                 translations = data.get('translations') or []
                 if translations:
@@ -2612,7 +2710,8 @@ def _is_too_old(published_struct, max_age_hours: Optional[int] = None) -> bool:
         pub_dt = datetime(*published_struct[:6])
     except (TypeError, ValueError, OverflowError):
         return False
-    age = datetime.utcnow() - pub_dt
+    # utcnow() объявлен устаревшим в 3.12 — берём aware-время и снимаем tz
+    age = datetime.now(timezone.utc).replace(tzinfo=None) - pub_dt
     return age > timedelta(hours=max_age_hours)
 
 
@@ -2962,7 +3061,7 @@ def get_reddit_anime():
                 if created_utc:
                     try:
                         post_dt = datetime.utcfromtimestamp(float(created_utc))
-                        if datetime.utcnow() - post_dt > timedelta(hours=settings.post_max_age_hours):
+                        if datetime.now(timezone.utc).replace(tzinfo=None) - post_dt > timedelta(hours=settings.post_max_age_hours):
                             continue
                     except (TypeError, ValueError):
                         pass
@@ -3071,6 +3170,28 @@ def _detect_lang(text: str) -> Optional[str]:
     return 'ru' if cyrillic >= latin else None
 
 
+def _msg_own(msg, selector: str) -> list:
+    """Элементы, принадлежащие ИМЕННО этому посту.
+
+    t.me/s/ иногда отдаёт разметку, в которой соседние посты оказываются вложены
+    друг в друга (незакрытый div в обёртке альбома). Тогда обычный msg.select()
+    захватывает содержимое соседа: пост получал чужой текст/дату и публиковался
+    со смесью «старый альбом + сегодняшний текст». Проверяем, что ближайший
+    предок-сообщение — это сам msg."""
+    out = []
+    for el in msg.select(selector):
+        holder = el.find_parent(class_='tgme_widget_message')
+        if holder is msg:
+            out.append(el)
+    return out
+
+
+def _msg_own_one(msg, selector: str):
+    """Первый собственный элемент поста (или None)."""
+    found = _msg_own(msg, selector)
+    return found[0] if found else None
+
+
 def get_telegram_channel(channel: str, label: str) -> list[dict]:
     """Парсит публичный Telegram-канал через t.me/s/. Возвращает список news-словарей."""
     url = f'https://t.me/s/{channel}'
@@ -3080,11 +3201,15 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
         return []
     soup = BeautifulSoup(r.text, 'html.parser')
     news_list: list[dict] = []
+    seen_ids: set[str] = set()
     for msg in soup.select('div.tgme_widget_message'):
         post_id = msg.get('data-post')          # вида 'channel/123'
-        text_el = msg.select_one('div.tgme_widget_message_text')
+        text_el = _msg_own_one(msg, 'div.tgme_widget_message_text')
         if not post_id or not text_el:
             continue                             # пост без текста — пропускаем
+        if post_id in seen_ids:
+            continue                             # тот же пост встретился дважды
+        seen_ids.add(post_id)
         full_text = text_el.get_text('\n', strip=True)
         if len(full_text) < 15:
             continue
@@ -3093,33 +3218,40 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
         summary = ' '.join(lines[1:])[:1000] if len(lines) > 1 else ''
         # Дата поста
         published_parsed = None
-        t = msg.select_one('time[datetime]')
+        t = _msg_own_one(msg, 'time[datetime]')
         if t and t.get('datetime'):
             try:
                 dt = datetime.fromisoformat(t['datetime'].replace('Z', '+00:00'))
                 published_parsed = dt.timetuple()
             except ValueError:
                 pass
-        if published_parsed and _is_too_old(published_parsed):
+        # Без собственной даты пост не берём: у TG-постов дата есть всегда, а её
+        # отсутствие означает кривую разметку — такой пост мог бы обойти фильтр
+        # свежести и вылезти месячной давности.
+        if published_parsed is None:
+            logger.debug(f"TG {channel}: пост {post_id} без даты — пропускаю")
+            continue
+        if _is_too_old(published_parsed):
             continue
         # Фото: обёртки со style="background-image:url('...')"
         images: list[str] = []
-        for wrap in msg.select('a.tgme_widget_message_photo_wrap[style]'):
+        for wrap in _msg_own(msg, 'a.tgme_widget_message_photo_wrap[style]'):
             m = re.search(r"background-image:url\('([^']+)'\)", wrap.get('style', ''))
             if m:
                 images.append(m.group(1))
         # Видео: t.me/s/ отдаёт его в разных формах. Прямой mp4 бывает в <video src>,
         # но часто — только превью-обёртка (.._video_thumb / .._video_player) с фоновым
         # изображением, а сам файл подгружается по клику. Берём mp4 если он доступен
-        # напрямую и короткий (≤60с); иначе достаём превью-кадр в images, чтобы пост
+        # напрямую и не длиннее 5 минут; иначе достаём превью-кадр в images, чтобы пост
         # не остался без картинки.
         video_url = None
-        dur_el = msg.select_one('.tgme_widget_message_video_duration')
-        has_video_marker = dur_el is not None or msg.select_one(
-            '.tgme_widget_message_video_player, .tgme_widget_message_video_thumb, '
-            '.tgme_widget_message_roundvideo') is not None
+        thumb_only = False
+        dur_el = _msg_own_one(msg, '.tgme_widget_message_video_duration')
+        has_video_marker = dur_el is not None or _msg_own_one(
+            msg, '.tgme_widget_message_video_player, .tgme_widget_message_video_thumb, '
+                 '.tgme_widget_message_roundvideo') is not None
         if has_video_marker:
-            # Длительность (если есть) — фильтр по ≤60с
+            # Длительность (если есть) — фильтр по TG_VIDEO_MAX_SECONDS
             dur_s = None
             if dur_el:
                 try:
@@ -3129,10 +3261,10 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
                 except (ValueError, IndexError):
                     dur_s = None
             # Ищем прямой mp4 в разных атрибутах
-            vid = msg.select_one('video[src]')
+            vid = _msg_own_one(msg, 'video[src]')
             direct = vid.get('src') if vid else None
             if not direct:
-                src_el = msg.select_one('video source[src]')
+                src_el = _msg_own_one(msg, 'video source[src]')
                 direct = src_el.get('src') if src_el else None
             if direct and (dur_s is None or dur_s <= TG_VIDEO_MAX_SECONDS):
                 video_url = direct
@@ -3140,11 +3272,12 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
                 # Прямого mp4 нет (ленивая загрузка) — вытащим превью-кадр видео
                 for sel in ('.tgme_widget_message_video_thumb[style]',
                             'a.tgme_widget_message_video_player[style]'):
-                    thumb = msg.select_one(sel)
+                    thumb = _msg_own_one(msg, sel)
                     if thumb:
                         mm = re.search(r"background-image:url\('([^']+)'\)", thumb.get('style', ''))
                         if mm and mm.group(1) not in images:
                             images.append(mm.group(1))
+                            thumb_only = True     # это лишь кадр-заглушка видео
                         break
                 logger.debug(f"TG {channel}/{post_id.split('/')[-1]}: видео без прямого mp4 — взял превью-кадр")
         news_list.append({
@@ -3158,6 +3291,9 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
             # Язык определяем по тексту: TG-каналы бывают не только русские
             # (напр. итальянский @VanitasNews) — их надо переводить.
             'lang': _detect_lang(full_text),
+            # True — единственная картинка это мыльный кадр-превью видео,
+            # перед отправкой попробуем найти вариант получше
+            '_thumb_only': thumb_only,
         })
     # На странице свежие посты ВНИЗУ — берём последние
     result = news_list[-NEWS_PER_SOURCE:]
@@ -4210,6 +4346,258 @@ class ScheduledPosts:
 scheduled_posts: Optional['ScheduledPosts'] = None
 
 
+# ============== ЗДОРОВЬЕ ИСТОЧНИКОВ И ОТПЕЧАТКИ КАРТИНОК ==============
+
+SOURCE_HEALTH_FILE = DATA_DIR / 'source_health.json'
+AUTO_DISABLE_AFTER = 5          # столько пустых/ошибочных проверок подряд → пауза
+
+
+class SourceHealth:
+    """Состояние источников: сколько проверок подряд прошло без новостей или
+    с ошибкой. Нужен, чтобы автоматически ставить на паузу умершие источники
+    (403 от анти-бота и т.п.) и показывать картину в /health.
+    Хранится на диске — счётчик переживает передеплой."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._data: dict[str, dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if self.path.exists():
+                loaded = json.loads(self.path.read_text(encoding='utf-8'))
+                if isinstance(loaded, dict):
+                    self._data = loaded
+        except (OSError, ValueError) as e:
+            logger.warning(f"source_health не загружен: {e}")
+
+    def _save(self) -> None:
+        try:
+            self.path.write_text(json.dumps(self._data, ensure_ascii=False),
+                                 encoding='utf-8')
+        except OSError as e:
+            logger.error(f"source_health не сохранён: {e}")
+
+    def _entry(self, name: str) -> dict:
+        return self._data.setdefault(
+            name, {'fails': 0, 'last_ok': None, 'last_count': 0, 'last_error': ''})
+
+    def record_ok(self, name: str, count: int) -> None:
+        entry = self._entry(name)
+        entry['fails'] = 0
+        entry['last_ok'] = datetime.now(timezone.utc).isoformat()
+        entry['last_count'] = int(count)
+        entry['last_error'] = ''
+        self._save()
+
+    def record_fail(self, name: str, reason: str) -> int:
+        """Отмечает неудачу. Возвращает число неудач подряд."""
+        entry = self._entry(name)
+        entry['fails'] = int(entry.get('fails', 0)) + 1
+        entry['last_error'] = str(reason)[:200]
+        self._save()
+        return entry['fails']
+
+    def reset(self, name: str) -> None:
+        """Сброс счётчика — например, когда источник включили вручную."""
+        if name in self._data:
+            self._data[name]['fails'] = 0
+            self._save()
+
+    def info(self, name: str) -> dict:
+        return dict(self._data.get(name, {}))
+
+    def all(self) -> dict:
+        return {k: dict(v) for k, v in self._data.items()}
+
+
+source_health: Optional['SourceHealth'] = None
+# Источники, которые бот выключил сам — check_news заберёт отсюда и уведомит
+_auto_disabled_pending: list[tuple[str, str]] = []
+
+
+IMAGE_HASHES_FILE = DATA_DIR / 'image_hashes.json'
+IMAGE_HASH_MAX = 500            # сколько последних отпечатков помним
+IMAGE_HASH_DISTANCE = 5         # расстояние Хэмминга, при котором картинки «те же»
+
+
+def _image_fingerprint(data: Optional[bytes]) -> Optional[str]:
+    """Отпечаток картинки.
+
+    С Pillow считаем перцептивный dHash: он переживает пережатие, смену размера
+    и лёгкий кроп — то, что происходит с одним и тем же кадром на разных сайтах.
+    Без Pillow откатываемся на md5 — тогда ловим только точные копии файла."""
+    if not data:
+        return None
+    if Image is not None:
+        try:
+            with Image.open(io.BytesIO(data)) as im:
+                # LANCZOS усредняет по площади: отпечаток почти не меняется при
+                # смене размера, чего не даёт быстрый bicubic по умолчанию
+                small = im.convert('L').resize((9, 8), Image.LANCZOS)
+                px = list(small.getdata())
+            bits = 0
+            pos = 0
+            for row in range(8):
+                base = row * 9
+                for col in range(8):
+                    if px[base + col] > px[base + col + 1]:
+                        bits |= (1 << pos)
+                    pos += 1
+            return f'd:{bits:016x}'
+        except Exception as e:
+            logger.debug(f"dHash не посчитан ({e}) — откат на md5")
+    return 'm:' + hashlib.md5(data).hexdigest()
+
+
+def _hash_distance(a: str, b: str) -> Optional[int]:
+    """Расстояние между отпечатками. None — если типы разные (несравнимы)."""
+    if not a or not b or a[:2] != b[:2]:
+        return None
+    if a.startswith('m:'):
+        return 0 if a == b else 64
+    try:
+        return bin(int(a[2:], 16) ^ int(b[2:], 16)).count('1')
+    except ValueError:
+        return None
+
+
+class ImageHashes:
+    """Отпечатки картинок опубликованных постов. Ловит один и тот же анонс,
+    пришедший с разных сайтов с разными заголовками (fuzzy-дедуп по тексту
+    такие случаи пропускает)."""
+
+    def __init__(self, path: Path, max_items: int = IMAGE_HASH_MAX):
+        self.path = path
+        self.max_items = max_items
+        self._items: list[dict] = []
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if self.path.exists():
+                loaded = json.loads(self.path.read_text(encoding='utf-8'))
+                if isinstance(loaded, list):
+                    self._items = [x for x in loaded if isinstance(x, dict) and x.get('h')]
+        except (OSError, ValueError) as e:
+            logger.warning(f"image_hashes не загружен: {e}")
+
+    def _save(self) -> None:
+        try:
+            self.path.write_text(json.dumps(self._items, ensure_ascii=False),
+                                 encoding='utf-8')
+        except OSError as e:
+            logger.error(f"image_hashes не сохранён: {e}")
+
+    def find_duplicate(self, fingerprint: str) -> Optional[dict]:
+        """Ищет ранее опубликованную картинку, похожую на эту."""
+        if not fingerprint:
+            return None
+        for item in reversed(self._items):        # свежие сначала
+            dist = _hash_distance(fingerprint, item.get('h', ''))
+            if dist is not None and dist <= IMAGE_HASH_DISTANCE:
+                return dict(item, distance=dist)
+        return None
+
+    def add(self, fingerprint: str, title: str = '') -> None:
+        if not fingerprint:
+            return
+        self._items.append({
+            'h': fingerprint,
+            't': re.sub(r'\s+', ' ', title or '').strip()[:80],
+            'at': datetime.now(timezone.utc).isoformat(),
+        })
+        if len(self._items) > self.max_items:
+            self._items = self._items[-self.max_items:]
+        self._save()
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+image_hashes: Optional['ImageHashes'] = None
+
+
+MIN_GOOD_IMAGE_PX = 500         # ниже этой ширины кадр выглядит мыльным
+
+
+def _image_width(data: Optional[bytes]) -> Optional[int]:
+    """Ширина картинки в пикселях (нужен Pillow). None — если не определить."""
+    if not data or Image is None:
+        return None
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            return im.width
+    except Exception:
+        return None
+
+
+async def _improve_thumb(news: dict) -> None:
+    """Если единственная картинка — мыльный кадр «ленивого» видео, пробуем взять
+    вариант покрупнее со страницы поста (og:image). Меняем только если он реально
+    больше: пост без картинки при включённом require_image вообще не выйдет,
+    так что мыло всё равно лучше пустоты."""
+    if not news.pop('_thumb_only', False):
+        return
+    images = news.get('images') or []
+    if not images or Image is None:
+        return
+    current = await asyncio.to_thread(_download_image_bytes, images[0])
+    width = _image_width(current)
+    if width is None or width >= MIN_GOOD_IMAGE_PX:
+        return
+    link = news.get('link')
+    if not link:
+        return
+    og = await asyncio.to_thread(fetch_og_image, link)
+    og_norm = _normalize_image_url(og, link) if og else None
+    if not og_norm or og_norm == images[0]:
+        logger.debug(f"Превью {width}px, замены не нашлось: {news.get('title', '')[:50]}")
+        return
+    candidate = await asyncio.to_thread(_download_image_bytes, og_norm)
+    cand_width = _image_width(candidate)
+    if cand_width and cand_width > width:
+        news['images'] = [og_norm] + [i for i in images[1:] if i != og_norm]
+        logger.info(f"🖼 Превью видео заменено на крупное: {width}px → {cand_width}px")
+    else:
+        logger.debug(f"Превью {width}px осталось: og:image не крупнее")
+
+
+async def _image_duplicate(news: dict) -> Optional[str]:
+    """Если картинка поста уже публиковалась — возвращает заголовок той новости.
+    Иначе запоминает отпечаток и возвращает None.
+
+    Скачивается только первая картинка: этого достаточно, чтобы узнать кадр,
+    и не хочется тратить трафик на весь альбом."""
+    if settings is None or not getattr(settings, 'image_dedup', True):
+        return None
+    if image_hashes is None:
+        return None
+    images = news.get('images') or []
+    if not images:
+        return None
+    data = await asyncio.to_thread(_download_image_bytes, images[0])
+    fingerprint = _image_fingerprint(data)
+    if not fingerprint:
+        return None
+    dup = image_hashes.find_duplicate(fingerprint)
+    if dup:
+        return dup.get('t') or 'без заголовка'
+    # Запоминаем не сейчас, а после успешной публикации (_commit_image_fingerprint):
+    # иначе сорвавшаяся отправка «застолбила» бы кадр, и та же новость с другого
+    # источника больше никогда бы не вышла.
+    news['_img_fp'] = fingerprint          # строка — безопасно для JSON-хранилищ
+    return None
+
+
+def _commit_image_fingerprint(news: dict) -> None:
+    """Фиксирует отпечаток картинки после того, как пост реально ушёл."""
+    fingerprint = news.pop('_img_fp', None)
+    if fingerprint and image_hashes is not None:
+        image_hashes.add(fingerprint, news.get('title', ''))
+
+
 PENDING_POSTS_FILE = DATA_DIR / 'pending_posts.json'
 
 
@@ -4318,20 +4706,38 @@ async def _tg_call_flood_safe(coro_factory):
         return await coro_factory()
 
 
-def _download_media_bytes(url: str, max_mb: int = 45) -> Optional[bytes]:
+def _download_media_bytes(url: str, max_mb: int = TG_VIDEO_MAX_MB) -> Optional[bytes]:
     """Скачивает медиа (фото/видео) для отправки байтами, когда Bot API не берёт URL.
-    Проверяет, что это image/* или video/*, и что размер в пределах max_mb."""
+
+    Качаем ПОТОКОМ и обрываем, как только превышен лимит: пятиминутное видео может
+    весить сотни мегабайт, а хостинг у нас на 1 ГБ RAM — читать такое целиком в
+    память нельзя. Дополнительно смотрим Content-Length, чтобы не начинать зря."""
+    limit = max_mb * 1024 * 1024
     try:
-        r = http_get_with_retry(url, headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT)
-        if not r or r.status_code != 200:
-            return None
-        ctype = (r.headers.get('Content-Type') or '').lower()
-        if not (ctype.startswith('image/') or ctype.startswith('video/')):
-            return None
-        data = r.content
-        if not data or len(data) > max_mb * 1024 * 1024:
-            return None
-        return data
+        r = requests.get(url, headers={'User-Agent': USER_AGENT},
+                         timeout=HTTP_TIMEOUT, stream=True)
+        with r:
+            if r.status_code != 200:
+                return None
+            ctype = (r.headers.get('Content-Type') or '').lower()
+            if not (ctype.startswith('image/') or ctype.startswith('video/')):
+                return None
+            declared = r.headers.get('Content-Length')
+            if declared and declared.isdigit() and int(declared) > limit:
+                logger.info(f"Медиа {int(declared) // (1024 * 1024)} МБ — больше лимита "
+                            f"{max_mb} МБ, не качаю: {url[:60]}")
+                return None
+            chunks = []
+            total = 0
+            for chunk in r.iter_content(chunk_size=256 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > limit:
+                    logger.info(f"Медиа превысило {max_mb} МБ на лету — обрываю: {url[:60]}")
+                    return None
+                chunks.append(chunk)
+            return b''.join(chunks) if total else None
     except Exception as e:
         logger.debug(f"download media fail {url[:80]}: {e}")
         return None
@@ -4339,13 +4745,13 @@ def _download_media_bytes(url: str, max_mb: int = 45) -> Optional[bytes]:
 
 async def _resolve_video(url: Optional[str]):
     """Готовит видео к отправке. cdn-telegram/telesco Bot API по URL не принимает
-    (та же болезнь, что у фото) — качаем сами и шлём байтами (до 45 МБ).
+    (та же болезнь, что у фото) — качаем сами и шлём байтами (до TG_VIDEO_MAX_MB).
     Возвращает: bytes | url | None (недоступно — пост пойдёт без видео)."""
     if not url:
         return None
     if not _download_needed_host(url):
         return url
-    data = await asyncio.to_thread(_download_media_bytes, url, 45)
+    data = await asyncio.to_thread(_download_media_bytes, url, TG_VIDEO_MAX_MB)
     if data:
         logger.info(f"🎬 Видео скачано байтами ({len(data) // (1024 * 1024)} МБ): {url[:60]}")
         return data
@@ -4637,6 +5043,17 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
         await stats.record_skipped('duplicate', source)
         return 'skipped_dup'
 
+    # Дедуп по картинке: один и тот же кадр с разных сайтов и с разными
+    # заголовками текстовый дедуп не ловит. Ссылка уже claim-нута, так что
+    # повторно скачивать эту новость в следующих циклах бот не будет.
+    await _improve_thumb(news)
+    dup_title = await _image_duplicate(news)
+    if dup_title:
+        logger.info(f"⊘ Картинка уже публиковалась («{dup_title[:40]}»): "
+                    f"{news.get('title', '')[:60]}")
+        await stats.record_skipped('duplicate', source)
+        return 'skipped_dup'
+
     # Догрузка полного текста отключена: посты короткие (заголовок + 1 предложение).
 
     video_file = None
@@ -4646,6 +5063,8 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
     try:
         ok = await _send_post_thread_split(bot, news, video_file)
         if ok:
+            _commit_image_fingerprint(news)
+            _mark_published()
             await stats.record_published(source)
             return 'sent'
         await sent_links.release(news['link'], news.get('title', ''))
@@ -4682,6 +5101,25 @@ async def notify_admin(bot: Bot, text: str) -> None:
 
 
 # ============== СБОР ==============
+def _note_source_failure(name: str, reason: str) -> None:
+    """Отмечает неудачу источника и, если их накопилось подряд слишком много,
+    ставит его на паузу. Уведомление отправит check_news — здесь нет бота."""
+    if source_health is None:
+        return
+    fails = source_health.record_fail(name, reason)
+    logger.info(f"{name}: неудача подряд #{fails} ({reason[:80]})")
+    if fails < AUTO_DISABLE_AFTER:
+        return
+    if settings is None or not settings.auto_disable_sources:
+        return
+    if not settings.is_source_enabled(name):
+        return                       # уже на паузе — второй раз не трогаем
+    settings.toggle_source(name)     # источник был включён → выключаем
+    _auto_disabled_pending.append((name, reason))
+    logger.warning(f"⏸ Источник {name} автоматически выключен после "
+                   f"{fails} неудач подряд: {reason[:100]}")
+
+
 async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
     """Собирает свежие новости со всех включённых источников.
     Возвращает (all_news, stats_lines, errors)."""
@@ -4691,12 +5129,27 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
     seen_urls: set[str] = set()
     seen_titles: set[str] = set()
 
-    for name, collector in SOURCES:
+    # Сбор идёт параллельно (сеть — самая долгая часть цикла), но результаты
+    # обрабатываются в исходном порядке источников: дедуп остаётся предсказуемым.
+    enabled = [(n, c) for n, c in SOURCES if settings.is_source_enabled(n)]
+    for name, _c in SOURCES:
         if not settings.is_source_enabled(name):
             stats_lines.append(f"{name}: ⏸")
-            continue
+
+    sem = asyncio.Semaphore(SOURCE_FETCH_CONCURRENCY)
+
+    async def _fetch(collector):
+        async with sem:
+            return await asyncio.to_thread(collector)
+
+    fetched = await asyncio.gather(*(_fetch(c) for _n, c in enabled),
+                                   return_exceptions=True)
+
+    for (name, _collector), result in zip(enabled, fetched):
         try:
-            items = await asyncio.to_thread(collector)
+            if isinstance(result, BaseException):
+                raise result
+            items = result
             unique_items = []
             no_image_skipped = 0
             duplicate_skipped = 0
@@ -4719,6 +5172,14 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
                     seen_titles.add(norm_title)
                 unique_items.append(item)
 
+            # Здоровье источника считаем по СЫРОМУ ответу: живой источник может
+            # отдать одни дубли, а мёртвый не отдаёт вообще ничего.
+            if source_health is not None:
+                if items:
+                    source_health.record_ok(name, len(items))
+                else:
+                    _note_source_failure(name, 'вернул 0 постов')
+
             all_news.extend(unique_items)
             stat_line = f"{name}: {len(unique_items)}"
             if no_image_skipped:
@@ -4737,6 +5198,7 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
             errors.append(f"{name}: {e}")
             logger.error(f"{name} failed: {e}")
             await stats.record_source_error(name)
+            _note_source_failure(name, f'{type(e).__name__}: {e}')
     return all_news, stats_lines, errors
 
 
@@ -4799,6 +5261,12 @@ def build_settings_menu() -> InlineKeyboardMarkup:
     quiet_label = "🔕 Тихий режим: ВКЛ" if settings.quiet_mode else "🔔 Тихий режим: ВЫКЛ"
     open_label = ("👥 Кнопки в ветке: ВСЕ" if settings.open_moderation
                   else "👤 Кнопки в ветке: ТОЛЬКО АДМИНЫ")
+    dedup_label = ("🖼 Дедуп по картинке: ВКЛ" if settings.image_dedup
+                   else "🖼 Дедуп по картинке: ВЫКЛ")
+    autodis_label = ("⏸ Автопауза мёртвых источников: ВКЛ" if settings.auto_disable_sources
+                     else "⏸ Автопауза мёртвых источников: ВЫКЛ")
+    backup_label = ("📦 Ежедневный бэкап: ВКЛ" if settings.daily_backup
+                    else "📦 Ежедневный бэкап: ВЫКЛ")
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📡 Источники", callback_data="settings:sources")],
         [InlineKeyboardButton("🔁 Интервал автопроверки", callback_data="settings:interval")],
@@ -4807,6 +5275,9 @@ def build_settings_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(tr_label, callback_data="settings:toggle_translator")],
         [InlineKeyboardButton(quiet_label, callback_data="settings:toggle_quiet")],
         [InlineKeyboardButton(open_label, callback_data="settings:toggle_open")],
+        [InlineKeyboardButton(dedup_label, callback_data="settings:toggle_dedup")],
+        [InlineKeyboardButton(autodis_label, callback_data="settings:toggle_autodis")],
+        [InlineKeyboardButton(backup_label, callback_data="settings:toggle_backup")],
         [InlineKeyboardButton("🎬 Видео", callback_data="settings:video")],
         [InlineKeyboardButton(img_label, callback_data="settings:toggle_require_image")],
         [InlineKeyboardButton("📦 Очередь постов", callback_data="settings:queue")],
@@ -5013,6 +5484,29 @@ async def _update_preview_text(bot: Bot, key: str, new_text: str) -> bool:
     return False
 
 
+# Лимит действий гостей: с открытой модерацией любой участник ветки может
+# нажимать «В канал». Без ограничения один человек способен за минуту засыпать
+# канал десятком постов. Админов лимит не касается.
+GUEST_ACTIONS_PER_HOUR = 10
+_guest_actions: dict[int, list[float]] = {}
+
+
+def _guest_rate_ok(user_id: int) -> bool:
+    """True, если гостю можно выполнить действие. Считает окно в час."""
+    now = time.time()
+    hits = [t for t in _guest_actions.get(user_id, []) if now - t < 3600]
+    if len(hits) >= GUEST_ACTIONS_PER_HOUR:
+        _guest_actions[user_id] = hits
+        return False
+    hits.append(now)
+    _guest_actions[user_id] = hits
+    if len(_guest_actions) > 500:            # чистим тех, у кого окно истекло
+        for uid in [u for u, ts in _guest_actions.items()
+                    if not ts or now - ts[-1] > 3600]:
+            _guest_actions.pop(uid, None)
+    return True
+
+
 def _in_moderation_thread(message) -> bool:
     """Нажатие произошло в предназначенной ветке модерации?
     Жёсткая защита: кнопки под постами работают ТОЛЬКО в нашей супергруппе
@@ -5056,6 +5550,13 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         actor_is_admin, actor_name = _actor(update)
         if not settings.open_moderation and not actor_is_admin:
             await query.answer('Кнопки доступны только админам.', show_alert=True)
+            return
+        actor_id = update.effective_user.id if update.effective_user else 0
+        if not actor_is_admin and not _guest_rate_ok(actor_id):
+            await query.answer(
+                f'Слишком много действий подряд (лимит {GUEST_ACTIONS_PER_HOUR} в час). '
+                f'Попробуй позже.', show_alert=True)
+            logger.warning(f"Гость {actor_name} ({actor_id}) упёрся в лимит действий")
             return
         action, key = data.split(':', 1)
 
@@ -5102,6 +5603,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ok = await _send_post(context.bot, news, CHANNEL_ID, None)
         if ok:
             pending_posts.pop(key)
+            _mark_published()
             await query.answer('📢 Опубликовано в канал!')
             await _mark_post_done(query, '\n\n✅ Опубликовано в канал')
             if not actor_is_admin:
@@ -5231,6 +5733,38 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Бот снова публикует по одному посту в канал за интервал."
             )
         await query.edit_message_text(text, reply_markup=build_settings_menu())
+        return
+
+    if data == "settings:toggle_dedup":
+        settings.image_dedup = not settings.image_dedup
+        await query.answer('Дедуп по картинке ' + ('включён' if settings.image_dedup else 'выключен'))
+        note = ('🖼 Посты с уже публиковавшейся картинкой будут отсеиваться — '
+                'ловит один и тот же анонс с разных сайтов.'
+                if settings.image_dedup else
+                '🖼 Проверка картинок выключена: возможны повторы одного кадра.')
+        await query.edit_message_text(f"⚙️ Настройки\n\n{note}",
+                                      reply_markup=build_settings_menu())
+        return
+
+    if data == "settings:toggle_autodis":
+        settings.auto_disable_sources = not settings.auto_disable_sources
+        await query.answer('Автопауза ' + ('включена' if settings.auto_disable_sources else 'выключена'))
+        note = (f'⏸ Источник, не отдавший новостей {AUTO_DISABLE_AFTER} проверок подряд, '
+                f'будет ставиться на паузу с уведомлением.'
+                if settings.auto_disable_sources else
+                '⏸ Мёртвые источники останутся включёнными — смотри /health.')
+        await query.edit_message_text(f"⚙️ Настройки\n\n{note}",
+                                      reply_markup=build_settings_menu())
+        return
+
+    if data == "settings:toggle_backup":
+        settings.daily_backup = not settings.daily_backup
+        await query.answer('Бэкап ' + ('включён' if settings.daily_backup else 'выключен'))
+        note = (f'📦 Раз в сутки (после {BACKUP_HOUR}:00) архив данных будет приходить в личку.'
+                if settings.daily_backup else
+                '📦 Автобэкап выключен. Вручную — /backup.')
+        await query.edit_message_text(f"⚙️ Настройки\n\n{note}",
+                                      reply_markup=build_settings_menu())
         return
 
     if data == "settings:toggle_open":
@@ -5510,6 +6044,8 @@ async def private_gate_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return                       # админам ЛС полностью доступна
     uid = update.effective_user.id if update.effective_user else 0
     if uid not in _private_denied:
+        if len(_private_denied) > 1000:      # не даём множеству расти бесконечно
+            _private_denied.clear()
         _private_denied.add(uid)
         try:
             await update.message.reply_text(
@@ -5785,6 +6321,7 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
 
         if ok:
             scheduled_posts.pop(key)
+            _mark_published()
             logger.info(f"📅 Опубликован отложенный пост: {news.get('title', '')[:60]}")
             await notify_admin(
                 context.bot,
@@ -5957,6 +6494,20 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
 
         # 1) Собираем свежие новости с источников
         all_news, stats_lines, errors = await collect_all_news()
+
+        # Накопленные предупреждения (квота переводчика и т.п.)
+        while _pending_admin_alerts:
+            await notify_admin(context.bot, _pending_admin_alerts.pop(0))
+
+        # Источники, которые бот выключил сам — сообщаем админам один раз
+        while _auto_disabled_pending:
+            src_name, reason = _auto_disabled_pending.pop(0)
+            await notify_admin(
+                context.bot,
+                f'⏸ Источник «{src_name}» выключен автоматически\n\n'
+                f'{AUTO_DISABLE_AFTER} проверок подряд без новостей.\n'
+                f'Последняя причина: {reason[:150]}\n\n'
+                f'Включить обратно: /settings → 📡 Источники')
         # Только то, что подходит по фильтру и не было отправлено ранее
         fresh = [
             n for n in all_news
@@ -5994,6 +6545,7 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
                 if errors:
                     message += "⚠️ Ошибки источников:\n" + "\n".join(errors)
                 await notify_admin(context.bot, message)
+            await _check_silence(context.bot)
             await _maybe_send_daily_summary(context.bot)
             return
 
@@ -6420,6 +6972,382 @@ async def deladmin_command(update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{uid} не был дополнительным админом.")
 
 
+# ============== САМОДИАГНОСТИКА: ТИШИНА, СТАРТ, КВОТА ПЕРЕВОДЧИКА ==============
+
+WATCHDOG_SILENCE_HOURS = 8      # столько без единой публикации → сигнал тревоги
+DEEPL_MONTHLY_LIMIT = 1_000_000  # символов в месяц (свой тариф — поправь тут)
+DEEPL_WARN_AT = (0.8, 0.95)     # на каких долях лимита предупреждать
+
+# Разовые сообщения админам, которые накопились вне контекста бота
+# (в парсерах и джобах бота под рукой нет) — check_news их разошлёт.
+_pending_admin_alerts: list[str] = []
+_silence_reported = False       # чтобы не повторять тревогу каждый цикл
+
+
+def _queue_admin_alert(text: str) -> None:
+    """Ставит сообщение админам в очередь. Дубли не копим."""
+    if text not in _pending_admin_alerts:
+        _pending_admin_alerts.append(text)
+    if len(_pending_admin_alerts) > 20:
+        del _pending_admin_alerts[:-20]
+
+
+def _mark_published() -> None:
+    """Отмечает факт успешной публикации — питание для сторожа тишины."""
+    global _silence_reported
+    _silence_reported = False
+    if settings is not None:
+        settings.last_publish_at = datetime.now(timezone.utc).isoformat()
+
+
+def _silence_hours() -> Optional[float]:
+    """Сколько часов не было ни одной публикации. None — если отметки ещё нет."""
+    raw = getattr(settings, 'last_publish_at', '') if settings else ''
+    if not isinstance(raw, str) or not raw:
+        return None                  # пусто или мусор в настройках — считаем «нет отметки»
+    try:
+        last = datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - last).total_seconds() / 3600
+
+
+async def _check_silence(bot: Bot) -> None:
+    """Сторож: если бот давно ничего не опубликовал, значит что-то тихо сломалось.
+    Ровно этот сценарий повторялся раньше — отложка, видео и картинки отваливались
+    молча, и узнавали мы об этом только глазами."""
+    global _silence_reported
+    hours = _silence_hours()
+    if hours is None:
+        _mark_published()            # первая отметка — точка отсчёта
+        return
+    if hours < WATCHDOG_SILENCE_HOURS:
+        return
+    if _silence_reported:
+        return
+    _silence_reported = True
+    enabled = sum(1 for n, _ in SOURCES if settings.is_source_enabled(n))
+    await notify_admin(
+        bot,
+        f'🔇 Тревога: {int(hours)} ч без единой публикации\n\n'
+        f'Источников включено: {enabled}\n'
+        f'В отложке: {len(scheduled_posts.all()) if scheduled_posts else 0}\n'
+        f'Ждут решения в ветке: {len(pending_posts._items) if pending_posts else 0}\n\n'
+        f'Обычно это значит: источники перестали отдавать новости, всё уходит '
+        f'в дубли или отправка падает. Диагностика — /health и /logs.')
+
+
+def _deepl_usage_local() -> tuple[int, str]:
+    """Наш локальный счётчик символов DeepL за текущий месяц: (символы, месяц)."""
+    if settings is None:
+        return 0, ''
+    month = datetime.now(timezone.utc).strftime('%Y-%m')
+    try:
+        if settings.deepl_month != month:
+            return 0, month
+        return int(settings.deepl_chars), month
+    except (TypeError, ValueError):
+        return 0, month
+
+
+def _count_deepl_chars(text: str) -> None:
+    """Прибавляет символы к месячному счётчику и предупреждает у порогов.
+
+    Нужно, чтобы упёршийся лимит не превратился в очередную тихую поломку:
+    переводы просто перестали бы приходить, а посты пошли бы на итальянском."""
+    if settings is None or not text:
+        return
+    month = datetime.now(timezone.utc).strftime('%Y-%m')
+    if settings.deepl_month != month:
+        settings.deepl_month = month
+        settings.deepl_chars = 0
+    before = settings.deepl_chars
+    after = before + len(text)
+    settings.deepl_chars = after
+    for share in DEEPL_WARN_AT:
+        edge = int(DEEPL_MONTHLY_LIMIT * share)
+        if before < edge <= after:
+            _queue_admin_alert(
+                f'📝 DeepL израсходован на {int(share * 100)}%: '
+                f'{after:,} из {DEEPL_MONTHLY_LIMIT:,} символов за {month}.\n'
+                f'При исчерпании лимита бот сам переключится на Google Translate — '
+                f'посты продолжат переводиться, но качеством пониже.'.replace(',', ' '))
+
+
+def _deepl_usage_remote() -> Optional[tuple[int, int]]:
+    """Реальные цифры из DeepL (/v2/usage): (использовано, лимит). None — если
+    ключа нет или запрос не удался. Дёргается только по команде /health."""
+    if not DEEPL_API_KEY:
+        return None
+    endpoint = ('https://api-free.deepl.com/v2/usage'
+                if DEEPL_API_KEY.endswith(':fx')
+                else 'https://api.deepl.com/v2/usage')
+    try:
+        r = requests.get(endpoint,
+                         headers={'Authorization': f'DeepL-Auth-Key {DEEPL_API_KEY}'},
+                         timeout=10)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        used = int(data.get('character_count', 0))
+        limit = int(data.get('character_limit', 0))
+        return used, limit
+    except Exception as e:
+        logger.debug(f"DeepL usage недоступен: {e}")
+        return None
+
+
+def _optional_deps_report() -> list[str]:
+    """Что из необязательных зависимостей доступно на этом хостинге."""
+    ffmpeg = shutil.which('ffmpeg') is not None
+    return [
+        f"  {'🟢' if Image is not None else '🟡'} Pillow: "
+        + ('есть (перцептивный дедуп картинок)' if Image is not None
+           else 'нет (дедуп только по точным копиям)'),
+        f"  {'🟢' if YT_DLP_AVAILABLE else '🟡'} yt-dlp: "
+        + ('есть' if YT_DLP_AVAILABLE else 'нет (YouTube-видео не качаются, TG-видео работают)'),
+        f"  {'🟢' if ffmpeg else '🟡'} ffmpeg: " + ('есть' if ffmpeg else 'нет'),
+    ]
+
+
+async def send_startup_report(app) -> None:
+    """Короткий отчёт админам при запуске: что поднялось и что настроено.
+
+    Деплой идёт через GitHub, и раньше единственным способом узнать результат
+    было ждать, появятся ли посты. Теперь бот сам говорит, что он живой."""
+    if settings is None or not settings.startup_report:
+        return
+    problems: list[str] = []
+    if not DISCUSSION_CHAT_ID or not DISCUSSION_THREAD_ID:
+        problems.append('не задан чат/ветка обсуждения — кнопки модерации работать не будут')
+    if not DEEPL_API_KEY:
+        problems.append('нет ключа DeepL — перевод идёт через Google Translate')
+    enabled = [n for n, _ in SOURCES if settings.is_source_enabled(n)]
+    paused = [n for n, _ in SOURCES if not settings.is_source_enabled(n)]
+    if not enabled:
+        problems.append('все источники на паузе — новостей не будет')
+
+    lines = ['🚀 <b>Бот запущен</b>', '']
+    lines.append(f'📡 Источников: {len(enabled)} вкл' + (f', {len(paused)} на паузе' if paused else ''))
+    if paused:
+        lines.append(f'   ⏸ {html.escape(", ".join(paused[:8]))}')
+    lines.append(f'🧵 Режим: ' + ('ветка обсуждения' if settings.thread_mode else 'сразу в канал'))
+    lines.append('🎬 Видео: ' + ('ВКЛ' if settings.video_enabled else 'ВЫКЛ')
+                 + f' (до {TG_VIDEO_MAX_SECONDS // 60} мин)')
+    lines.append('🖼 Дедуп по картинке: ' + ('ВКЛ' if settings.image_dedup else 'ВЫКЛ'))
+    lines.append('👥 Кнопки в ветке: ' + ('для всех' if settings.open_moderation else 'только админы'))
+    lines.append(f'🕒 Часовой пояс: UTC{_tz_offset():+d}, сейчас {_local_now():%d.%m %H:%M}')
+    lines.append('')
+    lines.append('<b>Хранилища</b>')
+    lines.append(f'  📅 Отложка: {len(scheduled_posts.all()) if scheduled_posts else 0}')
+    lines.append(f'  🗂 Ждут решения: {len(pending_posts._items) if pending_posts else 0}')
+    lines.append(f'  🔗 История ссылок: {len(sent_links._set) if sent_links else 0}')
+    lines.append(f'  🖼 Отпечатков картинок: {len(image_hashes) if image_hashes else 0}')
+    lines.append('')
+    lines.append('<b>Окружение</b>')
+    lines.extend(_optional_deps_report())
+    rss = _rss_mb()
+    if rss is not None:
+        lines.append(f'  🧠 Память: {rss} МБ')
+    if problems:
+        lines.append('')
+        lines.append('⚠️ <b>Обратить внимание</b>')
+        lines.extend(f'  • {html.escape(p)}' for p in problems)
+    lines.append('')
+    lines.append('Подробности в любой момент — /health')
+
+    text = '\n'.join(lines)
+    for uid in _all_admin_ids():
+        try:
+            await app.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML)
+        except TelegramError as e:
+            logger.warning(f"Стартовый отчёт не ушёл админу {uid}: {e}")
+
+
+BACKUP_HOUR = 5                 # во сколько по времени админа делать бэкап
+
+
+def _rss_mb() -> Optional[int]:
+    """Сколько памяти занимает процесс, МБ (Linux). None — если не прочиталось."""
+    try:
+        with open('/proc/self/status', encoding='utf-8') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _data_files() -> list[Path]:
+    """Все файлы данных бота (для бэкапа и отчёта о размерах)."""
+    try:
+        return sorted(p for p in DATA_DIR.glob('*.json') if p.is_file())
+    except OSError:
+        return []
+
+
+def _fmt_size(num: int) -> str:
+    return f"{num / 1024:.0f} КБ" if num >= 1024 else f"{num} Б"
+
+
+def _job_line(context, name: str, human: str) -> str:
+    try:
+        jobs = context.application.job_queue.get_jobs_by_name(name)
+    except Exception:
+        jobs = []
+    if not jobs:
+        return f"  ⚠️ {human}: НЕ ЗАРЕГИСТРИРОВАН"
+    nxt = getattr(jobs[0], 'next_t', None)
+    return f"  ✅ {human}" + (f" — следующий запуск {_fmt_local(nxt)}" if nxt else "")
+
+
+@admin_only
+async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Сводка о состоянии бота: джобы, источники, данные, память, диск."""
+    lines = ['🩺 <b>Состояние бота</b>', '', '<b>Фоновые задачи</b>']
+    lines.append(_job_line(context, 'anime_news_check', 'Автопроверка новостей'))
+    lines.append(_job_line(context, 'scheduled_publish', 'Публикация отложки'))
+    lines.append(_job_line(context, 'daily_backup', 'Ежедневный бэкап'))
+
+    # --- Источники ---
+    enabled = [n for n, _ in SOURCES if settings.is_source_enabled(n)]
+    disabled = [n for n, _ in SOURCES if not settings.is_source_enabled(n)]
+    lines.append('')
+    lines.append(f'<b>Источники: {len(enabled)} вкл / {len(disabled)} на паузе</b>')
+    problem = []
+    if source_health is not None:
+        for name in enabled:
+            info = source_health.info(name)
+            fails = int(info.get('fails', 0))
+            if fails:
+                problem.append((name, fails, info.get('last_error', '')))
+    problem.sort(key=lambda x: -x[1])
+    if problem:
+        for name, fails, err in problem[:8]:
+            left = AUTO_DISABLE_AFTER - fails
+            tail = f' (до паузы {left})' if left > 0 else ''
+            lines.append(f'  ⚠️ {name}: неудач подряд {fails}{tail}')
+            if err:
+                lines.append(f'      {html.escape(err[:70])}')
+    else:
+        lines.append('  ✅ Все включённые источники отвечают')
+    if disabled:
+        lines.append(f'  ⏸ На паузе: {html.escape(", ".join(disabled[:10]))}')
+
+    # --- Очереди ---
+    lines.append('')
+    lines.append('<b>Очереди</b>')
+    sched_total = len(scheduled_posts.all()) if scheduled_posts is not None else 0
+    sched_ripe = len(scheduled_posts.due()) if scheduled_posts is not None else 0
+    lines.append(f'  📅 В отложке: {sched_total}'
+                 + (f' (созрело: {sched_ripe})' if sched_ripe else ''))
+    lines.append(f'  🗂 Ждут решения в ветке: {len(pending_posts._items) if pending_posts else 0}')
+    lines.append(f'  🔗 История ссылок: {len(sent_links._set)}')
+    lines.append(f'  🖼 Отпечатков картинок: {len(image_hashes) if image_hashes else 0}'
+                 + ('' if Image is not None else ' (без Pillow — только точные копии)'))
+
+    # --- Данные и система ---
+    files = _data_files()
+    total = sum(p.stat().st_size for p in files if p.exists())
+    lines.append('')
+    lines.append('<b>Данные и система</b>')
+    lines.append(f'  💾 Файлов данных: {len(files)}, всего {_fmt_size(total)}')
+    biggest = sorted(files, key=lambda p: p.stat().st_size, reverse=True)[:3]
+    for p in biggest:
+        lines.append(f'      {p.name}: {_fmt_size(p.stat().st_size)}')
+    rss = _rss_mb()
+    if rss is not None:
+        lines.append(f'  🧠 Память процесса: {rss} МБ')
+    try:
+        usage = shutil.disk_usage(DATA_DIR)
+        lines.append(f'  🗄 Диск: свободно {usage.free // (1024 * 1024)} МБ '
+                     f'из {usage.total // (1024 * 1024)} МБ')
+    except OSError:
+        pass
+    last_backup = settings.last_backup_date or 'ещё не делался'
+    lines.append(f'  📦 Последний бэкап: {last_backup}')
+    silence = _silence_hours()
+    if silence is not None:
+        mark = '⚠️' if silence >= WATCHDOG_SILENCE_HOURS else '🕓'
+        lines.append(f'  {mark} Последняя публикация: {silence:.1f} ч назад')
+
+    # --- Переводчик ---
+    used, month = _deepl_usage_local()
+    lines.append('')
+    lines.append('<b>Переводчик</b>')
+    if DEEPL_API_KEY:
+        share = used / DEEPL_MONTHLY_LIMIT * 100 if DEEPL_MONTHLY_LIMIT else 0
+        lines.append(f'  📝 DeepL за {month}: {used} симв. (~{share:.0f}% лимита)')
+        remote = await asyncio.to_thread(_deepl_usage_remote)
+        if remote:
+            r_used, r_limit = remote
+            lines.append(f'      по данным DeepL: {r_used} из {r_limit}')
+    else:
+        lines.append('  📝 Google Translate (ключ DeepL не задан)')
+
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
+
+
+def _build_backup_archive() -> Optional[tuple[bytes, str]]:
+    """Собирает все файлы данных в zip в памяти. (bytes, имя файла) или None."""
+    files = _data_files()
+    if not files:
+        return None
+    buf = io.BytesIO()
+    try:
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for path in files:
+                try:
+                    zf.write(path, arcname=path.name)
+                except OSError as e:
+                    logger.warning(f"Бэкап: {path.name} не добавлен ({e})")
+    except Exception as e:
+        logger.error(f"Бэкап: архив не собрался ({e})")
+        return None
+    data = buf.getvalue()
+    if len(data) < 30:                      # пустой архив
+        return None
+    stamp = _local_now().strftime('%Y-%m-%d')
+    return data, f'anime_bot_backup_{stamp}.zip'
+
+
+async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Раз в сутки присылает архив данных в личку админам.
+
+    Именно в личку, а не в канал: внутри история ссылок, ID админов и настройки —
+    в публичном канале им не место. Задача крутится ежечасно и срабатывает один
+    раз за календарный день, после BACKUP_HOUR по времени админа."""
+    if settings is None or not settings.daily_backup:
+        return
+    today = _local_now().strftime('%Y-%m-%d')
+    if settings.last_backup_date == today:
+        return
+    if _local_now().hour < BACKUP_HOUR:
+        return
+    # Дату ставим сразу: даже если отправка сорвётся, повторять весь день не будем
+    settings.last_backup_date = today
+    archive = await asyncio.to_thread(_build_backup_archive)
+    if not archive:
+        logger.warning("Ежедневный бэкап: нечего архивировать")
+        return
+    data, filename = archive
+    caption = (f'📦 Ежедневный бэкап данных бота\n'
+               f'{filename} — {_fmt_size(len(data))}\n'
+               f'Сохрани: при сбросе диска хостинга отсюда восстанавливается всё.')
+    sent = 0
+    for uid in _all_admin_ids():
+        try:
+            await context.bot.send_document(chat_id=uid, document=data,
+                                            filename=filename, caption=caption)
+            sent += 1
+        except TelegramError as e:
+            logger.warning(f"Бэкап не ушёл админу {uid}: {e}")
+    logger.info(f"📦 Ежедневный бэкап отправлен ({sent} получателей, {_fmt_size(len(data))})")
+
+
 @admin_only
 async def backup_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Присылает админу все файлы данных бота (страховка на случай проблем с хостингом)."""
@@ -6564,6 +7492,17 @@ async def setup_bot_commands(app: Application) -> None:
         publish_scheduled, interval=60, first=15, name='scheduled_publish',
         job_kwargs=JOB_KWARGS,
     )
+    # Ежедневный бэкап: проверяем раз в час, срабатывает один раз в сутки
+    app.job_queue.run_repeating(
+        daily_backup_job, interval=3600, first=120, name='daily_backup',
+        job_kwargs=JOB_KWARGS,
+    )
+
+    # Отчёт о запуске: сразу видно, поднялся ли деплой и что настроено
+    try:
+        await send_startup_report(app)
+    except Exception as e:                     # отчёт не должен мешать старту
+        logger.warning(f"Стартовый отчёт не отправлен: {e}")
     total = len(scheduled_posts.all()) if scheduled_posts is not None else 0
     ripe = len(scheduled_posts.due()) if scheduled_posts is not None else 0
     logger.info(f"🕰 Джоб отложки зарегистрирован (тик раз в 60с). "
@@ -6578,6 +7517,7 @@ async def setup_bot_commands(app: Application) -> None:
         BotCommand("stats", "📈 Метрики и статистика"),
         BotCommand("deepl", "🌐 Лимит DeepL"),
         BotCommand("backup", "📦 Бэкап данных"),
+        BotCommand("health", "🩺 Состояние бота"),
         BotCommand("scheduled", "📅 Отложенные посты"),
         BotCommand("tz", "🕒 Часовой пояс"),
         BotCommand("sources", "📡 Динамические источники"),
@@ -6605,6 +7545,13 @@ def _init_globals() -> None:
         sent_links = SentLinksStore(SENT_LINKS_FILE)
     if pending_posts is None:
         pending_posts = PendingPosts(PENDING_POSTS_FILE)
+    global source_health, image_hashes
+    if source_health is None:
+        source_health = SourceHealth(SOURCE_HEALTH_FILE)
+    if image_hashes is None:
+        image_hashes = ImageHashes(IMAGE_HASHES_FILE)
+        logger.info(f"Отпечатков картинок в базе: {len(image_hashes)}"
+                    + ("" if Image is not None else " (Pillow нет — только точные копии)"))
     global scheduled_posts
     if scheduled_posts is None:
         scheduled_posts = ScheduledPosts(SCHEDULED_POSTS_FILE)
@@ -6663,6 +7610,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("deepl", deepl_command))
     app.add_handler(CommandHandler("backup", backup_command))
+    app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("scheduled", scheduled_command))
     app.add_handler(CommandHandler("tz", tz_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
