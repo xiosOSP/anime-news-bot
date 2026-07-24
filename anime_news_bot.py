@@ -3192,6 +3192,46 @@ def _msg_own_one(msg, selector: str):
     return found[0] if found else None
 
 
+TG_EMBED_LOOKUPS_PER_RUN = 3    # сколько «ленивых» видео пробуем достать за проверку
+
+
+def _parse_duration(text: str) -> Optional[int]:
+    """'1:43' → 103 секунды. None, если не разобрать."""
+    try:
+        parts = [int(x) for x in (text or '').strip().split(':')]
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    return (parts[-1] + (parts[-2] * 60 if len(parts) > 1 else 0)
+            + (parts[-3] * 3600 if len(parts) > 2 else 0))
+
+
+def _fetch_video_from_embed(post_id: str) -> tuple[Optional[str], Optional[int]]:
+    """Пробует достать прямой mp4 со страницы отдельного поста (?embed=1).
+
+    В ленте t.me/s/ Telegram часто НЕ отдаёт ссылку на видео — её подставляет
+    скрипт при клике. Но у embed-страницы одного поста mp4 обычно лежит прямо
+    в HTML. Это единственный способ забрать ролик без браузера.
+    Возвращает (ссылка, длительность в секундах)."""
+    url = f'https://t.me/{post_id}?embed=1&mode=tme'
+    try:
+        r = http_get_with_retry(url, headers={'User-Agent': USER_AGENT},
+                                timeout=HTTP_TIMEOUT)
+    except Exception as e:
+        logger.debug(f"embed {post_id}: запрос не удался ({e})")
+        return None, None
+    if not r or r.status_code != 200:
+        logger.debug(f"embed {post_id}: HTTP {r.status_code if r else 'нет ответа'}")
+        return None, None
+    soup = BeautifulSoup(r.text, 'html.parser')
+    vid = soup.select_one('video[src]') or soup.select_one('video source[src]')
+    direct = vid.get('src') if vid else None
+    dur_el = soup.select_one('.tgme_widget_message_video_duration')
+    duration = _parse_duration(dur_el.get_text()) if dur_el else None
+    return direct, duration
+
+
 def get_telegram_channel(channel: str, label: str) -> list[dict]:
     """Парсит публичный Telegram-канал через t.me/s/. Возвращает список news-словарей."""
     url = f'https://t.me/s/{channel}'
@@ -3202,6 +3242,7 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
     soup = BeautifulSoup(r.text, 'html.parser')
     news_list: list[dict] = []
     seen_ids: set[str] = set()
+    embed_budget = TG_EMBED_LOOKUPS_PER_RUN   # не тормозим цикл лишними запросами
     for msg in soup.select('div.tgme_widget_message'):
         post_id = msg.get('data-post')          # вида 'channel/123'
         text_el = _msg_own_one(msg, 'div.tgme_widget_message_text')
@@ -3246,40 +3287,54 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
         # не остался без картинки.
         video_url = None
         thumb_only = False
+        video_note = ''
+        video_thumb = None
         dur_el = _msg_own_one(msg, '.tgme_widget_message_video_duration')
         has_video_marker = dur_el is not None or _msg_own_one(
             msg, '.tgme_widget_message_video_player, .tgme_widget_message_video_thumb, '
                  '.tgme_widget_message_roundvideo') is not None
         if has_video_marker:
-            # Длительность (если есть) — фильтр по TG_VIDEO_MAX_SECONDS
-            dur_s = None
-            if dur_el:
-                try:
-                    parts = [int(x) for x in dur_el.get_text(strip=True).split(':')]
-                    dur_s = parts[-1] + (parts[-2] * 60 if len(parts) > 1 else 0) \
-                        + (parts[-3] * 3600 if len(parts) > 2 else 0)
-                except (ValueError, IndexError):
-                    dur_s = None
-            # Ищем прямой mp4 в разных атрибутах
+            dur_s = _parse_duration(dur_el.get_text()) if dur_el else None
+
+            # Кадр-превью запоминаем ВСЕГДА: пригодится, если ролик не доедет
+            video_thumb = None
+            for sel in ('.tgme_widget_message_video_thumb[style]',
+                        'a.tgme_widget_message_video_player[style]'):
+                thumb = _msg_own_one(msg, sel)
+                if thumb:
+                    mm = re.search(r"background-image:url\('([^']+)'\)", thumb.get('style', ''))
+                    if mm:
+                        video_thumb = mm.group(1)
+                    break
+
+            # Прямой mp4 в разметке ленты
             vid = _msg_own_one(msg, 'video[src]')
             direct = vid.get('src') if vid else None
             if not direct:
                 src_el = _msg_own_one(msg, 'video source[src]')
                 direct = src_el.get('src') if src_el else None
+
+            # Нет ссылки в ленте — идём на страницу самого поста
+            if not direct and embed_budget > 0:
+                embed_budget -= 1
+                direct, embed_dur = _fetch_video_from_embed(post_id)
+                if direct:
+                    dur_s = dur_s if dur_s is not None else embed_dur
+                    video_note = 'mp4 добыт со страницы поста'
+
             if direct and (dur_s is None or dur_s <= TG_VIDEO_MAX_SECONDS):
                 video_url = direct
-            elif direct is None:
-                # Прямого mp4 нет (ленивая загрузка) — вытащим превью-кадр видео
-                for sel in ('.tgme_widget_message_video_thumb[style]',
-                            'a.tgme_widget_message_video_player[style]'):
-                    thumb = _msg_own_one(msg, sel)
-                    if thumb:
-                        mm = re.search(r"background-image:url\('([^']+)'\)", thumb.get('style', ''))
-                        if mm and mm.group(1) not in images:
-                            images.append(mm.group(1))
-                            thumb_only = True     # это лишь кадр-заглушка видео
-                        break
-                logger.debug(f"TG {channel}/{post_id.split('/')[-1]}: видео без прямого mp4 — взял превью-кадр")
+                video_note = video_note or f'прямой mp4 ({dur_s if dur_s else "?"}с)'
+            else:
+                if direct:
+                    video_note = (f'ролик {dur_s}с длиннее лимита '
+                                  f'{TG_VIDEO_MAX_SECONDS}с — только кадр')
+                else:
+                    video_note = 'Telegram не отдал mp4 даже на странице поста — только кадр'
+                if video_thumb and video_thumb not in images:
+                    images.append(video_thumb)
+                    thumb_only = True
+            logger.info(f"TG {post_id}: видео — {video_note}")
         news_list.append({
             'title': title,
             'link': f'https://t.me/{post_id}',
@@ -3294,6 +3349,8 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
             # True — единственная картинка это мыльный кадр-превью видео,
             # перед отправкой попробуем найти вариант получше
             '_thumb_only': thumb_only,
+            '_video_thumb': video_thumb,      # запасной кадр, если ролик не доедет
+            '_video_note': video_note,        # что случилось с видео — видно в /logs
         })
     # На странице свежие посты ВНИЗУ — берём последние
     result = news_list[-NEWS_PER_SOURCE:]
@@ -3749,6 +3806,11 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
     caption = fit_to_limit(safe_text, TG_CAPTION_LIMIT)
 
     photos = _dedup_image_variants(news.get('images') or [])
+    # Ролик не доехал, а картинок нет — ставим кадр-превью из самого поста,
+    # он всегда лучше, чем случайная og:image со страницы канала.
+    if not photos and video_media is None and news.get('_video_thumb'):
+        photos = [news['_video_thumb']]
+        logger.info(f"🎬 Видео не доехало — кадр из поста: {news.get('title', '')[:50]}")
     # Картинки с хостов, которые Bot API не может скачать по URL (cdn-telegram.org
     # из t.me/s/-постов), заранее качаем байтами — иначе публикация в канал падала
     # с webpage_curl_failed / "Wrong type of the web page content" все 3 попытки.
@@ -4718,9 +4780,12 @@ def _download_media_bytes(url: str, max_mb: int = TG_VIDEO_MAX_MB) -> Optional[b
                          timeout=HTTP_TIMEOUT, stream=True)
         with r:
             if r.status_code != 200:
+                logger.info(f"Медиа не скачалось: HTTP {r.status_code} — {url[:70]}")
                 return None
             ctype = (r.headers.get('Content-Type') or '').lower()
             if not (ctype.startswith('image/') or ctype.startswith('video/')):
+                logger.info(f"Медиа не скачалось: тип «{ctype or '?'}» вместо файла "
+                            f"— {url[:70]}")
                 return None
             declared = r.headers.get('Content-Length')
             if declared and declared.isdigit() and int(declared) > limit:
@@ -4739,7 +4804,7 @@ def _download_media_bytes(url: str, max_mb: int = TG_VIDEO_MAX_MB) -> Optional[b
                 chunks.append(chunk)
             return b''.join(chunks) if total else None
     except Exception as e:
-        logger.debug(f"download media fail {url[:80]}: {e}")
+        logger.info(f"Медиа не скачалось ({type(e).__name__}: {e}) — {url[:70]}")
         return None
 
 
@@ -4807,6 +4872,11 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
         text = _add_video_link_to_text(text, video_url)
 
     photos = _dedup_image_variants(news.get('images') or [])
+    if not photos and video_media is None and news.get('_video_thumb'):
+        photos = [news['_video_thumb']]
+        news['_thumb_only'] = True
+        logger.info(f"🎬 Видео не доехало — ставлю кадр из поста: "
+                    f"{news.get('title', '')[:50]}")
     media_count = len(photos) + (1 if has_inline_video else 0)
 
     # Нет медиа — пробуем og:image со страницы, иначе (при require_image) пропуск
