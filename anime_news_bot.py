@@ -3207,29 +3207,67 @@ def _parse_duration(text: str) -> Optional[int]:
             + (parts[-3] * 3600 if len(parts) > 2 else 0))
 
 
-def _fetch_video_from_embed(post_id: str) -> tuple[Optional[str], Optional[int]]:
-    """Пробует достать прямой mp4 со страницы отдельного поста (?embed=1).
+def _extract_video_url(html_text: str) -> tuple[Optional[str], Optional[int], str]:
+    """Ищет прямой mp4 в HTML страницы поста тремя способами.
+    Возвращает (ссылка, длительность, каким способом нашли)."""
+    soup = BeautifulSoup(html_text, 'html.parser')
 
-    В ленте t.me/s/ Telegram часто НЕ отдаёт ссылку на видео — её подставляет
-    скрипт при клике. Но у embed-страницы одного поста mp4 обычно лежит прямо
-    в HTML. Это единственный способ забрать ролик без браузера.
-    Возвращает (ссылка, длительность в секундах)."""
-    url = f'https://t.me/{post_id}?embed=1&mode=tme'
-    try:
-        r = http_get_with_retry(url, headers={'User-Agent': USER_AGENT},
-                                timeout=HTTP_TIMEOUT)
-    except Exception as e:
-        logger.debug(f"embed {post_id}: запрос не удался ({e})")
-        return None, None
-    if not r or r.status_code != 200:
-        logger.debug(f"embed {post_id}: HTTP {r.status_code if r else 'нет ответа'}")
-        return None, None
-    soup = BeautifulSoup(r.text, 'html.parser')
-    vid = soup.select_one('video[src]') or soup.select_one('video source[src]')
-    direct = vid.get('src') if vid else None
     dur_el = soup.select_one('.tgme_widget_message_video_duration')
     duration = _parse_duration(dur_el.get_text()) if dur_el else None
-    return direct, duration
+
+    # 1) Обычный тег <video>
+    vid = soup.select_one('video[src]') or soup.select_one('video source[src]')
+    if vid and vid.get('src'):
+        return vid['src'], duration, 'тег video'
+
+    # 2) og:video / twitter:player — стандартные мета-теги, Telegram их выдаёт
+    #    для части видео-постов даже когда тега <video> на странице нет
+    for prop in ('og:video', 'og:video:url', 'og:video:secure_url',
+                 'twitter:player:stream'):
+        meta = (soup.select_one(f'meta[property="{prop}"]')
+                or soup.select_one(f'meta[name="{prop}"]'))
+        if meta and meta.get('content', '').strip():
+            return meta['content'].strip(), duration, f'мета {prop}'
+
+    # 3) Ссылка может лежать внутри скрипта — вытаскиваем регуляркой
+    m = re.search(r'https://[^"\'\s\\]+cdn-telegram\.org/file/[^"\'\s\\]+?\.mp4',
+                  html_text)
+    if not m:
+        m = re.search(r'https://[^"\'\s\\]+\.mp4', html_text)
+    if m:
+        return m.group(0), duration, 'ссылка в коде страницы'
+
+    return None, duration, ''
+
+
+def _fetch_video_from_embed(post_id: str) -> tuple[Optional[str], Optional[int]]:
+    """Пробует достать прямой mp4 со страницы отдельного поста.
+
+    В ленте t.me/s/ Telegram часто НЕ отдаёт ссылку на видео — её подставляет
+    скрипт. Обходим двумя адресами (embed-версия и обычная страница) и тремя
+    способами разбора. Всё, что происходит, пишем в лог: без этого «видео нет»
+    выглядит одинаково и когда страница не открылась, и когда файла там нет."""
+    for url in (f'https://t.me/{post_id}?embed=1&mode=tme',
+                f'https://t.me/{post_id}'):
+        kind = 'embed' if 'embed' in url else 'страница'
+        try:
+            r = http_get_with_retry(url, headers={'User-Agent': USER_AGENT},
+                                    timeout=HTTP_TIMEOUT)
+        except Exception as e:
+            logger.info(f"  {post_id}: {kind} — запрос не удался ({type(e).__name__}: {e})")
+            continue
+        if not r or r.status_code != 200:
+            logger.info(f"  {post_id}: {kind} — HTTP {r.status_code if r else 'нет ответа'}")
+            continue
+        direct, duration, how = _extract_video_url(r.text)
+        if direct:
+            logger.info(f"  {post_id}: {kind} — нашёл mp4 ({how})")
+            return direct, duration
+        # Отличаем «страница пустая/закрыта» от «страница есть, а файла нет»
+        has_post = 'tgme_widget_message' in r.text
+        logger.info(f"  {post_id}: {kind} — mp4 нет "
+                    f"({'пост загружен, ссылки на файл в HTML не оказалось' if has_post else 'пост не отдался (приватный/защищённый?)'})")
+    return None, None
 
 
 def get_telegram_channel(channel: str, label: str) -> list[dict]:
