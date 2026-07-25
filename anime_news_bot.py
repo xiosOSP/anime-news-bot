@@ -3271,46 +3271,64 @@ def _parse_duration(text: str) -> Optional[int]:
             + (parts[-3] * 3600 if len(parts) > 2 else 0))
 
 
-def _extract_video_url(html_text: str) -> tuple[Optional[str], Optional[int], str]:
-    """Ищет прямой mp4 в HTML страницы поста тремя способами.
-    Возвращает (ссылка, длительность, каким способом нашли)."""
+def _extract_video_url(html_text: str):
+    """Разбирает страницу отдельного поста.
+    Возвращает (ссылка на mp4, длительность, каким способом нашли, кадр-превью).
+
+    Кадр берём отсюда же: в ленте t.me/s/ превью видео — это размытая заглушка
+    в десяток пикселей, а на странице поста лежит полноразмерный кадр."""
     soup = BeautifulSoup(html_text, 'html.parser')
 
     dur_el = soup.select_one('.tgme_widget_message_video_duration')
     duration = _parse_duration(dur_el.get_text()) if dur_el else None
 
-    # 1) Обычный тег <video>
+    # --- Кадр-превью ---
+    thumb = None
+    for prop in ('og:image', 'twitter:image', 'og:image:url'):
+        meta = (soup.select_one(f'meta[property="{prop}"]')
+                or soup.select_one(f'meta[name="{prop}"]'))
+        content = meta.get('content', '').strip() if meta else ''
+        if content.startswith('http'):
+            thumb = content
+            break
+    if not thumb:
+        for el in soup.select('[class*="video"][style], [class*="photo"][style]'):
+            mm = re.search(r"background-image:url\('([^']+)'\)", el.get('style', ''))
+            if mm:
+                thumb = mm.group(1)
+                break
+
+    # --- Ссылка на файл ---
     vid = soup.select_one('video[src]') or soup.select_one('video source[src]')
     if vid and vid.get('src'):
-        return vid['src'], duration, 'тег video'
+        return vid['src'], duration, 'тег video', thumb
 
-    # 2) og:video / twitter:player — стандартные мета-теги, Telegram их выдаёт
-    #    для части видео-постов даже когда тега <video> на странице нет
     for prop in ('og:video', 'og:video:url', 'og:video:secure_url',
                  'twitter:player:stream'):
         meta = (soup.select_one(f'meta[property="{prop}"]')
                 or soup.select_one(f'meta[name="{prop}"]'))
         if meta and meta.get('content', '').strip():
-            return meta['content'].strip(), duration, f'мета {prop}'
+            return meta['content'].strip(), duration, f'мета {prop}', thumb
 
-    # 3) Ссылка может лежать внутри скрипта — вытаскиваем регуляркой
-    m = re.search(r'https://[^"\'\s\\]+cdn-telegram\.org/file/[^"\'\s\\]+?\.mp4',
-                  html_text)
-    if not m:
-        m = re.search(r'https://[^"\'\s\\]+\.mp4', html_text)
-    if m:
-        return m.group(0), duration, 'ссылка в коде страницы'
+    # Ссылка может лежать внутри скрипта. Сначала ищем на известных хостах
+    # Telegram (cdn-telegram.org, telesco.pe), потом любой mp4.
+    for pattern in (r'https://[^"\'\s\\]+(?:cdn-telegram\.org|telesco\.pe)/file/[^"\'\s\\]+?\.mp4[^"\'\s\\]*',
+                    r'https://[^"\'\s\\]+\.mp4[^"\'\s\\]*'):
+        m = re.search(pattern, html_text)
+        if m:
+            return m.group(0), duration, 'ссылка в коде страницы', thumb
 
-    return None, duration, ''
+    return None, duration, '', thumb
 
 
-def _fetch_video_from_embed(post_id: str) -> tuple[Optional[str], Optional[int]]:
+def _fetch_video_from_embed(post_id: str):
     """Пробует достать прямой mp4 со страницы отдельного поста.
 
     В ленте t.me/s/ Telegram часто НЕ отдаёт ссылку на видео — её подставляет
     скрипт. Обходим двумя адресами (embed-версия и обычная страница) и тремя
     способами разбора. Всё, что происходит, пишем в лог: без этого «видео нет»
     выглядит одинаково и когда страница не открылась, и когда файла там нет."""
+    best_thumb = None
     for url in (f'https://t.me/{post_id}?embed=1&mode=tme',
                 f'https://t.me/{post_id}'):
         kind = 'embed' if 'embed' in url else 'страница'
@@ -3323,15 +3341,18 @@ def _fetch_video_from_embed(post_id: str) -> tuple[Optional[str], Optional[int]]
         if not r or r.status_code != 200:
             logger.info(f"  {post_id}: {kind} — HTTP {r.status_code if r else 'нет ответа'}")
             continue
-        direct, duration, how = _extract_video_url(r.text)
+        direct, duration, how, thumb = _extract_video_url(r.text)
         if direct:
             logger.info(f"  {post_id}: {kind} — нашёл mp4 ({how})")
-            return direct, duration
+            return direct, duration, thumb
+        if thumb:
+            best_thumb = thumb
         # Отличаем «страница пустая/закрыта» от «страница есть, а файла нет»
         has_post = 'tgme_widget_message' in r.text
         logger.info(f"  {post_id}: {kind} — mp4 нет "
-                    f"({'пост загружен, ссылки на файл в HTML не оказалось' if has_post else 'пост не отдался (приватный/защищённый?)'})")
-    return None, None
+                    f"({'пост загружен, ссылки на файл в HTML не оказалось' if has_post else 'пост не отдался (приватный/защищённый?)'})"
+                    + (', но забрал полноразмерный кадр' if best_thumb else ''))
+    return None, None, best_thumb
 
 
 def get_telegram_channel(channel: str, label: str) -> list[dict]:
@@ -3421,7 +3442,10 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
             # Нет ссылки в ленте — идём на страницу самого поста
             if not direct and embed_budget > 0:
                 embed_budget -= 1
-                direct, embed_dur = _fetch_video_from_embed(post_id)
+                direct, embed_dur, embed_thumb = _fetch_video_from_embed(post_id)
+                if embed_thumb:
+                    # Кадр со страницы поста всегда лучше размытой заглушки из ленты
+                    video_thumb = embed_thumb
                 if direct:
                     dur_s = dur_s if dur_s is not None else embed_dur
                     video_note = 'mp4 добыт со страницы поста'
@@ -3435,8 +3459,9 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
                                   f'{TG_VIDEO_MAX_SECONDS}с — только кадр')
                 else:
                     video_note = 'Telegram не отдал mp4 даже на странице поста — только кадр'
-                if video_thumb and video_thumb not in images:
-                    images.append(video_thumb)
+                if video_thumb:
+                    # Ставим кадр первым и убираем размытую заглушку из ленты
+                    images = [video_thumb] + [i for i in images if i != video_thumb]
                     thumb_only = True
             logger.info(f"TG {post_id}: видео — {video_note}")
         news_list.append({
@@ -4730,8 +4755,10 @@ async def _improve_thumb(news: dict) -> None:
         return
     current = await asyncio.to_thread(_download_image_bytes, images[0])
     width = _image_width(current)
-    if width is None or width >= MIN_GOOD_IMAGE_PX:
+    if width is not None and width >= MIN_GOOD_IMAGE_PX:
         return
+    # width is None — картинку не удалось измерить. Раньше на этом сдавались,
+    # хотя это как раз повод поискать замену.
     link = news.get('link')
     if not link:
         return
@@ -4742,9 +4769,10 @@ async def _improve_thumb(news: dict) -> None:
         return
     candidate = await asyncio.to_thread(_download_image_bytes, og_norm)
     cand_width = _image_width(candidate)
-    if cand_width and cand_width > width:
+    if cand_width and (width is None or cand_width > width):
         news['images'] = [og_norm] + [i for i in images[1:] if i != og_norm]
-        logger.info(f"🖼 Превью видео заменено на крупное: {width}px → {cand_width}px")
+        logger.info(f"🖼 Превью видео заменено на крупное: "
+                    f"{width or '?'}px → {cand_width}px")
     else:
         logger.debug(f"Превью {width}px осталось: og:image не крупнее")
 
