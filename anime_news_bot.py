@@ -6984,6 +6984,23 @@ LLM_MODEL = _env('LLM_MODEL', '').strip() or _preset[1]
 LLM_TIMEOUT = _env_int('LLM_TIMEOUT', 30)
 LLM_MIN_INTERVAL = float(_env('LLM_MIN_INTERVAL', '1.2'))   # сек между запросами
 LLM_DAILY_LIMIT = _env_int('LLM_DAILY_LIMIT', 900)          # страховка от лимитов
+LLM_MAX_TOKENS = _env_int('LLM_MAX_TOKENS', 700)
+
+
+def _llm_extra_params() -> dict:
+    """Необязательные параметры запроса из LLM_EXTRA_PARAMS (JSON-строка).
+    Нужны для моделей с режимом рассуждений: например
+    LLM_EXTRA_PARAMS={"reasoning_effort":"none"} у Mistral Small 4 —
+    иначе модель тратит лимит токенов на размышления, и JSON не долетает."""
+    raw = _env('LLM_EXTRA_PARAMS', '').strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except ValueError:
+        logger.warning('LLM_EXTRA_PARAMS: не разобрался как JSON — игнорирую')
+        return {}
 
 _llm_lock = asyncio.Lock()          # запросы строго по одному (лимит req/sec)
 _llm_last_call = 0.0
@@ -7024,7 +7041,7 @@ def _llm_count_call() -> None:
     settings.llm_calls_today = settings.llm_calls_today + 1
 
 
-def _llm_request(messages: list, max_tokens: int = 700) -> Optional[str]:
+def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[str]:
     """Синхронный запрос к модели. Возвращает текст ответа или None.
 
     Никаких исключений наружу: если модель недоступна, бот обязан продолжить
@@ -7040,6 +7057,7 @@ def _llm_request(messages: list, max_tokens: int = 700) -> Optional[str]:
                 'messages': messages,
                 'temperature': 0.2,       # факты важнее фантазии
                 'max_tokens': max_tokens,
+                **_llm_extra_params(),
             },
             timeout=LLM_TIMEOUT,
         )
@@ -7076,7 +7094,7 @@ def _llm_request(messages: list, max_tokens: int = 700) -> Optional[str]:
     return (content or '').strip()
 
 
-async def _llm_call(messages: list, max_tokens: int = 700) -> Optional[str]:
+async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[str]:
     """Вызов модели с соблюдением лимитов: по одному запросу за раз,
     с паузой между ними и дневным потолком."""
     global _llm_last_call, _llm_disabled_runtime
