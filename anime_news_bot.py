@@ -3392,21 +3392,23 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
         video_note = ''
         video_thumb = None
         dur_el = _msg_own_one(msg, '.tgme_widget_message_video_duration')
-        has_video_marker = dur_el is not None or _msg_own_one(
-            msg, '.tgme_widget_message_video_player, .tgme_widget_message_video_thumb, '
-                 '.tgme_widget_message_roundvideo') is not None
+        # Признак видео ищем широко: у t.me/s/ имена классов отличаются от случая
+        # к случаю (одиночный ролик, видео внутри альбома, кружок), и жёсткий
+        # список из трёх классов пропускал видео-посты у части каналов.
+        video_tag = _msg_own_one(msg, 'video')
+        video_box = _msg_own_one(msg, '[class*="video"]')
+        has_video_marker = bool(dur_el or video_tag or video_box)
         if has_video_marker:
             dur_s = _parse_duration(dur_el.get_text()) if dur_el else None
 
             # Кадр-превью запоминаем ВСЕГДА: пригодится, если ролик не доедет
+            # Кадр берём из любой видео-обёртки с фоновой картинкой —
+            # по той же причине не привязываемся к конкретным классам.
             video_thumb = None
-            for sel in ('.tgme_widget_message_video_thumb[style]',
-                        'a.tgme_widget_message_video_player[style]'):
-                thumb = _msg_own_one(msg, sel)
-                if thumb:
-                    mm = re.search(r"background-image:url\('([^']+)'\)", thumb.get('style', ''))
-                    if mm:
-                        video_thumb = mm.group(1)
+            for el in _msg_own(msg, '[class*="video"][style]'):
+                mm = re.search(r"background-image:url\('([^']+)'\)", el.get('style', ''))
+                if mm:
+                    video_thumb = mm.group(1)
                     break
 
             # Прямой mp4 в разметке ленты
@@ -7363,13 +7365,26 @@ async def videocheck_command(update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     video_posts = [p for p in posts if p.get('_video_note')]
-    lines = [f'Постов получено: {len(posts)}, из них с видео: {len(video_posts)}']
+    lines = [f'Постов получено: {len(posts)}, из них с видео: {len(video_posts)}', '']
+    # Показываем ВСЕ посты: так видно, если бот не заметил видео там, где оно есть
+    lines.append('<b>Все посты канала</b>')
+    for post in posts:
+        num = _post_number(post.get('link', ''))
+        media = _media_summary(post)
+        mark = '📹' if post.get('_video_note') else '🖼'
+        title = re.sub(r'\s+', ' ', post.get('title', ''))[:38]
+        lines.append(f'{mark} {html.escape(num)}: {media} — {html.escape(title)}…')
+    lines.append('')
+    lines.append('🖼 = видео не обнаружено. Если у такого поста в канале '
+                 'на самом деле ролик — пришли мне его номер.')
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
+
     if not video_posts:
-        lines.append('')
-        lines.append('В свежих постах видео нет — проверить нечего. '
-                     'Дождись поста с роликом и повтори.')
-        await update.message.reply_text('\n'.join(lines))
+        await update.message.reply_text(
+            'В свежих постах видео не найдено. Если в канале оно есть — '
+            'значит бот его не распознал, пришли номер поста из списка выше.')
         return
+    lines = []
 
     for post in video_posts[:5]:
         num = _post_number(post.get('link', ''))
