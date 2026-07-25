@@ -7082,6 +7082,7 @@ _llm_last_call = 0.0
 _llm_fail_streak = 0                # подряд неудачных вызовов
 LLM_FAIL_PAUSE_AFTER = 5            # столько провалов подряд → пауза до рестарта
 _llm_disabled_runtime = False       # выключено на лету из-за ошибок/лимита
+_llm_json_mode = True               # просить строгий JSON (снимаем, если провайдер против)
 
 
 def _llm_configured() -> bool:
@@ -7121,19 +7122,24 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
 
     Никаких исключений наружу: если модель недоступна, бот обязан продолжить
     работать по-старому — через DeepL/Google и обычное форматирование."""
-    global _llm_fail_streak, _llm_disabled_runtime
+    global _llm_fail_streak, _llm_disabled_runtime, _llm_json_mode
+    payload = {
+        'model': LLM_MODEL,
+        'messages': messages,
+        'temperature': 0.2,           # факты важнее фантазии
+        'max_tokens': max_tokens,
+        **_llm_extra_params(),
+    }
+    # Строгий JSON поддерживают Mistral, Groq, OpenAI и большинство совместимых.
+    # Если провайдер параметр не понял — снимаем его и дальше работаем без него.
+    if _llm_json_mode:
+        payload.setdefault('response_format', {'type': 'json_object'})
     try:
         r = requests.post(
             f'{LLM_BASE_URL}/chat/completions',
             headers={'Authorization': f'Bearer {LLM_API_KEY}',
                      'Content-Type': 'application/json'},
-            json={
-                'model': LLM_MODEL,
-                'messages': messages,
-                'temperature': 0.2,       # факты важнее фантазии
-                'max_tokens': max_tokens,
-                **_llm_extra_params(),
-            },
+            json=payload,
             timeout=LLM_TIMEOUT,
         )
     except Exception as e:
@@ -7152,6 +7158,11 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
                            f'(HTTP {r.status_code}). Проверь LLM_API_KEY. '
                            'Бот продолжает работать на DeepL/Google.')
         return None
+    if r.status_code in (400, 422) and _llm_json_mode:
+        # Скорее всего провайдер не знает response_format — пробуем без него
+        _llm_json_mode = False
+        logger.info("LLM: провайдер не принял строгий JSON — повторяю без него")
+        return _llm_request(messages, max_tokens)
     if r.status_code != 200:
         _llm_fail_streak += 1
         logger.warning(f"LLM: HTTP {r.status_code} — {r.text[:150]}")
@@ -7219,24 +7230,57 @@ def _llm_parse_json(raw: str) -> Optional[dict]:
     return data if isinstance(data, dict) else None
 
 
+LLM_TOPICS_OK = ('аниме', 'манга', 'игры', 'кино', 'комиксы')
+LLM_TOPIC_ANY = LLM_TOPICS_OK + ('прочее',)
+
 LLM_SYSTEM_PROMPT = (
-    'Ты — редактор Telegram-канала об аниме, манге, играх и кино. '
-    'Тебе дают сырую новость. Верни ТОЛЬКО JSON, без пояснений и без markdown.\n\n'
-    'Формат:\n'
-    '{"relevant": true|false, "topic": "аниме|манга|игры|кино|прочее", '
-    '"title": "заголовок на русском", "summary": "1-3 предложения на русском", '
-    '"tags": ["#тег1", "#тег2"]}\n\n'
+    'Ты — редактор русскоязычного Telegram-канала об аниме, манге, играх, кино '
+    'и гик-культуре. Из сырой новости делаешь короткий пост.\n'
+    'Ответ — ТОЛЬКО JSON, без markdown и пояснений:\n'
+    '{"topic":"аниме|манга|игры|кино|комиксы|прочее","title":"...",'
+    '"summary":"...","tags":["#тег"]}\n\n'
+    'title — одна фраза с сутью новости, на русском, без эмодзи и кликбейта.\n'
+    'summary — 1-3 предложения, которые ДОБАВЛЯЮТ факты к заголовку: дата, студия, '
+    'платформа, номер сезона, количество серий. Если добавить нечего — пустая строка. '
+    'Пересказывать заголовок другими словами запрещено.\n'
+    'tags — 1-3 хэштега строчными русскими буквами. Сразу после # только буква, '
+    'не цифра.\n\n'
     'Правила:\n'
-    '1. Переводи на русский, НО не переводи названия тайтлов, студий, компаний '
-    'и сервисов (Prime Video, Target, Crunchyroll, MAPPA). Оставляй как в оригинале.\n'
-    '2. Ничего не выдумывай. Пиши только то, что есть в исходном тексте. '
-    'Если фактов мало — пусть summary будет коротким или пустым.\n'
-    '3. Никаких «в этой новости», «сообщается, что», рекламы и призывов подписаться.\n'
-    '4. relevant=false только если новость точно не про аниме, мангу, игры, '
-    'кино и сериалы, комиксы или гик-культуру.\n'
-    '5. tags: от 1 до 3 коротких русских хэштегов по сути новости.\n'
-    '6. Не добавляй эмодзи в title.'
+    '1. Названия тайтлов, студий, компаний, сервисов и имена людей НЕ переводи: '
+    'Bleach, MAPPA, Prime Video, Crunchyroll, Netflix, Target.\n'
+    '2. Названия в кавычках-ёлочках, если они кириллицей: «Атака титанов». '
+    'Латиницу оставляй без кавычек.\n'
+    '3. Только факты из исходного текста. Ничего не додумывай, не оценивай, '
+    'не добавляй мнений.\n'
+    '4. Без канцелярита: никаких «сообщается, что», «в данной новости», '
+    'призывов подписаться.\n'
+    '5. Вместо «сегодня», «завтра», «на этой неделе» пиши конкретную дату, если она '
+    'есть в тексте. Если даты нет — не упоминай срок вовсе.\n'
+    '6. topic — реальная тема новости. «прочее» ставь, только когда новость '
+    'вообще не про гик-культуру (политика, экономика, происшествия).\n\n'
+    'Пример.\n'
+    'Вход: "Bleach: Thousand-Year Blood War Part 4 opening by jo0ji revealed. '
+    'The final cour premieres October 4 on Disney+."\n'
+    'Выход: {"topic":"аниме","title":"Опенинг финальной части Bleach: '
+    'Thousand-Year Blood War — от jo0ji","summary":"Заключительный кур выходит '
+    '4 октября на Disney+.","tags":["#аниме","#опенинг"]}'
 )
+
+
+def _too_similar(a: str, b: str) -> bool:
+    """Пересказывает ли summary заголовок вместо того, чтобы дополнять его.
+
+    Сравниваем по общим словам: модель любит перефразировать заголовок, и такой
+    пост выглядит как заикание — одно и то же двумя абзацами."""
+    def stems(text):
+        # Обрезаем до основы: русские окончания меняются («карт»/«карточек»),
+        # а пересказ от этого пересказом быть не перестаёт
+        return {w[:5] for w in re.findall(r'[а-яёa-z0-9]{4,}', text.lower())}
+    wa, wb = stems(a), stems(b)
+    if not wa or not wb:
+        return False
+    overlap = len(wa & wb) / min(len(wa), len(wb))
+    return overlap >= 0.6
 
 
 def _sanity_ok(value: str, source: str, limit: int) -> bool:
@@ -7274,10 +7318,15 @@ async def _llm_enrich(news: dict) -> str:
         return 'off'
 
     # --- Фильтр непрофильного ---
-    if settings.llm_filter and data.get('relevant') is False:
-        topic = str(data.get('topic', '?'))[:30]
-        logger.info(f"⊘ Модель: новость не по теме канала ({topic}): {title[:60]}")
+    # Решаем по теме, а не по флагу relevant: модель регулярно противоречила
+    # сама себе — ставила topic="игры" (разрешённая тема) и relevant=false.
+    topic = str(data.get('topic') or '').strip().lower()
+    if topic not in LLM_TOPIC_ANY:
+        topic = 'прочее' if data.get('relevant') is False else ''
+    if settings.llm_filter and topic == 'прочее':
+        logger.info(f"⊘ Модель: новость не по теме канала: {title[:60]}")
         return 'skip'
+    news['_llm_topic'] = topic
 
     new_title = str(data.get('title') or '').strip()
     new_summary = str(data.get('summary') or '').strip()
@@ -7285,9 +7334,14 @@ async def _llm_enrich(news: dict) -> str:
     # --- Текст: только если он адекватен ---
     if settings.llm_rewrite and new_title:
         if _sanity_ok(new_title, title, 300) and _sanity_ok(new_summary, summary or title, 900):
+            # Пересказ заголовка вместо дополнения — выбрасываем, оставляя заголовок
+            if new_summary and _too_similar(new_title, new_summary):
+                logger.info(f"LLM: текст пересказывает заголовок — оставляю только его "
+                            f"({new_title[:45]})")
+                new_summary = ''
             parts = [new_title.rstrip('.') + '.' if not new_title.endswith(('.', '!', '?'))
                      else new_title]
-            if new_summary and new_summary.lower() not in new_title.lower():
+            if new_summary:
                 parts.append(_extract_sentences(new_summary, max_sentences=3, max_len=850))
             body = '\n\n'.join(p for p in parts if p)
 
@@ -7305,9 +7359,11 @@ async def _llm_enrich(news: dict) -> str:
         if isinstance(tags, list):
             clean = []
             for tag in tags[:3]:
-                tag = re.sub(r'[^0-9A-Za-zА-Яа-яЁё_]', '', str(tag))
+                tag = re.sub(r'[^0-9A-Za-zА-Яа-яЁё_]', '', str(tag)).lower()
+                # Telegram нестабильно подсвечивает теги, начинающиеся с цифры
+                tag = re.sub(r'^[0-9_]+', '', tag)
                 if 2 <= len(tag) <= 24:
-                    clean.append('#' + tag.lower())
+                    clean.append('#' + tag)
             if clean:
                 news['_llm_tags'] = ' '.join(dict.fromkeys(clean))
     return 'ok'
@@ -7366,30 +7422,47 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f'⚠️ Ошибок подряд: {_llm_fail_streak}')
     await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
 
-    # Живая проверка на настоящей новости
-    await update.message.reply_text('Проверяю связь…')
-    probe = {
-        'title': "Prime Video's biggest sci-fi show of the year redefines a cyberpunk icon",
-        'summary': 'The series premieres this fall on Prime Video. '
-                   'Studio MAPPA is handling the animation.',
-        'source': 'проверка', 'lang': 'en',
-    }
-    before = _llm_disabled_runtime
+    # Живая проверка. С аргументом — на своём тексте: /llm <заголовок>
+    custom = ' '.join(context.args or []).strip()
+    await update.message.reply_text('Проверяю…')
+    if custom:
+        probe = {'title': custom[:300], 'summary': '', 'source': 'проверка', 'lang': 'ru'}
+    else:
+        probe = {
+            'title': "Bleach: Thousand-Year Blood War Part 4 opening by jo0ji revealed",
+            'summary': 'The final cour premieres October 4 on Disney+. '
+                       'Studio Pierrot returns for the last part.',
+            'source': 'проверка', 'lang': 'en',
+        }
+    before_disabled = _llm_disabled_runtime
     result = await _llm_enrich(probe)
     if result == 'off':
         await update.message.reply_text(
             '❌ Ответа нет.\n\n'
-            + ('Ключ отклонён провайдером — проверь LLM_API_KEY.' if _llm_disabled_runtime
-               and not before else
-               'Смотри причину: /logs LLM')
-        )
+            + ('Ключ отклонён провайдером — проверь LLM_API_KEY.'
+               if _llm_disabled_runtime and not before_disabled
+               else 'Причина в логах: /logs LLM'))
         return
-    out = ['✅ Модель отвечает', '', 'Было:',
-           f'<i>{html.escape(probe["title"])}</i>', '', 'Стало:']
-    out.append(f'<b>{html.escape(probe.get("_llm_text", "(текст не заменён)"))}</b>')
+    if result == 'skip':
+        await update.message.reply_text(
+            '🚫 Модель посчитала это непрофильным и отсеяла бы такой пост.\n'
+            'Если это ошибка — выключи отсев: /settings → 🚫 Отсев не по теме')
+        return
+
+    out = ['✅ <b>Модель отвечает</b>', '', '<u>Было</u>',
+           f'<i>{html.escape(probe["title"])}</i>']
+    if probe.get('summary'):
+        out.append(f'<i>{html.escape(probe["summary"])}</i>')
+    out += ['', '<u>Стало</u>']
+    out.append(html.escape(probe.get('_llm_text') or '(текст не заменён)'))
     if probe.get('_llm_tags'):
         out.append('')
-        out.append('Теги: ' + html.escape(probe['_llm_tags']))
+        out.append(html.escape(probe['_llm_tags']))
+    out += ['', f'Тема: {html.escape(probe.get("_llm_topic") or "?")}',
+            f'Строгий JSON: {"да" if _llm_json_mode else "нет"}']
+    if not custom:
+        out.append('')
+        out.append('Проверить на своём тексте: <code>/llm заголовок новости</code>')
     await update.message.reply_text('\n'.join(out), parse_mode=ParseMode.HTML)
 
 
@@ -8341,7 +8414,7 @@ async def setup_bot_commands(app: Application) -> None:
         BotCommand("backup", "📦 Бэкап данных"),
         BotCommand("health", "🩺 Состояние бота"),
         BotCommand("videocheck", "🎬 Почему нет видео"),
-        BotCommand("llm", "🤖 Языковая модель"),
+        BotCommand("llm", "🤖 Модель: статус и проверка"),
         BotCommand("scheduled", "📅 Отложенные посты"),
         BotCommand("tz", "🕒 Часовой пояс"),
         BotCommand("sources", "📡 Динамические источники"),
