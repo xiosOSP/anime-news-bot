@@ -732,6 +732,12 @@ class BotSettings:
         'last_publish_at': '',   # когда последний раз что-то опубликовали
         'deepl_month': '',       # месяц, за который считаем символы DeepL
         'deepl_chars': 0,        # израсходовано символов DeepL за месяц
+        'llm_enabled': True,     # использовать языковую модель (если задан ключ)
+        'llm_rewrite': True,     # брать у модели перевод и текст поста
+        'llm_filter': True,      # отсеивать непрофильные новости
+        'llm_tags': True,        # добавлять хэштеги
+        'llm_day': '',           # сутки, за которые считаем вызовы
+        'llm_calls_today': 0,    # сколько вызовов модели сделано сегодня
     }
 
     def __init__(self, path: Path):
@@ -865,6 +871,63 @@ class BotSettings:
     @image_dedup.setter
     def image_dedup(self, value: bool) -> None:
         self._data['image_dedup'] = bool(value)
+        self.save()
+
+    @property
+    def llm_enabled(self) -> bool:
+        return bool(self._data.get('llm_enabled', True))
+
+    @llm_enabled.setter
+    def llm_enabled(self, value: bool) -> None:
+        self._data['llm_enabled'] = bool(value)
+        self.save()
+
+    @property
+    def llm_rewrite(self) -> bool:
+        return bool(self._data.get('llm_rewrite', True))
+
+    @llm_rewrite.setter
+    def llm_rewrite(self, value: bool) -> None:
+        self._data['llm_rewrite'] = bool(value)
+        self.save()
+
+    @property
+    def llm_filter(self) -> bool:
+        return bool(self._data.get('llm_filter', True))
+
+    @llm_filter.setter
+    def llm_filter(self, value: bool) -> None:
+        self._data['llm_filter'] = bool(value)
+        self.save()
+
+    @property
+    def llm_tags(self) -> bool:
+        return bool(self._data.get('llm_tags', True))
+
+    @llm_tags.setter
+    def llm_tags(self, value: bool) -> None:
+        self._data['llm_tags'] = bool(value)
+        self.save()
+
+    @property
+    def llm_day(self) -> str:
+        return str(self._data.get('llm_day', ''))
+
+    @llm_day.setter
+    def llm_day(self, value: str) -> None:
+        self._data['llm_day'] = str(value)
+        self.save()
+
+    @property
+    def llm_calls_today(self) -> int:
+        try:
+            return int(self._data.get('llm_calls_today', 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @llm_calls_today.setter
+    def llm_calls_today(self, value: int) -> None:
+        self._data['llm_calls_today'] = max(0, int(value))
         self.save()
 
     @property
@@ -1008,6 +1071,7 @@ class BotStats:
                 'skipped_too_old': 0,     # отброшено по возрасту
                 'skipped_duplicate': 0,   # отброшено как дубль
                 'skipped_spam': 0,        # Reddit-megathread и подобное
+                'skipped_filtered': 0,    # отсеяно языковой моделью как не по теме
                 'failed_send': 0,         # реальные ошибки отправки в Telegram
                 'source_errors': 0,       # источник упал при сборе
             },
@@ -1092,7 +1156,7 @@ class BotStats:
             self._save()
 
     async def record_skipped(self, reason: str, source: Optional[str] = None) -> None:
-        """Пост отброшен. reason: no_image / too_old / duplicate / spam."""
+        """Пост отброшен. reason: no_image / too_old / duplicate / spam / filtered."""
         key = f'skipped_{reason}'
         async with self._lock:
             if key in self._data['totals']:
@@ -3715,6 +3779,20 @@ def _format_post_date(published_struct) -> str:
     return f'{pub.day} {RU_MONTHS.get(pub.month, "")}'.strip()
 
 
+def _with_tags(text: str, news: dict) -> str:
+    """Дописывает хэштеги от модели в конец поста.
+
+    Настройку проверяем именно здесь, а не только при обращении к модели:
+    пост мог пролежать в ветке с уже готовыми тегами, а админ тем временем
+    их выключил — в канал они уйти не должны."""
+    if settings is not None and not getattr(settings, 'llm_tags', True):
+        return text
+    tags = news.get('_llm_tags')
+    if not tags or tags in text:
+        return text
+    return f'{text}\n\n{tags}'
+
+
 def format_news_short(news: dict) -> str:
     """Короткий формат поста: заголовок + одно предложение сути + дата.
     Используется и для канала, и для ветки. Без воды.
@@ -3723,6 +3801,10 @@ def format_news_short(news: dict) -> str:
     edited = news.get('_edited_text')
     if edited:
         return edited
+    # Текст от языковой модели (если она включена и ответила адекватно)
+    llm_text = news.get('_llm_text')
+    if llm_text:
+        return _with_tags(llm_text, news)
     is_ru = news.get('lang') == 'ru'
 
     # Эпизоды форматируем отдельно (они и так короткие); парсер английский
@@ -3771,6 +3853,7 @@ def format_news_short(news: dict) -> str:
     body = '\n\n'.join(parts)
     if date_str:
         body += f'\n\n📅 {date_str}'
+    body = _with_tags(body, news)
     return body
 
 
@@ -5155,6 +5238,13 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
     # заголовками текстовый дедуп не ловит. Ссылка уже claim-нута, так что
     # повторно скачивать эту новость в следующих циклах бот не будет.
     await _improve_thumb(news)
+
+    # Языковая модель: перевод, чистый текст, теги и отсев непрофильного.
+    # Стоит после дедупов, чтобы не тратить лимит на повторы.
+    if await _llm_enrich(news) == 'skip':
+        await stats.record_skipped('filtered', source)
+        return 'skipped_filter'
+
     dup_title = await _image_duplicate(news)
     if dup_title:
         logger.info(f"⊘ Картинка уже публиковалась («{dup_title[:40]}»): "
@@ -5375,6 +5465,26 @@ def build_settings_menu() -> InlineKeyboardMarkup:
                      else "⏸ Автопауза мёртвых источников: ВЫКЛ")
     backup_label = ("📦 Ежедневный бэкап: ВКЛ" if settings.daily_backup
                     else "📦 Ежедневный бэкап: ВЫКЛ")
+    llm_rows = []
+    if _llm_configured():
+        llm_rows = [
+            [InlineKeyboardButton(
+                "🤖 Языковая модель: ВКЛ" if settings.llm_enabled
+                else "🤖 Языковая модель: ВЫКЛ",
+                callback_data="settings:toggle_llm")],
+            [InlineKeyboardButton(
+                "  📝 Перевод и текст: ВКЛ" if settings.llm_rewrite
+                else "  📝 Перевод и текст: ВЫКЛ",
+                callback_data="settings:toggle_llm_rewrite")],
+            [InlineKeyboardButton(
+                "  🚫 Отсев не по теме: ВКЛ" if settings.llm_filter
+                else "  🚫 Отсев не по теме: ВЫКЛ",
+                callback_data="settings:toggle_llm_filter")],
+            [InlineKeyboardButton(
+                "  #️⃣ Хэштеги: ВКЛ" if settings.llm_tags
+                else "  #️⃣ Хэштеги: ВЫКЛ",
+                callback_data="settings:toggle_llm_tags")],
+        ]
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📡 Источники", callback_data="settings:sources")],
         [InlineKeyboardButton("🔁 Интервал автопроверки", callback_data="settings:interval")],
@@ -5386,6 +5496,7 @@ def build_settings_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(dedup_label, callback_data="settings:toggle_dedup")],
         [InlineKeyboardButton(autodis_label, callback_data="settings:toggle_autodis")],
         [InlineKeyboardButton(backup_label, callback_data="settings:toggle_backup")],
+        *llm_rows,
         [InlineKeyboardButton("🎬 Видео", callback_data="settings:video")],
         [InlineKeyboardButton(img_label, callback_data="settings:toggle_require_image")],
         [InlineKeyboardButton("📦 Очередь постов", callback_data="settings:queue")],
@@ -5842,6 +5953,25 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         await query.edit_message_text(text, reply_markup=build_settings_menu())
         return
+
+    if data.startswith("settings:toggle_llm"):
+        field = {
+            'settings:toggle_llm': ('llm_enabled', 'Языковая модель'),
+            'settings:toggle_llm_rewrite': ('llm_rewrite', 'Перевод и текст'),
+            'settings:toggle_llm_filter': ('llm_filter', 'Отсев не по теме'),
+            'settings:toggle_llm_tags': ('llm_tags', 'Хэштеги'),
+        }.get(data)
+        if field:
+            attr, human = field
+            setattr(settings, attr, not getattr(settings, attr))
+            state = 'включено' if getattr(settings, attr) else 'выключено'
+            await query.answer(f'{human}: {state}')
+            note = f'🤖 {human}: {state.upper()}'
+            if attr == 'llm_enabled' and not settings.llm_enabled:
+                note += '\n\nБот вернулся к переводу через DeepL/Google.'
+            await query.edit_message_text(f"⚙️ Настройки\n\n{note}",
+                                          reply_markup=build_settings_menu())
+            return
 
     if data == "settings:toggle_dedup":
         settings.image_dedup = not settings.image_dedup
@@ -6826,9 +6956,446 @@ def _scheduled_status_block(context) -> str:
     return f"{job_line}\n{sched_line}\n"
 
 
+# ============== ЯЗЫКОВАЯ МОДЕЛЬ (перевод, текст, фильтр, теги) ==============
+# Работаем через формат OpenAI chat/completions — его понимают Mistral, Groq,
+# Gemini, OpenRouter, Cerebras, NVIDIA и почти все остальные. Поэтому смена
+# провайдера — это две переменные окружения, а не правка кода.
+#
+# Настройка на хостинге:
+#   LLM_PROVIDER=mistral   (или groq / gemini / openrouter / nvidia / cerebras)
+#   LLM_API_KEY=<ключ>
+# Необязательно: LLM_MODEL, LLM_BASE_URL — если хочется другую модель/адрес.
+
+LLM_PRESETS = {
+    'mistral':    ('https://api.mistral.ai/v1', 'mistral-small-latest'),
+    'groq':       ('https://api.groq.com/openai/v1', 'llama-3.3-70b-versatile'),
+    'gemini':     ('https://generativelanguage.googleapis.com/v1beta/openai',
+                   'gemini-2.0-flash'),
+    'openrouter': ('https://openrouter.ai/api/v1', 'google/gemma-3-27b-it:free'),
+    'nvidia':     ('https://integrate.api.nvidia.com/v1', 'meta/llama-3.3-70b-instruct'),
+    'cerebras':   ('https://api.cerebras.ai/v1', 'llama-3.3-70b'),
+}
+
+LLM_PROVIDER = _env('LLM_PROVIDER', '').strip().lower()
+LLM_API_KEY = _env('LLM_API_KEY', '').strip()
+_preset = LLM_PRESETS.get(LLM_PROVIDER, ('', ''))
+LLM_BASE_URL = (_env('LLM_BASE_URL', '').strip() or _preset[0]).rstrip('/')
+LLM_MODEL = _env('LLM_MODEL', '').strip() or _preset[1]
+LLM_TIMEOUT = _env_int('LLM_TIMEOUT', 30)
+LLM_MIN_INTERVAL = float(_env('LLM_MIN_INTERVAL', '1.2'))   # сек между запросами
+LLM_DAILY_LIMIT = _env_int('LLM_DAILY_LIMIT', 900)          # страховка от лимитов
+
+_llm_lock = asyncio.Lock()          # запросы строго по одному (лимит req/sec)
+_llm_last_call = 0.0
+_llm_fail_streak = 0                # подряд неудачных вызовов
+LLM_FAIL_PAUSE_AFTER = 5            # столько провалов подряд → пауза до рестарта
+_llm_disabled_runtime = False       # выключено на лету из-за ошибок/лимита
+
+
+def _llm_configured() -> bool:
+    """Заданы ли ключ, адрес и модель."""
+    return bool(LLM_API_KEY and LLM_BASE_URL and LLM_MODEL)
+
+
+def _llm_active() -> bool:
+    """Можно ли прямо сейчас обращаться к модели."""
+    if not _llm_configured() or _llm_disabled_runtime:
+        return False
+    return bool(settings is not None and settings.llm_enabled)
+
+
+def _llm_quota_left() -> int:
+    """Сколько вызовов осталось на сегодня по нашему счётчику."""
+    if settings is None:
+        return 0
+    today = _local_now().strftime('%Y-%m-%d')
+    used = settings.llm_calls_today if settings.llm_day == today else 0
+    return max(0, LLM_DAILY_LIMIT - used)
+
+
+def _llm_count_call() -> None:
+    """Прибавляет вызов к дневному счётчику (и обнуляет его в новые сутки)."""
+    if settings is None:
+        return
+    today = _local_now().strftime('%Y-%m-%d')
+    if settings.llm_day != today:
+        settings.llm_day = today
+        settings.llm_calls_today = 0
+    settings.llm_calls_today = settings.llm_calls_today + 1
+
+
+def _llm_request(messages: list, max_tokens: int = 700) -> Optional[str]:
+    """Синхронный запрос к модели. Возвращает текст ответа или None.
+
+    Никаких исключений наружу: если модель недоступна, бот обязан продолжить
+    работать по-старому — через DeepL/Google и обычное форматирование."""
+    global _llm_fail_streak, _llm_disabled_runtime
+    try:
+        r = requests.post(
+            f'{LLM_BASE_URL}/chat/completions',
+            headers={'Authorization': f'Bearer {LLM_API_KEY}',
+                     'Content-Type': 'application/json'},
+            json={
+                'model': LLM_MODEL,
+                'messages': messages,
+                'temperature': 0.2,       # факты важнее фантазии
+                'max_tokens': max_tokens,
+            },
+            timeout=LLM_TIMEOUT,
+        )
+    except Exception as e:
+        _llm_fail_streak += 1
+        logger.warning(f"LLM: запрос не удался ({type(e).__name__}: {e})")
+        return None
+
+    if r.status_code == 429:
+        _llm_fail_streak += 1
+        logger.warning("LLM: провайдер вернул 429 (лимит запросов) — притормаживаю")
+        return None
+    if r.status_code in (401, 403):
+        _llm_disabled_runtime = True
+        logger.error(f"LLM: ключ отклонён (HTTP {r.status_code}) — выключаю до рестарта")
+        _queue_admin_alert('🤖 Языковая модель отключена: провайдер не принял ключ '
+                           f'(HTTP {r.status_code}). Проверь LLM_API_KEY. '
+                           'Бот продолжает работать на DeepL/Google.')
+        return None
+    if r.status_code != 200:
+        _llm_fail_streak += 1
+        logger.warning(f"LLM: HTTP {r.status_code} — {r.text[:150]}")
+        return None
+
+    try:
+        data = r.json()
+        content = data['choices'][0]['message']['content']
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        _llm_fail_streak += 1
+        logger.warning(f"LLM: непонятный ответ ({e})")
+        return None
+
+    _llm_fail_streak = 0
+    return (content or '').strip()
+
+
+async def _llm_call(messages: list, max_tokens: int = 700) -> Optional[str]:
+    """Вызов модели с соблюдением лимитов: по одному запросу за раз,
+    с паузой между ними и дневным потолком."""
+    global _llm_last_call, _llm_disabled_runtime
+    if not _llm_active():
+        return None
+    if _llm_quota_left() <= 0:
+        if not _llm_disabled_runtime:
+            logger.info(f"LLM: дневной лимит {LLM_DAILY_LIMIT} исчерпан — "
+                        f"до завтра работаю без модели")
+        return None
+    if _llm_fail_streak >= LLM_FAIL_PAUSE_AFTER:
+        if not _llm_disabled_runtime:
+            _llm_disabled_runtime = True
+            logger.error(f"LLM: {_llm_fail_streak} ошибок подряд — выключаю до рестарта")
+            _queue_admin_alert('🤖 Языковая модель отключена: слишком много ошибок подряд. '
+                               'Бот продолжает работать на DeepL/Google. Подробности — /llm')
+        return None
+
+    async with _llm_lock:
+        wait = LLM_MIN_INTERVAL - (time.time() - _llm_last_call)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _llm_count_call()
+        result = await asyncio.to_thread(_llm_request, messages, max_tokens)
+        _llm_last_call = time.time()
+    return result
+
+
+def _llm_parse_json(raw: str) -> Optional[dict]:
+    """Достаёт JSON из ответа модели (та любит обрамлять его ```json)."""
+    if not raw:
+        return None
+    text = raw.strip()
+    if text.startswith('```'):
+        text = re.sub(r'^```[a-zA-Z]*\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
+    try:
+        data = json.loads(text)
+    except ValueError:
+        m = re.search(r'\{.*\}', text, re.S)      # вдруг вокруг есть болтовня
+        if not m:
+            return None
+        try:
+            data = json.loads(m.group(0))
+        except ValueError:
+            return None
+    return data if isinstance(data, dict) else None
+
+
+LLM_SYSTEM_PROMPT = (
+    'Ты — редактор Telegram-канала об аниме, манге, играх и кино. '
+    'Тебе дают сырую новость. Верни ТОЛЬКО JSON, без пояснений и без markdown.\n\n'
+    'Формат:\n'
+    '{"relevant": true|false, "topic": "аниме|манга|игры|кино|прочее", '
+    '"title": "заголовок на русском", "summary": "1-3 предложения на русском", '
+    '"tags": ["#тег1", "#тег2"]}\n\n'
+    'Правила:\n'
+    '1. Переводи на русский, НО не переводи названия тайтлов, студий, компаний '
+    'и сервисов (Prime Video, Target, Crunchyroll, MAPPA). Оставляй как в оригинале.\n'
+    '2. Ничего не выдумывай. Пиши только то, что есть в исходном тексте. '
+    'Если фактов мало — пусть summary будет коротким или пустым.\n'
+    '3. Никаких «в этой новости», «сообщается, что», рекламы и призывов подписаться.\n'
+    '4. relevant=false только если новость точно не про аниме, мангу, игры, '
+    'кино и сериалы, комиксы или гик-культуру.\n'
+    '5. tags: от 1 до 3 коротких русских хэштегов по сути новости.\n'
+    '6. Не добавляй эмодзи в title.'
+)
+
+
+def _sanity_ok(value: str, source: str, limit: int) -> bool:
+    """Защита от выдумок: результат не должен быть подозрительно длиннее исходника."""
+    if len(value) > limit:
+        return False
+    return len(value) <= max(len(source) * 3 + 120, 200)
+
+
+async def _llm_enrich(news: dict) -> str:
+    """Прогоняет новость через модель: перевод, чистый текст, тема и теги.
+
+    Возвращает:
+      'off'  — модель не используется, работаем как раньше;
+      'ok'   — обогатили (результат лежит в news['_llm_*']);
+      'skip' — модель считает новость непрофильной, пост публиковать не надо."""
+    if not _llm_active():
+        return 'off'
+    title = (news.get('title') or '').strip()
+    if not title:
+        return 'off'
+    summary = re.sub(r'\s+', ' ', (news.get('summary') or '')).strip()[:1500]
+
+    payload = (f'Источник: {news.get("source", "?")}\n'
+               f'Заголовок: {title}\n'
+               f'Текст: {summary or "(нет)"}')
+    raw = await _llm_call([
+        {'role': 'system', 'content': LLM_SYSTEM_PROMPT},
+        {'role': 'user', 'content': payload},
+    ])
+    data = _llm_parse_json(raw or '')
+    if not data:
+        if raw:
+            logger.info(f"LLM: ответ не разобрался, беру обычный путь — {raw[:80]}")
+        return 'off'
+
+    # --- Фильтр непрофильного ---
+    if settings.llm_filter and data.get('relevant') is False:
+        topic = str(data.get('topic', '?'))[:30]
+        logger.info(f"⊘ Модель: новость не по теме канала ({topic}): {title[:60]}")
+        return 'skip'
+
+    new_title = str(data.get('title') or '').strip()
+    new_summary = str(data.get('summary') or '').strip()
+
+    # --- Текст: только если он адекватен ---
+    if settings.llm_rewrite and new_title:
+        if _sanity_ok(new_title, title, 300) and _sanity_ok(new_summary, summary or title, 900):
+            parts = [new_title.rstrip('.') + '.' if not new_title.endswith(('.', '!', '?'))
+                     else new_title]
+            if new_summary and new_summary.lower() not in new_title.lower():
+                parts.append(_extract_sentences(new_summary, max_sentences=3, max_len=850))
+            body = '\n\n'.join(p for p in parts if p)
+
+            date_str = extract_release_date_from_text(
+                (news.get('title') or '') + ' ' + (news.get('summary') or '')[:600])
+            if date_str:
+                body += f'\n\n📅 {date_str}'
+            news['_llm_text'] = body
+        else:
+            logger.info(f"LLM: ответ подозрительно длинный, беру обычный путь: {title[:50]}")
+
+    # --- Теги ---
+    if settings.llm_tags:
+        tags = data.get('tags')
+        if isinstance(tags, list):
+            clean = []
+            for tag in tags[:3]:
+                tag = re.sub(r'[^0-9A-Za-zА-Яа-яЁё_]', '', str(tag))
+                if 2 <= len(tag) <= 24:
+                    clean.append('#' + tag.lower())
+            if clean:
+                news['_llm_tags'] = ' '.join(dict.fromkeys(clean))
+    return 'ok'
+
+
+def _tg_channels_available() -> list[tuple[str, str]]:
+    """Все подключённые Telegram-каналы: [(канал, метка)]."""
+    out = list(TELEGRAM_CHANNELS)
+    if custom_sources is not None:
+        for item in custom_sources.all():
+            if item.get('type') == 'tg':
+                pair = (item['value'], item['label'])
+                if pair not in out:
+                    out.append(pair)
+    return out
+
+
+def _post_number(link: str) -> str:
+    """'https://t.me/ch/22342' → '22342'."""
+    return (link or '').rstrip('/').split('/')[-1] or '?'
+
+
+@admin_only
+async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Состояние языковой модели и живая проверка связи."""
+    lines = ['🤖 <b>Языковая модель</b>', '']
+    if not _llm_configured():
+        lines.append('❌ Не настроена.')
+        lines.append('')
+        lines.append('Задай на хостинге две переменные:')
+        lines.append('  <code>LLM_PROVIDER</code> — '
+                     + ' / '.join(sorted(LLM_PRESETS)))
+        lines.append('  <code>LLM_API_KEY</code> — ключ провайдера')
+        lines.append('')
+        lines.append('Необязательно: <code>LLM_MODEL</code>, <code>LLM_BASE_URL</code> — '
+                     'если нужна другая модель или адрес.')
+        lines.append('')
+        lines.append('Пока не настроена, бот переводит через DeepL/Google — как раньше.')
+        await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    used = settings.llm_calls_today if settings.llm_day == _local_now().strftime('%Y-%m-%d') else 0
+    lines.append(f'Провайдер: {html.escape(LLM_PROVIDER or "свой адрес")}')
+    lines.append(f'Модель: <code>{html.escape(LLM_MODEL)}</code>')
+    lines.append(f'Адрес: <code>{html.escape(LLM_BASE_URL)}</code>')
+    lines.append('')
+    lines.append('Включено: ' + ('ДА' if settings.llm_enabled else 'НЕТ'))
+    lines.append('  📝 Перевод и текст: ' + ('ВКЛ' if settings.llm_rewrite else 'ВЫКЛ'))
+    lines.append('  🚫 Отсев не по теме: ' + ('ВКЛ' if settings.llm_filter else 'ВЫКЛ'))
+    lines.append('  #️⃣ Хэштеги: ' + ('ВКЛ' if settings.llm_tags else 'ВЫКЛ'))
+    lines.append('')
+    lines.append(f'Вызовов сегодня: {used} из {LLM_DAILY_LIMIT}')
+    if _llm_disabled_runtime:
+        lines.append('⚠️ Временно отключена из-за ошибок — вернётся после перезапуска')
+    elif _llm_fail_streak:
+        lines.append(f'⚠️ Ошибок подряд: {_llm_fail_streak}')
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
+
+    # Живая проверка на настоящей новости
+    await update.message.reply_text('Проверяю связь…')
+    probe = {
+        'title': "Prime Video's biggest sci-fi show of the year redefines a cyberpunk icon",
+        'summary': 'The series premieres this fall on Prime Video. '
+                   'Studio MAPPA is handling the animation.',
+        'source': 'проверка', 'lang': 'en',
+    }
+    before = _llm_disabled_runtime
+    result = await _llm_enrich(probe)
+    if result == 'off':
+        await update.message.reply_text(
+            '❌ Ответа нет.\n\n'
+            + ('Ключ отклонён провайдером — проверь LLM_API_KEY.' if _llm_disabled_runtime
+               and not before else
+               'Смотри причину: /logs LLM')
+        )
+        return
+    out = ['✅ Модель отвечает', '', 'Было:',
+           f'<i>{html.escape(probe["title"])}</i>', '', 'Стало:']
+    out.append(f'<b>{html.escape(probe.get("_llm_text", "(текст не заменён)"))}</b>')
+    if probe.get('_llm_tags'):
+        out.append('')
+        out.append('Теги: ' + html.escape(probe['_llm_tags']))
+    await update.message.reply_text('\n'.join(out), parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def videocheck_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Живая проверка: почему у постов канала не прикрепляется видео.
+
+    Отвечает прямо в чат, а не в лог: диагностика видео пишется в начале цикла
+    проверки, и в хвосте /logs её уже не видно."""
+    channels = _tg_channels_available()
+    arg = (context.args or [''])[0].strip().lstrip('@')
+    if not arg:
+        listing = '\n'.join(f'  • {ch}' for ch, _lbl in channels[:20]) or '  (нет)'
+        await update.message.reply_text(
+            '🎬 Проверка видео в канале\n\n'
+            'Формат: /videocheck <канал>\n\n'
+            f'Подключённые каналы:\n{listing}')
+        return
+
+    match = next(((ch, lbl) for ch, lbl in channels if ch.lower() == arg.lower()), None)
+    channel, label = match if match else (arg, f'TG: {arg}')
+
+    # Настройки важнее всего: при выключенном видео остальное не имеет значения
+    head = ['🎬 <b>Проверка видео</b>', f'Канал: @{html.escape(channel)}', '']
+    if not settings.video_enabled:
+        head.append('⚠️ <b>Настройка «🎬 Видео» ВЫКЛЮЧЕНА</b>')
+        head.append('Пока она выключена, ролики не прикрепляются ни при каких условиях.')
+        head.append('Включить: /settings → 🎬 Видео')
+    else:
+        head.append('🎬 Видео: ВКЛ')
+    head.append(f'Лимит длительности: {TG_VIDEO_MAX_SECONDS // 60} мин')
+    head.append(f'Лимит размера файла: {TG_VIDEO_MAX_MB} МБ')
+    head.append('')
+    await update.message.reply_text('\n'.join(head), parse_mode=ParseMode.HTML)
+
+    await update.message.reply_text('Забираю посты канала…')
+    try:
+        posts = await asyncio.to_thread(get_telegram_channel, channel, label)
+    except Exception as e:
+        await update.message.reply_text(f'❌ Канал не прочитался: {type(e).__name__}: {e}')
+        return
+    if not posts:
+        await update.message.reply_text(
+            '❌ Постов не получено. Канал закрыт, переименован или Telegram '
+            'не отдал страницу серверу.')
+        return
+
+    video_posts = [p for p in posts if p.get('_video_note')]
+    lines = [f'Постов получено: {len(posts)}, из них с видео: {len(video_posts)}']
+    if not video_posts:
+        lines.append('')
+        lines.append('В свежих постах видео нет — проверить нечего. '
+                     'Дождись поста с роликом и повтори.')
+        await update.message.reply_text('\n'.join(lines))
+        return
+
+    for post in video_posts[:5]:
+        num = _post_number(post.get('link', ''))
+        note = post.get('_video_note', '')
+        block = ['', f'📹 <b>Пост {html.escape(num)}</b>',
+                 f'  Разбор: {html.escape(note)}']
+        url = post.get('video')
+        if not url:
+            block.append('  Итог: ❌ ролика нет — уйдёт кадр-превью')
+        else:
+            block.append(f'  Ссылка: <code>{html.escape(url[:60])}…</code>')
+            resolved = await _resolve_video(url)
+            if resolved is None:
+                block.append('  Скачивание: ❌ файл не отдался '
+                             '(см. строку «Медиа не скачалось» в /logs)')
+                block.append('  Итог: ❌ уйдёт кадр-превью')
+            elif isinstance(resolved, (bytes, bytearray)):
+                mb = len(resolved) / (1024 * 1024)
+                block.append(f'  Скачивание: ✅ {mb:.1f} МБ')
+                block.append('  Итог: ✅ видео прикрепится')
+            else:
+                block.append('  Скачивание: не требуется (обычный хост)')
+                block.append('  Итог: ✅ видео прикрепится')
+        lines.extend(block)
+
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
+
+    if all(not p.get('video') for p in video_posts):
+        await update.message.reply_text(
+            'ℹ️ Ни у одного поста нет прямой ссылки на файл.\n\n'
+            'Это значит, что Telegram не отдаёт видео веб-странице канала — '
+            'чаще всего из-за включённой в канале защиты контента. '
+            'Обойти это можно только через пользовательский аккаунт '
+            '(Telethon), а не через бота. Кадр-превью остаётся рабочим '
+            'компромиссом.')
+
+
 @admin_only
 async def logs_command(update, context: ContextTypes.DEFAULT_TYPE):
-    """Присылает последние строки лог-файла в личку админу."""
+    """Присылает последние строки лога. С аргументом — только строки с этим словом.
+
+    Фильтр нужен потому, что интересное (диагностика видео, ошибки источников)
+    пишется в начале цикла, а в хвост последних 50 строк попадает уже только
+    публикация — искомого там просто нет. Пример: /logs видео"""
     if not LOG_FILE.exists():
         await update.message.reply_text("📝 Лог-файла нет (бот, видимо, недавно запущен).")
         return
@@ -6848,6 +7415,15 @@ async def logs_command(update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Не удалось прочитать лог: {e}")
         return
 
+    needle = ' '.join(context.args or []).strip().lower()
+    if needle:
+        lines = [ln for ln in lines if needle in ln.lower()]
+        if not lines:
+            await update.message.reply_text(
+                f"📝 Строк со словом «{needle}» в логе нет.\n\n"
+                f"Подсказки: /logs видео • /logs ошибка • /logs отложк")
+            return
+
     tail = lines[-LOG_TAIL_LINES:] if len(lines) > LOG_TAIL_LINES else lines
     if not tail:
         await update.message.reply_text("📝 Лог пуст.")
@@ -6855,7 +7431,9 @@ async def logs_command(update, context: ContextTypes.DEFAULT_TYPE):
 
     text = ''.join(tail)
     # Telegram message limit = 4096 chars. Обрезаем с начала если не влезает.
-    header = f"📝 Последние {len(tail)} строк лога ({LOG_FILE.name}):\n\n"
+    header = (f"📝 Последние {len(tail)} строк"
+              + (f" со словом «{needle}»" if needle else "")
+              + f" ({LOG_FILE.name}):\n\n")
     body_limit = 4096 - len(header) - 10  # запас
     if len(text) > body_limit:
         text = '…\n' + text[-(body_limit - 2):]
@@ -7245,6 +7823,11 @@ async def send_startup_report(app) -> None:
     lines.append('🎬 Видео: ' + ('ВКЛ' if settings.video_enabled else 'ВЫКЛ')
                  + f' (до {TG_VIDEO_MAX_SECONDS // 60} мин)')
     lines.append('🖼 Дедуп по картинке: ' + ('ВКЛ' if settings.image_dedup else 'ВЫКЛ'))
+    if _llm_configured():
+        lines.append(f'🤖 Модель: {html.escape(LLM_MODEL)} '
+                     + ('(вкл)' if settings.llm_enabled else '(выкл)'))
+    else:
+        lines.append('🤖 Модель: не настроена — перевод через DeepL/Google')
     lines.append('👥 Кнопки в ветке: ' + ('для всех' if settings.open_moderation else 'только админы'))
     lines.append(f'🕒 Часовой пояс: UTC{_tz_offset():+d}, сейчас {_local_now():%d.%m %H:%M}')
     lines.append('')
@@ -7386,6 +7969,16 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
     used, month = _deepl_usage_local()
     lines.append('')
     lines.append('<b>Переводчик</b>')
+    if _llm_configured():
+        today = _local_now().strftime('%Y-%m-%d')
+        llm_used = settings.llm_calls_today if settings.llm_day == today else 0
+        if not settings.llm_enabled:
+            lines.append('  🤖 Модель: выключена в настройках')
+        elif _llm_disabled_runtime:
+            lines.append('  🤖 Модель: ⚠️ отключена из-за ошибок (см. /llm)')
+        else:
+            lines.append(f'  🤖 Модель {html.escape(LLM_MODEL)}: '
+                         f'{llm_used} из {LLM_DAILY_LIMIT} вызовов сегодня')
     if DEEPL_API_KEY:
         share = used / DEEPL_MONTHLY_LIMIT * 100 if DEEPL_MONTHLY_LIMIT else 0
         lines.append(f'  📝 DeepL за {month}: {used} симв. (~{share:.0f}% лимита)')
@@ -7521,6 +8114,7 @@ async def stats_command(update, context: ContextTypes.DEFAULT_TYPE):
         + totals.get('skipped_too_old', 0)
         + totals.get('skipped_duplicate', 0)
         + totals.get('skipped_spam', 0)
+        + totals.get('skipped_filtered', 0)
     )
     lines.append(f'  ⊘ Отброшено: {skipped_total}')
     lines.append(f'      без фото: {totals.get("skipped_no_image", 0)}')
@@ -7626,6 +8220,8 @@ async def setup_bot_commands(app: Application) -> None:
         BotCommand("deepl", "🌐 Лимит DeepL"),
         BotCommand("backup", "📦 Бэкап данных"),
         BotCommand("health", "🩺 Состояние бота"),
+        BotCommand("videocheck", "🎬 Почему нет видео"),
+        BotCommand("llm", "🤖 Языковая модель"),
         BotCommand("scheduled", "📅 Отложенные посты"),
         BotCommand("tz", "🕒 Часовой пояс"),
         BotCommand("sources", "📡 Динамические источники"),
@@ -7719,6 +8315,8 @@ def main():
     app.add_handler(CommandHandler("deepl", deepl_command))
     app.add_handler(CommandHandler("backup", backup_command))
     app.add_handler(CommandHandler("health", health_command))
+    app.add_handler(CommandHandler("videocheck", videocheck_command))
+    app.add_handler(CommandHandler("llm", llm_command))
     app.add_handler(CommandHandler("scheduled", scheduled_command))
     app.add_handler(CommandHandler("tz", tz_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
