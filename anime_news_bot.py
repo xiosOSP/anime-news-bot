@@ -3321,6 +3321,42 @@ def _extract_video_url(html_text: str):
     return None, duration, '', thumb
 
 
+def _ytdlp_telegram_video(post_id: str):
+    """Последняя попытка достать видео — через yt-dlp (экстрактор telegram:embed).
+
+    Он понимает ссылки вида t.me/канал/номер и вытаскивает прямую ссылку на файл
+    там, где её нет в HTML: yt-dlp разбирает служебные данные страницы, до которых
+    обычным парсингом не добраться. Сам файл НЕ качаем — берём только адрес,
+    чтобы дальше применить свои лимиты по размеру.
+    Возвращает (ссылка, длительность, кадр-превью)."""
+    if not YT_DLP_AVAILABLE:
+        return None, None, None
+    url = f'https://t.me/{post_id}'
+    opts = {
+        'quiet': True, 'no_warnings': True, 'skip_download': True,
+        'noplaylist': True, 'socket_timeout': 20, 'retries': 1,
+        'extractor_args': {'generic': {'impersonate': ['']}},
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        logger.info(f"  {post_id}: yt-dlp — не смог ({type(e).__name__}: {str(e)[:90]})")
+        return None, None, None
+    if not info:
+        return None, None, None
+    if info.get('_type') == 'playlist':          # в посте несколько видео
+        entries = [e for e in (info.get('entries') or []) if e]
+        info = entries[0] if entries else {}
+    direct = info.get('url')
+    if not direct:
+        formats = [f for f in (info.get('formats') or []) if f.get('url')]
+        direct = formats[-1]['url'] if formats else None
+    if direct:
+        logger.info(f"  {post_id}: yt-dlp — нашёл видео")
+    return direct, info.get('duration'), info.get('thumbnail')
+
+
 def _fetch_video_from_embed(post_id: str):
     """Пробует достать прямой mp4 со страницы отдельного поста.
 
@@ -3352,7 +3388,12 @@ def _fetch_video_from_embed(post_id: str):
         logger.info(f"  {post_id}: {kind} — mp4 нет "
                     f"({'пост загружен, ссылки на файл в HTML не оказалось' if has_post else 'пост не отдался (приватный/защищённый?)'})"
                     + (', но забрал полноразмерный кадр' if best_thumb else ''))
-    return None, None, best_thumb
+
+    # HTML ничего не дал — пробуем yt-dlp, он копает глубже
+    direct, duration, thumb = _ytdlp_telegram_video(post_id)
+    if direct:
+        return direct, duration, thumb or best_thumb
+    return None, None, best_thumb or thumb
 
 
 def get_telegram_channel(channel: str, label: str) -> list[dict]:
@@ -3447,8 +3488,12 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
                     # Кадр со страницы поста всегда лучше размытой заглушки из ленты
                     video_thumb = embed_thumb
                 if direct:
-                    dur_s = dur_s if dur_s is not None else embed_dur
-                    video_note = 'mp4 добыт со страницы поста'
+                    # Источники длительности могут расходиться (подпись в ленте
+                    # против метаданных файла) — берём большее, чтобы случайно
+                    # не протащить ролик длиннее лимита.
+                    known = [d for d in (dur_s, embed_dur) if d]
+                    dur_s = max(known) if known else None
+                    video_note = 'ссылка добыта со страницы поста'
 
             if direct and (dur_s is None or dur_s <= TG_VIDEO_MAX_SECONDS):
                 video_url = direct
@@ -7853,9 +7898,11 @@ def _optional_deps_report() -> list[str]:
         f"  {'🟢' if Image is not None else '🟡'} Pillow: "
         + ('есть (перцептивный дедуп картинок)' if Image is not None
            else 'нет (дедуп только по точным копиям)'),
-        f"  {'🟢' if YT_DLP_AVAILABLE else '🟡'} yt-dlp: "
-        + ('есть' if YT_DLP_AVAILABLE else 'нет (YouTube-видео не качаются, TG-видео работают)'),
-        f"  {'🟢' if ffmpeg else '🟡'} ffmpeg: " + ('есть' if ffmpeg else 'нет'),
+        f"  {'🟢' if YT_DLP_AVAILABLE else '🔴'} yt-dlp: "
+        + ('есть (запасной способ добычи видео из Telegram работает)' if YT_DLP_AVAILABLE
+           else 'НЕТ — часть видео из Telegram достать не получится'),
+        f"  {'🟢' if ffmpeg else '🟡'} ffmpeg: "
+        + ('есть' if ffmpeg else 'нет (для видео из Telegram не нужен)'),
     ]
 
 
@@ -7988,6 +8035,17 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
         lines.append('  ✅ Все включённые источники отвечают')
     if disabled:
         lines.append(f'  ⏸ На паузе: {html.escape(", ".join(disabled[:10]))}')
+
+    # --- Медиа ---
+    lines.append('')
+    lines.append('<b>Медиа</b>')
+    lines.append('  🎬 Видео: ' + ('ВКЛ' if settings.video_enabled
+                                   else '⚠️ ВЫКЛ — ролики не прикрепляются!'))
+    lines.append(f'     до {TG_VIDEO_MAX_SECONDS // 60} мин, до {TG_VIDEO_MAX_MB} МБ')
+    lines.append('  🔧 Запасная добыча видео (yt-dlp): '
+                 + ('есть' if YT_DLP_AVAILABLE else '⚠️ НЕТ'))
+    lines.append('  🖼 Только с картинками: '
+                 + ('ВКЛ' if settings.require_image else 'ВЫКЛ'))
 
     # --- Очереди ---
     lines.append('')
@@ -8235,16 +8293,17 @@ async def blacklist_command(update, context: ContextTypes.DEFAULT_TYPE):
 def check_video_deps():
     """Проверяет наличие yt-dlp и ffmpeg, выводит предупреждения."""
     if not YT_DLP_AVAILABLE:
-        logger.warning("⚠️  yt-dlp не установлен — видео скачиваться не будут.")
-        logger.warning("    Установка: pip install yt-dlp")
+        logger.warning("⚠️  yt-dlp не установлен. Без него: не качаются видео с YouTube "
+                       "и не работает запасной способ добычи видео из Telegram-постов.")
+        logger.warning("    Добавь yt-dlp в requirements.txt и передеплой.")
     else:
         logger.info("✓ yt-dlp найден")
 
     if shutil.which('ffmpeg'):
         logger.info("✓ ffmpeg найден")
     else:
-        logger.warning("⚠️  ffmpeg не найден в PATH — некоторые видео не скачаются.")
-        logger.warning("    Скачайте с https://www.gyan.dev/ffmpeg/builds/ и положите ffmpeg.exe рядом со скриптом или в PATH")
+        logger.warning("⚠️  ffmpeg не найден. Для видео из Telegram он НЕ нужен — "
+                       "нужен только для склейки раздельных дорожек с YouTube.")
 
 
 async def setup_bot_commands(app: Application) -> None:
