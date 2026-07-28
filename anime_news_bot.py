@@ -120,7 +120,11 @@ TOKEN = _env('BOT_TOKEN', '') or _env('TELEGRAM_BOT_TOKEN', '')
 
 # Эти значения не секретны (ID публичного канала и т.п.), поэтому fallback допустим.
 # При желании их тоже можно переопределить через env.
-CHANNEL_ID = _env('CHANNEL_ID', '@Doyentor88777999777279')
+_channel_raw = _env('CHANNEL_ID', '-1003040322753')
+# Числовой ID приводим к int: Telegram принимает оба вида, но с числом
+# меньше шансов на опечатку вроде лишнего пробела в переменной окружения
+CHANNEL_ID = int(_channel_raw) if re.fullmatch(r'-?\d+', _channel_raw.strip()) \
+    else _channel_raw.strip()
 ADMIN_ID = _env_int('ADMIN_ID', 5056873937)
 
 # Группа обсуждения и ветка (тема форума) для режима "слать всё в ветку".
@@ -7979,6 +7983,27 @@ def _optional_deps_report() -> list[str]:
     ]
 
 
+async def _check_channel_access(bot) -> tuple[bool, str]:
+    """Может ли бот публиковать в канал. Проверяем на старте: промах с правами
+    иначе виден только по молчанию канала."""
+    try:
+        chat = await bot.get_chat(CHANNEL_ID)
+    except Exception as e:
+        return False, f'канал недоступен ({type(e).__name__}: {e})'
+    title = getattr(chat, 'title', None) or str(CHANNEL_ID)
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(CHANNEL_ID, me.id)
+    except Exception as e:
+        return False, f'{title} — права не проверить ({type(e).__name__})'
+    status = getattr(member, 'status', '?')
+    if status not in ('administrator', 'creator'):
+        return False, f'{title} — бот не администратор (сейчас: {status})'
+    if getattr(member, 'can_post_messages', None) is False:
+        return False, f'{title} — у бота нет права публиковать'
+    return True, title
+
+
 async def send_startup_report(app) -> None:
     """Короткий отчёт админам при запуске: что поднялось и что настроено.
 
@@ -7996,7 +8021,13 @@ async def send_startup_report(app) -> None:
     if not enabled:
         problems.append('все источники на паузе — новостей не будет')
 
+    ok_channel, channel_note = await _check_channel_access(app.bot)
+    if not ok_channel:
+        problems.append(f'публикация в канал не сработает: {channel_note}')
+
     lines = ['🚀 <b>Бот запущен</b>', '']
+    lines.append(('📢 Канал: ' if ok_channel else '⚠️ Канал: ')
+                 + html.escape(channel_note))
     lines.append(f'📡 Источников: {len(enabled)} вкл' + (f', {len(paused)} на паузе' if paused else ''))
     if paused:
         lines.append(f'   ⏸ {html.escape(", ".join(paused[:8]))}')
@@ -8119,6 +8150,9 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
                  + ('есть' if YT_DLP_AVAILABLE else '⚠️ НЕТ'))
     lines.append('  🖼 Только с картинками: '
                  + ('ВКЛ' if settings.require_image else 'ВЫКЛ'))
+    ok_channel, channel_note = await _check_channel_access(context.bot)
+    lines.append(('  📢 Канал: ' if ok_channel else '  ⚠️ Канал: ')
+                 + html.escape(channel_note))
 
     # --- Очереди ---
     lines.append('')
