@@ -740,6 +740,10 @@ class BotSettings:
         'llm_rewrite': True,     # брать у модели перевод и текст поста
         'llm_filter': True,      # отсеивать непрофильные новости
         'llm_tags': True,        # добавлять хэштеги
+        'llm_read_article': True,  # читать статью, если в ленте только тизер
+        'llm_skip_filler': True,   # отсеивать подборки и авторские колонки
+        'llm_dedup_subject': True, # ловить одну новость из разных источников
+        'llm_limit_repeats': True, # не больше 3 постов про один тайтл в сутки
         'llm_day': '',           # сутки, за которые считаем вызовы
         'llm_calls_today': 0,    # сколько вызовов модели сделано сегодня
     }
@@ -911,6 +915,42 @@ class BotSettings:
     @llm_tags.setter
     def llm_tags(self, value: bool) -> None:
         self._data['llm_tags'] = bool(value)
+        self.save()
+
+    @property
+    def llm_dedup_subject(self) -> bool:
+        return bool(self._data.get('llm_dedup_subject', True))
+
+    @llm_dedup_subject.setter
+    def llm_dedup_subject(self, value: bool) -> None:
+        self._data['llm_dedup_subject'] = bool(value)
+        self.save()
+
+    @property
+    def llm_limit_repeats(self) -> bool:
+        return bool(self._data.get('llm_limit_repeats', True))
+
+    @llm_limit_repeats.setter
+    def llm_limit_repeats(self, value: bool) -> None:
+        self._data['llm_limit_repeats'] = bool(value)
+        self.save()
+
+    @property
+    def llm_read_article(self) -> bool:
+        return bool(self._data.get('llm_read_article', True))
+
+    @llm_read_article.setter
+    def llm_read_article(self, value: bool) -> None:
+        self._data['llm_read_article'] = bool(value)
+        self.save()
+
+    @property
+    def llm_skip_filler(self) -> bool:
+        return bool(self._data.get('llm_skip_filler', True))
+
+    @llm_skip_filler.setter
+    def llm_skip_filler(self, value: bool) -> None:
+        self._data['llm_skip_filler'] = bool(value)
         self.save()
 
     @property
@@ -2312,6 +2352,92 @@ def upgrade_image_url(url: str) -> str:
     if url != original:
         logger.debug(f"Upgraded image URL: {original[:80]}... -> {url[:80]}...")
     return url
+
+
+ARTICLE_CACHE_MAX = 200         # сколько разобранных статей держим в памяти
+ARTICLE_MIN_WORDS = 25          # ниже этого RSS-описание считаем бедным
+ARTICLE_MAX_CHARS = 2500        # столько текста статьи отдаём модели
+_article_cache: dict = {}
+
+# Мусор, который на новостных сайтах лежит вперемешку с текстом
+_ARTICLE_JUNK = re.compile(
+    r'(?:^|\s)(?:advertisement|sponsored|read more|related:|share this|'
+    r'subscribe|newsletter|follow us|click here|источник:|читайте также)',
+    re.IGNORECASE)
+
+
+def _looks_thin(text: str) -> bool:
+    """Хватает ли описания из ленты, чтобы написать содержательный пост."""
+    return len((text or '').split()) < ARTICLE_MIN_WORDS
+
+
+def _extract_article_text(html_text: str) -> str:
+    """Достаёт основной текст статьи из HTML.
+
+    Без тяжёлых библиотек: выбрасываем служебные блоки, находим контейнер
+    с наибольшим объёмом связного текста и собираем из него абзацы."""
+    soup = BeautifulSoup(html_text, 'html.parser')
+    for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'aside',
+                     'form', 'noscript', 'iframe', 'figure']):
+        tag.decompose()
+
+    # Кандидаты в порядке убывания надёжности
+    containers = []
+    for selector in ('article', '[itemprop="articleBody"]', '.article-content',
+                     '.entry-content', '.post-content', '.article-body', 'main'):
+        containers.extend(soup.select(selector))
+    if not containers:
+        containers = soup.find_all('div')
+
+    best_text, best_score = '', 0
+    for node in containers[:60]:            # не перебираем весь документ
+        paragraphs = [p.get_text(' ', strip=True) for p in node.find_all('p')]
+        paragraphs = [p for p in paragraphs
+                      if len(p) > 60 and not _ARTICLE_JUNK.search(p)]
+        if not paragraphs:
+            continue
+        text = ' '.join(paragraphs)
+        # Оцениваем по объёму текста, а не по числу тегов: так навигационные
+        # блоки со ссылками проигрывают настоящему тексту статьи
+        score = len(text)
+        if score > best_score:
+            best_text, best_score = text, score
+
+    text = re.sub(r'\s+', ' ', best_text).strip()
+    return text[:ARTICLE_MAX_CHARS]
+
+
+def fetch_article_text(url: str) -> str:
+    """Читает статью по ссылке и возвращает её основной текст.
+
+    Нужно потому, что в RSS обычно лежит обрезанный тизер в 8-10 слов —
+    модели просто не из чего собрать пост с фактами и вводными."""
+    if not url or not url.startswith(('http://', 'https://')):
+        return ''
+    if url in _article_cache:
+        return _article_cache[url]
+    try:
+        r = http_get_with_retry(url, headers={'User-Agent': USER_AGENT},
+                                timeout=HTTP_TIMEOUT)
+    except Exception as e:
+        logger.debug(f"статья не прочиталась ({type(e).__name__}): {url[:70]}")
+        return ''
+    if not r or r.status_code != 200:
+        return ''
+    ctype = (r.headers.get('Content-Type') or '').lower()
+    if 'html' not in ctype and ctype:
+        return ''
+    try:
+        text = _extract_article_text(r.text)
+    except Exception as e:
+        logger.debug(f"статья не разобралась ({type(e).__name__}): {url[:70]}")
+        text = ''
+    if len(_article_cache) > ARTICLE_CACHE_MAX:
+        _article_cache.clear()
+    _article_cache[url] = text
+    if text:
+        logger.info(f"📄 Прочитана статья: {len(text.split())} слов — {url[:60]}")
+    return text
 
 
 def fetch_og_image(url: str) -> Optional[str]:
@@ -4607,6 +4733,103 @@ scheduled_posts: Optional['ScheduledPosts'] = None
 
 # ============== ЗДОРОВЬЕ ИСТОЧНИКОВ И ОТПЕЧАТКИ КАРТИНОК ==============
 
+SUBJECT_MEMORY_FILE = DATA_DIR / 'recent_subjects.json'
+SUBJECT_MEMORY_HOURS = 36       # столько помним, о чём уже писали
+SUBJECT_MAX_PER_DAY = 3         # больше постов про один тайтл за сутки — перебор
+
+
+class RecentSubjects:
+    """О чём бот уже писал: предмет новости + её тип.
+
+    Нужно для двух вещей. Во-первых, одну новость подхватывают сразу несколько
+    сайтов, и текстовый дедуп её не ловит — заголовки-то разные. После обработки
+    моделью у них совпадает subject, и повтор становится виден. Во-вторых, лента
+    из пяти постов про один тайтл подряд выглядит зациклённой."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._items: list[dict] = []
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if self.path.exists():
+                data = json.loads(self.path.read_text(encoding='utf-8'))
+                if isinstance(data, list):
+                    self._items = data
+        except (OSError, ValueError) as e:
+            logger.warning(f"recent_subjects не загружен: {e}")
+        self._prune()
+
+    def _save(self) -> None:
+        try:
+            self.path.write_text(json.dumps(self._items, ensure_ascii=False),
+                                 encoding='utf-8')
+        except OSError as e:
+            logger.error(f"recent_subjects не сохранён: {e}")
+
+    def _prune(self) -> None:
+        edge = datetime.now(timezone.utc) - timedelta(hours=SUBJECT_MEMORY_HOURS)
+        kept = []
+        for item in self._items:
+            try:
+                if datetime.fromisoformat(item['at']) > edge:
+                    kept.append(item)
+            except (KeyError, ValueError, TypeError):
+                continue
+        self._items = kept
+
+    @staticmethod
+    def _key(subject: str) -> str:
+        """Ключ сравнения: без регистра, кавычек и служебных слов."""
+        text = re.sub(r'[«»"\'`:,.\-–—]', ' ', (subject or '').lower())
+        text = re.sub(r'\b(?:season|сезон|часть|part|the|аниме|anime)\b', ' ', text)
+        return ' '.join(text.split())
+
+    def seen_same_news(self, subject: str, kind: str) -> bool:
+        """Писали ли уже об этом же событии (тот же тайтл и тот же тип)."""
+        key = self._key(subject)
+        if not key:
+            return False
+        return any(it.get('key') == key and it.get('kind') == kind
+                   for it in self._items)
+
+    def count_today(self, subject: str) -> int:
+        """Сколько постов про этот тайтл за последние сутки."""
+        key = self._key(subject)
+        if not key:
+            return 0
+        edge = datetime.now(timezone.utc) - timedelta(hours=24)
+        total = 0
+        for it in self._items:
+            if it.get('key') != key:
+                continue
+            try:
+                if datetime.fromisoformat(it['at']) > edge:
+                    total += 1
+            except (KeyError, ValueError, TypeError):
+                continue
+        return total
+
+    def add(self, subject: str, kind: str, title: str = '') -> None:
+        key = self._key(subject)
+        if not key:
+            return
+        self._items.append({
+            'key': key, 'kind': kind,
+            'title': re.sub(r'\s+', ' ', title or '').strip()[:70],
+            'at': datetime.now(timezone.utc).isoformat(),
+        })
+        self._prune()
+        self._save()
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+recent_subjects: Optional['RecentSubjects'] = None
+
+
 SOURCE_HEALTH_FILE = DATA_DIR / 'source_health.json'
 AUTO_DISABLE_AFTER = 5          # столько пустых/ошибочных проверок подряд → пауза
 
@@ -4854,10 +5077,16 @@ async def _image_duplicate(news: dict) -> Optional[str]:
 
 
 def _commit_image_fingerprint(news: dict) -> None:
-    """Фиксирует отпечаток картинки после того, как пост реально ушёл."""
+    """Фиксирует отпечаток картинки и предмет новости после того, как пост
+    реально ушёл. До отправки не запоминаем: сорвавшаяся публикация не должна
+    закрывать дорогу той же новости из другого источника."""
     fingerprint = news.pop('_img_fp', None)
     if fingerprint and image_hashes is not None:
         image_hashes.add(fingerprint, news.get('title', ''))
+    subject = news.get('_llm_subject')
+    if subject and recent_subjects is not None:
+        recent_subjects.add(subject, news.get('_llm_kind', 'новость'),
+                            news.get('title', ''))
 
 
 PENDING_POSTS_FILE = DATA_DIR / 'pending_posts.json'
@@ -5563,6 +5792,22 @@ def build_settings_menu() -> InlineKeyboardMarkup:
                 "  #️⃣ Хэштеги: ВКЛ" if settings.llm_tags
                 else "  #️⃣ Хэштеги: ВЫКЛ",
                 callback_data="settings:toggle_llm_tags")],
+            [InlineKeyboardButton(
+                "  📄 Читать статьи: ВКЛ" if settings.llm_read_article
+                else "  📄 Читать статьи: ВЫКЛ",
+                callback_data="settings:toggle_llm_article")],
+            [InlineKeyboardButton(
+                "  🗑 Отсев подборок: ВКЛ" if settings.llm_skip_filler
+                else "  🗑 Отсев подборок: ВЫКЛ",
+                callback_data="settings:toggle_llm_filler")],
+            [InlineKeyboardButton(
+                "  ♻️ Ловить повторы: ВКЛ" if settings.llm_dedup_subject
+                else "  ♻️ Ловить повторы: ВЫКЛ",
+                callback_data="settings:toggle_llm_dedup")],
+            [InlineKeyboardButton(
+                "  🔁 Лимит на тайтл: ВКЛ" if settings.llm_limit_repeats
+                else "  🔁 Лимит на тайтл: ВЫКЛ",
+                callback_data="settings:toggle_llm_repeats")],
         ]
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📡 Источники", callback_data="settings:sources")],
@@ -6039,6 +6284,10 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'settings:toggle_llm_rewrite': ('llm_rewrite', 'Перевод и текст'),
             'settings:toggle_llm_filter': ('llm_filter', 'Отсев не по теме'),
             'settings:toggle_llm_tags': ('llm_tags', 'Хэштеги'),
+            'settings:toggle_llm_article': ('llm_read_article', 'Чтение статей'),
+            'settings:toggle_llm_filler': ('llm_skip_filler', 'Отсев подборок'),
+            'settings:toggle_llm_dedup': ('llm_dedup_subject', 'Ловля повторов'),
+            'settings:toggle_llm_repeats': ('llm_limit_repeats', 'Лимит на тайтл'),
         }.get(data)
         if field:
             attr, human = field
@@ -7235,14 +7484,19 @@ def _llm_parse_json(raw: str) -> Optional[dict]:
 
 
 LLM_TOPICS_OK = ('аниме', 'манга', 'игры', 'кино', 'комиксы')
+# Типы материалов. Подборки и колонки — это SEO-наполнитель, а не новость.
+LLM_KINDS_NEWS = ('новость', 'анонс', 'трейлер', 'релиз', 'слух')
+LLM_KINDS_FILLER = ('подборка', 'обзор', 'мнение')
 LLM_TOPIC_ANY = LLM_TOPICS_OK + ('прочее',)
 
 LLM_SYSTEM_PROMPT = (
     'Ты — редактор русскоязычного Telegram-канала об аниме, манге, играх, кино '
     'и гик-культуре. Из сырой новости делаешь готовый пост.\n'
     'Ответ — ТОЛЬКО JSON, без markdown и пояснений:\n'
-    '{"topic":"аниме|манга|игры|кино|комиксы|прочее","title":"...",'
-    '"summary":"...","tags":["#тег"]}\n\n'
+    '{"topic":"аниме|манга|игры|кино|комиксы|прочее",'
+    '"kind":"новость|анонс|трейлер|релиз|слух|подборка|обзор|мнение",'
+    '"subject":"название тайтла или франшизы",'
+    '"title":"...","summary":"...","tags":["#тег"]}\n\n'
 
     'ГЛАВНОЕ: пост должен читаться сам по себе. После него у человека не должно '
     'остаться вопросов «что это за тайтл?», «когда?», «где смотреть?», '
@@ -7261,6 +7515,12 @@ LLM_SYSTEM_PROMPT = (
     'не нужны. Всего не больше 650 символов.\n\n'
 
     'tags — 1-3 хэштега строчными русскими буквами. Сразу после # только буква.\n\n'
+    'kind — что это за материал. «новость», «анонс», «трейлер», «релиз», «слух» — '
+    'сообщение о конкретном событии. «подборка» — список вроде «5 лучших аниме». '
+    '«обзор» — рецензия. «мнение» — авторская колонка без нового факта.\n\n'
+    'subject — главный тайтл, франшиза или игра, о которых новость, в оригинальном '
+    'написании: Bleach, Chainsaw Man, «Атака титанов». Одна короткая строка. '
+    'Если новость не про конкретное произведение — пустая строка.\n\n'
 
     'Правила:\n'
     '1. Факты о новости — даты, числа, имена, названия студий и платформ — '
@@ -7282,7 +7542,8 @@ LLM_SYSTEM_PROMPT = (
     'Пример.\n'
     'Вход: "Bleach: Thousand-Year Blood War Part 4 opening by jo0ji revealed. '
     'The final cour premieres October 4 on Disney+. Studio Pierrot returns."\n'
-    'Выход: {"topic":"аниме","title":"Опенинг финальной части Bleach: '
+    'Выход: {"topic":"аниме","kind":"новость","subject":"Bleach: Thousand-Year '
+    'Blood War","title":"Опенинг финальной части Bleach: '
     'Thousand-Year Blood War записал jo0ji","summary":"Заключительный кур выходит '
     '4 октября на Disney+, анимацией снова занимается студия Pierrot.\\n\\n'
     'Это экранизация последней арки манги Тайто Кубо — на ней история '
@@ -7349,6 +7610,14 @@ async def _llm_enrich(news: dict) -> str:
         return 'off'
     summary = re.sub(r'\s+', ' ', (news.get('summary') or '')).strip()[:1500]
 
+    # В RSS обычно лежит обрезанный тизер в 8-10 слов. Из него нельзя собрать
+    # пост с фактами, поэтому при бедном описании читаем саму статью.
+    if settings.llm_read_article and _looks_thin(summary) and news.get('link'):
+        article = await asyncio.to_thread(fetch_article_text, news['link'])
+        if article and len(article.split()) > len(summary.split()):
+            summary = article
+            news['_article_used'] = True
+
     payload = (f'Источник: {news.get("source", "?")}\n'
                f'Заголовок: {title}\n'
                f'Текст: {summary or "(нет)"}')
@@ -7372,6 +7641,28 @@ async def _llm_enrich(news: dict) -> str:
         logger.info(f"⊘ Модель: новость не по теме канала: {title[:60]}")
         return 'skip'
     news['_llm_topic'] = topic
+
+    # --- Тип материала: подборки и колонки это не новости ---
+    kind = str(data.get('kind') or '').strip().lower()
+    if kind not in LLM_KINDS_NEWS + LLM_KINDS_FILLER:
+        kind = 'новость'
+    news['_llm_kind'] = kind
+    if settings.llm_skip_filler and kind in LLM_KINDS_FILLER:
+        logger.info(f"⊘ Модель: это {kind}, а не новость: {title[:60]}")
+        return 'skip'
+
+    # --- Предмет новости: ловим повторы и однообразие ---
+    subject = str(data.get('subject') or '').strip()[:120]
+    news['_llm_subject'] = subject
+    if subject and recent_subjects is not None:
+        if settings.llm_dedup_subject and recent_subjects.seen_same_news(subject, kind):
+            logger.info(f"⊘ Об этом уже писали ({subject[:40]} / {kind}): {title[:50]}")
+            return 'skip'
+        same_today = recent_subjects.count_today(subject)
+        if settings.llm_limit_repeats and same_today >= SUBJECT_MAX_PER_DAY:
+            logger.info(f"⊘ Уже {same_today} поста про «{subject[:40]}» за сутки — "
+                        f"пропускаю: {title[:45]}")
+            return 'skip'
 
     new_title = str(data.get('title') or '').strip()
     new_summary = str(data.get('summary') or '').strip()
@@ -7459,6 +7750,9 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
     lines.append('  📝 Перевод и текст: ' + ('ВКЛ' if settings.llm_rewrite else 'ВЫКЛ'))
     lines.append('  🚫 Отсев не по теме: ' + ('ВКЛ' if settings.llm_filter else 'ВЫКЛ'))
     lines.append('  #️⃣ Хэштеги: ' + ('ВКЛ' if settings.llm_tags else 'ВЫКЛ'))
+    lines.append('  📄 Читать статьи: ' + ('ВКЛ' if settings.llm_read_article else 'ВЫКЛ'))
+    lines.append('  🗑 Отсев подборок: ' + ('ВКЛ' if settings.llm_skip_filler else 'ВЫКЛ'))
+    lines.append('  ♻️ Ловить повторы: ' + ('ВКЛ' if settings.llm_dedup_subject else 'ВЫКЛ'))
     lines.append('')
     lines.append(f'Вызовов сегодня: {used} из {LLM_DAILY_LIMIT}')
     if _llm_disabled_runtime:
@@ -8088,6 +8382,9 @@ async def send_startup_report(app) -> None:
     lines.append(f'  📅 Отложка: {len(scheduled_posts.all()) if scheduled_posts else 0}')
     lines.append(f'  🗂 Ждут решения: {len(pending_posts._items) if pending_posts else 0}')
     lines.append(f'  🔗 История ссылок: {len(sent_links._set) if sent_links else 0}')
+    lines.append(f'  🧠 Помню тем за {SUBJECT_MEMORY_HOURS} ч: '
+                 f'{len(recent_subjects) if recent_subjects else 0}')
+    lines.append(f'  📄 Статей в кэше: {len(_article_cache)}')
     lines.append(f'  🖼 Отпечатков картинок: {len(image_hashes) if image_hashes else 0}')
     lines.append('')
     lines.append('<b>Окружение</b>')
@@ -8517,7 +8814,9 @@ def _init_globals() -> None:
         sent_links = SentLinksStore(SENT_LINKS_FILE)
     if pending_posts is None:
         pending_posts = PendingPosts(PENDING_POSTS_FILE)
-    global source_health, image_hashes
+    global source_health, image_hashes, recent_subjects
+    if recent_subjects is None:
+        recent_subjects = RecentSubjects(SUBJECT_MEMORY_FILE)
     if source_health is None:
         source_health = SourceHealth(SOURCE_HEALTH_FILE)
     if image_hashes is None:
