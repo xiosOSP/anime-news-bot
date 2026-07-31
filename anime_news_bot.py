@@ -120,11 +120,14 @@ TOKEN = _env('BOT_TOKEN', '') or _env('TELEGRAM_BOT_TOKEN', '')
 
 # Эти значения не секретны (ID публичного канала и т.п.), поэтому fallback допустим.
 # При желании их тоже можно переопределить через env.
-_channel_raw = _env('CHANNEL_ID', '-1003040322753')
+MAIN_CHANNEL_ID = -1003040322753        # основной канал проекта
+_channel_env = (os.getenv('CHANNEL_ID') or '').strip()
+CHANNEL_FROM_ENV = bool(_channel_env)   # видно в /health и стартовом отчёте
+_channel_raw = _channel_env or str(MAIN_CHANNEL_ID)
 # Числовой ID приводим к int: Telegram принимает оба вида, но с числом
 # меньше шансов на опечатку вроде лишнего пробела в переменной окружения
-CHANNEL_ID = int(_channel_raw) if re.fullmatch(r'-?\d+', _channel_raw.strip()) \
-    else _channel_raw.strip()
+CHANNEL_ID = int(_channel_raw) if re.fullmatch(r'-?\d+', _channel_raw) \
+    else _channel_raw
 ADMIN_ID = _env_int('ADMIN_ID', 5056873937)
 
 # Группа обсуждения и ветка (тема форума) для режима "слать всё в ветку".
@@ -8480,10 +8483,18 @@ async def send_startup_report(app) -> None:
     ok_channel, channel_note = await _check_channel_access(app.bot)
     if not ok_channel:
         problems.append(f'публикация в канал не сработает: {channel_note}')
+    if CHANNEL_FROM_ENV and CHANNEL_ID != MAIN_CHANNEL_ID:
+        problems.append(
+            f'посты уходят в {CHANNEL_ID} — это задано переменной CHANNEL_ID '
+            f'на хостинге, а не значением в коде ({MAIN_CHANNEL_ID}). '
+            f'Если канал не тот, поправь переменную или удали её.')
 
     lines = ['🚀 <b>Бот запущен</b>', '']
     lines.append(('📢 Канал: ' if ok_channel else '⚠️ Канал: ')
                  + html.escape(channel_note))
+    lines.append(f'   ID {CHANNEL_ID} '
+                 + ('(из переменной CHANNEL_ID)' if CHANNEL_FROM_ENV
+                    else '(из кода)'))
     lines.append(f'📡 Источников: {len(enabled)} вкл' + (f', {len(paused)} на паузе' if paused else ''))
     if paused:
         lines.append(f'   ⏸ {html.escape(", ".join(paused[:8]))}')
@@ -8612,6 +8623,10 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
     ok_channel, channel_note = await _check_channel_access(context.bot)
     lines.append(('  📢 Канал: ' if ok_channel else '  ⚠️ Канал: ')
                  + html.escape(channel_note))
+    lines.append(f'     ID {CHANNEL_ID} '
+                 + ('(переменная CHANNEL_ID)' if CHANNEL_FROM_ENV else '(из кода)'))
+    if CHANNEL_FROM_ENV and CHANNEL_ID != MAIN_CHANNEL_ID:
+        lines.append(f'     ⚠️ не совпадает с основным {MAIN_CHANNEL_ID}')
 
     # --- Очереди ---
     lines.append('')
