@@ -4479,6 +4479,62 @@ async def _send_post_fallback(
         return False
 
 
+# Посты, которые прямо сейчас отправляются. Отправка занимает секунды, и за это
+# время можно успеть нажать кнопку второй раз или получить тик планировщика —
+# без этой защиты пост уходил в канал дважды.
+_publishing_now: set[str] = set()
+
+
+class _PublishGuard:
+    """Не даёт начать вторую отправку того же поста."""
+
+    def __init__(self, key: str):
+        self.key = str(key)
+        self.acquired = False
+
+    def __enter__(self):
+        if self.key in _publishing_now:
+            return self
+        _publishing_now.add(self.key)
+        self.acquired = True
+        return self
+
+    def __exit__(self, *exc):
+        if self.acquired:
+            _publishing_now.discard(self.key)
+        return False
+
+
+async def _prepare_news_for_send(news: dict, source: str,
+                                count_stats: bool = True) -> Optional[str]:
+    """Общий конвейер подготовки поста: картинка, модель, дедупы.
+
+    Живёт отдельно, потому что путей отправки два — в ветку и напрямую в канал.
+    Раньше вся обработка была вшита только в первый, и режим канала публиковал
+    сырые машинные переводы без фильтров и тегов. Любая новая проверка теперь
+    автоматически действует в обоих режимах.
+
+    Возвращает код пропуска ('skipped_filter' / 'skipped_dup') или None, если
+    пост можно отправлять."""
+    await _improve_thumb(news)
+
+    # Модель: перевод, чистый текст, теги, отсев непрофильного и повторов
+    if await _llm_enrich(news) == 'skip':
+        if count_stats:
+            await stats.record_skipped('filtered', source)
+        return 'skipped_filter'
+
+    # Дедуп по картинке: один кадр с разных сайтов под разными заголовками
+    dup_title = await _image_duplicate(news)
+    if dup_title:
+        logger.info(f"⊘ Картинка уже публиковалась («{dup_title[:40]}»): "
+                    f"{news.get('title', '')[:60]}")
+        if count_stats:
+            await stats.record_skipped('duplicate', source)
+        return 'skipped_dup'
+    return None
+
+
 async def send_news(bot: Bot, news: dict, chat_id=None) -> str:
     """Отправляет один пост. Возвращает строковый код результата:
     - 'sent' — успешно отправлено
@@ -4503,16 +4559,17 @@ async def send_news(bot: Bot, news: dict, chat_id=None) -> str:
 
     target = chat_id or CHANNEL_ID
 
-    # Догрузка полного текста отключена: посты теперь короткие (заголовок + 1 предложение),
-    # полный текст статьи не нужен. Функция enrich_summary_from_page оставлена в коде.
+    skip = await _prepare_news_for_send(news, source, count_stats=is_channel)
+    if skip:
+        return skip
 
-    video_file = None
-    if news.get('video'):
-        video_file = await _prepare_video_file(news)
+    video_file = await _prepare_video_file(news)
 
     try:
         ok = await _send_post(bot, news, target, video_file)
         if ok:
+            _commit_image_fingerprint(news)
+            _mark_published()
             if is_channel:
                 await stats.record_published(source)
             return 'sent'
@@ -5673,29 +5730,13 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
         await stats.record_skipped('duplicate', source)
         return 'skipped_dup'
 
-    # Дедуп по картинке: один и тот же кадр с разных сайтов и с разными
-    # заголовками текстовый дедуп не ловит. Ссылка уже claim-нута, так что
-    # повторно скачивать эту новость в следующих циклах бот не будет.
-    await _improve_thumb(news)
+    # Общий конвейер: картинка, модель, дедупы. Стоит после claim, чтобы
+    # не тратить лимит модели на повторы.
+    skip = await _prepare_news_for_send(news, source)
+    if skip:
+        return skip
 
-    # Языковая модель: перевод, чистый текст, теги и отсев непрофильного.
-    # Стоит после дедупов, чтобы не тратить лимит на повторы.
-    if await _llm_enrich(news) == 'skip':
-        await stats.record_skipped('filtered', source)
-        return 'skipped_filter'
-
-    dup_title = await _image_duplicate(news)
-    if dup_title:
-        logger.info(f"⊘ Картинка уже публиковалась («{dup_title[:40]}»): "
-                    f"{news.get('title', '')[:60]}")
-        await stats.record_skipped('duplicate', source)
-        return 'skipped_dup'
-
-    # Догрузка полного текста отключена: посты короткие (заголовок + 1 предложение).
-
-    video_file = None
-    if news.get('video'):
-        video_file = await _prepare_video_file(news)
+    video_file = await _prepare_video_file(news)
 
     try:
         ok = await _send_post_thread_split(bot, news, video_file)
@@ -6277,7 +6318,11 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # 📢 В канал — публикуем сразу
-        ok = await _send_post(context.bot, news, CHANNEL_ID, None)
+        with _PublishGuard(f'pending:{key}') as guard:
+            if not guard.acquired:
+                await query.answer('Этот пост уже публикуется…')
+                return
+            ok = await _send_post(context.bot, news, CHANNEL_ID, None)
         if ok:
             pending_posts.pop(key)
             _mark_published()
@@ -6365,7 +6410,11 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text, markup = _scheduled_overview()
             await _safe_edit(query, text, markup)
             return
-        ok = await _send_post(context.bot, news, CHANNEL_ID, None)
+        with _PublishGuard(f'sched:{key}') as guard:
+            if not guard.acquired:
+                await query.answer('Этот пост уже публикуется…')
+                return
+            ok = await _send_post(context.bot, news, CHANNEL_ID, None)
         if ok:
             scheduled_posts.pop(key)
             _mark_published()
@@ -7196,13 +7245,19 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
     for key, news in due:
         meta = scheduled_posts.meta(key)      # ДО pop — потом данных не будет
         card = _post_card(news, meta)
-        try:
-            ok = await _send_post(context.bot, news, CHANNEL_ID, None)
-            err = None
-        except Exception as e:                # не даём джобу умереть молча
-            ok = False
-            err = f'{type(e).__name__}: {e}'
-            logger.exception(f"Отложенный пост упал с ошибкой: {news.get('title', '')[:60]}")
+        guard = _PublishGuard(f'sched:{key}')
+        with guard:
+            if not guard.acquired:
+                logger.info(f"Пост уже публикуется вручную, пропускаю тик: {key}")
+                continue
+            try:
+                ok = await _send_post(context.bot, news, CHANNEL_ID, None)
+                err = None
+            except Exception as e:            # не даём джобу умереть молча
+                ok = False
+                err = f'{type(e).__name__}: {e}'
+                logger.exception(
+                    f"Отложенный пост упал с ошибкой: {news.get('title', '')[:60]}")
 
         if ok:
             scheduled_posts.pop(key)
