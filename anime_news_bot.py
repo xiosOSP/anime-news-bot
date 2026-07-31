@@ -213,7 +213,25 @@ REDDIT_PROXY: Optional[str] = None
 # --- Видео ---
 VIDEO_MAX_DURATION_SEC = 0            # 0 = без ограничения по длине, ограничение только по размеру файла
 VIDEO_MAX_FILE_SIZE_MB = 48           # запас от лимита Telegram (50 МБ)
-VIDEO_FORMAT = 'best[height<=480][ext=mp4]/best[height<=480]/best[filesize<48M]/worst'
+def _video_format() -> str:
+    """Строка формата для yt-dlp.
+
+    Без ffmpeg склеить отдельные дорожки видео и звука невозможно, поэтому
+    берём только «прогрессивные» форматы — где картинка и звук уже в одном
+    файле. Раньше формат этого не учитывал, и на хостинге без ffmpeg
+    скачивание молча срывалось."""
+    if shutil.which('ffmpeg'):
+        return ('bv*[height<=720][filesize<45M]+ba/'
+                'b[height<=720][filesize<45M]/'
+                'b[height<=720]/b')
+    progressive = '[vcodec!=none][acodec!=none]'
+    return (f'b[ext=mp4]{progressive}[filesize<45M]/'
+            f'b{progressive}[filesize<45M]/'
+            f'b[ext=mp4]{progressive}/'
+            f'b{progressive}')
+
+
+VIDEO_FORMAT = _video_format()
 VIDEO_DOWNLOAD_DIR = Path(tempfile.gettempdir()) / 'anime_news_bot_videos'
 VIDEO_DOWNLOAD_DIR.mkdir(exist_ok=True)
 
@@ -2366,6 +2384,61 @@ _ARTICLE_JUNK = re.compile(
     re.IGNORECASE)
 
 
+# Слова, по которым видно: у новости почти наверняка есть ролик.
+# Ради них стоит заглянуть в статью, если в ленте видео не оказалось.
+_VIDEO_HINT_RE = re.compile(
+    r'(?:trailer|teaser|promo video|\bpv\b|opening|ending|first look|'
+    r'трейлер|тизер|промо|опенинг|эндинг|ролик|видео)', re.IGNORECASE)
+
+
+def _probably_has_video(news: dict) -> bool:
+    """Похоже ли, что новость про ролик (трейлер, опенинг, тизер)."""
+    text = f"{news.get('title', '')} {news.get('summary', '')[:200]}"
+    return bool(_VIDEO_HINT_RE.search(text))
+
+
+def _find_video_in_html(html_text: str) -> Optional[str]:
+    """Ищет ролик на странице статьи: og:video, встроенный плеер, ссылки.
+
+    В RSS обычно лежит обрезанный тизер без плеера — трейлер живёт в самой
+    статье. Раньше мы туда не заглядывали, и новости про трейлеры выходили
+    без видео."""
+    try:
+        soup = BeautifulSoup(html_text, 'html.parser')
+    except Exception:
+        return None
+
+    # 1. Мета-теги: самый надёжный признак
+    for prop in ('og:video:url', 'og:video:secure_url', 'og:video',
+                 'twitter:player:stream'):
+        meta = (soup.select_one(f'meta[property="{prop}"]')
+                or soup.select_one(f'meta[name="{prop}"]'))
+        content = (meta.get('content') or '').strip() if meta else ''
+        if content.startswith('http') and (_is_video_host(content)
+                                           or _is_direct_video(content)):
+            return content
+
+    # 2. Встроенный плеер
+    for frame in soup.select('iframe[src], embed[src]'):
+        url = (frame.get('src') or '').strip()
+        if url.startswith('//'):
+            url = 'https:' + url
+        if url.startswith('http') and _is_video_host(url):
+            return url
+
+    # 3. Тег video
+    tag = soup.select_one('video[src]') or soup.select_one('video source[src]')
+    if tag and (tag.get('src') or '').startswith('http'):
+        return tag['src'].strip()
+
+    # 4. Ссылка на видеохостинг в тексте статьи
+    for link in soup.select('a[href]'):
+        url = (link.get('href') or '').strip()
+        if url.startswith('http') and _is_video_host(url):
+            return url
+    return None
+
+
 def _looks_thin(text: str) -> bool:
     """Хватает ли описания из ленты, чтобы написать содержательный пост."""
     return len((text or '').split()) < ARTICLE_MIN_WORDS
@@ -2407,13 +2480,15 @@ def _extract_article_text(html_text: str) -> str:
     return text[:ARTICLE_MAX_CHARS]
 
 
-def fetch_article_text(url: str) -> str:
-    """Читает статью по ссылке и возвращает её основной текст.
+def fetch_article(url: str) -> dict:
+    """Читает статью по ссылке: основной текст и ролик, если он там есть.
 
-    Нужно потому, что в RSS обычно лежит обрезанный тизер в 8-10 слов —
-    модели просто не из чего собрать пост с фактами и вводными."""
+    Один запрос закрывает две дыры сразу. В RSS лежит обрезанный тизер в 8-10
+    слов — модели не из чего собрать пост; и там же нет плеера, из-за чего
+    новости про трейлеры выходили без видео."""
+    empty = {'text': '', 'video': None}
     if not url or not url.startswith(('http://', 'https://')):
-        return ''
+        return empty
     if url in _article_cache:
         return _article_cache[url]
     try:
@@ -2421,23 +2496,35 @@ def fetch_article_text(url: str) -> str:
                                 timeout=HTTP_TIMEOUT)
     except Exception as e:
         logger.debug(f"статья не прочиталась ({type(e).__name__}): {url[:70]}")
-        return ''
+        return empty
     if not r or r.status_code != 200:
-        return ''
+        return empty
     ctype = (r.headers.get('Content-Type') or '').lower()
     if 'html' not in ctype and ctype:
-        return ''
+        return empty
     try:
         text = _extract_article_text(r.text)
     except Exception as e:
         logger.debug(f"статья не разобралась ({type(e).__name__}): {url[:70]}")
         text = ''
+    try:
+        video = _find_video_in_html(r.text)
+    except Exception:
+        video = None
+    result = {'text': text, 'video': video}
     if len(_article_cache) > ARTICLE_CACHE_MAX:
         _article_cache.clear()
-    _article_cache[url] = text
-    if text:
-        logger.info(f"📄 Прочитана статья: {len(text.split())} слов — {url[:60]}")
-    return text
+    _article_cache[url] = result
+    if text or video:
+        logger.info(f"📄 Статья: {len(text.split())} слов"
+                    + (f", найден ролик {video[:50]}" if video else ", ролика нет")
+                    + f" — {url[:55]}")
+    return result
+
+
+def fetch_article_text(url: str) -> str:
+    """Только текст статьи (обёртка над fetch_article)."""
+    return fetch_article(url).get('text', '')
 
 
 def fetch_og_image(url: str) -> Optional[str]:
@@ -2799,13 +2886,22 @@ def extract_video_url(entry, summary_html: Optional[str] = None) -> Optional[str
     return None
 
 
-def download_video(url: str) -> Optional[Path]:
+def download_video(url: str, note: Optional[list] = None) -> Optional[Path]:
     """Скачивает видео через yt-dlp с лимитами по длине и размеру.
     Возвращает путь к файлу или None.
+
+    В note (если передан) кладём причину провала: без неё «видео не пришло»
+    выглядит одинаково и когда yt-dlp не установлен, и когда ролик слишком
+    большой, и когда хостинг закрыл доступ.
     Эту функцию нужно вызывать через asyncio.to_thread, она блокирующая."""
-    if not YT_DLP_AVAILABLE:
-        logger.warning("yt-dlp не установлен — пропускаю видео")
+    def say(reason: str):
+        if note is not None:
+            note.append(reason)
         return None
+
+    if not YT_DLP_AVAILABLE:
+        logger.warning("yt-dlp не установлен — видео с внешних хостингов недоступны")
+        return say('yt-dlp не установлен')
 
     # Уникальное имя файла на основе URL, чтобы не было коллизий
     safe_name = re.sub(r'[^\w\-]', '_', url)[-80:]
@@ -2830,8 +2926,8 @@ def download_video(url: str) -> Optional[Path]:
 
             duration = info.get('duration', 0)
             if VIDEO_MAX_DURATION_SEC > 0 and duration and duration > VIDEO_MAX_DURATION_SEC:
-                logger.info(f"Видео {url} слишком длинное ({duration}с), пропускаю")
-                return None
+                logger.info(f"Видео слишком длинное ({duration}с): {url[:60]}")
+                return say(f'ролик длиннее лимита ({duration}с)')
 
             # Скачиваем
             info = ydl.extract_info(url, download=True)
@@ -2847,19 +2943,24 @@ def download_video(url: str) -> Optional[Path]:
 
             if not file_path.exists():
                 logger.warning(f"yt-dlp скачал, но файл не найден: {file_path}")
-                return None
+                return say('файл после скачивания не найден '
+                           '(возможно, нужна склейка дорожек и ffmpeg)')
 
             size_mb = file_path.stat().st_size / (1024 * 1024)
             if size_mb > VIDEO_MAX_FILE_SIZE_MB:
-                logger.info(f"Видео {url} слишком большое ({size_mb:.1f} МБ), пропускаю")
+                logger.info(f"Видео слишком большое ({size_mb:.1f} МБ): {url[:60]}")
                 file_path.unlink(missing_ok=True)
-                return None
+                return say(f'файл {size_mb:.0f} МБ больше лимита '
+                           f'{VIDEO_MAX_FILE_SIZE_MB} МБ')
 
-            logger.info(f"Скачано видео: {file_path.name} ({size_mb:.1f} МБ)")
+            logger.info(f"🎬 Скачано видео: {file_path.name} ({size_mb:.1f} МБ)")
+            if note is not None:
+                note.append(f'скачано через yt-dlp, {size_mb:.1f} МБ')
             return file_path
     except Exception as e:
-        logger.warning(f"Не удалось скачать видео {url}: {e}")
-        return None
+        text = str(e)[:120]
+        logger.warning(f"Видео не скачалось ({type(e).__name__}): {text}")
+        return say(f'{type(e).__name__}: {text}')
 
 
 def cleanup_video_dir(max_age_hours: int = 1) -> None:
@@ -4081,17 +4182,27 @@ async def _prepare_video_file(news: dict) -> Optional[Path]:
     Прямые видео (.mp4 и т.д.) возвращаются как URL-ссылка не здесь — для них Telegram сам качает.
     Здесь занимаемся только yt-dlp-хостингами."""
     if not settings.video_enabled:
+        news.setdefault('_video_note', 'настройка «🎬 Видео» выключена')
         return None
     video_url = news.get('video')
     if not video_url:
+        if _probably_has_video(news):
+            news.setdefault('_video_note', 'новость про ролик, но ссылки на него нет')
         return None
     # Прямой mp4/webm — Telegram скачает сам, нам качать не надо
     if _is_direct_video(video_url):
         return None
-    # yt-dlp хост — качаем
-    if _is_video_host(video_url) and YT_DLP_AVAILABLE:
-        return await asyncio.to_thread(download_video, video_url)
-    return None
+    if not _is_video_host(video_url):
+        news['_video_note'] = f'хостинг не поддерживается: {urlparse(video_url).netloc}'
+        return None
+    if not YT_DLP_AVAILABLE:
+        news['_video_note'] = 'yt-dlp не установлен — ролик не скачать'
+        return None
+    note: list = []
+    path = await asyncio.to_thread(download_video, video_url, note)
+    if note:
+        news['_video_note'] = note[0]
+    return path
 
 
 def _add_video_link_to_text(text: str, video_url: str) -> str:
@@ -7612,11 +7723,21 @@ async def _llm_enrich(news: dict) -> str:
 
     # В RSS обычно лежит обрезанный тизер в 8-10 слов. Из него нельзя собрать
     # пост с фактами, поэтому при бедном описании читаем саму статью.
-    if settings.llm_read_article and _looks_thin(summary) and news.get('link'):
-        article = await asyncio.to_thread(fetch_article_text, news['link'])
-        if article and len(article.split()) > len(summary.split()):
-            summary = article
+    # Статью читаем в двух случаях: описание слишком бедное для поста, либо
+    # новость явно про ролик, а ролика в ленте не оказалось.
+    need_text = _looks_thin(summary)
+    need_video = not news.get('video') and _probably_has_video(news)
+    if settings.llm_read_article and news.get('link') and (need_text or need_video):
+        article = await asyncio.to_thread(fetch_article, news['link'])
+        text = article.get('text') or ''
+        if text and len(text.split()) > len(summary.split()):
+            summary = text
             news['_article_used'] = True
+        # Ролик у новостей про трейлеры лежит в статье, а не в ленте
+        if not news.get('video') and article.get('video'):
+            news['video'] = article['video']
+            news['_video_note'] = 'ролик найден в статье'
+            logger.info(f"🎬 Ролик найден на странице статьи: {title[:50]}")
 
     payload = (f'Источник: {news.get("source", "?")}\n'
                f'Заголовок: {title}\n'
