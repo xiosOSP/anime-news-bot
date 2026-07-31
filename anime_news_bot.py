@@ -4825,6 +4825,23 @@ class ScheduledPosts:
             'tries': int(item.get('tries', 0)),
         }
 
+    def reschedule(self, key: str, when_utc: datetime) -> bool:
+        """Меняет время публикации, не теряя пост и историю попыток."""
+        item = self._items.get(key)
+        if not item:
+            return False
+        item['at'] = when_utc.astimezone(timezone.utc).isoformat()
+        item['tries'] = 0          # новое время — новые попытки
+        self._save()
+        return True
+
+    def clear(self) -> int:
+        """Снимает всю отложку. Возвращает, сколько постов убрали."""
+        count = len(self._items)
+        self._items.clear()
+        self._save()
+        return count
+
     def pop(self, key: str) -> Optional[dict]:
         item = self._items.pop(key, None)
         if item is not None:
@@ -5862,8 +5879,9 @@ async def deny_access(update: Update) -> None:
             await update.callback_query.answer("Эта кнопка только для админа.", show_alert=True)
         elif update.message:
             await update.message.reply_text("⛔ Этот бот только для администратора.")
-    except TelegramError:
-        pass
+    except Exception as e:
+        # Отказ в доступе не должен ронять обработчик ни при каких условиях
+        logger.debug(f"deny_access: {type(e).__name__}: {e}")
 
 
 # ============== INLINE-МЕНЮ "НАСТРОЙКИ" ==============
@@ -6204,6 +6222,8 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer('Эти кнопки работают только в ветке модерации.',
                                show_alert=True)
             return
+        if user_directory is not None:
+            user_directory.remember(update.effective_user)
         actor_is_admin, actor_name = _actor(update)
         if not settings.open_moderation and not actor_is_admin:
             await query.answer('Кнопки доступны только админам.', show_alert=True)
@@ -6272,7 +6292,60 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer('❌ Не удалось опубликовать — см. /logs', show_alert=True)
         return
 
-    # === Кнопки под списком /scheduled ===
+    # === Обзор очереди: список / карточка / очистка ===
+    if data == 'slist' or data.startswith('sview:') or data in ('sclear', 'sclearyes'):
+        if not is_admin(update):
+            await deny_access(update)
+            return
+        if data == 'slist':
+            text, markup = _scheduled_overview()
+            await query.answer()
+            await _safe_edit(query, text, markup)
+            return
+        if data.startswith('sview:'):
+            text, markup = _scheduled_detail(data.split(':', 1)[1])
+            await query.answer()
+            await _safe_edit(query, text, markup)
+            return
+        if data == 'sclear':
+            total = len(scheduled_posts.all()) if scheduled_posts is not None else 0
+            if not total:
+                await query.answer('Отложка и так пуста')
+                return
+            await query.answer()
+            await _safe_edit(
+                query,
+                f'🗑 Снять с отложки все посты ({total})?\n\nЭто необратимо.',
+                InlineKeyboardMarkup([[
+                    InlineKeyboardButton('Да, очистить', callback_data='sclearyes'),
+                    InlineKeyboardButton('Отмена', callback_data='slist'),
+                ]]))
+            return
+        removed = scheduled_posts.clear() if scheduled_posts is not None else 0
+        logger.info(f"📅 Отложка очищена вручную: снято {removed}")
+        await query.answer(f'Снято постов: {removed}')
+        text, markup = _scheduled_overview()
+        await _safe_edit(query, text, markup)
+        return
+
+    # === Перенос времени публикации ===
+    if data.startswith('sedit:'):
+        if not is_admin(update):
+            await deny_access(update)
+            return
+        key = data.split(':', 1)[1]
+        if scheduled_posts is None or scheduled_posts.get(key) is None:
+            await query.answer('Этого поста уже нет в отложке', show_alert=True)
+            return
+        context.user_data['await_input'] = _await_ctx('reschedule', key, query.message)
+        when = scheduled_posts.when(key)
+        await query.answer('Пришли новое время')
+        await _ask_in_thread(context.bot, query.message, _RESCHEDULE_HINT.format(
+            old=_fmt_local(when) if when else '?',
+            now=_local_now().strftime('%d.%m %H:%M'), off=_tz_offset()))
+        return
+
+    # === Кнопки под карточкой поста ===
     if data.startswith(('snow:', 'scan:')):
         if not is_admin(update):
             await deny_access(update)
@@ -6288,14 +6361,17 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if action == 'scan':
             scheduled_posts.pop(key)
-            await query.answer('Отложка отменена')
-            await _mark_post_done(query, '\n\n🗑 Снято с отложки')
+            await query.answer('Снято с отложки')
+            text, markup = _scheduled_overview()
+            await _safe_edit(query, text, markup)
             return
         ok = await _send_post(context.bot, news, CHANNEL_ID, None)
         if ok:
             scheduled_posts.pop(key)
+            _mark_published()
             await query.answer('📢 Опубликовано!')
-            await _mark_post_done(query, '\n\n✅ Опубликовано досрочно')
+            text, markup = _scheduled_overview()
+            await _safe_edit(query, text, markup)
         else:
             await query.answer('❌ Не удалось опубликовать — см. /logs', show_alert=True)
         return
@@ -6755,6 +6831,27 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     key = pending.get('key')
     mode = pending.get('mode')
+
+    # === 🕒 Перенос времени у поста, который уже в отложке ===
+    if mode == 'reschedule':
+        if scheduled_posts is None or scheduled_posts.get(key) is None:
+            context.user_data.pop('await_input', None)
+            await update.message.reply_text('Этого поста уже нет в отложке.')
+            raise ApplicationHandlerStop
+        when = _parse_schedule_time(text)
+        if when is None:
+            await update.message.reply_text(
+                '⏰ Не понял время. Примеры: 18:30 • 12.09 18:30 • завтра 10:00 • +2ч\n'
+                'Время должно быть в будущем. Отмена — /cancel')
+            raise ApplicationHandlerStop
+        scheduled_posts.reschedule(key, when)
+        context.user_data.pop('await_input', None)
+        logger.info(f"📅 Пост перенесён на {_fmt_local(when)}")
+        await update.message.reply_text(
+            f'🕒 Перенёс на {_fmt_local(when)} — через {_human_delta(when)}.\n'
+            f'Список: /scheduled')
+        raise ApplicationHandlerStop
+
     news = pending_posts.get(key) if pending_posts is not None else None
     if not news:
         context.user_data.pop('await_input', None)
@@ -6879,31 +6976,139 @@ async def tz_command(update, context: ContextTypes.DEFAULT_TYPE):
         f'🕒 Часовой пояс: UTC{off:+d}\nСейчас у тебя: {_local_now().strftime("%d.%m %H:%M")}')
 
 
-@admin_only
-async def scheduled_command(update, context: ContextTypes.DEFAULT_TYPE):
-    """Список отложенных постов: полная карточка каждого ДО публикации —
-    текст, который уйдёт, источник, кто отложил, медиа, время и отсчёт."""
+_RESCHEDULE_HINT = (
+    '🕒 <b>На какое время перенести?</b>\n'
+    'Сейчас стоит: {old}\n\n'
+    'Ответь сообщением, например:\n'
+    '• <code>18:30</code>\n'
+    '• <code>12.09 18:30</code>\n'
+    '• <code>завтра 10:00</code>\n'
+    '• <code>+2ч</code>\n\n'
+    'У тебя {now} (UTC{off:+d}). Отмена — /cancel'
+)
+
+
+async def _safe_edit(query, text: str, markup) -> None:
+    """Меняет сообщение обзора. Telegram ругается, если текст не изменился —
+    для нас это не ошибка."""
+    try:
+        await query.edit_message_text(text, reply_markup=markup,
+                                      parse_mode=ParseMode.HTML,
+                                      disable_web_page_preview=True)
+    except TelegramError as e:
+        if 'not modified' not in str(e).lower():
+            logger.debug(f"обзор отложки не обновился: {e}")
+
+
+SCHEDULED_LIST_MAX = 25         # столько постов показываем в обзоре
+
+
+def _day_label(when_utc: datetime) -> str:
+    """«Сегодня», «Завтра» или «17 августа» — по времени админа."""
+    local = _utc_to_local(when_utc).date()
+    today = _local_now().date()
+    delta = (local - today).days
+    if delta == 0:
+        return 'Сегодня'
+    if delta == 1:
+        return 'Завтра'
+    if delta == -1:
+        return 'Вчера (просрочено)'
+    if delta < 0:
+        return 'Просрочено'
+    months = ('января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля',
+              'августа', 'сентября', 'октября', 'ноября', 'декабря')
+    return f'{local.day} {months[local.month - 1]}'
+
+
+def _short_title(news: dict, limit: int = 46) -> str:
+    """Короткий заголовок поста для списка."""
+    text = news.get('_llm_text') or news.get('_edited_text') or news.get('title') or ''
+    text = re.sub(r'\s+', ' ', text.split('\n')[0]).strip()
+    return (text[:limit] + '…') if len(text) > limit else (text or 'без заголовка')
+
+
+def _scheduled_overview() -> tuple[str, InlineKeyboardMarkup]:
+    """Весь список одним сообщением: время, заголовок, кто отложил.
+
+    Раньше на каждый пост уходило отдельное сообщение — двадцать постов
+    превращались в двадцать уведомлений, и очередь целиком было не окинуть
+    взглядом. Теперь обзор компактный, а подробности открываются по номеру."""
     items = scheduled_posts.all() if scheduled_posts is not None else []
     if not items:
-        await update.message.reply_text(
-            '📅 Отложенных постов нет.\n\n'
-            'Отложить: кнопка «📅 В отложку» под постом в ветке.')
-        return
-    await update.message.reply_text(
-        f'📅 В отложке: {len(items)} (время в UTC{_tz_offset():+d})')
-    for key, news, when in items[:20]:
+        return ('📅 Отложенных постов нет.\n\n'
+                'Отложить: кнопка «📅 В отложку» под постом в ветке.'), None
+
+    now = datetime.now(timezone.utc)
+    ripe = sum(1 for _k, _n, when in items if when <= now)
+    head = f'📅 <b>В отложке: {len(items)}</b>'
+    if ripe:
+        head += f' · {ripe} ждёт публикации'
+    lines = [head, f'<i>время в UTC{_tz_offset():+d}</i>', '']
+
+    buttons, row = [], []
+    current_day = None
+    for number, (key, news, when) in enumerate(items[:SCHEDULED_LIST_MAX], 1):
+        day = _day_label(when)
+        if day != current_day:
+            if current_day is not None:
+                lines.append('')
+            lines.append(f'<b>{day}</b>')
+            current_day = day
         meta = scheduled_posts.meta(key)
-        card = _post_card(news, meta, countdown=True, with_body=True)
-        markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton('📢 Сейчас', callback_data=f'snow:{key}'),
-            InlineKeyboardButton('🗑 Отменить', callback_data=f'scan:{key}'),
-        ]])
-        await update.message.reply_text(
-            fit_to_limit(card, TG_TEXT_LIMIT), reply_markup=markup,
-            disable_web_page_preview=True)
-        await asyncio.sleep(0.2)
-    if len(items) > 20:
-        await update.message.reply_text(f'…и ещё {len(items) - 20}.')
+        who = (meta.get('by') or {}).get('name', '')
+        when_local = _utc_to_local(when).strftime('%H:%M')
+        mark = '⏳' if when <= now else '🕒'
+        tail = f' · через {_human_delta(when)}' if when > now else ' · пора'
+        line = f'{number}. {mark} {when_local}{tail}\n    {html.escape(_short_title(news))}'
+        if who:
+            line += f'\n    👤 {html.escape(who[:24])}'
+        tries = meta.get('tries') or 0
+        if tries:
+            line += f' · ⚠️ попыток: {tries}'
+        lines.append(line)
+
+        row.append(InlineKeyboardButton(str(number), callback_data=f'sview:{key}'))
+        if len(row) == 5:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    if len(items) > SCHEDULED_LIST_MAX:
+        lines.append('')
+        lines.append(f'…и ещё {len(items) - SCHEDULED_LIST_MAX}')
+    lines.append('')
+    lines.append('Нажми номер, чтобы открыть пост целиком.')
+    buttons.append([InlineKeyboardButton('🔄 Обновить', callback_data='slist'),
+                    InlineKeyboardButton('🗑 Очистить всё', callback_data='sclear')])
+    return fit_to_limit('\n'.join(lines), TG_TEXT_LIMIT), InlineKeyboardMarkup(buttons)
+
+
+def _scheduled_detail(key: str) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    """Карточка одного отложенного поста с действиями."""
+    news = scheduled_posts.get(key) if scheduled_posts is not None else None
+    if not news:
+        return 'Этого поста уже нет в отложке.', InlineKeyboardMarkup(
+            [[InlineKeyboardButton('⬅️ К списку', callback_data='slist')]])
+    meta = scheduled_posts.meta(key)
+    card = _post_card(news, meta, countdown=True, with_body=True)
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton('📢 Сейчас', callback_data=f'snow:{key}'),
+         InlineKeyboardButton('🕒 Перенести', callback_data=f'sedit:{key}')],
+        [InlineKeyboardButton('🗑 Отменить', callback_data=f'scan:{key}'),
+         InlineKeyboardButton('⬅️ К списку', callback_data='slist')],
+    ])
+    return fit_to_limit(card, TG_TEXT_LIMIT), markup
+
+
+@admin_only
+async def scheduled_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Очередь отложенных постов: обзор одним сообщением."""
+    text, markup = _scheduled_overview()
+    await update.message.reply_text(text, reply_markup=markup,
+                                    parse_mode=ParseMode.HTML,
+                                    disable_web_page_preview=True)
 
 
 def _media_summary(news: dict) -> str:
@@ -8248,56 +8453,255 @@ async def delsource_command(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🗑 «{removed['label']}» удалён.")
 
 
+USER_DIRECTORY_FILE = DATA_DIR / 'known_users.json'
+USER_DIRECTORY_MAX = 3000
+
+
+class UserDirectory:
+    """Кто и под каким именем писал боту или в ветку модерации.
+
+    Нужен, потому что Bot API не умеет искать пользователя по @имени: ботам
+    доступны только те, кого они уже видели. Поэтому запоминаем всех, кто
+    что-то написал или нажал кнопку, и по этому справочнику выдаём права."""
+
+    SAVE_EVERY_SEC = 60          # чаще на диск не пишем
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._by_id: dict[str, dict] = {}
+        self._dirty = False
+        self._last_save = 0.0
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if self.path.exists():
+                data = json.loads(self.path.read_text(encoding='utf-8'))
+                if isinstance(data, dict):
+                    self._by_id = data
+        except (OSError, ValueError) as e:
+            logger.warning(f"known_users не загружен: {e}")
+
+    def _save(self, force: bool = False) -> None:
+        """Пишет на диск не чаще раза в минуту.
+
+        Справочник пополняется на каждое сообщение в ветке, а полная перезапись
+        файла на каждого пользователя — лишняя нагрузка. Потерять пару записей
+        при перезапуске не страшно: человек напишет снова и вернётся в список."""
+        self._dirty = True
+        now = time.time()
+        if not force and now - self._last_save < self.SAVE_EVERY_SEC:
+            return
+        try:
+            self.path.write_text(json.dumps(self._by_id, ensure_ascii=False),
+                                 encoding='utf-8')
+            self._dirty = False
+            self._last_save = now
+        except OSError as e:
+            logger.error(f"known_users не сохранён: {e}")
+
+    def flush(self) -> None:
+        """Принудительно сбрасывает накопленное на диск."""
+        if self._dirty:
+            self._save(force=True)
+
+    def remember(self, user) -> None:
+        """Запоминает пользователя. Тихо: вызывается на каждое сообщение."""
+        if user is None or getattr(user, 'is_bot', False):
+            return
+        raw_id = getattr(user, 'id', None)
+        if not isinstance(raw_id, int):
+            return
+        uid = str(raw_id)
+        entry = {
+            'username': (getattr(user, 'username', '') or '').lower(),
+            'name': getattr(user, 'full_name', '') or '',
+            'seen': datetime.now(timezone.utc).isoformat(),
+        }
+        if self._by_id.get(uid) == entry:
+            return                       # ничего не изменилось — не пишем на диск
+        old = self._by_id.get(uid)
+        self._by_id[uid] = entry
+        if len(self._by_id) > USER_DIRECTORY_MAX:
+            oldest = sorted(self._by_id, key=lambda k: self._by_id[k].get('seen', ''))
+            for key in oldest[:len(self._by_id) - USER_DIRECTORY_MAX]:
+                del self._by_id[key]
+        # На диск пишем только при реальном изменении данных, а не каждый раз
+        if old is None or old.get('username') != entry['username'] \
+                or old.get('name') != entry['name']:
+            self._save()
+
+    def remember_now(self, user) -> None:
+        """Запомнить и сразу записать — для случаев, когда это важно
+        (например, человеку только что выдали права)."""
+        self.remember(user)
+        self.flush()
+
+    def find_by_username(self, username: str) -> Optional[tuple[int, str]]:
+        """(id, отображаемое имя) по @имени или None."""
+        key = (username or '').strip().lstrip('@').lower()
+        if not key:
+            return None
+        for uid, entry in self._by_id.items():
+            if entry.get('username') == key:
+                try:
+                    return int(uid), entry.get('name') or f'@{key}'
+                except ValueError:
+                    return None
+        return None
+
+    def describe(self, user_id: int) -> str:
+        """Человекочитаемое имя по id: «Вася Пупкин (@vasya)»."""
+        entry = self._by_id.get(str(user_id))
+        if not entry:
+            return str(user_id)
+        name = entry.get('name') or ''
+        username = entry.get('username') or ''
+        if name and username:
+            return f'{name} (@{username})'
+        return name or (f'@{username}' if username else str(user_id))
+
+    def __len__(self) -> int:
+        return len(self._by_id)
+
+
+user_directory: Optional['UserDirectory'] = None
+
+
+async def remember_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Тихо запоминает всех, кто пишет боту или в ветку. Ничего не блокирует."""
+    if user_directory is None:
+        return
+    try:
+        user_directory.remember(update.effective_user)
+        msg = getattr(update, 'message', None)
+        if msg is not None and getattr(msg, 'reply_to_message', None):
+            user_directory.remember(msg.reply_to_message.from_user)
+    except Exception as e:
+        logger.debug(f"пользователь не запомнился: {e}")
+
+
+async def _resolve_user(update, context) -> tuple[Optional[int], str, str]:
+    """Кому адресована команда: (id, имя, пояснение при неудаче).
+
+    Три способа, в порядке надёжности:
+      1) команда отправлена ответом на сообщение — берём автора;
+      2) @имя — ищем среди тех, кого бот уже видел;
+      3) числовой id — как есть."""
+    message = update.message
+    reply = getattr(message, 'reply_to_message', None)
+    if reply is not None and getattr(reply, 'from_user', None):
+        user = reply.from_user
+        if user_directory is not None:
+            user_directory.remember(user)
+        return user.id, (user.full_name or f'@{user.username}' if user.username
+                         else str(user.id)), ''
+
+    args = context.args or []
+    if not args:
+        return None, '', ('Ответь этой командой на сообщение человека — так надёжнее всего.\n'
+                          'Либо укажи @имя или числовой id.')
+
+    arg = args[0].strip()
+    if arg.lstrip('-').isdigit():
+        return int(arg), (user_directory.describe(int(arg)) if user_directory
+                          else arg), ''
+
+    if arg.startswith('@') or re.fullmatch(r'[A-Za-z0-9_]{4,}', arg):
+        found = user_directory.find_by_username(arg) if user_directory else None
+        if found:
+            return found[0], found[1], ''
+        # Пробуем спросить у Telegram — сработает редко, но попробовать стоит
+        try:
+            chat = await context.bot.get_chat(arg if arg.startswith('@') else f'@{arg}')
+            uid = getattr(chat, 'id', None)
+            if isinstance(uid, int) and uid > 0:
+                return uid, (getattr(chat, 'full_name', None)
+                             or getattr(chat, 'title', None) or arg), ''
+        except Exception:
+            pass          # Telegram почти всегда отказывает — это ожидаемо
+        return None, '', (
+            f'Не знаю пользователя {html.escape(arg)}.\n\n'
+            'Telegram не позволяет ботам искать людей по @имени — я знаю только тех, '
+            'кто уже что-то писал в ветку или мне.\n\n'
+            'Надёжный способ: ответь этой командой на любое сообщение этого человека '
+            'в ветке модерации.')
+
+    return None, '', 'Не понял, кому. Ответь на сообщение человека или укажи @имя.'
+
+
 async def admins_command(update, context: ContextTypes.DEFAULT_TYPE):
-    """Список админов. Управление — только у главного админа."""
+    """Список админов с именами. Управление — только у главного админа."""
     if update.effective_user.id != ADMIN_ID:
         await deny_access(update)
         return
+    who = user_directory.describe if user_directory else str
+    lines = ['👥 <b>Администраторы</b>', '',
+             f'👑 {html.escape(who(ADMIN_ID))} — главный']
     extra = settings.extra_admins
-    lines = [f"👑 Главный: {ADMIN_ID}"]
-    lines += [f"• {uid}" for uid in extra] or []
+    for uid in extra:
+        lines.append(f'• {html.escape(who(uid))}')
     if not extra:
-        lines.append("Дополнительных админов нет.")
-    lines.append("")
-    lines.append("Добавить: /addadmin <telegram_id>\nУдалить: /deladmin <telegram_id>")
-    lines.append("ID можно узнать у @userinfobot")
-    await update.message.reply_text('\n'.join(lines))
+        lines.append('Дополнительных админов нет.')
+    lines += ['', '<b>Выдать права</b>',
+              'Ответь на сообщение человека: <code>/addadmin</code>',
+              'Или по имени: <code>/addadmin @username</code>',
+              '', '<b>Забрать права</b>',
+              '<code>/deladmin</code> ответом на сообщение или '
+              '<code>/deladmin @username</code>']
+    if user_directory is not None:
+        lines.append('')
+        lines.append(f'Знакомых пользователей: {len(user_directory)}')
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
 
 
 async def addadmin_command(update, context: ContextTypes.DEFAULT_TYPE):
-    """Добавляет дополнительного админа. Только для главного админа."""
+    """Выдаёт права админа. Ответом на сообщение, по @имени или по id."""
     if update.effective_user.id != ADMIN_ID:
         await deny_access(update)
         return
-    args = context.args or []
-    if not args or not args[0].lstrip('-').isdigit():
-        await update.message.reply_text("Формат: /addadmin <telegram_id>\nID узнать: @userinfobot")
+    uid, name, problem = await _resolve_user(update, context)
+    if uid is None:
+        await update.message.reply_text(problem, parse_mode=ParseMode.HTML)
         return
-    uid = int(args[0])
+    if uid == ADMIN_ID:
+        await update.message.reply_text('Это ты и есть — главный админ.')
+        return
+    label = html.escape(name or str(uid))
     if settings.add_admin(uid):
+        if user_directory is not None:
+            user_directory.flush()
+        logger.info(f"👥 Выдана админка: {name} ({uid})")
         await update.message.reply_text(
-            f"✅ {uid} добавлен в админы.\n"
-            f"Ему доступны команды бота и кнопки модерации в ветке.\n"
-            f"Пусть напишет боту /start."
-        )
+            f'✅ <b>{label}</b> теперь админ.\n\n'
+            f'Доступны команды бота и кнопки модерации в ветке.\n'
+            f'Чтобы получать уведомления, ему нужно открыть бота и нажать /start.',
+            parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(f"{uid} уже админ.")
+        await update.message.reply_text(f'{label} уже админ.', parse_mode=ParseMode.HTML)
 
 
 async def deladmin_command(update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаляет дополнительного админа. Только для главного админа."""
+    """Забирает права админа. Ответом на сообщение, по @имени или по id."""
     if update.effective_user.id != ADMIN_ID:
         await deny_access(update)
         return
-    args = context.args or []
-    if not args or not args[0].lstrip('-').isdigit():
-        await update.message.reply_text("Формат: /deladmin <telegram_id>\nСписок: /admins")
+    uid, name, problem = await _resolve_user(update, context)
+    if uid is None:
+        await update.message.reply_text(problem, parse_mode=ParseMode.HTML)
         return
-    uid = int(args[0])
+    if uid == ADMIN_ID:
+        await update.message.reply_text(
+            'Себя разжаловать нельзя — иначе управлять ботом станет некому.')
+        return
+    label = html.escape(name or str(uid))
     if settings.remove_admin(uid):
-        await update.message.reply_text(f"🗑 {uid} больше не админ.")
+        logger.info(f"👥 Забрана админка: {name} ({uid})")
+        await update.message.reply_text(f'🗑 <b>{label}</b> больше не админ.',
+                                        parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(f"{uid} не был дополнительным админом.")
+        await update.message.reply_text(f'{label} и не был админом.',
+                                        parse_mode=ParseMode.HTML)
 
 
 # ============== САМОДИАГНОСТИКА: ТИШИНА, СТАРТ, КВОТА ПЕРЕВОДЧИКА ==============
@@ -8921,6 +9325,7 @@ async def setup_bot_commands(app: Application) -> None:
         BotCommand("deepl", "🌐 Лимит DeepL"),
         BotCommand("backup", "📦 Бэкап данных"),
         BotCommand("health", "🩺 Состояние бота"),
+        BotCommand("admins", "👥 Администраторы"),
         BotCommand("videocheck", "🎬 Почему нет видео"),
         BotCommand("llm", "🤖 Модель: статус и проверка"),
         BotCommand("scheduled", "📅 Отложенные посты"),
@@ -8950,6 +9355,11 @@ def _init_globals() -> None:
         sent_links = SentLinksStore(SENT_LINKS_FILE)
     if pending_posts is None:
         pending_posts = PendingPosts(PENDING_POSTS_FILE)
+    global user_directory
+    if user_directory is None:
+        user_directory = UserDirectory(USER_DIRECTORY_FILE)
+        if len(user_directory):
+            logger.info(f"Знакомых пользователей: {len(user_directory)}")
     global source_health, image_hashes, recent_subjects
     if recent_subjects is None:
         recent_subjects = RecentSubjects(SUBJECT_MEMORY_FILE)
@@ -9041,6 +9451,9 @@ def main():
     reply_filter = filters.TEXT & filters.Regex(
         f"^({'|'.join(re.escape(t) for t in reply_button_texts)})$"
     )
+    # Наблюдатель: тихо запоминает, кто пишет. Группа -3 — раньше всех, чтобы
+    # успеть запомнить человека даже перед отказом в личке.
+    app.add_handler(MessageHandler(filters.ALL, remember_user_handler), group=-3)
     # ЛС-гейт: посторонним в личке бот не отвечает (group=-2 — самый первый)
     app.add_handler(MessageHandler(filters.ALL, private_gate_handler), group=-2)
     # Ввод времени отложки / нового текста поста. Группа -1 = проверяется раньше
