@@ -5019,7 +5019,8 @@ recent_subjects: Optional['RecentSubjects'] = None
 
 
 SOURCE_HEALTH_FILE = DATA_DIR / 'source_health.json'
-AUTO_DISABLE_AFTER = 5          # столько пустых/ошибочных проверок подряд → пауза
+AUTO_DISABLE_AFTER_HOURS = 24   # столько часов без единой новости → пауза
+AUTO_DISABLE_MIN_CHECKS = 3     # но не раньше, чем после стольких проверок
 
 
 class SourceHealth:
@@ -5051,11 +5052,13 @@ class SourceHealth:
 
     def _entry(self, name: str) -> dict:
         return self._data.setdefault(
-            name, {'fails': 0, 'last_ok': None, 'last_count': 0, 'last_error': ''})
+            name, {'fails': 0, 'last_ok': None, 'last_count': 0, 'last_error': '',
+                   'silent_since': None})
 
     def record_ok(self, name: str, count: int) -> None:
         entry = self._entry(name)
         entry['fails'] = 0
+        entry['silent_since'] = None
         entry['last_ok'] = datetime.now(timezone.utc).isoformat()
         entry['last_count'] = int(count)
         entry['last_error'] = ''
@@ -5066,13 +5069,35 @@ class SourceHealth:
         entry = self._entry(name)
         entry['fails'] = int(entry.get('fails', 0)) + 1
         entry['last_error'] = str(reason)[:200]
+        if not entry.get('silent_since'):
+            # Засекаем момент, с которого источник замолчал: считать паузу
+            # по времени надёжнее, чем по числу проверок — ночью или в выходной
+            # живой источник тоже может ничего не отдать.
+            entry['silent_since'] = datetime.now(timezone.utc).isoformat()
         self._save()
         return entry['fails']
 
+    def silent_hours(self, name: str) -> Optional[float]:
+        """Сколько часов источник не отдаёт новостей. None — если всё хорошо."""
+        entry = self._data.get(name)
+        if not entry:
+            return None
+        started = entry.get('silent_since') or entry.get('last_ok')
+        if not started or not entry.get('fails'):
+            return None
+        try:
+            since = datetime.fromisoformat(started)
+        except (ValueError, TypeError):
+            return None
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - since).total_seconds() / 3600
+
     def reset(self, name: str) -> None:
-        """Сброс счётчика — например, когда источник включили вручную."""
+        """Сброс — например, когда источник включили вручную."""
         if name in self._data:
             self._data[name]['fails'] = 0
+            self._data[name]['silent_since'] = None
             self._save()
 
     def info(self, name: str) -> dict:
@@ -5785,17 +5810,21 @@ def _note_source_failure(name: str, reason: str) -> None:
     if source_health is None:
         return
     fails = source_health.record_fail(name, reason)
-    logger.info(f"{name}: неудача подряд #{fails} ({reason[:80]})")
-    if fails < AUTO_DISABLE_AFTER:
+    silent = source_health.silent_hours(name) or 0
+    logger.info(f"{name}: молчит {silent:.1f} ч, проверок подряд без новостей: "
+                f"{fails} ({reason[:70]})")
+    # Пауза по времени, а не по счётчику: источник может законно молчать
+    # ночью или в выходной, но сутки тишины — это уже симптом.
+    if silent < AUTO_DISABLE_AFTER_HOURS or fails < AUTO_DISABLE_MIN_CHECKS:
         return
     if settings is None or not settings.auto_disable_sources:
         return
     if not settings.is_source_enabled(name):
         return                       # уже на паузе — второй раз не трогаем
     settings.toggle_source(name)     # источник был включён → выключаем
-    _auto_disabled_pending.append((name, reason))
-    logger.warning(f"⏸ Источник {name} автоматически выключен после "
-                   f"{fails} неудач подряд: {reason[:100]}")
+    _auto_disabled_pending.append((name, f'{silent:.0f} ч без новостей. {reason}'))
+    logger.warning(f"⏸ Источник {name} выключен: молчит {silent:.0f} ч "
+                   f"({fails} проверок), последняя причина: {reason[:80]}")
 
 
 async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
@@ -5926,80 +5955,184 @@ async def deny_access(update: Update) -> None:
 
 
 # ============== INLINE-МЕНЮ "НАСТРОЙКИ" ==============
+def _sw(value: bool) -> str:
+    """Компактный индикатор состояния для кнопки."""
+    return '🟢' if value else '⚪️'
+
+
+SETTINGS_SECTIONS = {
+    'posts': '📝 Посты',
+    'media': '🎬 Медиа',
+    'llm': '🤖 Модель',
+    'sources': '📡 Источники',
+    'system': '🔧 Система',
+}
+
+
 def build_settings_menu() -> InlineKeyboardMarkup:
-    """Главное меню настроек."""
-    img_label = "🖼 Только с картинками: ВКЛ" if settings.require_image else "🖼 Только с картинками: ВЫКЛ"
-    age_label = f"⏰ Свежесть постов: {settings.post_max_age_hours} ч"
-    thread_label = "🧵 Режим ветки: ВКЛ" if settings.thread_mode else "🧵 Режим ветки: ВЫКЛ"
+    """Главное меню: разделы, а не два десятка кнопок подряд.
+
+    Раньше все настройки лежали одним столбцом на 23 кнопки — с телефона это
+    бесконечная прокрутка, где важное перемешано с редко нужным."""
+    rows = [[InlineKeyboardButton(SETTINGS_SECTIONS['posts'],
+                                  callback_data='settings:sec:posts'),
+             InlineKeyboardButton(SETTINGS_SECTIONS['media'],
+                                  callback_data='settings:sec:media')],
+            [InlineKeyboardButton(SETTINGS_SECTIONS['llm'],
+                                  callback_data='settings:sec:llm'),
+             InlineKeyboardButton(SETTINGS_SECTIONS['sources'],
+                                  callback_data='settings:sec:sources')],
+            [InlineKeyboardButton(SETTINGS_SECTIONS['system'],
+                                  callback_data='settings:sec:system')],
+            [InlineKeyboardButton('✖ Закрыть', callback_data='settings:close')]]
+    return InlineKeyboardMarkup(rows)
+
+
+def _menu_posts() -> InlineKeyboardMarkup:
+    """Что и как публикуется."""
+    thread = ('🧵 Куда слать: в ветку' if settings.thread_mode
+              else '📢 Куда слать: сразу в канал')
+    quiet = f'{_sw(settings.quiet_mode)} Тихий режим'
+    open_mod = ('👥 Кнопки в ветке: всем' if settings.open_moderation
+                else '👤 Кнопки в ветке: админам')
+    rows = [
+        [InlineKeyboardButton(thread, callback_data='settings:toggle_thread')],
+        [InlineKeyboardButton(f'⏰ Свежесть: {settings.post_max_age_hours} ч',
+                              callback_data='settings:age'),
+         InlineKeyboardButton('🔁 Интервал', callback_data='settings:interval')],
+        [InlineKeyboardButton(open_mod, callback_data='settings:toggle_open')],
+        [InlineKeyboardButton(quiet, callback_data='settings:toggle_quiet')],
+        [InlineKeyboardButton('📦 Очередь', callback_data='settings:queue'),
+         InlineKeyboardButton('🧹 История', callback_data='settings:history')],
+        [InlineKeyboardButton('⬅️ Назад', callback_data='settings:back')],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _menu_media() -> InlineKeyboardMarkup:
+    """Картинки и видео."""
+    rows = [
+        [InlineKeyboardButton(f'{_sw(settings.video_enabled)} Видео в постах',
+                              callback_data='settings:video')],
+        [InlineKeyboardButton(f'{_sw(settings.require_image)} Только с картинкой',
+                              callback_data='settings:toggle_require_image')],
+        [InlineKeyboardButton(f'{_sw(settings.image_dedup)} Ловить повтор картинок',
+                              callback_data='settings:toggle_dedup')],
+        [InlineKeyboardButton('⬅️ Назад', callback_data='settings:back')],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _menu_llm() -> InlineKeyboardMarkup:
+    """Языковая модель и перевод."""
     if settings.translator_engine == 'google':
-        tr_label = "🌐 Переводчик: Google"
+        tr = '🌐 Перевод: Google'
     elif DEEPL_API_KEY:
-        tr_label = "🌐 Переводчик: DeepL"
+        tr = '🌐 Перевод: DeepL'
     else:
-        tr_label = "🌐 Переводчик: DeepL (нет ключа → Google)"
-    quiet_label = "🔕 Тихий режим: ВКЛ" if settings.quiet_mode else "🔔 Тихий режим: ВЫКЛ"
-    open_label = ("👥 Кнопки в ветке: ВСЕ" if settings.open_moderation
-                  else "👤 Кнопки в ветке: ТОЛЬКО АДМИНЫ")
-    dedup_label = ("🖼 Дедуп по картинке: ВКЛ" if settings.image_dedup
-                   else "🖼 Дедуп по картинке: ВЫКЛ")
-    autodis_label = ("⏸ Автопауза мёртвых источников: ВКЛ" if settings.auto_disable_sources
-                     else "⏸ Автопауза мёртвых источников: ВЫКЛ")
-    backup_label = ("📦 Ежедневный бэкап: ВКЛ" if settings.daily_backup
-                    else "📦 Ежедневный бэкап: ВЫКЛ")
-    llm_rows = []
+        tr = '🌐 Перевод: DeepL (нет ключа → Google)'
+    rows = []
     if _llm_configured():
-        llm_rows = [
-            [InlineKeyboardButton(
-                "🤖 Языковая модель: ВКЛ" if settings.llm_enabled
-                else "🤖 Языковая модель: ВЫКЛ",
-                callback_data="settings:toggle_llm")],
-            [InlineKeyboardButton(
-                "  📝 Перевод и текст: ВКЛ" if settings.llm_rewrite
-                else "  📝 Перевод и текст: ВЫКЛ",
-                callback_data="settings:toggle_llm_rewrite")],
-            [InlineKeyboardButton(
-                "  🚫 Отсев не по теме: ВКЛ" if settings.llm_filter
-                else "  🚫 Отсев не по теме: ВЫКЛ",
-                callback_data="settings:toggle_llm_filter")],
-            [InlineKeyboardButton(
-                "  #️⃣ Хэштеги: ВКЛ" if settings.llm_tags
-                else "  #️⃣ Хэштеги: ВЫКЛ",
-                callback_data="settings:toggle_llm_tags")],
-            [InlineKeyboardButton(
-                "  📄 Читать статьи: ВКЛ" if settings.llm_read_article
-                else "  📄 Читать статьи: ВЫКЛ",
-                callback_data="settings:toggle_llm_article")],
-            [InlineKeyboardButton(
-                "  🗑 Отсев подборок: ВКЛ" if settings.llm_skip_filler
-                else "  🗑 Отсев подборок: ВЫКЛ",
-                callback_data="settings:toggle_llm_filler")],
-            [InlineKeyboardButton(
-                "  ♻️ Ловить повторы: ВКЛ" if settings.llm_dedup_subject
-                else "  ♻️ Ловить повторы: ВЫКЛ",
-                callback_data="settings:toggle_llm_dedup")],
-            [InlineKeyboardButton(
-                "  🔁 Лимит на тайтл: ВКЛ" if settings.llm_limit_repeats
-                else "  🔁 Лимит на тайтл: ВЫКЛ",
-                callback_data="settings:toggle_llm_repeats")],
-        ]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📡 Источники", callback_data="settings:sources")],
-        [InlineKeyboardButton("🔁 Интервал автопроверки", callback_data="settings:interval")],
-        [InlineKeyboardButton(age_label, callback_data="settings:age")],
-        [InlineKeyboardButton(thread_label, callback_data="settings:toggle_thread")],
-        [InlineKeyboardButton(tr_label, callback_data="settings:toggle_translator")],
-        [InlineKeyboardButton(quiet_label, callback_data="settings:toggle_quiet")],
-        [InlineKeyboardButton(open_label, callback_data="settings:toggle_open")],
-        [InlineKeyboardButton(dedup_label, callback_data="settings:toggle_dedup")],
-        [InlineKeyboardButton(autodis_label, callback_data="settings:toggle_autodis")],
-        [InlineKeyboardButton(backup_label, callback_data="settings:toggle_backup")],
-        *llm_rows,
-        [InlineKeyboardButton("🎬 Видео", callback_data="settings:video")],
-        [InlineKeyboardButton(img_label, callback_data="settings:toggle_require_image")],
-        [InlineKeyboardButton("📦 Очередь постов", callback_data="settings:queue")],
-        [InlineKeyboardButton("🧹 История", callback_data="settings:history")],
-        [InlineKeyboardButton("✖ Закрыть", callback_data="settings:close")],
-    ])
+        rows.append([InlineKeyboardButton(
+            f'{_sw(settings.llm_enabled)} Языковая модель',
+            callback_data='settings:toggle_llm')])
+        if settings.llm_enabled:
+            rows += [
+                [InlineKeyboardButton(f'{_sw(settings.llm_rewrite)} Перевод и текст',
+                                      callback_data='settings:toggle_llm_rewrite'),
+                 InlineKeyboardButton(f'{_sw(settings.llm_tags)} Хэштеги',
+                                      callback_data='settings:toggle_llm_tags')],
+                [InlineKeyboardButton(f'{_sw(settings.llm_read_article)} Читать статьи',
+                                      callback_data='settings:toggle_llm_article'),
+                 InlineKeyboardButton(f'{_sw(settings.llm_filter)} Отсев чужих тем',
+                                      callback_data='settings:toggle_llm_filter')],
+                [InlineKeyboardButton(f'{_sw(settings.llm_skip_filler)} Отсев подборок',
+                                      callback_data='settings:toggle_llm_filler'),
+                 InlineKeyboardButton(f'{_sw(settings.llm_dedup_subject)} Ловить повторы',
+                                      callback_data='settings:toggle_llm_dedup')],
+                [InlineKeyboardButton(f'{_sw(settings.llm_limit_repeats)} Лимит на тайтл',
+                                      callback_data='settings:toggle_llm_repeats')],
+            ]
+    else:
+        rows.append([InlineKeyboardButton('🤖 Модель не настроена — /llm',
+                                          callback_data='settings:llm_help')])
+    rows.append([InlineKeyboardButton(tr, callback_data='settings:toggle_translator')])
+    rows.append([InlineKeyboardButton('⬅️ Назад', callback_data='settings:back')])
+    return InlineKeyboardMarkup(rows)
+
+
+def _menu_sources() -> InlineKeyboardMarkup:
+    """Источники новостей."""
+    enabled = sum(1 for n, _ in SOURCES if settings.is_source_enabled(n))
+    rows = [
+        [InlineKeyboardButton(f'📡 Список ({enabled} из {len(SOURCES)})',
+                              callback_data='settings:sources')],
+        [InlineKeyboardButton(f'{_sw(settings.auto_disable_sources)} Автопауза молчунов',
+                              callback_data='settings:toggle_autodis')],
+        [InlineKeyboardButton('⬅️ Назад', callback_data='settings:back')],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _menu_system() -> InlineKeyboardMarkup:
+    """Служебное."""
+    rows = [
+        [InlineKeyboardButton(f'{_sw(settings.daily_backup)} Ежедневный бэкап',
+                              callback_data='settings:toggle_backup')],
+        [InlineKeyboardButton(f'{_sw(settings.startup_report)} Отчёт при запуске',
+                              callback_data='settings:toggle_startup')],
+        [InlineKeyboardButton('⬅️ Назад', callback_data='settings:back')],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+_SECTION_BUILDERS = {
+    'posts': _menu_posts,
+    'media': _menu_media,
+    'llm': _menu_llm,
+    'sources': _menu_sources,
+    'system': _menu_system,
+}
+
+
+_TOGGLE_SECTION = {
+    'toggle_thread': 'posts', 'toggle_quiet': 'posts', 'toggle_open': 'posts',
+    'age': 'posts', 'interval': 'posts',
+    'video': 'media', 'toggle_require_image': 'media', 'toggle_dedup': 'media',
+    'toggle_llm': 'llm', 'toggle_llm_rewrite': 'llm', 'toggle_llm_filter': 'llm',
+    'toggle_llm_tags': 'llm', 'toggle_llm_article': 'llm', 'toggle_llm_filler': 'llm',
+    'toggle_llm_dedup': 'llm', 'toggle_llm_repeats': 'llm',
+    'toggle_translator': 'llm',
+    'toggle_autodis': 'sources', 'sources': 'sources',
+    'toggle_backup': 'system', 'toggle_startup': 'system',
+}
+
+
+def _menu_for(data: str) -> InlineKeyboardMarkup:
+    """Клавиатура того раздела, откуда нажали кнопку.
+
+    После переключения тумблера надо остаться на месте: выбрасывать в корень
+    каждый раз — значит заставлять заново нырять в раздел ради второй галочки."""
+    key = data.split(':', 1)[-1]
+    section = _TOGGLE_SECTION.get(key)
+    builder = _SECTION_BUILDERS.get(section) if section else None
+    return builder() if builder else build_settings_menu()
+
+
+def _section_view(name: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Заголовок и клавиатура раздела."""
+    builder = _SECTION_BUILDERS.get(name)
+    if builder is None:
+        return '⚙️ Настройки', build_settings_menu()
+    hints = {
+        'posts': 'Куда и как часто уходят посты.',
+        'media': 'Картинки и видео в постах.',
+        'llm': 'Перевод, текст постов, теги и фильтры.',
+        'sources': 'Откуда бот берёт новости.',
+        'system': 'Бэкапы и уведомления.',
+    }
+    return f'{SETTINGS_SECTIONS[name]}\n\n{hints[name]}', builder()
+
 
 
 def build_age_menu() -> InlineKeyboardMarkup:
@@ -6432,9 +6565,20 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
-    # === Главное меню ===
+    # === Главное меню и разделы ===
     if data == "settings:back":
-        await query.edit_message_text("⚙️ Настройки", reply_markup=build_settings_menu())
+        await _safe_edit(query, '⚙️ <b>Настройки</b>\n\nВыбери раздел.',
+                         build_settings_menu())
+        return
+    if data.startswith("settings:sec:"):
+        text, markup = _section_view(data.split(':', 2)[2])
+        await _safe_edit(query, text, markup)
+        return
+    if data == "settings:llm_help":
+        await query.answer(
+            'Модель включается двумя переменными на хостинге: '
+            'LLM_PROVIDER и LLM_API_KEY. Подробности — команда /llm',
+            show_alert=True)
         return
     if data == "settings:close":
         await query.edit_message_text("Меню закрыто.")
@@ -6493,7 +6637,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"Только с картинками: {state}")
         await query.edit_message_text(
             "⚙️ Настройки",
-            reply_markup=build_settings_menu(),
+            reply_markup=_menu_for(data),
         )
         return
 
@@ -6514,7 +6658,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🧵 Режим ветки ВЫКЛЮЧЕН.\n"
                 "Бот снова публикует по одному посту в канал за интервал."
             )
-        await query.edit_message_text(text, reply_markup=build_settings_menu())
+        await query.edit_message_text(text, reply_markup=_menu_for(data))
         return
 
     if data.startswith("settings:toggle_llm"):
@@ -6537,7 +6681,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if attr == 'llm_enabled' and not settings.llm_enabled:
                 note += '\n\nБот вернулся к переводу через DeepL/Google.'
             await query.edit_message_text(f"⚙️ Настройки\n\n{note}",
-                                          reply_markup=build_settings_menu())
+                                          reply_markup=_menu_for(data))
             return
 
     if data == "settings:toggle_dedup":
@@ -6548,18 +6692,19 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if settings.image_dedup else
                 '🖼 Проверка картинок выключена: возможны повторы одного кадра.')
         await query.edit_message_text(f"⚙️ Настройки\n\n{note}",
-                                      reply_markup=build_settings_menu())
+                                      reply_markup=_menu_for(data))
         return
 
     if data == "settings:toggle_autodis":
         settings.auto_disable_sources = not settings.auto_disable_sources
         await query.answer('Автопауза ' + ('включена' if settings.auto_disable_sources else 'выключена'))
-        note = (f'⏸ Источник, не отдавший новостей {AUTO_DISABLE_AFTER} проверок подряд, '
-                f'будет ставиться на паузу с уведомлением.'
+        note = (f'⏸ Источник, не отдающий новостей больше '
+                f'{AUTO_DISABLE_AFTER_HOURS} ч, будет ставиться на паузу '
+                f'с уведомлением.'
                 if settings.auto_disable_sources else
                 '⏸ Мёртвые источники останутся включёнными — смотри /health.')
         await query.edit_message_text(f"⚙️ Настройки\n\n{note}",
-                                      reply_markup=build_settings_menu())
+                                      reply_markup=_menu_for(data))
         return
 
     if data == "settings:toggle_backup":
@@ -6569,7 +6714,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if settings.daily_backup else
                 '📦 Автобэкап выключен. Вручную — /backup.')
         await query.edit_message_text(f"⚙️ Настройки\n\n{note}",
-                                      reply_markup=build_settings_menu())
+                                      reply_markup=_menu_for(data))
         return
 
     if data == "settings:toggle_open":
@@ -6584,7 +6729,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer('Кнопки в ветке — только админам 👤')
             text = ("⚙️ Настройки\n\n"
                     "👤 Кнопки под постами теперь работают только у админов.")
-        await query.edit_message_text(text, reply_markup=build_settings_menu())
+        await query.edit_message_text(text, reply_markup=_menu_for(data))
         return
 
     if data == "settings:toggle_quiet":
@@ -6606,7 +6751,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Бот снова уведомляет о каждой проверке (каждые "
                 f"{settings.check_interval_min} мин)."
             )
-        await query.edit_message_text(text, reply_markup=build_settings_menu())
+        await query.edit_message_text(text, reply_markup=_menu_for(data))
         return
 
     if data == "settings:toggle_translator":
@@ -6639,7 +6784,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         # Переводы кешируются — очищаем кеш чтобы новый движок применился сразу
         _translation_cache.clear()
-        await query.edit_message_text(text, reply_markup=build_settings_menu())
+        await query.edit_message_text(text, reply_markup=_menu_for(data))
         return
 
     # === Переключение источника ===
@@ -6705,7 +6850,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("История очищена")
         await query.edit_message_text(
             "✅ История ссылок очищена.",
-            reply_markup=build_settings_menu(),
+            reply_markup=_menu_for(data),
         )
         return
 
@@ -6771,7 +6916,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"Удалено {count} постов")
         await query.edit_message_text(
             f"✅ Очередь очищена ({count} постов).",
-            reply_markup=build_settings_menu(),
+            reply_markup=_menu_for(data),
         )
         return
 
@@ -6798,7 +6943,7 @@ async def reply_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     elif text == BTN_SETTINGS:
         await update.message.reply_text(
             "⚙️ Настройки",
-            reply_markup=build_settings_menu(),
+            reply_markup=_menu_for(data),
         )
 
 
@@ -7307,7 +7452,7 @@ async def settings_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /settings — открыть inline-меню настроек."""
     await update.message.reply_text(
         "⚙️ Настройки",
-        reply_markup=build_settings_menu(),
+        reply_markup=_menu_for(data),
     )
 
 
@@ -7445,8 +7590,8 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
             await notify_admin(
                 context.bot,
                 f'⏸ Источник «{src_name}» выключен автоматически\n\n'
-                f'{AUTO_DISABLE_AFTER} проверок подряд без новостей.\n'
-                f'Последняя причина: {reason[:150]}\n\n'
+                f'Больше {AUTO_DISABLE_AFTER_HOURS} ч не отдаёт новостей.\n'
+                f'{reason[:180]}\n\n'
                 f'Включить обратно: /settings → 📡 Источники')
         # Только то, что подходит по фильтру и не было отправлено ранее
         fresh = [
@@ -9053,15 +9198,16 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
     if source_health is not None:
         for name in enabled:
             info = source_health.info(name)
-            fails = int(info.get('fails', 0))
-            if fails:
-                problem.append((name, fails, info.get('last_error', '')))
+            if int(info.get('fails', 0)):
+                problem.append((name, source_health.silent_hours(name) or 0,
+                                info.get('last_error', '')))
     problem.sort(key=lambda x: -x[1])
     if problem:
-        for name, fails, err in problem[:8]:
-            left = AUTO_DISABLE_AFTER - fails
-            tail = f' (до паузы {left})' if left > 0 else ''
-            lines.append(f'  ⚠️ {name}: неудач подряд {fails}{tail}')
+        for name, silent, err in problem[:8]:
+            left = AUTO_DISABLE_AFTER_HOURS - silent
+            tail = (f' (до паузы {left:.0f} ч)' if left > 0
+                    else ' — пора на паузу')
+            lines.append(f'  ⚠️ {name}: молчит {silent:.1f} ч{tail}')
             if err:
                 lines.append(f'      {html.escape(err[:70])}')
     else:
@@ -9370,28 +9516,20 @@ async def setup_bot_commands(app: Application) -> None:
     logger.info(f"🕰 Джоб отложки зарегистрирован (тик раз в 60с). "
                 f"В отложке: {total}, из них созрело: {ripe}")
     print(f"Джоб отложки: зарегистрирован | постов в отложке: {total}", flush=True)
+    # В синем меню Telegram держим то, чем пользуются часто. Остальные команды
+    # (/deepl, /blacklist, /addsource, /delsource, /tz, /preview, /backup)
+    # работают по-прежнему, просто не засоряют список из двух десятков строк.
     commands = [
-        BotCommand("news", "🔍 Свежие новости"),
-        BotCommand("preview", "👁 Превью постов в личку"),
-        BotCommand("start_auto", "▶️ Включить авторассылку"),
-        BotCommand("stop_auto", "⏸ Выключить авторассылку"),
-        BotCommand("status", "📊 Статус бота"),
-        BotCommand("stats", "📈 Метрики и статистика"),
-        BotCommand("deepl", "🌐 Лимит DeepL"),
-        BotCommand("backup", "📦 Бэкап данных"),
-        BotCommand("health", "🩺 Состояние бота"),
-        BotCommand("admins", "👥 Администраторы"),
-        BotCommand("videocheck", "🎬 Почему нет видео"),
-        BotCommand("llm", "🤖 Модель: статус и проверка"),
-        BotCommand("scheduled", "📅 Отложенные посты"),
-        BotCommand("tz", "🕒 Часовой пояс"),
-        BotCommand("sources", "📡 Динамические источники"),
-        BotCommand("addsource", "➕ Добавить источник"),
-        BotCommand("delsource", "➖ Удалить источник"),
-        BotCommand("logs", "📝 Последние строки лога"),
-        BotCommand("blacklist", "📛 Список стоп-слов"),
         BotCommand("settings", "⚙️ Настройки"),
-        BotCommand("start", "🚀 Перезапуск меню"),
+        BotCommand("scheduled", "📅 Отложенные посты"),
+        BotCommand("news", "🔍 Проверить новости сейчас"),
+        BotCommand("status", "📊 Что сейчас происходит"),
+        BotCommand("health", "🩺 Состояние бота"),
+        BotCommand("stats", "📈 Статистика"),
+        BotCommand("sources", "📡 Источники"),
+        BotCommand("llm", "🤖 Модель: статус и проверка"),
+        BotCommand("admins", "👥 Администраторы"),
+        BotCommand("logs", "📝 Логи"),
     ]
     try:
         await app.bot.set_my_commands(commands)
