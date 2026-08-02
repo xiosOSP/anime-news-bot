@@ -751,6 +751,7 @@ class BotSettings:
         'open_moderation': True, # кнопки под постами в ветке доступны всем участникам
         'auto_disable_sources': True,  # сам ставить на паузу умершие источники
         'image_dedup': True,     # отсеивать посты с уже публиковавшейся картинкой
+        'dedup_final_text': True,  # сверять готовый текст поста с недавними
         'daily_backup': True,    # ежедневный бэкап данных в личку админу
         'last_backup_date': '',  # дата последнего бэкапа (YYYY-MM-DD)
         'startup_report': True,  # отчёт админам при запуске бота
@@ -891,6 +892,15 @@ class BotSettings:
     @auto_disable_sources.setter
     def auto_disable_sources(self, value: bool) -> None:
         self._data['auto_disable_sources'] = bool(value)
+        self.save()
+
+    @property
+    def dedup_final_text(self) -> bool:
+        return bool(self._data.get('dedup_final_text', True))
+
+    @dedup_final_text.setter
+    def dedup_final_text(self, value: bool) -> None:
+        self._data['dedup_final_text'] = bool(value)
         self.save()
 
     @property
@@ -4532,6 +4542,20 @@ async def _prepare_news_for_send(news: dict, source: str,
         if count_stats:
             await stats.record_skipped('duplicate', source)
         return 'skipped_dup'
+
+    # Последняя проверка — на готовом тексте. Все предыдущие сравнивают исходные
+    # заголовки, а одна новость с двух сайтов приходит разными формулировками
+    # и совпадает только после перевода.
+    if published_texts is not None and settings.dedup_final_text:
+        final_text = format_news_short(news)
+        twin = published_texts.find_similar(final_text)
+        if twin:
+            logger.info(f"⊘ Такой пост уже выходил («{twin[:45]}»): "
+                        f"{final_text.split(chr(10))[0][:50]}")
+            if count_stats:
+                await stats.record_skipped('duplicate', source)
+            return 'skipped_dup'
+        news['_final_text'] = final_text     # запомним после публикации
     return None
 
 
@@ -4921,6 +4945,112 @@ scheduled_posts: Optional['ScheduledPosts'] = None
 
 # ============== ЗДОРОВЬЕ ИСТОЧНИКОВ И ОТПЕЧАТКИ КАРТИНОК ==============
 
+PUBLISHED_TEXTS_FILE = DATA_DIR / 'published_texts.json'
+PUBLISHED_TEXT_HOURS = 48
+PUBLISHED_TEXT_MAX = 300
+FINAL_SIMILARITY = 0.55        # доля общих слов, при которой считаем дублем
+
+
+class PublishedTexts:
+    """Тексты уже опубликованных постов — в том виде, в каком они ушли.
+
+    Все прочие дедупы работают ДО перевода, на исходных заголовках. Но одна
+    новость с двух сайтов приходит разными формулировками на английском
+    («Anime of FX Fighter Kurumi-chan Manga Premieres in October» и «FX Senshi
+    Kurumi-chan Anime Reveals October Premiere»), и совпадать они начинают
+    только после перевода. Эта проверка — последняя, уже на готовом тексте."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._items: list[dict] = []
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if self.path.exists():
+                data = json.loads(self.path.read_text(encoding='utf-8'))
+                if isinstance(data, list):
+                    self._items = data
+        except (OSError, ValueError) as e:
+            logger.warning(f"published_texts не загружен: {e}")
+        self._prune()
+
+    def _save(self) -> None:
+        try:
+            self.path.write_text(json.dumps(self._items, ensure_ascii=False),
+                                 encoding='utf-8')
+        except OSError as e:
+            logger.error(f"published_texts не сохранён: {e}")
+
+    def _prune(self) -> None:
+        edge = time.time() - PUBLISHED_TEXT_HOURS * 3600
+        self._items = [i for i in self._items
+                       if isinstance(i.get('ts'), (int, float)) and i['ts'] > edge]
+        if len(self._items) > PUBLISHED_TEXT_MAX:
+            self._items = self._items[-PUBLISHED_TEXT_MAX:]
+
+    # Кириллица → латиница: названия тайтлов приходят в обоих написаниях
+    # («Куруми» и «Kurumi»), и без приведения к одному алфавиту один и тот же
+    # тайтл выглядит как два разных.
+    _TRANSLIT = str.maketrans({
+        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
+        'ж': 'j', 'з': 'z', 'и': 'i', 'й': 'i', 'к': 'k', 'л': 'l', 'м': 'm',
+        'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+        'ф': 'f', 'х': 'h', 'ц': 'c', 'ч': 'c', 'ш': 's', 'щ': 's', 'ъ': '',
+        'ы': 'i', 'ь': '', 'э': 'e', 'ю': 'u', 'я': 'a',
+    })
+
+    @classmethod
+    def _words(cls, text: str) -> set:
+        """Значимые слова первой строки, приведённые к латинице."""
+        head = (text or '').split('\n')[0].lower()
+        raw = re.findall(r'[а-яёa-z0-9]{3,}', head)
+        stop = {'аниме', 'манга', 'манге', 'манги', 'the', 'and', 'for', 'уже',
+                'выйдет', 'вышел', 'вышла', 'состоится', 'получит', 'anime',
+                'manga', 'премьера', 'этого', 'года'}
+        words = set()
+        for word in raw:
+            if word in stop:
+                continue
+            latin = word.translate(cls._TRANSLIT)
+            if len(latin) >= 3:
+                words.add(latin[:6])
+        return words
+
+    def find_similar(self, text: str) -> Optional[str]:
+        """Заголовок недавнего поста, который говорит о том же. Или None."""
+        words = self._words(text)
+        if len(words) < 3:                 # слишком коротко, чтобы судить
+            return None
+        self._prune()
+        for item in reversed(self._items):
+            old = set(item.get('w') or [])
+            if not old:
+                continue
+            overlap = len(words & old) / min(len(words), len(old))
+            if overlap >= FINAL_SIMILARITY:
+                return item.get('t', '')
+        return None
+
+    def add(self, text: str) -> None:
+        words = self._words(text)
+        if len(words) < 3:
+            return
+        self._items.append({
+            'w': sorted(words),
+            't': re.sub(r'\s+', ' ', (text or '').split('\n')[0])[:70],
+            'ts': time.time(),
+        })
+        self._prune()
+        self._save()
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+published_texts: Optional['PublishedTexts'] = None
+
+
 SUBJECT_MEMORY_FILE = DATA_DIR / 'recent_subjects.json'
 SUBJECT_MEMORY_HOURS = 36       # столько помним, о чём уже писали
 SUBJECT_MAX_PER_DAY = 3         # больше постов про один тайтл за сутки — перебор
@@ -5300,6 +5430,9 @@ def _commit_image_fingerprint(news: dict) -> None:
     if subject and recent_subjects is not None:
         recent_subjects.add(subject, news.get('_llm_kind', 'новость'),
                             news.get('title', ''))
+    final_text = news.pop('_final_text', None)
+    if final_text and published_texts is not None:
+        published_texts.add(final_text)
 
 
 PENDING_POSTS_FILE = DATA_DIR / 'pending_posts.json'
@@ -6002,6 +6135,8 @@ def _menu_posts() -> InlineKeyboardMarkup:
          InlineKeyboardButton('🔁 Интервал', callback_data='settings:interval')],
         [InlineKeyboardButton(open_mod, callback_data='settings:toggle_open')],
         [InlineKeyboardButton(quiet, callback_data='settings:toggle_quiet')],
+        [InlineKeyboardButton(f'{_sw(settings.dedup_final_text)} Ловить повтор новостей',
+                              callback_data='settings:toggle_finaldedup')],
         [InlineKeyboardButton('📦 Очередь', callback_data='settings:queue'),
          InlineKeyboardButton('🧹 История', callback_data='settings:history')],
         [InlineKeyboardButton('⬅️ Назад', callback_data='settings:back')],
@@ -6097,6 +6232,7 @@ _SECTION_BUILDERS = {
 
 _TOGGLE_SECTION = {
     'toggle_thread': 'posts', 'toggle_quiet': 'posts', 'toggle_open': 'posts',
+    'toggle_finaldedup': 'posts',
     'age': 'posts', 'interval': 'posts',
     'video': 'media', 'toggle_require_image': 'media', 'toggle_dedup': 'media',
     'toggle_llm': 'llm', 'toggle_llm_rewrite': 'llm', 'toggle_llm_filter': 'llm',
@@ -6684,6 +6820,18 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                           reply_markup=_menu_for(data))
             return
 
+    if data == "settings:toggle_finaldedup":
+        settings.dedup_final_text = not settings.dedup_final_text
+        state = 'включена' if settings.dedup_final_text else 'выключена'
+        await query.answer(f'Проверка повторов {state}')
+        note = ('🔁 Готовый текст поста сверяется с недавними — ловит одну новость, '
+                'пришедшую с разных сайтов разными формулировками.'
+                if settings.dedup_final_text else
+                '🔁 Проверка выключена: возможны повторы одной новости.')
+        await query.edit_message_text(f"⚙️ Настройки\n\n{note}",
+                                      reply_markup=_menu_for(data))
+        return
+
     if data == "settings:toggle_dedup":
         settings.image_dedup = not settings.image_dedup
         await query.answer('Дедуп по картинке ' + ('включён' if settings.image_dedup else 'выключен'))
@@ -6942,8 +7090,9 @@ async def reply_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await status(update, context)
     elif text == BTN_SETTINGS:
         await update.message.reply_text(
-            "⚙️ Настройки",
-            reply_markup=_menu_for(data),
+            '⚙️ <b>Настройки</b>\n\nВыбери раздел.',
+            reply_markup=build_settings_menu(),
+            parse_mode=ParseMode.HTML,
         )
 
 
@@ -7451,8 +7600,9 @@ async def start(update, context: ContextTypes.DEFAULT_TYPE):
 async def settings_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /settings — открыть inline-меню настроек."""
     await update.message.reply_text(
-        "⚙️ Настройки",
-        reply_markup=_menu_for(data),
+        '⚙️ <b>Настройки</b>\n\nВыбери раздел.',
+        reply_markup=build_settings_menu(),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -9548,6 +9698,9 @@ def _init_globals() -> None:
         sent_links = SentLinksStore(SENT_LINKS_FILE)
     if pending_posts is None:
         pending_posts = PendingPosts(PENDING_POSTS_FILE)
+    global published_texts
+    if published_texts is None:
+        published_texts = PublishedTexts(PUBLISHED_TEXTS_FILE)
     global user_directory
     if user_directory is None:
         user_directory = UserDirectory(USER_DIRECTORY_FILE)
