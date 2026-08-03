@@ -459,6 +459,7 @@ class SentLinksStore:
         self.path = path
         self._urls: list[str] = []          # нормализованные URL (для обрезки старых)
         self._url_set: set[str] = set()      # быстрая проверка
+        self._titles: list[str] = []         # заголовки в порядке добавления
         self._title_set: set[str] = set()    # нормализованные заголовки
         # Недавние заголовки для fuzzy-дедупа «одна новость с разных источников»:
         # (timestamp, склейка normalize_title, значимые токены). Не персистентно —
@@ -477,13 +478,17 @@ class SentLinksStore:
             if isinstance(data, list):
                 self._urls = [normalize_url(u) for u in data]
                 self._url_set = set(self._urls)
+                self._titles = []
                 self._title_set = set()
                 logger.info(f"Загружена старая история ({len(self._urls)} URL), мигрирую в новый формат")
                 self._save()
             elif isinstance(data, dict):
                 self._urls = data.get('urls', [])
                 self._url_set = set(self._urls)
-                self._title_set = set(data.get('titles', []))
+                # titles хранится списком в порядке добавления — так при обрезке
+                # выбрасываются самые старые, а не все подряд
+                self._titles = [t for t in data.get('titles', []) if t]
+                self._title_set = set(self._titles)
                 for item in data.get('recent', []):
                     try:
                         ts, norm, tokens = item
@@ -498,7 +503,7 @@ class SentLinksStore:
             with self.path.open('w', encoding='utf-8') as f:
                 json.dump({
                     'urls': self._urls,
-                    'titles': list(self._title_set),
+                    'titles': self._titles,
                     # окно fuzzy-дедупа переживает рестарты
                     'recent': [[ts, norm, sorted(tokens)] for ts, norm, tokens in self._recent_titles],
                 }, f, ensure_ascii=False)
@@ -575,23 +580,31 @@ class SentLinksStore:
                     pass
             if norm_title:
                 self._title_set.discard(norm_title)
+                try:
+                    self._titles.remove(norm_title)
+                except ValueError:
+                    pass
             self._save()
 
     def _add_unlocked(self, norm_url: str, norm_title: str) -> None:
         if norm_url not in self._url_set:
             self._urls.append(norm_url)
             self._url_set.add(norm_url)
-        if norm_title:
+        if norm_title and norm_title not in self._title_set:
+            self._titles.append(norm_title)
             self._title_set.add(norm_title)
         # Чистка старых записей
         if len(self._urls) > SENT_LINKS_MAX:
             self._urls = self._urls[-SENT_LINKS_TRIM_TO:]
             self._url_set = set(self._urls)
-            # Заголовки тоже подрезаем — храним столько же
-            if len(self._title_set) > SENT_LINKS_MAX:
-                # Не знаем порядок, просто очищаем все и накопим заново
-                self._title_set = set()
-            logger.info("Очищена старая история ссылок")
+            logger.info(f"История ссылок подрезана до {len(self._urls)}")
+        if len(self._titles) > SENT_LINKS_MAX:
+            # Раньше здесь стирались ВСЕ заголовки разом — и защита от дублей
+            # по названию обнулялась на несколько дней вперёд. Теперь режем
+            # так же, как URL: выбрасываем самые старые.
+            self._titles = self._titles[-SENT_LINKS_TRIM_TO:]
+            self._title_set = set(self._titles)
+            logger.info(f"История заголовков подрезана до {len(self._titles)}")
         self._save()
 
 
@@ -5347,6 +5360,27 @@ image_hashes: Optional['ImageHashes'] = None
 MIN_GOOD_IMAGE_PX = 500         # ниже этой ширины кадр выглядит мыльным
 
 
+IMAGE_BYTES_CACHE_MAX = 40      # столько скачанных картинок держим в памяти
+_image_bytes_cache: dict = {}
+
+
+def _cached_image_bytes(url: str) -> Optional[bytes]:
+    """Скачивает картинку с кэшем на время цикла.
+
+    Один и тот же файл нужен несколько раз: посчитать отпечаток для дедупа,
+    измерить размер превью, отправить байтами при отказе Bot API. Раньше каждый
+    шаг качал заново — лишний трафик и задержка на ровном месте."""
+    if not url:
+        return None
+    if url in _image_bytes_cache:
+        return _image_bytes_cache[url]
+    data = _download_image_bytes(url)
+    if len(_image_bytes_cache) >= IMAGE_BYTES_CACHE_MAX:
+        _image_bytes_cache.clear()
+    _image_bytes_cache[url] = data
+    return data
+
+
 def _image_width(data: Optional[bytes]) -> Optional[int]:
     """Ширина картинки в пикселях (нужен Pillow). None — если не определить."""
     if not data or Image is None:
@@ -5368,7 +5402,7 @@ async def _improve_thumb(news: dict) -> None:
     images = news.get('images') or []
     if not images or Image is None:
         return
-    current = await asyncio.to_thread(_download_image_bytes, images[0])
+    current = await asyncio.to_thread(_cached_image_bytes, images[0])
     width = _image_width(current)
     if width is not None and width >= MIN_GOOD_IMAGE_PX:
         return
@@ -5382,7 +5416,7 @@ async def _improve_thumb(news: dict) -> None:
     if not og_norm or og_norm == images[0]:
         logger.debug(f"Превью {width}px, замены не нашлось: {news.get('title', '')[:50]}")
         return
-    candidate = await asyncio.to_thread(_download_image_bytes, og_norm)
+    candidate = await asyncio.to_thread(_cached_image_bytes, og_norm)
     cand_width = _image_width(candidate)
     if cand_width and (width is None or cand_width > width):
         news['images'] = [og_norm] + [i for i in images[1:] if i != og_norm]
@@ -5405,7 +5439,7 @@ async def _image_duplicate(news: dict) -> Optional[str]:
     images = news.get('images') or []
     if not images:
         return None
-    data = await asyncio.to_thread(_download_image_bytes, images[0])
+    data = await asyncio.to_thread(_cached_image_bytes, images[0])
     fingerprint = _image_fingerprint(data)
     if not fingerprint:
         return None
@@ -5606,7 +5640,7 @@ async def _resolve_photos_for_album(photos: list[str]) -> list:
     resolved: list = []
     for ph in photos[:MAX_PHOTOS_PER_POST]:
         if _download_needed_host(ph):
-            data = await asyncio.to_thread(_download_image_bytes, ph)
+            data = await asyncio.to_thread(_cached_image_bytes, ph)
             resolved.append(data if data else ph)
         else:
             resolved.append(ph)
@@ -7729,6 +7763,8 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
 
         # 1) Собираем свежие новости с источников
         all_news, stats_lines, errors = await collect_all_news()
+
+        _image_bytes_cache.clear()      # цикл закончился, картинки больше не нужны
 
         # Накопленные предупреждения (квота переводчика и т.п.)
         while _pending_admin_alerts:
