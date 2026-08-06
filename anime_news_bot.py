@@ -73,7 +73,7 @@ except ImportError:
 # Для локального запуска на ПК создайте файл .env рядом с этим скриптом (см. .env.example).
 # Файл .env в репозиторий не попадает (он в .gitignore).
 
-def _load_dotenv(path: str = '.env') -> None:
+def _load_dotenv(path: str | Path = Path(__file__).with_name('.env')) -> None:
     """Простой загрузчик .env без внешних зависимостей.
     Читает строки вида KEY=VALUE и кладёт в окружение (не перезаписывая уже заданные).
     Если файла нет — молча пропускает (на хостинге переменные задаются в панели)."""
@@ -128,12 +128,24 @@ _channel_raw = _channel_env or str(MAIN_CHANNEL_ID)
 # меньше шансов на опечатку вроде лишнего пробела в переменной окружения
 CHANNEL_ID = int(_channel_raw) if re.fullmatch(r'-?\d+', _channel_raw) \
     else _channel_raw
-ADMIN_ID = _env_int('ADMIN_ID', 5056873937)
+_admin_env = (os.getenv('ADMIN_ID') or '').strip()
+ADMIN_FROM_ENV = bool(re.fullmatch(r'-?\d+', _admin_env))
+ADMIN_ID = int(_admin_env) if ADMIN_FROM_ENV else 5056873937
 
 # Группа обсуждения и ветка (тема форума) для режима "слать всё в ветку".
 # Узнать ID можно командой /chatinfo внутри нужной ветки.
-DISCUSSION_CHAT_ID = _env_int('DISCUSSION_CHAT_ID', -1003178917488)   # ID супергруппы обсуждения
-DISCUSSION_THREAD_ID = _env_int('DISCUSSION_THREAD_ID', 10138)        # ID темы "бот-новостник"
+_discussion_chat_env = (os.getenv('DISCUSSION_CHAT_ID') or '').strip()
+_discussion_thread_env = (os.getenv('DISCUSSION_THREAD_ID') or '').strip()
+DISCUSSION_CHAT_FROM_ENV = bool(re.fullmatch(r'-?\d+', _discussion_chat_env))
+DISCUSSION_THREAD_FROM_ENV = bool(re.fullmatch(r'-?\d+', _discussion_thread_env))
+DISCUSSION_CHAT_ID = int(_discussion_chat_env) if DISCUSSION_CHAT_FROM_ENV else -1003178917488
+DISCUSSION_THREAD_ID = int(_discussion_thread_env) if DISCUSSION_THREAD_FROM_ENV else 10138
+
+# Старые ID оставлены как совместимый fallback для владельца исходного проекта,
+# но новый деплой обязан явно подтвердить их или задать свои значения через env.
+ALLOW_LEGACY_IDS = _env('ALLOW_LEGACY_IDS', '').strip().lower() in {
+    '1', 'true', 'yes', 'on',
+}
 
 # DeepL API-ключ (опционально). Если задан — перевод идёт через DeepL (качество выше),
 # иначе через Google Translate. Ключ бесплатного тира заканчивается на ':fx'.
@@ -319,17 +331,29 @@ _TRACKING_PARAMS = re.compile(
 
 
 def normalize_url(url: str) -> str:
-    """Приводит URL к каноническому виду для сравнения дубликатов:
-    - lowercase scheme и host, убираем www.
-    - выкидываем utm_*, fbclid, ref и пр. трекинг
-    - убираем trailing slash и фрагмент
+    """Приводит HTTP(S)-URL к каноническому виду для сравнения дубликатов.
+
+    Относительные ссылки и специальные схемы (mailto:, tg: и т.п.) не пытаемся
+    превращать в HTTP: прежняя реализация могла получить ``https:///path`` или
+    ``https:example.com/news``, из-за чего дедуп работал непредсказуемо.
     """
     if not url or not url.strip():
         return ''
+    raw = url.strip()
     try:
         from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
-        parsed = urlparse(url.strip())
-        scheme = (parsed.scheme or 'https').lower()
+        if raw.startswith('//'):
+            raw = 'https:' + raw
+        parsed = urlparse(raw)
+        if not parsed.scheme and not parsed.netloc:
+            # Домен без схемы считаем HTTPS; относительный путь оставляем как есть.
+            if re.match(r'^(?:localhost|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})(?::\d+)?(?:/|$)', raw):
+                parsed = urlparse('https://' + raw)
+            else:
+                return raw
+        scheme = parsed.scheme.lower()
+        if scheme not in ('http', 'https') or not parsed.netloc:
+            return raw
         netloc = parsed.netloc.lower()
         if netloc.startswith('www.'):
             netloc = netloc[4:]
@@ -339,7 +363,7 @@ def normalize_url(url: str) -> str:
         path = parsed.path.rstrip('/') or '/'
         return urlunparse((scheme, netloc, path, parsed.params, query, ''))
     except Exception:
-        return url.strip()
+        return raw
 
 
 def normalize_title(title: str) -> str:
@@ -584,6 +608,13 @@ class SentLinksStore:
                     self._titles.remove(norm_title)
                 except ValueError:
                     pass
+                # claim() добавляет заголовок и в fuzzy-окно. Если отправка упала,
+                # его тоже надо убрать, иначе has_similar_title() блокирует повтор
+                # на 48 часов, хотя пост так и не был опубликован.
+                self._recent_titles = deque(
+                    (item for item in self._recent_titles if item[1] != norm_title),
+                    maxlen=self._recent_titles.maxlen,
+                )
             self._save()
 
     def _add_unlocked(self, norm_url: str, norm_title: str) -> None:
@@ -761,7 +792,7 @@ class BotSettings:
         'last_daily_summary': '',  # дата (YYYY-MM-DD) последней ежедневной сводки
         'extra_admins': [],      # дополнительные Telegram ID с правами админа
         'tz_offset': 3,          # часовой пояс админа относительно UTC (МСК = +3)
-        'open_moderation': True, # кнопки под постами в ветке доступны всем участникам
+        'open_moderation': False, # безопасный default: публикация только для админов
         'auto_disable_sources': True,  # сам ставить на паузу умершие источники
         'image_dedup': True,     # отсеивать посты с уже публиковавшейся картинкой
         'dedup_final_text': True,  # сверять готовый текст поста с недавними
@@ -1077,7 +1108,7 @@ class BotSettings:
 
     @property
     def open_moderation(self) -> bool:
-        return bool(self._data.get('open_moderation', True))
+        return bool(self._data.get('open_moderation', False))
 
     @open_moderation.setter
     def open_moderation(self, value: bool) -> None:
@@ -3049,7 +3080,16 @@ def _parse_rss_with_fallback(
     """
     news_list = []
     try:
-        feed = feedparser.parse(rss_url)
+        response = http_get_with_retry(
+            rss_url,
+            headers={'User-Agent': USER_AGENT},
+            timeout=HTTP_TIMEOUT,
+        )
+        if response is None or response.status_code >= 400:
+            status = getattr(response, 'status_code', 'нет ответа')
+            logger.warning(f"{source_name}: RSS недоступен (HTTP {status})")
+            return []
+        feed = feedparser.parse(response.content)
         for entry in feed.entries[:NEWS_PER_SOURCE * 3]:
             link = getattr(entry, 'link', None)
             if not link or link in sent_links:
@@ -4419,7 +4459,7 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
         except TelegramError as e:
             logger.warning(f"Альбом не отправился ({e}), пробую одиночно")
             # Fallback: пробуем по очереди — сначала видео/первая фотка с caption, остальное без
-            return await _send_post_fallback(bot, news, target, video_file, photos, caption, safe_text, has_inline_video, thread_id)
+            return await _send_post_fallback(bot, news, target, video_file, video_media, photos, caption, safe_text, has_inline_video, thread_id)
     finally:
         for f in opened_files:
             try:
@@ -4430,7 +4470,7 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
 
 async def _send_post_fallback(
     bot: Bot, news: dict, target,
-    video_file: Optional[Path], photos: list[str],
+    video_file: Optional[Path], video_media, photos: list,
     caption: str, safe_text: str, has_inline_video: bool,
     thread_id: Optional[int] = None,
 ) -> bool:
@@ -5710,6 +5750,9 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     pending_key = None
     if pending_posts is not None:
         pending_key = pending_posts.add(news)
+        # Временная метка нужна вызывающему коду для отката, если Telegram не
+        # принял пост. В сохранённую запись она не попадает: add() уже выполнен.
+        news['_pending_key'] = pending_key
         reply_markup = _moderation_markup(pending_key)
 
     # Если медиа нет вовсе (require_image выключен) — просто текст
@@ -5931,12 +5974,21 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
     video_file = await _prepare_video_file(news)
 
     try:
-        ok = await _send_post_thread_split(bot, news, video_file)
+        try:
+            ok = await _send_post_thread_split(bot, news, video_file)
+        except Exception as e:
+            logger.exception(f"Отправка в ветку упала: {news.get('title', '')[:60]}")
+            ok = False
+        pending_key = news.pop('_pending_key', None)
         if ok:
             _commit_image_fingerprint(news)
             _mark_published()
             await stats.record_published(source)
             return 'sent'
+        # pending_posts.add() происходит до Telegram-вызова, чтобы кнопки знали
+        # callback key. При полном провале удаляем невидимую «призрачную» запись.
+        if pending_key and pending_posts is not None:
+            pending_posts.pop(pending_key)
         await sent_links.release(news['link'], news.get('title', ''))
         await stats.record_failed_send(source)
         return 'failed'
@@ -9519,8 +9571,6 @@ async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
         return
     if _local_now().hour < BACKUP_HOUR:
         return
-    # Дату ставим сразу: даже если отправка сорвётся, повторять весь день не будем
-    settings.last_backup_date = today
     archive = await asyncio.to_thread(_build_backup_archive)
     if not archive:
         logger.warning("Ежедневный бэкап: нечего архивировать")
@@ -9537,34 +9587,36 @@ async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
             sent += 1
         except TelegramError as e:
             logger.warning(f"Бэкап не ушёл админу {uid}: {e}")
-    logger.info(f"📦 Ежедневный бэкап отправлен ({sent} получателей, {_fmt_size(len(data))})")
+    if sent:
+        settings.last_backup_date = today
+        logger.info(f"📦 Ежедневный бэкап отправлен ({sent} получателей, {_fmt_size(len(data))})")
+    else:
+        # Не ставим дату: следующий часовой тик попробует снова.
+        logger.error("Ежедневный бэкап не доставлен ни одному админу — повторю позже")
 
 
 @admin_only
 async def backup_command(update, context: ContextTypes.DEFAULT_TYPE):
-    """Присылает админу все файлы данных бота (страховка на случай проблем с хостингом)."""
-    files = [SENT_LINKS_FILE, QUEUE_FILE, SETTINGS_FILE, STATS_FILE, ANILIST_CACHE_FILE]
-    await update.message.reply_text("📦 Собираю бэкап...")
-    sent, skipped = 0, []
-    for path in files:
-        try:
-            if not path.exists() or path.stat().st_size == 0:
-                skipped.append(path.name)
-                continue
-            with path.open('rb') as f:
-                await context.bot.send_document(
-                    chat_id=ADMIN_ID, document=f, filename=path.name,
-                )
-            sent += 1
-            await asyncio.sleep(0.3)
-        except (TelegramError, OSError) as e:
-            logger.warning(f"Бэкап {path.name} не отправился: {e}")
-            skipped.append(path.name)
-    msg = f"✅ Бэкап готов: отправлено {sent} файлов."
-    if skipped:
-        msg += f"\nПропущено (нет/пусто/ошибка): {', '.join(skipped)}"
-    msg += "\n\nСохрани файлы — при переезде или сбросе данных их можно будет вернуть."
-    await update.message.reply_text(msg)
+    """Присылает полный архив данных тому админу, который вызвал команду."""
+    await update.message.reply_text("📦 Собираю полный бэкап...")
+    archive = await asyncio.to_thread(_build_backup_archive)
+    if not archive:
+        await update.message.reply_text("Бэкап не создан: файлов данных пока нет.")
+        return
+    data, filename = archive
+    target = update.effective_chat.id if update.effective_chat else update.effective_user.id
+    try:
+        await context.bot.send_document(
+            chat_id=target,
+            document=data,
+            filename=filename,
+            caption=f'Полный бэкап данных бота — {_fmt_size(len(data))}',
+        )
+    except TelegramError as e:
+        logger.warning(f"Ручной бэкап не отправился: {e}")
+        await update.message.reply_text(f"❌ Не удалось отправить бэкап: {e}")
+        return
+    await update.message.reply_text("✅ Полный архив отправлен в этот чат.")
 
 
 @admin_only
@@ -9775,6 +9827,39 @@ def _init_globals() -> None:
         anilist = AniListClient(ANILIST_CACHE_FILE)
 
 
+def _validate_runtime_config() -> None:
+    """Не даёт новому деплою случайно использовать чужие ID из исходника."""
+    missing = []
+    if not ADMIN_FROM_ENV:
+        missing.append('ADMIN_ID')
+    if not CHANNEL_FROM_ENV:
+        missing.append('CHANNEL_ID')
+    if settings is not None and settings.thread_mode:
+        if not DISCUSSION_CHAT_FROM_ENV:
+            missing.append('DISCUSSION_CHAT_ID')
+        if not DISCUSSION_THREAD_FROM_ENV:
+            missing.append('DISCUSSION_THREAD_ID')
+    if not missing:
+        return
+    names = ', '.join(missing)
+    if ALLOW_LEGACY_IDS:
+        logger.warning(f"⚠️ Используются ID из исходного кода: {names}")
+        return
+
+    # Значения в коде — рабочие ID основного деплоя. Останавливать запуск из-за
+    # незаданных переменных нельзя: обычное обновление тихо оставило бы канал
+    # без новостей. Поэтому громко предупреждаем, но работаем.
+    logger.warning(
+        f"⚠️ Не заданы переменные окружения: {names}. Работаю на значениях из "
+        f"кода: канал {CHANNEL_ID}, админ {ADMIN_ID}. Если это ваша копия бота, "
+        f"задайте свои ID в .env или панели хостинга.")
+    _queue_admin_alert(
+        f'⚠️ Бот использует ID из исходного кода: {names}\n\n'
+        f'Канал: {CHANNEL_ID}\nАдмин: {ADMIN_ID}\n\n'
+        f'Для основного деплоя это нормально. Чтобы предупреждение пропало, '
+        f'вынеси значения в переменные окружения.')
+
+
 def main():
     # Самый первый вывод — чтобы в логах хостинга было видно что процесс стартовал
     print("=== Запуск anime_news_bot ===", flush=True)
@@ -9793,6 +9878,7 @@ def main():
         raise SystemExit("BOT_TOKEN не задан")
 
     _init_globals()
+    _validate_runtime_config()
     check_video_deps()
 
     print("Создаю Application...", flush=True)
