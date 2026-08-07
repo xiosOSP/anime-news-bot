@@ -22,6 +22,10 @@ import zipfile
 import copy
 import time
 import difflib
+try:
+    import fcntl  # POSIX: защищает DATA_DIR от одновременного запуска двух ботов
+except ImportError:  # pragma: no cover - Windows fallback: polling сам конфликтует
+    fcntl = None
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -47,6 +51,11 @@ from telegram import (
 )
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TelegramError
+try:
+    from telegram.error import NetworkError as _TelegramNetworkError, TimedOut as _TelegramTimedOut
+    _TG_AMBIGUOUS_ERROR_TYPES = (_TelegramNetworkError, _TelegramTimedOut)
+except ImportError:  # лёгкие test-stubs/старые PTB
+    _TG_AMBIGUOUS_ERROR_TYPES = ()
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -66,8 +75,10 @@ except ImportError:
     Image = None
 
 # Опциональная зависимость — если yt-dlp нет, скачивание видео отключится
+yt_dlp = None
 try:
-    import yt_dlp
+    import yt_dlp as _yt_dlp
+    yt_dlp = _yt_dlp
     YT_DLP_AVAILABLE = True
 except ImportError:
     YT_DLP_AVAILABLE = False
@@ -119,12 +130,75 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_float(key: str, default: float) -> float:
+    """Безопасно читает float из env: опечатка не должна ломать импорт бота."""
+    val = os.getenv(key)
+    if val is None or not val.strip():
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            f"Некорректное число в {key}={val!r}; использую {default}")
+        return default
+
+
+def _safe_nonnegative_int(value, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return max(0, int(default))
+
+
+def _bounded_cache_put(cache: dict, key, value, max_items: int) -> None:
+    """Добавляет элемент в bounded dict без полного ``clear()`` при переполнении.
+
+    Обычный dict сохраняет порядок вставки, поэтому удаляем самые старые записи.
+    Это избегает cache stampede: раньше 201-я статья мгновенно стирала все 200.
+    """
+    if max_items <= 0:
+        return
+    if key in cache:
+        cache.pop(key, None)
+    while len(cache) >= max_items:
+        try:
+            cache.pop(next(iter(cache)))
+        except StopIteration:
+            break
+    cache[key] = value
+
+
+def _atomic_write_json(path: Path, data, *, indent: Optional[int] = None) -> None:
+    """Атомарно сохраняет JSON рядом с целевым файлом.
+
+    Запись напрямую в runtime JSON опасна: kill/restart посередине ``write``
+    оставляет обрезанный файл и бот теряет очередь/настройки. Временный файл +
+    ``os.replace`` гарантирует, что на диске остаётся либо старая, либо новая
+    целая версия.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f'.{path.name}.', suffix='.tmp', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=indent)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 # Токен бота — ТОЛЬКО из переменной окружения (в коде не хранится).
 # Локально: задайте в .env. На хостинге: в панели переменных окружения.
 TOKEN = _env('BOT_TOKEN', '') or _env('TELEGRAM_BOT_TOKEN', '')
 
-# Эти значения не секретны (ID публичного канала и т.п.), поэтому fallback допустим.
-# При желании их тоже можно переопределить через env.
+# Legacy ID сохранён только для совместимости старого деплоя. Новый запуск обязан
+# задать свои значения через env либо явно включить ALLOW_LEGACY_IDS=true.
 MAIN_CHANNEL_ID = -1003040322753        # основной канал проекта
 _channel_env = (os.getenv('CHANNEL_ID') or '').strip()
 CHANNEL_FROM_ENV = bool(_channel_env)   # видно в /health и стартовом отчёте
@@ -177,10 +251,13 @@ BLACKLIST: list[str] = [
 # Базовая папка для данных бота (JSON-файлы, логи).
 # На хостинге с постоянным хранилищем (Bothost Volume и др.) задаётся через env DATA_DIR,
 # например '/data' или '/storage'. Локально (без env) — текущая папка.
-DATA_DIR = Path(os.getenv('DATA_DIR', '.'))
+_data_dir_env = (os.getenv('DATA_DIR') or '').strip()
+DATA_DIR = Path(_data_dir_env or '.')
 try:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-except Exception:
+except OSError as e:
+    if _data_dir_env:
+        raise SystemExit(f"DATA_DIR недоступен: {DATA_DIR}: {e}") from e
     DATA_DIR = Path('.')
 
 CHECK_INTERVAL_SEC = 1800
@@ -191,7 +268,13 @@ HTTP_TIMEOUT = 15
 HTTP_MAX_REDIRECTS = 5
 HTTP_IMAGE_MAX_BYTES = 9 * 1024 * 1024
 HTTP_RSS_MAX_BYTES = 5 * 1024 * 1024
+HTTP_HTML_MAX_BYTES = 4 * 1024 * 1024
+HTTP_URL_MAX_CHARS = 4096
 DEDUP_RESERVATION_TTL_SEC = 15 * 60
+# После аварии во время физической отправки результат Telegram неоднозначен.
+# Такие записи держим существенно дольше обычного claim, чтобы рестарт не
+# породил автоматический дубль уже принятого поста.
+DEDUP_UNCERTAIN_TTL_SEC = 7 * 24 * 3600
 DEDUP_REJECT_TTL_SEC = 24 * 3600
 HEALTH_HOST = _env('HEALTH_HOST', '127.0.0.1')
 HEALTH_PORT = _env_int('HEALTH_PORT', _env_int('PORT', 0))  # 0 = HTTP health endpoint выключен
@@ -209,10 +292,11 @@ TRANSLATION_INPUT_LIMIT_THREAD = 4000
 NEWS_PER_SOURCE = 5
 PAUSE_BETWEEN_SENDS = 2.0
 SOURCE_FETCH_CONCURRENCY = 5          # столько источников качаем одновременно
+SOURCE_FETCH_WALL_TIMEOUT = max(10, _env_int('SOURCE_FETCH_WALL_TIMEOUT', 60))
 # APScheduler по умолчанию ставит misfire_grace_time=1с: если тик джоба опоздал
 # больше чем на секунду (цикл занят сбором новостей/отправкой), запуск МОЛЧА
 # выбрасывается. Для нас это означало «отложка не публикуется». Даём час запаса.
-JOB_KWARGS = {'misfire_grace_time': 3600}
+JOB_KWARGS = {'misfire_grace_time': 3600, 'coalesce': True, 'max_instances': 1}
 
 # --- AniList API ---
 ANILIST_CACHE_FILE = DATA_DIR / 'anilist_cache.json'
@@ -266,6 +350,8 @@ VIDEO_DOWNLOAD_DIR.mkdir(exist_ok=True)
 MAX_PHOTOS_PER_POST = 6               # сколько фото максимум собирать в media group
 TG_VIDEO_MAX_SECONDS = 300            # видео из TG-каналов: до 5 минут
 TG_VIDEO_MAX_MB = 48                  # Bot API не принимает файлы больше ~50 МБ
+TG_FLOOD_MAX_RETRIES = 3              # сколько RetryAfter подряд терпим за один вызов
+TG_FLOOD_MAX_WAIT_SEC = 60.0          # огромный flood-wait не должен заморозить джоб надолго
 # Хосты, для которых пробуем yt-dlp
 VIDEO_HOSTS = (
     'youtube.com', 'youtu.be', 'm.youtube.com',
@@ -400,6 +486,7 @@ def http_get_with_retry(
     Бэкофф: HTTP_RETRY_BACKOFFS = (1, 2, 4) секунд."""
     last_exc = None
     for attempt in range(HTTP_RETRY_ATTEMPTS):
+        retry_after = None
         try:
             r = requests.get(
                 url,
@@ -412,8 +499,19 @@ def http_get_with_retry(
             # Успех — возвращаем сразу
             if r.status_code < 500 and r.status_code not in HTTP_RETRY_STATUSES:
                 return r
-            # 5xx/429 — стоит повторить
+            # 5xx/429 — стоит повторить. Ответ обязательно закрываем, иначе
+            # при серии 5xx connection pool постепенно забивается.
             logger.debug(f"HTTP {r.status_code} для {url}, попытка {attempt + 1}/{HTTP_RETRY_ATTEMPTS}")
+            retry_after = None
+            if r.status_code == 429:
+                try:
+                    retry_after = min(30.0, max(0.0, float(r.headers.get('Retry-After', ''))))
+                except (TypeError, ValueError):
+                    retry_after = None
+            try:
+                r.close()
+            except Exception:
+                pass
             last_exc = None
         except (requests.ConnectionError, requests.Timeout) as e:
             last_exc = e
@@ -426,7 +524,9 @@ def http_get_with_retry(
         # Это была не последняя попытка — пауза перед следующей
         if attempt < HTTP_RETRY_ATTEMPTS - 1:
             backoff = HTTP_RETRY_BACKOFFS[min(attempt, len(HTTP_RETRY_BACKOFFS) - 1)]
-            time.sleep(backoff)
+            # Серверный Retry-After при 429 предпочтительнее нашего backoff, но
+            # ограничиваем его, чтобы один источник не заморозил worker надолго.
+            time.sleep(retry_after if retry_after is not None else backoff)
 
     if last_exc:
         logger.warning(f"HTTP не удался после {HTTP_RETRY_ATTEMPTS} попыток для {url}: {last_exc}")
@@ -442,8 +542,12 @@ def _is_public_http_url(url: str) -> bool:
     сети, link-local и metadata endpoints через SSRF.
     """
     try:
+        if not isinstance(url, str) or not url or len(url) > HTTP_URL_MAX_CHARS:
+            return False
         parsed = urlparse(url)
         if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            return False
+        if parsed.username is not None or parsed.password is not None:
             return False
         host = parsed.hostname.rstrip('.').lower()
         if host in {'localhost', 'localhost.localdomain'}:
@@ -527,11 +631,28 @@ def _read_limited_response(response, max_bytes: int) -> Optional[bytes]:
                 return b''.join(chunks)
             data = getattr(response, 'content', b'') or b''
             return data if len(data) <= max_bytes else None
-        except Exception:
-            data = getattr(response, 'content', b'') or b''
-            return data if len(data) <= max_bytes else None
+        except Exception as e:
+            logger.debug(f"Потоковое чтение HTTP-ответа прервано: {type(e).__name__}: {e}")
+            return None
     data = getattr(response, 'content', b'') or b''
     return data if len(data) <= max_bytes else None
+
+
+def _read_limited_text(response, max_bytes: int = HTTP_HTML_MAX_BYTES) -> Optional[str]:
+    """Читает HTML с лимитом тела; для тестовых fake-response поддерживает .text."""
+    if isinstance(response, requests.Response):
+        data = _read_limited_response(response, max_bytes)
+        if data is None:
+            return None
+        encoding = response.encoding or 'utf-8'
+        try:
+            return data.decode(encoding, errors='replace')
+        except LookupError:
+            return data.decode('utf-8', errors='replace')
+    text = getattr(response, 'text', None)
+    if isinstance(text, str) and len(text.encode('utf-8', errors='replace')) <= max_bytes:
+        return text
+    return None
 
 
 def http_post_with_retry(
@@ -544,11 +665,22 @@ def http_post_with_retry(
     """POST с retry на 5xx/429 и сетевых ошибках."""
     last_exc = None
     for attempt in range(HTTP_RETRY_ATTEMPTS):
+        retry_after = None
         try:
             r = requests.post(url, json=json_body, headers=headers, timeout=timeout)
             if r.status_code < 500 and r.status_code not in HTTP_RETRY_STATUSES:
                 return r
             logger.debug(f"HTTP {r.status_code} для POST {url}, попытка {attempt + 1}")
+            retry_after = None
+            if r.status_code == 429:
+                try:
+                    retry_after = min(30.0, max(0.0, float(r.headers.get('Retry-After', ''))))
+                except (TypeError, ValueError):
+                    retry_after = None
+            try:
+                r.close()
+            except Exception:
+                pass
             last_exc = None
         except (requests.ConnectionError, requests.Timeout) as e:
             last_exc = e
@@ -558,7 +690,7 @@ def http_post_with_retry(
 
         if attempt < HTTP_RETRY_ATTEMPTS - 1:
             backoff = HTTP_RETRY_BACKOFFS[min(attempt, len(HTTP_RETRY_BACKOFFS) - 1)]
-            time.sleep(backoff)
+            time.sleep(retry_after if retry_after is not None else backoff)
 
     if last_exc:
         logger.warning(f"POST не удался после {HTTP_RETRY_ATTEMPTS} попыток для {url}: {last_exc}")
@@ -632,6 +764,17 @@ class SentLinksStore:
             raw_res = data.get('reservations', {})
             if isinstance(raw_res, dict):
                 self._reservations = {str(k): v for k, v in raw_res.items() if isinstance(v, dict)}
+                recovered_uncertain = False
+                for meta in self._reservations.values():
+                    state = str(meta.get('state') or 'claimed')
+                    if state == 'sending':
+                        meta['state'] = 'uncertain'
+                        recovered_uncertain = True
+                    elif state not in ('claimed', 'uncertain'):
+                        meta['state'] = 'claimed'
+                if recovered_uncertain:
+                    logger.warning('Ledger: найдена прерванная отправка; URL оставлен '
+                                   'в uncertain, автоматический повтор заблокирован')
             raw_rej = data.get('rejected', {})
             if isinstance(raw_rej, dict):
                 self._rejected = {str(k): v for k, v in raw_rej.items() if isinstance(v, dict)}
@@ -640,18 +783,19 @@ class SentLinksStore:
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"Не удалось прочитать {self.path}: {e}")
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         try:
-            with self.path.open('w', encoding='utf-8') as f:
-                json.dump({
-                    'urls': self._urls,
-                    'titles': self._titles,
-                    'recent': [[ts, norm, sorted(tokens)] for ts, norm, tokens in self._recent_titles],
-                    'reservations': self._reservations,
-                    'rejected': self._rejected,
-                }, f, ensure_ascii=False)
+            _atomic_write_json(self.path, {
+                'urls': self._urls,
+                'titles': self._titles,
+                'recent': [[ts, norm, sorted(tokens)] for ts, norm, tokens in self._recent_titles],
+                'reservations': self._reservations,
+                'rejected': self._rejected,
+            })
+            return True
         except OSError as e:
             logger.error(f"Не удалось сохранить {self.path}: {e}")
+            return False
 
     def _remove_unlocked(self, norm_url: str, norm_title: str = '') -> None:
         self._url_set.discard(norm_url)
@@ -674,15 +818,18 @@ class SentLinksStore:
         now = time.time()
         changed = False
         for norm_url, meta in list(self._reservations.items()):
+            state = str(meta.get('state') or 'claimed')
+            ttl = (DEDUP_UNCERTAIN_TTL_SEC if state == 'uncertain'
+                   else DEDUP_RESERVATION_TTL_SEC)
             try:
-                expired = now - float(meta.get('at', 0)) > DEDUP_RESERVATION_TTL_SEC
+                expired = now - float(meta.get('at', 0)) > ttl
             except (TypeError, ValueError):
                 expired = True
             if expired:
                 self._remove_unlocked(norm_url, str(meta.get('title') or ''))
                 self._reservations.pop(norm_url, None)
                 changed = True
-                logger.info(f"Освобождено просроченное резервирование URL: {norm_url[:80]}")
+                logger.info(f"Освобождено просроченное {state}-резервирование URL: {norm_url[:80]}")
         for norm_url, meta in list(self._rejected.items()):
             try:
                 expired = now - float(meta.get('at', 0)) > DEDUP_REJECT_TTL_SEC
@@ -706,10 +853,9 @@ class SentLinksStore:
         self._purge_transient_unlocked()
         return normalize_title(title) in self._title_set
 
-    def has_similar_title(self, title: str, window_hours: int = 48) -> bool:
+    def _has_similar_title_unlocked(self, title: str, window_hours: int = 48) -> bool:
         if not title:
             return False
-        self._purge_transient_unlocked()
         norm = normalize_title(title)
         tokens = _title_tokens(title)
         now = time.time()
@@ -727,7 +873,11 @@ class SentLinksStore:
                     return True
         return False
 
-    async def claim(self, link: str, title: str = '') -> bool:
+    def has_similar_title(self, title: str, window_hours: int = 48) -> bool:
+        self._purge_transient_unlocked()
+        return self._has_similar_title_unlocked(title, window_hours)
+
+    async def claim(self, link: str, title: str = '', *, check_similar: bool = False) -> bool:
         """Атомарно резервирует URL/заголовок на время подготовки и отправки."""
         norm_url = normalize_url(link)
         norm_title = normalize_title(title)
@@ -735,6 +885,12 @@ class SentLinksStore:
             if self._purge_transient_unlocked():
                 self._save()
             if norm_url in self._url_set or norm_url in self._rejected:
+                return False
+            # Внешняя pre-check недостаточна: две coroutine могут одновременно
+            # пройти has_similar_title(), а затем по очереди зайти сюда. Проверка
+            # fuzzy-дубля внутри lock делает резервирование действительно атомарным.
+            if check_similar and norm_title and self._has_similar_title_unlocked(title):
+                logger.info(f"Дубль по похожему заголовку, пропускаю: {title[:60]}")
                 return False
             if norm_title and norm_title in self._title_set:
                 logger.info(f"Дубль по заголовку, пропускаю: {title[:60]}")
@@ -745,27 +901,96 @@ class SentLinksStore:
                         return False
                 self._recent_titles.append((time.time(), norm_title, _title_tokens(title)))
             self._add_unlocked(norm_url, norm_title, save=False)
-            self._reservations[norm_url] = {'title': norm_title, 'at': time.time()}
-            self._save()
+            self._reservations[norm_url] = {'title': norm_title, 'at': time.time(), 'state': 'claimed'}
+            if not self._save():
+                # Без durable claim запрещаем физическую публикацию: иначе после
+                # рестарта тот же URL снова станет новым и может задублироваться.
+                self._reservations.pop(norm_url, None)
+                self._remove_unlocked(norm_url, norm_title)
+                logger.error(f'Ledger claim не записан на диск, публикация заблокирована: {norm_url[:100]}')
+                return False
             return True
 
-    async def commit(self, link: str, title: str = '') -> None:
-        """Подтверждает резервирование после фактической успешной публикации."""
+    async def mark_sending(self, link: str) -> bool:
+        """Фиксирует durable-границу непосредственно перед Telegram API."""
         norm_url = normalize_url(link)
         async with self._lock:
-            self._reservations.pop(norm_url, None)
+            meta = self._reservations.get(norm_url)
+            if not meta or str(meta.get('state') or 'claimed') != 'claimed':
+                return False
+            old_state = str(meta.get('state') or 'claimed')
+            old_at = meta.get('at')
+            meta['state'] = 'sending'
+            meta['at'] = time.time()
+            if not self._save():
+                meta['state'] = old_state
+                meta['at'] = old_at
+                logger.error(f'Ledger sending-state не записан; Telegram API не вызываю: {norm_url[:100]}')
+                return False
+            return True
+
+    async def mark_uncertain(self, link: str) -> bool:
+        """Сохраняет ambiguous delivery при отмене/обрыве после начала Telegram API."""
+        norm_url = normalize_url(link)
+        async with self._lock:
+            meta = self._reservations.get(norm_url)
+            if not meta:
+                return False
+            meta['state'] = 'uncertain'
+            meta['at'] = time.time()
+            saved = self._save()
+            if not saved:
+                logger.critical(f'Не удалось записать uncertain delivery: {norm_url[:100]}')
+            return saved
+
+    def uncertain_count(self) -> int:
+        self._purge_transient_unlocked()
+        return sum(1 for meta in self._reservations.values()
+                   if str(meta.get('state') or 'claimed') == 'uncertain')
+
+    async def clear(self) -> None:
+        """Полностью очищает историю и все временные дедуп-состояния."""
+        async with self._lock:
+            self._urls.clear()
+            self._url_set.clear()
+            self._titles.clear()
+            self._title_set.clear()
+            self._recent_titles.clear()
+            self._reservations.clear()
+            self._rejected.clear()
             self._save()
 
+    async def commit(self, link: str, title: str = '') -> bool:
+        """Подтверждает публикацию; при disk-error оставляет in-memory uncertain."""
+        norm_url = normalize_url(link)
+        async with self._lock:
+            meta = self._reservations.pop(norm_url, None)
+            if self._save():
+                return True
+            if meta is not None:
+                meta = dict(meta)
+                meta['state'] = 'uncertain'
+                meta['at'] = time.time()
+                self._reservations[norm_url] = meta
+            logger.critical(f'Ledger commit не записан после успешной отправки: {norm_url[:100]}')
+            return False
+
     async def release(self, link: str, title: str = '') -> None:
-        """Откатывает только незавершённое резервирование после технической ошибки."""
+        """Откатывает резервирование; при disk-error остаётся fail-closed in-memory."""
         norm_url = normalize_url(link)
         norm_title = normalize_title(title)
         async with self._lock:
             meta = self._reservations.pop(norm_url, None)
             if meta is None:
                 return
-            self._remove_unlocked(norm_url, str(meta.get('title') or norm_title))
-            self._save()
+            saved_title = str(meta.get('title') or norm_title)
+            self._remove_unlocked(norm_url, saved_title)
+            if not self._save():
+                # Старый файл на диске всё равно содержит reservation. Не даём
+                # текущему процессу считать URL новым, пока storage неисправен.
+                self._add_unlocked(norm_url, saved_title, save=False)
+                self._reservations[norm_url] = meta
+                logger.error(f'Ledger release не записан; оставляю URL заблокированным: {norm_url[:100]}')
 
     async def reject(self, link: str, title: str = '', reason: str = '') -> None:
         """Фиксирует осознанный фильтр отдельно от истории опубликованных постов."""
@@ -813,6 +1038,7 @@ translator: Optional[GoogleTranslator] = None
 QUEUE_FILE = DATA_DIR / 'post_queue.json'
 QUEUE_MAX_SIZE = 30                  # больше — старые вытесняются
 QUEUE_POST_TTL_HOURS = 24            # пост старше — выбрасывается без отправки
+QUEUE_MAX_SEND_RETRIES = 4           # после N технических ошибок пост не блокирует очередь вечно
 
 # Свежесть поста (по дате публикации в источнике).
 # Посты старше этого порога вообще не попадают в очередь.
@@ -827,8 +1053,20 @@ class PostQueue:
     def __init__(self, path: Path):
         self.path = path
         self._items: list[dict] = []   # каждая запись = {'news': dict, 'queued_at': iso-str}
+        self._inflight: Optional[dict] = None
+        self._inflight_owner = None
         self._lock = asyncio.Lock()
         self._load()
+
+    @staticmethod
+    def _valid_item(item) -> bool:
+        return (
+            isinstance(item, dict)
+            and isinstance(item.get('news'), dict)
+            and isinstance(item['news'].get('link'), str)
+            and bool(item['news'].get('link'))
+            and isinstance(item.get('queued_at'), str)
+        )
 
     def _load(self) -> None:
         if not self.path.exists():
@@ -837,24 +1075,66 @@ class PostQueue:
             with self.path.open('r', encoding='utf-8') as f:
                 data = json.load(f)
             if isinstance(data, list):
-                self._items = data
-        except (json.JSONDecodeError, OSError) as e:
+                self._items = [item for item in data if self._valid_item(item)]
+            elif isinstance(data, dict):
+                raw_items = data.get('items', [])
+                if isinstance(raw_items, list):
+                    self._items = [item for item in raw_items if self._valid_item(item)]
+                raw_inflight = data.get('inflight')
+                if self._valid_item(raw_inflight):
+                    self._items.insert(0, raw_inflight)
+                    logger.warning(
+                        "📦 Восстановлен незавершённый пост после рестарта: %s",
+                        str(raw_inflight['news'].get('title', ''))[:80],
+                    )
+                    self._save()
+        except (json.JSONDecodeError, OSError, TypeError) as e:
             logger.warning(f"Не удалось прочитать очередь {self.path}: {e}")
             self._items = []
+            self._inflight = None
 
     def _save(self) -> None:
         try:
-            with self.path.open('w', encoding='utf-8') as f:
-                json.dump(self._items, f, ensure_ascii=False, indent=2)
+            _atomic_write_json(self.path, {
+                'items': self._items,
+                'inflight': self._inflight,
+            }, indent=2)
         except OSError as e:
             logger.error(f"Не удалось сохранить очередь: {e}")
+
+    @staticmethod
+    def _item_priority(item: dict) -> float:
+        try:
+            return float((item.get('news') or {}).get('_priority_score', 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _trim_overflow_unlocked(self) -> int:
+        if len(self._items) <= QUEUE_MAX_SIZE:
+            return 0
+        # Legacy/ручные записи без score сохраняют старую политику "новее важнее".
+        # Автосбор же проставляет _priority_score — там оставляем именно TOP-N.
+        if not any(self._item_priority(item) for item in self._items):
+            dropped = len(self._items) - QUEUE_MAX_SIZE
+            self._items = self._items[-QUEUE_MAX_SIZE:]
+            return dropped
+        ranked = sorted(
+            range(len(self._items)),
+            key=lambda i: (self._item_priority(self._items[i]), -i),
+            reverse=True,
+        )
+        keep = set(ranked[:QUEUE_MAX_SIZE])
+        dropped = len(self._items) - len(keep)
+        self._items = [item for i, item in enumerate(self._items) if i in keep]
+        return dropped
 
     def _is_expired(self, item: dict) -> bool:
         try:
             queued_at = datetime.fromisoformat(item.get('queued_at', ''))
         except (ValueError, TypeError):
-            return False
-        return datetime.now() - queued_at > timedelta(hours=QUEUE_POST_TTL_HOURS)
+            return True
+        now = datetime.now(queued_at.tzinfo) if queued_at.tzinfo else datetime.now()
+        return now - queued_at > timedelta(hours=QUEUE_POST_TTL_HOURS)
 
     def _purge_expired_unlocked(self) -> int:
         """Удаляет протухшие посты. Возвращает сколько удалено."""
@@ -874,6 +1154,8 @@ class PostQueue:
             self._purge_expired_unlocked()
             now_iso = datetime.now().isoformat()
             existing_links = {i['news']['link'] for i in self._items}
+            if self._inflight is not None:
+                existing_links.add(self._inflight['news']['link'])
             added = 0
             require_img = settings.require_image
             for news in news_list:
@@ -883,13 +1165,14 @@ class PostQueue:
                 if require_img and not news.get('images'):
                     continue
                 clean_news = {k: v for k, v in news.items() if k != 'published_parsed'}
-                self._items.append({'news': clean_news, 'queued_at': now_iso})
+                clean_news.setdefault('_queue_first_at', now_iso)
+                clean_news.setdefault('_queue_send_failures', 0)
+                self._items.append({'news': clean_news, 'queued_at': clean_news['_queue_first_at']})
                 existing_links.add(news['link'])
                 added += 1
-            if len(self._items) > QUEUE_MAX_SIZE:
-                dropped = len(self._items) - QUEUE_MAX_SIZE
-                self._items = self._items[-QUEUE_MAX_SIZE:]
-                logger.info(f"📦 Очередь переполнена, выброшено {dropped} старых постов")
+            dropped = self._trim_overflow_unlocked()
+            if dropped:
+                logger.info(f"📦 Очередь переполнена, выброшено {dropped} низкоприоритетных постов")
             self._save()
             return added
 
@@ -898,6 +1181,15 @@ class PostQueue:
         Если включён require_image — пропускает (выбрасывает) посты без картинок,
         пока не найдёт подходящий или очередь не закончится."""
         async with self._lock:
+            if self._inflight is not None:
+                current = asyncio.current_task()
+                if self._inflight_owner is current:
+                    # Совместимость со старым API: последовательные pop_next()
+                    # из одной coroutine считались завершением прошлого элемента.
+                    self._inflight = None
+                    self._inflight_owner = None
+                else:
+                    return None
             self._purge_expired_unlocked()
             require_img = settings.require_image
             skipped = 0
@@ -909,6 +1201,8 @@ class PostQueue:
                     continue
                 if skipped:
                     logger.info(f"⊘ Из очереди выброшено {skipped} постов без картинок")
+                self._inflight = item
+                self._inflight_owner = asyncio.current_task()
                 self._save()
                 return news
             if skipped:
@@ -916,16 +1210,64 @@ class PostQueue:
             self._save()
             return None
 
+    async def ack_done(self, news: Optional[dict] = None) -> None:
+        """Подтверждает завершение обработки извлечённого поста."""
+        async with self._lock:
+            if self._inflight is None:
+                return
+            if news is not None:
+                expected = str((self._inflight.get('news') or {}).get('link') or '')
+                actual = str(news.get('link') or '')
+                if expected and actual and expected != actual:
+                    logger.warning("Очередь: ack не совпал с inflight (%s != %s)", actual, expected)
+                    return
+            self._inflight = None
+            self._inflight_owner = None
+            self._save()
+
+    async def requeue_failed(self, news: dict) -> bool:
+        """Возвращает технически неотправленный пост в начало без сброса TTL.
+
+        Возвращает False, если лимит повторов исчерпан и пост отброшен, чтобы
+        одна постоянно битая публикация не блокировала FIFO бесконечно.
+        """
+        async with self._lock:
+            if self._inflight is not None:
+                inflight_link = str((self._inflight.get('news') or {}).get('link') or '')
+                if not inflight_link or inflight_link == str(news.get('link') or ''):
+                    self._inflight = None
+                    self._inflight_owner = None
+            failures = _safe_nonnegative_int(news.get('_queue_send_failures', 0)) + 1
+            if failures >= QUEUE_MAX_SEND_RETRIES:
+                logger.error(
+                    f"Пост удалён из очереди после {failures} ошибок отправки: "
+                    f"{str(news.get('title', ''))[:80]}")
+                self._save()
+                return False
+            clean = {k: v for k, v in news.items() if k != 'published_parsed'}
+            clean['_queue_send_failures'] = failures
+            first_at = str(clean.get('_queue_first_at') or datetime.now().isoformat())
+            clean['_queue_first_at'] = first_at
+            self._items.insert(0, {'news': clean, 'queued_at': first_at})
+            self._save()
+            return True
+
     async def peek_size(self) -> int:
         async with self._lock:
             self._purge_expired_unlocked()
             self._save()
             return len(self._items)
 
+    async def has_inflight(self) -> bool:
+        async with self._lock:
+            return self._inflight is not None
+
     async def clear(self) -> int:
         async with self._lock:
-            count = len(self._items)
+            count = len(self._items) + (1 if self._inflight else 0)
             self._items.clear()
+            self._inflight = None
+            self._inflight_owner = None
             self._save()
             return count
 
@@ -994,17 +1336,75 @@ class BotSettings:
         try:
             with self.path.open('r', encoding='utf-8') as f:
                 loaded = json.load(f)
-            # Мерджим с дефолтами, чтобы новые настройки добавлялись автоматически
+            if not isinstance(loaded, dict):
+                raise ValueError('ожидался JSON-объект настроек')
+            # Мерджим с дефолтами и не принимаем значения несовместимого типа:
+            # строка "false" не должна внезапно включать bool-настройку.
             for k, v in loaded.items():
-                if k in self.DEFAULTS:
-                    self._data[k] = v
-        except (json.JSONDecodeError, OSError) as e:
+                if k not in self.DEFAULTS:
+                    continue
+                default = self.DEFAULTS[k]
+                if isinstance(default, bool):
+                    if isinstance(v, bool):
+                        self._data[k] = v
+                elif isinstance(default, int) and not isinstance(default, bool):
+                    if isinstance(v, int) and not isinstance(v, bool):
+                        self._data[k] = v
+                elif isinstance(default, list):
+                    if isinstance(v, list):
+                        self._data[k] = v
+                elif isinstance(default, str):
+                    if isinstance(v, str):
+                        self._data[k] = v
+            self._normalize_loaded()
+        except (json.JSONDecodeError, OSError, ValueError) as e:
             logger.warning(f"Не удалось прочитать {self.path}: {e}")
+
+    def _normalize_loaded(self) -> None:
+        """Санитизирует значения из вручную отредактированного/старого JSON."""
+        self._data['check_interval_min'] = max(5, _safe_nonnegative_int(
+            self._data.get('check_interval_min'), self.DEFAULTS['check_interval_min']))
+        self._data['post_max_age_hours'] = max(1, _safe_nonnegative_int(
+            self._data.get('post_max_age_hours'), self.DEFAULTS['post_max_age_hours']))
+        try:
+            self._data['tz_offset'] = max(-12, min(14, int(self._data.get('tz_offset', 3))))
+        except (TypeError, ValueError):
+            self._data['tz_offset'] = 3
+        tz_name = str(self._data.get('timezone_name', '') or '').strip()
+        if tz_name:
+            try:
+                ZoneInfo(tz_name)
+            except (ZoneInfoNotFoundError, ValueError):
+                logger.warning(f"Неизвестная timezone в настройках: {tz_name!r}; используется UTC offset")
+                tz_name = ''
+        self._data['timezone_name'] = tz_name
+        self._data['translator_engine'] = (
+            'google' if self._data.get('translator_engine') == 'google' else 'deepl')
+        raw_admins = self._data.get('extra_admins', [])
+        admins: list[int] = []
+        for value in raw_admins if isinstance(raw_admins, list) else []:
+            try:
+                uid = int(value)
+            except (TypeError, ValueError):
+                continue
+            if uid > 0 and uid != ADMIN_ID and uid not in admins:
+                admins.append(uid)
+        self._data['extra_admins'] = admins
+        raw_disabled = self._data.get('disabled_sources', [])
+        disabled: list[str] = []
+        for value in raw_disabled if isinstance(raw_disabled, list) else []:
+            if not isinstance(value, str):
+                continue
+            name = value.strip()
+            if name and name.lower() not in {x.lower() for x in disabled}:
+                disabled.append(name[:CUSTOM_SOURCE_LABEL_MAX] if 'CUSTOM_SOURCE_LABEL_MAX' in globals() else name[:80])
+        self._data['disabled_sources'] = disabled
+        self._data['llm_calls_today'] = _safe_nonnegative_int(self._data.get('llm_calls_today'))
+        self._data['deepl_chars'] = _safe_nonnegative_int(self._data.get('deepl_chars'))
 
     def save(self) -> None:
         try:
-            with self.path.open('w', encoding='utf-8') as f:
-                json.dump(self._data, f, ensure_ascii=False, indent=2)
+            _atomic_write_json(self.path, self._data, indent=2)
         except OSError as e:
             logger.error(f"Не удалось сохранить {self.path}: {e}")
 
@@ -1230,6 +1630,17 @@ class BotSettings:
         self._data['llm_calls_today'] = max(0, int(value))
         self.save()
 
+    def increment_llm_call(self, day: str) -> int:
+        """Обновляет дневной LLM-счётчик одной атомарной записью на диск."""
+        day = str(day)
+        if self._data.get('llm_day') != day:
+            self._data['llm_day'] = day
+            self._data['llm_calls_today'] = 0
+        self._data['llm_calls_today'] = _safe_nonnegative_int(
+            self._data.get('llm_calls_today')) + 1
+        self.save()
+        return self._data['llm_calls_today']
+
     @property
     def startup_report(self) -> bool:
         return bool(self._data.get('startup_report', True))
@@ -1269,6 +1680,19 @@ class BotSettings:
         self._data['deepl_chars'] = max(0, int(value))
         self.save()
 
+    def add_deepl_chars(self, month: str, count: int) -> tuple[int, int]:
+        """(before, after) с одной записью JSON вместо 2–3 fsync на перевод."""
+        month = str(month)
+        count = max(0, int(count))
+        if self._data.get('deepl_month') != month:
+            self._data['deepl_month'] = month
+            self._data['deepl_chars'] = 0
+        before = _safe_nonnegative_int(self._data.get('deepl_chars'))
+        after = before + count
+        self._data['deepl_chars'] = after
+        self.save()
+        return before, after
+
     @property
     def daily_backup(self) -> bool:
         return bool(self._data.get('daily_backup', True))
@@ -1298,11 +1722,11 @@ class BotSettings:
 
     @property
     def extra_admins(self) -> list[int]:
-        return [int(x) for x in self._data.get('extra_admins', [])]
+        return [x for x in self._data.get('extra_admins', []) if isinstance(x, int) and x > 0]
 
     def add_admin(self, user_id: int) -> bool:
         ids = self._data.setdefault('extra_admins', [])
-        if int(user_id) in [int(x) for x in ids] or int(user_id) == ADMIN_ID:
+        if int(user_id) in ids or int(user_id) == ADMIN_ID:
             return False
         ids.append(int(user_id))
         self.save()
@@ -1310,7 +1734,7 @@ class BotSettings:
 
     def remove_admin(self, user_id: int) -> bool:
         ids = self._data.get('extra_admins', [])
-        new = [x for x in ids if int(x) != int(user_id)]
+        new = [x for x in ids if x != int(user_id)]
         if len(new) == len(ids):
             return False
         self._data['extra_admins'] = new
@@ -1388,26 +1812,47 @@ class BotStats:
             if isinstance(data, dict):
                 # Мягкое слияние с дефолтами на случай новых полей
                 merged = self._default_data()
-                merged['bot_started_at'] = data.get('bot_started_at', merged['bot_started_at'])
-                merged['totals'].update(data.get('totals', {}))
-                merged['by_source'].update(data.get('by_source', {}))
-                merged['events'] = data.get('events', [])[-STATS_EVENTS_MAX:]
+                if isinstance(data.get('bot_started_at'), str):
+                    merged['bot_started_at'] = data['bot_started_at']
+                raw_totals = data.get('totals', {})
+                if isinstance(raw_totals, dict):
+                    for key in merged['totals']:
+                        merged['totals'][key] = _safe_nonnegative_int(
+                            raw_totals.get(key, merged['totals'][key]))
+                raw_sources = data.get('by_source', {})
+                if isinstance(raw_sources, dict):
+                    for source, raw in raw_sources.items():
+                        if not isinstance(raw, dict):
+                            continue
+                        merged['by_source'][str(source)] = {
+                            'collected': _safe_nonnegative_int(raw.get('collected')),
+                            'published': _safe_nonnegative_int(raw.get('published')),
+                            'errors': _safe_nonnegative_int(raw.get('errors')),
+                            'last_success_at': (raw.get('last_success_at')
+                                                if isinstance(raw.get('last_success_at'), str)
+                                                else None),
+                        }
+                raw_events = data.get('events', [])
+                if isinstance(raw_events, list):
+                    merged['events'] = [e for e in raw_events if isinstance(e, dict)][-STATS_EVENTS_MAX:]
                 self._data = merged
-        except (json.JSONDecodeError, OSError) as e:
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
             logger.warning(f"Не удалось прочитать {self.path}: {e}")
 
     def _save(self) -> None:
         try:
-            with self.path.open('w', encoding='utf-8') as f:
-                json.dump(self._data, f, ensure_ascii=False)
+            _atomic_write_json(self.path, self._data)
         except OSError as e:
             logger.error(f"Не удалось сохранить {self.path}: {e}")
 
-    def _add_event_unlocked(self, event_type: str, source: Optional[str] = None) -> None:
+    def _add_event_unlocked(self, event_type: str, source: Optional[str] = None,
+                            count: int = 1) -> None:
         """Добавляет событие в лог. Без блокировки — вызывается из locked-методов."""
         event = {'at': datetime.now().isoformat(), 'type': event_type}
         if source:
             event['source'] = source
+        if count > 1:
+            event['count'] = count
         self._data['events'].append(event)
         # Обрезаем чтобы не разрасталось
         if len(self._data['events']) > STATS_EVENTS_MAX:
@@ -1455,13 +1900,17 @@ class BotStats:
             self._add_event_unlocked('published', source)
             self._save()
 
-    async def record_skipped(self, reason: str, source: Optional[str] = None) -> None:
+    async def record_skipped(self, reason: str, source: Optional[str] = None,
+                             count: int = 1) -> None:
         """Пост отброшен. reason: no_image / too_old / duplicate / spam / filtered."""
         key = f'skipped_{reason}'
+        count = max(0, int(count))
+        if count <= 0:
+            return
         async with self._lock:
             if key in self._data['totals']:
-                self._data['totals'][key] += 1
-            self._add_event_unlocked(key, source)
+                self._data['totals'][key] += count
+            self._add_event_unlocked(key, source, count)
             self._save()
 
     async def record_failed_send(self, source: Optional[str] = None) -> None:
@@ -1497,7 +1946,7 @@ class BotStats:
                 continue
             if event_type and ev.get('type') != event_type:
                 continue
-            count += 1
+            count += max(1, _safe_nonnegative_int(ev.get('count'), 1))
         return count
 
 
@@ -1523,7 +1972,7 @@ class ModerationFeedback:
 
     def _save(self) -> None:
         try:
-            self.path.write_text(json.dumps(self._events[-self.MAX_EVENTS:], ensure_ascii=False), encoding='utf-8')
+            _atomic_write_json(self.path, self._events[-self.MAX_EVENTS:])
         except OSError as e:
             logger.warning(f"feedback не сохранён: {e}")
 
@@ -2025,7 +2474,7 @@ class AniListClient:
             with self.cache_path.open('r', encoding='utf-8') as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                self._cache = data
+                self._cache = {str(k): v for k, v in data.items() if isinstance(v, dict)}
             logger.info(f"AniList cache loaded: {len(self._cache)} entries")
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"Не удалось прочитать AniList кеш: {e}")
@@ -2033,8 +2482,7 @@ class AniListClient:
 
     def _save(self) -> None:
         try:
-            with self.cache_path.open('w', encoding='utf-8') as f:
-                json.dump(self._cache, f, ensure_ascii=False)
+            _atomic_write_json(self.cache_path, self._cache)
         except OSError as e:
             logger.error(f"Не удалось сохранить AniList кеш: {e}")
 
@@ -2221,6 +2669,10 @@ _TOKEN_PATTERN = re.compile(r'〖\s*(\d+)\s*〗')
 def auto_protect_proper_nouns(text: str, start_index: int = 1000) -> tuple[str, dict]:
     """Защита имён собственных перед переводом.
     Консервативная: не трогает слова в начале предложений и общие английские слова."""
+    # AniList — вспомогательный улучшатель, а не обязательная зависимость
+    # перевода. Во время старта/деградации API клиент может ещё быть None.
+    if anilist is None:
+        return text, {}
     placeholders: dict[str, str] = {}
     result = text
     counter = [start_index]
@@ -2676,8 +3128,9 @@ def upgrade_image_url(url: str) -> str:
 
 ARTICLE_CACHE_MAX = 200         # сколько разобранных статей держим в памяти
 ARTICLE_MIN_WORDS = 25          # ниже этого RSS-описание считаем бедным
-ARTICLE_MAX_CHARS = 2500        # столько текста статьи отдаём модели
-_article_cache: dict = {}
+ARTICLE_MAX_CHARS = 3500        # столько текста статьи отдаём модели
+_article_cache: dict[str, dict] = {}
+_article_text_cache: dict[str, str] = {}
 
 # Мусор, который на новостных сайтах лежит вперемешку с текстом
 _ARTICLE_JUNK = re.compile(
@@ -2794,29 +3247,46 @@ def fetch_article(url: str) -> dict:
     if url in _article_cache:
         return _article_cache[url]
     try:
-        r = http_get_with_retry(url, headers={'User-Agent': USER_AGENT},
-                                timeout=HTTP_TIMEOUT)
+        r = http_get_public_with_retry(url, headers={'User-Agent': USER_AGENT},
+                                       timeout=HTTP_TIMEOUT, stream=True)
     except Exception as e:
         logger.debug(f"статья не прочиталась ({type(e).__name__}): {url[:70]}")
         return empty
     if not r or r.status_code != 200:
+        if r is not None:
+            try:
+                r.close()
+            except Exception:
+                pass
         return empty
     ctype = (r.headers.get('Content-Type') or '').lower()
     if 'html' not in ctype and ctype:
+        try:
+            r.close()
+        except Exception:
+            pass
+        return empty
+    html_text = _read_limited_text(r)
+    try:
+        r.close()
+    except Exception:
+        pass
+    if html_text is None:
+        logger.info(f"Статья слишком большая или не прочиталась: {url[:70]}")
         return empty
     try:
-        text = _extract_article_text(r.text)
+        text = _extract_article_text(html_text)
     except Exception as e:
         logger.debug(f"статья не разобралась ({type(e).__name__}): {url[:70]}")
         text = ''
     try:
-        video = _find_video_in_html(r.text)
+        video = _find_video_in_html(html_text)
     except Exception:
         video = None
     result = {'text': text, 'video': video}
-    if len(_article_cache) > ARTICLE_CACHE_MAX:
-        _article_cache.clear()
-    _article_cache[url] = result
+    _bounded_cache_put(_article_cache, url, result, ARTICLE_CACHE_MAX)
+    if text:
+        _bounded_cache_put(_article_text_cache, url, text, ARTICLE_CACHE_MAX)
     if text or video:
         logger.info(f"📄 Статья: {len(text.split())} слов"
                     + (f", найден ролик {video[:50]}" if video else ", ролика нет")
@@ -2831,14 +3301,27 @@ def fetch_article_text(url: str) -> str:
 
 def fetch_og_image(url: str) -> Optional[str]:
     try:
-        r = http_get_with_retry(
+        r = http_get_public_with_retry(
             url,
             headers={'User-Agent': USER_AGENT},
             timeout=HTTP_TIMEOUT,
+            stream=True,
         )
         if not r or r.status_code != 200:
+            if r is not None:
+                try:
+                    r.close()
+                except Exception:
+                    pass
             return None
-        soup = BeautifulSoup(r.text, 'html.parser')
+        html_text = _read_limited_text(r)
+        try:
+            r.close()
+        except Exception:
+            pass
+        if html_text is None:
+            return None
+        soup = BeautifulSoup(html_text, 'html.parser')
         og = soup.find('meta', property='og:image')
         if og and og.get('content'):
             return og['content']
@@ -2855,10 +3338,7 @@ def fetch_og_image(url: str) -> Optional[str]:
 
 # Если RSS-превью длиннее этого — на страницу не лезем, текста уже достаточно
 ARTICLE_FETCH_THRESHOLD = 400
-# Сколько максимум символов берём из полной статьи
-ARTICLE_MAX_CHARS = 3500
-# Кеш полных текстов (по URL) в памяти на время работы
-_article_cache: dict[str, str] = {}
+# Кеш полных текстов разделён с detail-cache: значения имеют разные типы.
 
 # Селекторы мусора, который надо выкинуть из текста статьи
 _ARTICLE_JUNK_SELECTORS = [
@@ -2877,16 +3357,33 @@ def fetch_full_article_text(url: str) -> Optional[str]:
     выкидываем мусор (меню, реклама, подписи). Если не нашли — берём og:description."""
     if not url:
         return None
-    if url in _article_cache:
-        return _article_cache[url] or None
+    if url in _article_text_cache:
+        return _article_text_cache[url] or None
+    detail = _article_cache.get(url)
+    if isinstance(detail, dict) and detail.get('text'):
+        return str(detail['text'])
 
     try:
-        r = http_get_with_retry(url, headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT)
+        r = http_get_public_with_retry(
+            url, headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT, stream=True)
         if not r or r.status_code != 200:
-            _article_cache[url] = ''
+            if r is not None:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+            _article_text_cache[url] = ''
+            return None
+        html_text = _read_limited_text(r)
+        try:
+            r.close()
+        except Exception:
+            pass
+        if html_text is None:
+            _article_text_cache[url] = ''
             return None
 
-        soup = BeautifulSoup(r.text, 'html.parser')
+        soup = BeautifulSoup(html_text, 'html.parser')
 
         # Удаляем явный мусор
         for selector in _ARTICLE_JUNK_SELECTORS:
@@ -2935,11 +3432,11 @@ def fetch_full_article_text(url: str) -> Optional[str]:
         text = re.sub(r'\s+', ' ', text).strip()
         text = text[:ARTICLE_MAX_CHARS]
 
-        _article_cache[url] = text
+        _bounded_cache_put(_article_text_cache, url, text, ARTICLE_CACHE_MAX)
         return text or None
     except Exception as e:
         logger.debug(f"full article fail для {url}: {e}")
-        _article_cache[url] = ''
+        _article_text_cache[url] = ''
         return None
 
 
@@ -2968,7 +3465,7 @@ def extract_image_from_entry(entry, summary_html: Optional[str] = None) -> Optio
 def _download_image_bytes(url: str) -> Optional[bytes]:
     """Скачивает картинку потоково и прекращает чтение после 9 МБ."""
     try:
-        r = http_get_with_retry(
+        r = http_get_public_with_retry(
             url, headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT, stream=True)
         if not r or r.status_code != 200:
             return None
@@ -3334,23 +3831,25 @@ def _parse_rss_with_fallback(
             rss_url,
             headers={'User-Agent': USER_AGENT},
             timeout=HTTP_TIMEOUT,
-            stream=public_only,
+            stream=True,
         )
         if response is None or response.status_code >= 400:
             status = getattr(response, 'status_code', 'нет ответа')
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
             logger.warning(f"{source_name}: RSS недоступен (HTTP {status})")
             return []
-        if public_only:
-            rss_data = _read_limited_response(response, HTTP_RSS_MAX_BYTES)
-            try:
-                response.close()
-            except Exception:
-                pass
-            if not rss_data:
-                logger.warning(f"{source_name}: RSS пустой или превышает лимит {HTTP_RSS_MAX_BYTES // (1024*1024)} МБ")
-                return []
-        else:
-            rss_data = response.content
+        rss_data = _read_limited_response(response, HTTP_RSS_MAX_BYTES)
+        try:
+            response.close()
+        except Exception:
+            pass
+        if not rss_data:
+            logger.warning(f"{source_name}: RSS пустой или превышает лимит {HTTP_RSS_MAX_BYTES // (1024*1024)} МБ")
+            return []
         feed = feedparser.parse(rss_data)
         for entry in feed.entries[:NEWS_PER_SOURCE * 3]:
             link = getattr(entry, 'link', None)
@@ -3525,10 +4024,24 @@ def get_myanimelist():
             'https://myanimelist.net/news',
             headers={'User-Agent': USER_AGENT},
             timeout=HTTP_TIMEOUT,
+            stream=True,
         )
         if not response or response.status_code != 200:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
             return news_list
-        soup = BeautifulSoup(response.text, 'html.parser')
+        page_text = _read_limited_text(response)
+        try:
+            response.close()
+        except Exception:
+            pass
+        if page_text is None:
+            logger.warning('MyAnimeList: HTML слишком большой')
+            return news_list
+        soup = BeautifulSoup(page_text, 'html.parser')
         for item in soup.select('div.news-unit')[:NEWS_PER_SOURCE]:
             title_tag = item.select_one('p.title a')
             if not title_tag:
@@ -3928,22 +4441,35 @@ def _fetch_video_from_embed(post_id: str):
                 f'https://t.me/{post_id}'):
         kind = 'embed' if 'embed' in url else 'страница'
         try:
-            r = http_get_with_retry(url, headers={'User-Agent': USER_AGENT},
-                                    timeout=HTTP_TIMEOUT)
+            r = http_get_public_with_retry(url, headers={'User-Agent': USER_AGENT},
+                                           timeout=HTTP_TIMEOUT, stream=True)
         except Exception as e:
             logger.info(f"  {post_id}: {kind} — запрос не удался ({type(e).__name__}: {e})")
             continue
         if not r or r.status_code != 200:
             logger.info(f"  {post_id}: {kind} — HTTP {r.status_code if r else 'нет ответа'}")
+            if r is not None:
+                try:
+                    r.close()
+                except Exception:
+                    pass
             continue
-        direct, duration, how, thumb = _extract_video_url(r.text)
+        page_text = _read_limited_text(r)
+        try:
+            r.close()
+        except Exception:
+            pass
+        if page_text is None:
+            logger.info(f"  {post_id}: {kind} — страница слишком большая")
+            continue
+        direct, duration, how, thumb = _extract_video_url(page_text)
         if direct:
             logger.info(f"  {post_id}: {kind} — нашёл mp4 ({how})")
             return direct, duration, thumb
         if thumb:
             best_thumb = thumb
         # Отличаем «страница пустая/закрыта» от «страница есть, а файла нет»
-        has_post = 'tgme_widget_message' in r.text
+        has_post = 'tgme_widget_message' in page_text
         logger.info(f"  {post_id}: {kind} — mp4 нет "
                     f"({'пост загружен, ссылки на файл в HTML не оказалось' if has_post else 'пост не отдался (приватный/защищённый?)'})"
                     + (', но забрал полноразмерный кадр' if best_thumb else ''))
@@ -3958,11 +4484,25 @@ def _fetch_video_from_embed(post_id: str):
 def get_telegram_channel(channel: str, label: str) -> list[dict]:
     """Парсит публичный Telegram-канал через t.me/s/. Возвращает список news-словарей."""
     url = f'https://t.me/s/{channel}'
-    r = http_get_with_retry(url, headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT)
+    r = http_get_public_with_retry(
+        url, headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT, stream=True)
     if not r or r.status_code != 200:
         logger.warning(f"TG {channel}: HTTP {r.status_code if r else 'нет ответа'}")
+        if r is not None:
+            try:
+                r.close()
+            except Exception:
+                pass
         return []
-    soup = BeautifulSoup(r.text, 'html.parser')
+    page_text = _read_limited_text(r)
+    try:
+        r.close()
+    except Exception:
+        pass
+    if page_text is None:
+        logger.warning(f"TG {channel}: HTML слишком большой")
+        return []
+    soup = BeautifulSoup(page_text, 'html.parser')
     news_list: list[dict] = []
     seen_ids: set[str] = set()
     embed_budget = TG_EMBED_LOOKUPS_PER_RUN   # не тормозим цикл лишними запросами
@@ -4098,11 +4638,24 @@ def get_animatetimes() -> list[dict]:
     Заголовки японские — переводятся DeepL (JA→RU он умеет).
     Превью в списке нет — картинку подтянет og:image-fallback при отправке."""
     r = http_get_with_retry('https://www.animatetimes.com/',
-                            headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT)
+                            headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT, stream=True)
     if not r or r.status_code != 200:
         logger.warning(f"AnimateTimes: HTTP {r.status_code if r else 'нет ответа'}")
+        if r is not None:
+            try:
+                r.close()
+            except Exception:
+                pass
         return []
-    soup = BeautifulSoup(r.text, 'html.parser')
+    page_text = _read_limited_text(r)
+    try:
+        r.close()
+    except Exception:
+        pass
+    if page_text is None:
+        logger.warning('AnimateTimes: HTML слишком большой')
+        return []
+    soup = BeautifulSoup(page_text, 'html.parser')
     news_list: list[dict] = []
     seen: set[str] = set()
     for a in soup.select('a[href*="/news/details.php?id="]'):
@@ -4146,11 +4699,24 @@ def get_filmix() -> list[dict]:
     """Filmix — русские новости кино и сериалов (/mnews/).
     Контент на русском — lang='ru', перевод не нужен."""
     r = http_get_with_retry('https://filmix.gg/mnews/',
-                            headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT)
+                            headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT, stream=True)
     if not r or r.status_code != 200:
         logger.warning(f"Filmix: HTTP {r.status_code if r else 'нет ответа'}")
+        if r is not None:
+            try:
+                r.close()
+            except Exception:
+                pass
         return []
-    soup = BeautifulSoup(r.text, 'html.parser')
+    page_text = _read_limited_text(r)
+    try:
+        r.close()
+    except Exception:
+        pass
+    if page_text is None:
+        logger.warning('Filmix: HTML слишком большой')
+        return []
+    soup = BeautifulSoup(page_text, 'html.parser')
     news_list: list[dict] = []
     seen: set[str] = set()
     for a in soup.select('h2 a[href*="/mnews/"], h3 a[href*="/mnews/"]'):
@@ -4505,6 +5071,15 @@ def fit_to_limit(text: str, limit: int) -> str:
     return text[:limit - 1].rstrip() + '…'
 
 
+def _escape_to_limit(text: str, limit: int) -> str:
+    """Обрезает ДО HTML escaping: Telegram считает лимит после parsing entities.
+
+    Если резать уже экранированную строку, граница может попасть внутрь ``&amp;``
+    или ``&lt;`` и Bot API получит синтаксически битый HTML.
+    """
+    return html.escape(fit_to_limit(str(text or ''), limit))
+
+
 async def _prepare_video_file(news: dict) -> Optional[Path]:
     """Если у новости есть видео — пытается его скачать. Возвращает путь к файлу или None.
     Прямые видео (.mp4 и т.д.) возвращаются как URL-ссылка не здесь — для них Telegram сам качает.
@@ -4542,6 +5117,21 @@ def _add_video_link_to_text(text: str, video_url: str) -> str:
     return f'{text}\n\n🎬 Смотреть: {video_url}'
 
 
+class DeliveryUncertain(RuntimeError):
+    """Telegram-вызов мог выполниться, но клиент не получил подтверждение."""
+
+
+def _raise_if_ambiguous_tg_error(exc: BaseException) -> None:
+    # PTB NetworkError/TimedOut означают отсутствие достоверного ответа сервера.
+    # По имени проверяем также лёгкие test-stubs и совместимые версии PTB.
+    ambiguous = bool(_TG_AMBIGUOUS_ERROR_TYPES and
+                     isinstance(exc, _TG_AMBIGUOUS_ERROR_TYPES))
+    if not ambiguous:
+        ambiguous = type(exc).__name__ in {'NetworkError', 'TimedOut'}
+    if ambiguous:
+        raise DeliveryUncertain(f'{type(exc).__name__}: {exc}') from exc
+
+
 async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
                      thread_id: Optional[int] = None) -> bool:
     """Главная отправка: собирает альбом из видео и фото, шлёт media group или одиночное сообщение.
@@ -4564,8 +5154,8 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
     if video_url and not has_inline_video:
         text = _add_video_link_to_text(text, video_url)
 
-    safe_text = html.escape(text)
-    caption = fit_to_limit(safe_text, TG_CAPTION_LIMIT)
+    safe_text = _escape_to_limit(text, TG_TEXT_LIMIT)
+    caption = _escape_to_limit(text, TG_CAPTION_LIMIT)
 
     photos = _dedup_image_variants(news.get('images') or [])
     # Ролик не доехал, а картинок нет — ставим кадр-превью из самого поста,
@@ -4590,7 +5180,7 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
         try:
             await bot.send_message(
                 chat_id=target,
-                text=fit_to_limit(safe_text, TG_TEXT_LIMIT),
+                text=safe_text,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=False,
                 **thread_kw,
@@ -4598,6 +5188,7 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
             logger.info(f"📝 {news['source']}: {news['title'][:60]}")
             return True
         except TelegramError as e:
+            _raise_if_ambiguous_tg_error(e)
             logger.error(f"Не удалось отправить текст: {e}")
             return False
 
@@ -4622,6 +5213,7 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
                 logger.info(f"🎬 {news['source']}: {news['title'][:60]}")
                 return True
             except TelegramError as e:
+                _raise_if_ambiguous_tg_error(e)
                 if settings.require_image:
                     logger.warning(f"⊘ Видео не отправилось ({e}), require_image включено — пост пропущен")
                     return False
@@ -4631,12 +5223,13 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
                 try:
                     await bot.send_message(
                         chat_id=target,
-                        text=fit_to_limit(html.escape(fallback_text), TG_TEXT_LIMIT),
+                        text=_escape_to_limit(fallback_text, TG_TEXT_LIMIT),
                         parse_mode=ParseMode.HTML, disable_web_page_preview=False,
                         **thread_kw,
                     )
                     return True
                 except TelegramError as e2:
+                    _raise_if_ambiguous_tg_error(e2)
                     logger.error(f"Текстовый fallback тоже упал: {e2}")
                     return False
         else:
@@ -4650,6 +5243,7 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
                 logger.info(f"📷 {news['source']}: {news['title'][:60]}")
                 return True
             except TelegramError as e:
+                _raise_if_ambiguous_tg_error(e)
                 # URL не принят Bot API — скачиваем сами и шлём байтами
                 if isinstance(photos[0], str):
                     data = await asyncio.to_thread(_download_image_bytes, photos[0])
@@ -4662,6 +5256,7 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
                             logger.info(f"📷 {news['source']}: {news['title'][:60]} (байтами)")
                             return True
                         except TelegramError as e2:
+                            _raise_if_ambiguous_tg_error(e2)
                             e = e2
                 if settings.require_image:
                     logger.warning(f"⊘ Фото не отправилось ({e}), require_image включено — пост пропущен")
@@ -4670,12 +5265,13 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
                 try:
                     await bot.send_message(
                         chat_id=target,
-                        text=fit_to_limit(safe_text, TG_TEXT_LIMIT),
+                        text=safe_text,
                         parse_mode=ParseMode.HTML, disable_web_page_preview=False,
                         **thread_kw,
                     )
                     return True
                 except TelegramError as e2:
+                    _raise_if_ambiguous_tg_error(e2)
                     logger.error(f"Текстовый fallback тоже упал: {e2}")
                     return False
 
@@ -4719,6 +5315,7 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
             logger.info(f"{kind} {news['source']}: {news['title'][:60]} ({len(media)} медиа)")
             return True
         except TelegramError as e:
+            _raise_if_ambiguous_tg_error(e)
             logger.warning(f"Альбом не отправился ({e}), пробую одиночно")
             # Fallback: пробуем по очереди — сначала видео/первая фотка с caption, остальное без
             return await _send_post_fallback(bot, news, target, video_file, video_media, photos, caption, safe_text, has_inline_video, thread_id)
@@ -4794,12 +5391,13 @@ async def _send_post_fallback(
         # Совсем не получилось — текст
         await bot.send_message(
             chat_id=target,
-            text=fit_to_limit(safe_text, TG_TEXT_LIMIT),
+            text=safe_text,
             parse_mode=ParseMode.HTML, disable_web_page_preview=False,
             **thread_kw,
         )
         return True
     except TelegramError as e:
+        _raise_if_ambiguous_tg_error(e)
         logger.error(f"Fallback провалился: {e}")
         return False
 
@@ -4808,6 +5406,7 @@ async def _send_post_fallback(
 # время можно успеть нажать кнопку второй раз или получить тик планировщика —
 # без этой защиты пост уходил в канал дважды.
 _publishing_now: set[str] = set()
+_channel_send_lock = asyncio.Lock()
 
 
 class _PublishGuard:
@@ -4828,6 +5427,22 @@ class _PublishGuard:
         if self.acquired:
             _publishing_now.discard(self.key)
         return False
+
+
+def _is_publishing(key: str) -> bool:
+    return str(key) in _publishing_now
+
+
+async def _send_channel_post(bot: Bot, news: dict, video_file: Optional[Path] = None) -> bool:
+    """Сериализует все публикации именно в канал.
+
+    Автоочередь, ручная кнопка и scheduled-job могут сработать одновременно.
+    Telegram это переживёт, но порядок постов и flood-паузы становятся
+    непредсказуемыми. Один lock оставляет подготовку параллельной, а сам publish
+    — строго последовательным.
+    """
+    async with _channel_send_lock:
+        return await _send_post(bot, news, CHANNEL_ID, video_file)
 
 
 async def _prepare_news_for_send(news: dict, source: str,
@@ -4863,7 +5478,7 @@ async def _prepare_news_for_send(news: dict, source: str,
     # и совпадает только после перевода.
     if published_texts is not None and settings.dedup_final_text:
         final_text = format_news_short(news)
-        twin = published_texts.find_similar(final_text)
+        twin = published_texts.reserve(final_text)
         if twin:
             logger.info(f"⊘ Такой пост уже выходил («{twin[:45]}»): "
                         f"{final_text.split(chr(10))[0][:50]}")
@@ -4874,8 +5489,13 @@ async def _prepare_news_for_send(news: dict, source: str,
     return None
 
 
-async def send_news(bot: Bot, news: dict, chat_id=None) -> str:
-    """Отправляет один пост с транзакционным резервированием дедупа."""
+async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool = True) -> str:
+    """Отправляет один пост с транзакционным резервированием дедупа.
+
+    ``track_history=False`` предназначен для приватного просмотра администратором:
+    все проверки и временные reservations остаются, но успешный просмотр не
+    помечает новость опубликованной и не расходует channel-дедуп.
+    """
     source = news.get('source', 'unknown')
     is_channel = chat_id is None
     link = news.get('link', '')
@@ -4888,7 +5508,7 @@ async def send_news(bot: Bot, news: dict, chat_id=None) -> str:
         if is_channel:
             await stats.record_skipped('duplicate', source)
         return 'skipped_dup'
-    if not await sent_links.claim(link, title):
+    if not await sent_links.claim(link, title, check_similar=True):
         if is_channel:
             await stats.record_skipped('duplicate', source)
         return 'skipped_dup'
@@ -4897,16 +5517,29 @@ async def send_news(bot: Bot, news: dict, chat_id=None) -> str:
     video_file = None
     committed = False
     rejected = False
+    send_started = False
+    preserve_ambiguous = False
     try:
         skip = await _prepare_news_for_send(news, source, count_stats=is_channel)
         if skip:
-            await sent_links.reject(link, title, skip)
-            rejected = True
+            if track_history:
+                await sent_links.reject(link, title, skip)
+                rejected = True
             return skip
 
         video_file = await _prepare_video_file(news)
+        if track_history:
+            if not await sent_links.mark_sending(link):
+                logger.warning(f'Ledger reservation исчез перед отправкой: {link[:100]}')
+                return 'failed'
+            send_started = True
         try:
-            ok = await _send_post(bot, news, target, video_file)
+            if is_channel:
+                ok = await _send_channel_post(bot, news, video_file)
+            else:
+                ok = await _send_post(bot, news, target, video_file)
+        except DeliveryUncertain:
+            raise
         except Exception:
             logger.exception(f"Отправка поста упала: {title[:60]}")
             ok = False
@@ -4915,16 +5548,37 @@ async def send_news(bot: Bot, news: dict, chat_id=None) -> str:
                 await stats.record_failed_send(source)
             return 'failed'
 
-        await sent_links.commit(link, title)
-        committed = True
-        _commit_image_fingerprint(news)
-        _mark_published()
-        if is_channel:
-            await stats.record_published(source)
+        if track_history:
+            await sent_links.commit(link, title)
+            committed = True
+            _commit_image_fingerprint(news)
+            _mark_published()
+            if is_channel:
+                await stats.record_published(source)
         return 'sent'
+    except DeliveryUncertain as e:
+        logger.warning(f'Результат отправки неизвестен, автоповтор запрещён: {title[:60]} ({e})')
+        if track_history and send_started and not committed:
+            await sent_links.mark_uncertain(link)
+            _commit_image_fingerprint(news)
+            preserve_ambiguous = True
+        if is_channel:
+            await stats.record_failed_send(source)
+        return 'uncertain'
+    except asyncio.CancelledError:
+        if track_history and send_started and not committed:
+            # После входа в Telegram API отмена неоднозначна: сообщение могло
+            # уже уйти. Пессимистично сохраняем дедуп, чтобы рестарт/следующий
+            # тик не создал дубль. Админ увидит uncertain в /health.
+            await sent_links.mark_uncertain(link)
+            _commit_image_fingerprint(news)
+            preserve_ambiguous = True
+        raise
     finally:
-        if not committed and not rejected:
+        if not committed and not rejected and not preserve_ambiguous:
             await sent_links.release(link, title)
+        if not committed and not preserve_ambiguous:
+            _release_publish_reservations(news)
         if video_file:
             try:
                 video_file.unlink(missing_ok=True)
@@ -4948,13 +5602,23 @@ class CustomSources:
     def _load(self) -> None:
         try:
             if self.path.exists():
-                self._items = json.loads(self.path.read_text(encoding='utf-8'))
-        except (OSError, ValueError) as e:
+                raw = json.loads(self.path.read_text(encoding='utf-8'))
+                if not isinstance(raw, list):
+                    raise ValueError('ожидался список источников')
+                self._items = [
+                    {'type': str(it['type']), 'value': str(it['value']), 'label': str(it['label'])}
+                    for it in raw
+                    if isinstance(it, dict)
+                    and it.get('type') in {'rss', 'tg'}
+                    and isinstance(it.get('value'), str) and it.get('value')
+                    and isinstance(it.get('label'), str) and it.get('label')
+                ]
+        except (OSError, ValueError, KeyError, TypeError) as e:
             logger.warning(f"custom_sources не загружен: {e}")
 
     def _save(self) -> None:
         try:
-            self.path.write_text(json.dumps(self._items, ensure_ascii=False), encoding='utf-8')
+            _atomic_write_json(self.path, self._items)
         except OSError as e:
             logger.error(f"custom_sources не сохранён: {e}")
 
@@ -4994,6 +5658,14 @@ def _attach_custom_source(item: dict) -> None:
     SOURCES.append((item['label'], _make_source_fn(item['type'], item['value'], item['label'])))
 
 
+CUSTOM_SOURCE_LABEL_MAX = 80
+CUSTOM_SOURCE_URL_MAX = 2048
+
+
+def _clean_source_label(value: str) -> str:
+    return re.sub(r'\s+', ' ', str(value or '')).strip()[:CUSTOM_SOURCE_LABEL_MAX]
+
+
 def _parse_addsource_args(args: list) :
     """Разбирает аргументы /addsource → (type, value, label) или None.
     Форматы:
@@ -5008,16 +5680,16 @@ def _parse_addsource_args(args: list) :
         m = re.match(r'^(?:https?://)?t\.me/(?:s/)?([A-Za-z0-9_]{4,})/?$', first)
     if m:
         ch = m.group(1)
-        label = rest_label or f'TG: {ch}'
+        label = _clean_source_label(rest_label or f'TG: {ch}')
         if not label.lower().startswith('tg'):
-            label = f'TG: {label}'
+            label = _clean_source_label(f'TG: {label}')
         return 'tg', ch, label
-    if first.startswith(('http://', 'https://')):
+    if first.startswith(('http://', 'https://')) and len(first) <= CUSTOM_SOURCE_URL_MAX:
         try:
             host = urlparse(first).netloc.replace('www.', '')
         except Exception:
             host = 'RSS'
-        label = rest_label or host or 'RSS'
+        label = _clean_source_label(rest_label or host or 'RSS')
         return 'rss', first, label
     return None
 
@@ -5062,8 +5734,28 @@ def _local_now() -> datetime:
 
 
 def _local_to_utc(local_naive: datetime) -> datetime:
-    """Локальное время админа (naive) → aware UTC с учётом DST."""
-    return local_naive.replace(tzinfo=_admin_tz()).astimezone(timezone.utc)
+    """Локальное время админа (naive) → aware UTC с корректной обработкой DST.
+
+    В момент весеннего перевода часов некоторые локальные времена не существуют;
+    осенью один и тот же час бывает дважды. Несуществующее время отклоняем, а для
+    неоднозначного выбираем более позднее (fold=1), чтобы пост не вышел раньше
+    ожидаемого пользователем.
+    """
+    tz = _admin_tz()
+    if not isinstance(tz, ZoneInfo):
+        return local_naive.replace(tzinfo=tz).astimezone(timezone.utc)
+
+    valid = []
+    for fold in (0, 1):
+        aware = local_naive.replace(tzinfo=tz, fold=fold)
+        roundtrip = aware.astimezone(timezone.utc).astimezone(tz).replace(tzinfo=None)
+        if roundtrip == local_naive:
+            valid.append(aware)
+    if not valid:
+        raise ValueError(f'Локальное время {local_naive} не существует в зоне {tz.key}')
+    if len(valid) == 2 and valid[0].utcoffset() != valid[1].utcoffset():
+        return valid[1].astimezone(timezone.utc)
+    return valid[0].astimezone(timezone.utc)
 
 
 def _utc_to_local(dt_utc: datetime) -> datetime:
@@ -5076,6 +5768,14 @@ def _utc_to_local(dt_utc: datetime) -> datetime:
 def _fmt_local(dt_utc: datetime) -> str:
     """Человекочитаемое время публикации в поясе админа."""
     return _utc_to_local(dt_utc).strftime('%d.%m в %H:%M')
+
+
+def _safe_local_to_utc(local_naive: datetime) -> Optional[datetime]:
+    try:
+        return _local_to_utc(local_naive)
+    except ValueError as e:
+        logger.info(f"Некорректное локальное время из-за DST: {e}")
+        return None
 
 
 _REL_TIME_RE = re.compile(
@@ -5111,7 +5811,7 @@ def _parse_schedule_time(text: str) -> Optional[datetime]:
             delta = timedelta(days=n)
         if delta.total_seconds() < 60:
             return None
-        return _local_to_utc(now_local + delta)
+        return _safe_local_to_utc(now_local + delta)
 
     # Словесный сдвиг дня: 'завтра 10:00'
     day_shift = 0
@@ -5142,7 +5842,7 @@ def _parse_schedule_time(text: str) -> Optional[datetime]:
                 local = local.replace(year=year + 1)
             except ValueError:
                 return None
-        return _local_to_utc(local) if local > now_local else None
+        return _safe_local_to_utc(local) if local > now_local else None
 
     # Просто время: 18:30
     m = _TIME_RE.match(t)
@@ -5155,7 +5855,7 @@ def _parse_schedule_time(text: str) -> Optional[datetime]:
             local += timedelta(days=day_shift)
         elif local <= now_local:
             local += timedelta(days=1)   # время на сегодня прошло — значит завтра
-        return _local_to_utc(local) if local > now_local else None
+        return _safe_local_to_utc(local) if local > now_local else None
 
     return None
 
@@ -5179,18 +5879,39 @@ class ScheduledPosts:
         try:
             if self.path.exists():
                 data = json.loads(self.path.read_text(encoding='utf-8'))
-                self._counter = int(data.get('counter', 0))
-                self._items = data.get('items', {})
+                if not isinstance(data, dict):
+                    raise ValueError('ожидался JSON-объект')
+                self._counter = max(0, int(data.get('counter', 0)))
+                raw_items = data.get('items', {})
+                if not isinstance(raw_items, dict):
+                    raise ValueError('items должен быть объектом')
+                self._items = {str(k): v for k, v in raw_items.items()
+                               if isinstance(v, dict) and isinstance(v.get('news'), dict)}
+                recovered_uncertain = False
+                for item in self._items.values():
+                    state = str(item.get('state') or 'pending')
+                    if state == 'sending':
+                        # Процесс мог умереть после успешного Telegram API, но до pop().
+                        # Автоматический повтор в такой ситуации создаёт дубль, поэтому
+                        # после рестарта требуем осознанного решения администратора.
+                        item['state'] = 'uncertain'
+                        recovered_uncertain = True
+                    elif state not in ('pending', 'uncertain'):
+                        item['state'] = 'pending'
+                if recovered_uncertain:
+                    logger.warning('Отложка: найдены посты с неопределённым результатом '
+                                   'после аварийного рестарта; авто-повтор отключён')
+                    self._save()
         except (OSError, ValueError, TypeError) as e:
             logger.warning(f"scheduled_posts не загружен: {e}")
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         try:
-            self.path.write_text(
-                json.dumps({'counter': self._counter, 'items': self._items}, ensure_ascii=False),
-                encoding='utf-8')
+            _atomic_write_json(self.path, {'counter': self._counter, 'items': self._items})
+            return True
         except OSError as e:
             logger.error(f"scheduled_posts не сохранён: {e}")
+            return False
 
     @staticmethod
     def _at(item: dict) -> Optional[datetime]:
@@ -5201,7 +5922,13 @@ class ScheduledPosts:
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
     def add(self, news: dict, when_utc: datetime, by: Optional[dict] = None) -> str:
-        """by — кто отложил: {'id': int, 'name': str}. Нужен для внятных уведомлений."""
+        """by — кто отложил: {'id': int, 'name': str}. Нужен для внятных уведомлений.
+
+        При полном хранилище не удаляем молча уже запланированные публикации:
+        вызывающий код должен сообщить админу и оставить исходный пост в модерации.
+        """
+        if len(self._items) >= self.MAX_ITEMS:
+            raise OverflowError(f'Лимит отложки: {self.MAX_ITEMS} постов')
         self._counter += 1
         key = str(self._counter)
         clean = {k: v for k, v in news.items() if k != 'published_parsed'}
@@ -5209,14 +5936,14 @@ class ScheduledPosts:
             'news': clean,
             'at': when_utc.astimezone(timezone.utc).isoformat(),
             'tries': 0,
+            'state': 'pending',
             'by': by,
             'created': datetime.now(timezone.utc).isoformat(),
         }
-        if len(self._items) > self.MAX_ITEMS:
-            oldest = sorted(self._items, key=lambda k: self._items[k].get('at', ''))
-            for k in oldest[:len(self._items) - self.MAX_ITEMS]:
-                del self._items[k]
-        self._save()
+        if not self._save():
+            self._items.pop(key, None)
+            self._counter -= 1
+            raise OSError('Не удалось надёжно сохранить отложенный пост')
         return key
 
     def all(self) -> list:
@@ -5230,9 +5957,10 @@ class ScheduledPosts:
         return out
 
     def due(self, now_utc: Optional[datetime] = None) -> list:
-        """Посты, время которых уже наступило."""
+        """Посты, время которых наступило и которые безопасно автоповторять."""
         now = now_utc or datetime.now(timezone.utc)
-        return [(k, news) for k, news, dt in self.all() if dt <= now]
+        return [(k, news) for k, news, dt in self.all()
+                if dt <= now and (self._items.get(k) or {}).get('state', 'pending') == 'pending']
 
     def get(self, key: str) -> Optional[dict]:
         item = self._items.get(key)
@@ -5249,7 +5977,8 @@ class ScheduledPosts:
         return {
             'by': item.get('by') or {},
             'at': self._at(item),
-            'tries': int(item.get('tries', 0)),
+            'tries': _safe_nonnegative_int(item.get('tries', 0)),
+            'state': str(item.get('state') or 'pending'),
         }
 
     def reschedule(self, key: str, when_utc: datetime) -> bool:
@@ -5257,9 +5986,13 @@ class ScheduledPosts:
         item = self._items.get(key)
         if not item:
             return False
+        old = (item.get('at'), item.get('tries'), item.get('state'))
         item['at'] = when_utc.astimezone(timezone.utc).isoformat()
         item['tries'] = 0          # новое время — новые попытки
-        self._save()
+        item['state'] = 'pending'
+        if not self._save():
+            item['at'], item['tries'], item['state'] = old
+            return False
         return True
 
     def clear(self) -> int:
@@ -5276,12 +6009,59 @@ class ScheduledPosts:
             return item.get('news')
         return None
 
+    def mark_sending(self, key: str, *, force: bool = False) -> bool:
+        """Перед Telegram API атомарно фиксирует рискованное состояние отправки.
+
+        Если процесс умрёт после этой записи, следующий запуск переведёт запись
+        в ``uncertain`` и не станет автоматически дублировать её в канал.
+        ``force`` используется только для осознанного ручного повтора админом.
+        """
+        item = self._items.get(key)
+        if not item:
+            return False
+        state = str(item.get('state') or 'pending')
+        if state != 'pending' and not (force and state == 'uncertain'):
+            return False
+        old_state = state
+        item['state'] = 'sending'
+        if not self._save():
+            item['state'] = old_state
+            logger.error(f'Отложка: sending-state не записан, публикация {key} заблокирована')
+            return False
+        return True
+
+    def mark_pending(self, key: str) -> bool:
+        item = self._items.get(key)
+        if not item:
+            return False
+        old_state = str(item.get('state') or 'pending')
+        item['state'] = 'pending'
+        if not self._save():
+            item['state'] = old_state
+            return False
+        return True
+
+    def mark_uncertain(self, key: str) -> bool:
+        item = self._items.get(key)
+        if not item:
+            return False
+        item['state'] = 'uncertain'
+        saved = self._save()
+        if not saved:
+            logger.critical(f'Отложка: uncertain-state {key} не записан на диск')
+        return saved
+
+    def uncertain_count(self) -> int:
+        return sum(1 for item in self._items.values()
+                   if str(item.get('state') or 'pending') == 'uncertain')
+
     def mark_try(self, key: str) -> int:
-        """Считает неудачные попытки публикации. Возвращает их количество."""
+        """Считает неудачные попытки и снова разрешает безопасный автоповтор."""
         item = self._items.get(key)
         if not item:
             return 0
-        item['tries'] = int(item.get('tries', 0)) + 1
+        item['tries'] = _safe_nonnegative_int(item.get('tries', 0)) + 1
+        item['state'] = 'pending'
         self._save()
         return item['tries']
 
@@ -5309,6 +6089,7 @@ class PublishedTexts:
     def __init__(self, path: Path):
         self.path = path
         self._items: list[dict] = []
+        self._pending: dict[str, dict] = {}
         self._load()
 
     def _load(self) -> None:
@@ -5316,15 +6097,14 @@ class PublishedTexts:
             if self.path.exists():
                 data = json.loads(self.path.read_text(encoding='utf-8'))
                 if isinstance(data, list):
-                    self._items = data
+                    self._items = [i for i in data if isinstance(i, dict)]
         except (OSError, ValueError) as e:
             logger.warning(f"published_texts не загружен: {e}")
         self._prune()
 
     def _save(self) -> None:
         try:
-            self.path.write_text(json.dumps(self._items, ensure_ascii=False),
-                                 encoding='utf-8')
+            _atomic_write_json(self.path, self._items)
         except OSError as e:
             logger.error(f"published_texts не сохранён: {e}")
 
@@ -5363,13 +6143,24 @@ class PublishedTexts:
                 words.add(latin[:6])
         return words
 
-    def find_similar(self, text: str) -> Optional[str]:
-        """Заголовок недавнего поста, который говорит о том же. Или None."""
-        words = self._words(text)
-        if len(words) < 3:                 # слишком коротко, чтобы судить
-            return None
+    @staticmethod
+    def _key(words: set) -> str:
+        return hashlib.sha1('\x1f'.join(sorted(words)).encode('utf-8')).hexdigest()
+
+    def _prune_pending(self) -> None:
+        for key, item in list(self._pending.items()):
+            owner = item.get('_owner')
+            try:
+                done = owner is None or owner.done()
+            except Exception:
+                done = True
+            if done:
+                self._pending.pop(key, None)
+
+    def _find_similar_words(self, words: set) -> Optional[str]:
         self._prune()
-        for item in reversed(self._items):
+        self._prune_pending()
+        for item in list(reversed(self._items)) + list(self._pending.values()):
             old = set(item.get('w') or [])
             if not old:
                 continue
@@ -5377,6 +6168,37 @@ class PublishedTexts:
             if overlap >= FINAL_SIMILARITY:
                 return item.get('t', '')
         return None
+
+    def find_similar(self, text: str) -> Optional[str]:
+        """Заголовок недавнего или прямо сейчас отправляемого похожего поста."""
+        words = self._words(text)
+        if len(words) < 3:
+            return None
+        return self._find_similar_words(words)
+
+    def reserve(self, text: str) -> Optional[str]:
+        """Резервирует финальный текст; возвращает заголовок дубля или None."""
+        words = self._words(text)
+        if len(words) < 3:
+            return None
+        duplicate = self._find_similar_words(words)
+        if duplicate:
+            return duplicate
+        self._pending[self._key(words)] = {
+            'w': sorted(words),
+            't': re.sub(r'\s+', ' ', (text or '').split('\n')[0])[:70],
+            '_owner': asyncio.current_task() if asyncio.get_event_loop().is_running() else None,
+        }
+        return None
+
+    def release(self, text: str) -> None:
+        words = self._words(text)
+        if len(words) >= 3:
+            self._pending.pop(self._key(words), None)
+
+    def commit(self, text: str) -> None:
+        self.release(text)
+        self.add(text)
 
     def add(self, text: str) -> None:
         words = self._words(text)
@@ -5413,6 +6235,7 @@ class RecentSubjects:
     def __init__(self, path: Path):
         self.path = path
         self._items: list[dict] = []
+        self._pending: dict[str, dict] = {}
         self._load()
 
     def _load(self) -> None:
@@ -5427,8 +6250,7 @@ class RecentSubjects:
 
     def _save(self) -> None:
         try:
-            self.path.write_text(json.dumps(self._items, ensure_ascii=False),
-                                 encoding='utf-8')
+            _atomic_write_json(self.path, self._items)
         except OSError as e:
             logger.error(f"recent_subjects не сохранён: {e}")
 
@@ -5450,19 +6272,34 @@ class RecentSubjects:
         text = re.sub(r'\b(?:season|сезон|часть|part|the|аниме|anime)\b', ' ', text)
         return ' '.join(text.split())
 
+    def _prune_pending(self) -> None:
+        for pending_key, item in list(self._pending.items()):
+            owner = item.get('owner')
+            try:
+                done = owner is None or owner.done()
+            except Exception:
+                done = True
+            if done:
+                self._pending.pop(pending_key, None)
+
     def seen_same_news(self, subject: str, kind: str) -> bool:
         """Писали ли уже об этом же событии (тот же тайтл и тот же тип)."""
         key = self._key(subject)
         if not key:
             return False
-        return any(it.get('key') == key and it.get('kind') == kind
-                   for it in self._items)
+        self._prune_pending()
+        return (
+            any(it.get('key') == key and it.get('kind') == kind for it in self._items)
+            or any(it.get('key') == key and it.get('kind') == kind
+                   for it in self._pending.values())
+        )
 
     def count_today(self, subject: str) -> int:
         """Сколько постов про этот тайтл за последние сутки."""
         key = self._key(subject)
         if not key:
             return 0
+        self._prune_pending()
         edge = datetime.now(timezone.utc) - timedelta(hours=24)
         total = 0
         for it in self._items:
@@ -5473,7 +6310,30 @@ class RecentSubjects:
                     total += 1
             except (KeyError, ValueError, TypeError):
                 continue
+        total += sum(1 for it in self._pending.values() if it.get('key') == key)
         return total
+
+    def reserve(self, subject: str, kind: str, title: str = '') -> None:
+        key = self._key(subject)
+        if not key:
+            return
+        self._prune_pending()
+        pending_key = f'{key}\x1f{kind}'
+        self._pending[pending_key] = {
+            'key': key,
+            'kind': kind,
+            'title': re.sub(r'\s+', ' ', title or '').strip()[:70],
+            'owner': asyncio.current_task(),
+        }
+
+    def release(self, subject: str, kind: str) -> None:
+        key = self._key(subject)
+        if key:
+            self._pending.pop(f'{key}\x1f{kind}', None)
+
+    def commit(self, subject: str, kind: str, title: str = '') -> None:
+        self.release(subject, kind)
+        self.add(subject, kind, title)
 
     def add(self, subject: str, kind: str, title: str = '') -> None:
         key = self._key(subject)
@@ -5515,14 +6375,13 @@ class SourceHealth:
             if self.path.exists():
                 loaded = json.loads(self.path.read_text(encoding='utf-8'))
                 if isinstance(loaded, dict):
-                    self._data = loaded
+                    self._data = {str(k): v for k, v in loaded.items() if isinstance(v, dict)}
         except (OSError, ValueError) as e:
             logger.warning(f"source_health не загружен: {e}")
 
     def _save(self) -> None:
         try:
-            self.path.write_text(json.dumps(self._data, ensure_ascii=False),
-                                 encoding='utf-8')
+            _atomic_write_json(self.path, self._data)
         except OSError as e:
             logger.error(f"source_health не сохранён: {e}")
 
@@ -5643,6 +6502,7 @@ class ImageHashes:
         self.path = path
         self.max_items = max_items
         self._items: list[dict] = []
+        self._pending: dict[str, dict] = {}
         self._load()
 
     def _load(self) -> None:
@@ -5656,8 +6516,7 @@ class ImageHashes:
 
     def _save(self) -> None:
         try:
-            self.path.write_text(json.dumps(self._items, ensure_ascii=False),
-                                 encoding='utf-8')
+            _atomic_write_json(self.path, self._items)
         except OSError as e:
             logger.error(f"image_hashes не сохранён: {e}")
 
@@ -5671,9 +6530,38 @@ class ImageHashes:
                 return dict(item, distance=dist)
         return None
 
+    def reserve(self, fingerprint: str, title: str = '') -> Optional[dict]:
+        """Резервирует fingerprint до завершения отправки, закрывая concurrent race."""
+        duplicate = self.find_duplicate(fingerprint)
+        if duplicate:
+            return duplicate
+        for pending_fp, pending in list(self._pending.items()):
+            owner = pending.get('owner')
+            try:
+                if owner is None or owner.done():
+                    self._pending.pop(pending_fp, None)
+                    continue
+            except Exception:
+                self._pending.pop(pending_fp, None)
+                continue
+            dist = _hash_distance(fingerprint, pending_fp)
+            if dist is not None and dist <= IMAGE_HASH_DISTANCE:
+                return {'h': pending_fp, 't': pending.get('title', ''),
+                        'distance': dist, 'pending': True}
+        self._pending[fingerprint] = {
+            'title': re.sub(r'\s+', ' ', title or '').strip()[:80],
+            'owner': asyncio.current_task() if asyncio.get_event_loop().is_running() else None,
+        }
+        return None
+
+    def release(self, fingerprint: str) -> None:
+        if fingerprint:
+            self._pending.pop(fingerprint, None)
+
     def add(self, fingerprint: str, title: str = '') -> None:
         if not fingerprint:
             return
+        self._pending.pop(fingerprint, None)
         self._items.append({
             'h': fingerprint,
             't': re.sub(r'\s+', ' ', title or '').strip()[:80],
@@ -5708,9 +6596,7 @@ def _cached_image_bytes(url: str) -> Optional[bytes]:
     if url in _image_bytes_cache:
         return _image_bytes_cache[url]
     data = _download_image_bytes(url)
-    if len(_image_bytes_cache) >= IMAGE_BYTES_CACHE_MAX:
-        _image_bytes_cache.clear()
-    _image_bytes_cache[url] = data
+    _bounded_cache_put(_image_bytes_cache, url, data, IMAGE_BYTES_CACHE_MAX)
     return data
 
 
@@ -5776,7 +6662,7 @@ async def _image_duplicate(news: dict) -> Optional[str]:
     fingerprint = _image_fingerprint(data)
     if not fingerprint:
         return None
-    dup = image_hashes.find_duplicate(fingerprint)
+    dup = image_hashes.reserve(fingerprint, news.get('title', ''))
     if dup:
         return dup.get('t') or 'без заголовка'
     # Запоминаем не сейчас, а после успешной публикации (_commit_image_fingerprint):
@@ -5795,11 +6681,25 @@ def _commit_image_fingerprint(news: dict) -> None:
         image_hashes.add(fingerprint, news.get('title', ''))
     subject = news.get('_llm_subject')
     if subject and recent_subjects is not None:
-        recent_subjects.add(subject, news.get('_llm_kind', 'новость'),
-                            news.get('title', ''))
+        recent_subjects.commit(subject, news.get('_llm_kind', 'новость'),
+                               news.get('title', ''))
     final_text = news.pop('_final_text', None)
     if final_text and published_texts is not None:
-        published_texts.add(final_text)
+        published_texts.commit(final_text)
+
+
+def _release_publish_reservations(news: dict) -> None:
+    """Освобождает in-flight дедупы после любой неуспешной отправки/фильтра."""
+    fingerprint = news.pop('_img_fp', None)
+    if fingerprint and image_hashes is not None:
+        image_hashes.release(fingerprint)
+    final_text = news.pop('_final_text', None)
+    if final_text and published_texts is not None:
+        published_texts.release(final_text)
+    if news.pop('_subject_reserved', False) and recent_subjects is not None:
+        subject = news.get('_llm_subject')
+        if subject:
+            recent_subjects.release(subject, news.get('_llm_kind', 'новость'))
 
 
 PENDING_POSTS_FILE = DATA_DIR / 'pending_posts.json'
@@ -5821,25 +6721,46 @@ class PendingPosts:
         try:
             if self.path.exists():
                 data = json.loads(self.path.read_text(encoding='utf-8'))
-                self._counter = int(data.get('counter', 0))
-                self._items = data.get('items', {})
+                if not isinstance(data, dict):
+                    raise ValueError('ожидался JSON-объект')
+                self._counter = max(0, int(data.get('counter', 0)))
+                raw_items = data.get('items', {})
+                if not isinstance(raw_items, dict):
+                    raise ValueError('items должен быть объектом')
+                self._items = {str(k): v for k, v in raw_items.items()
+                               if isinstance(v, dict) and isinstance(v.get('news'), dict)}
+                recovered = False
+                for item in self._items.values():
+                    state = str(item.get('channel_state') or 'pending')
+                    if state == 'sending':
+                        item['channel_state'] = 'uncertain'
+                        recovered = True
+                    elif state not in ('pending', 'uncertain'):
+                        item['channel_state'] = 'pending'
+                if recovered:
+                    logger.warning('Модерация: найдены ручные публикации с неизвестным результатом')
+                    self._save()
         except (OSError, ValueError, TypeError) as e:
             logger.warning(f"pending_posts не загружен: {e}")
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         try:
-            self.path.write_text(
-                json.dumps({'counter': self._counter, 'items': self._items},
-                           ensure_ascii=False),
-                encoding='utf-8')
+            _atomic_write_json(self.path, {'counter': self._counter, 'items': self._items})
+            return True
         except OSError as e:
             logger.error(f"pending_posts не сохранён: {e}")
+            return False
 
     def _cleanup(self) -> None:
         cutoff = time.time() - self.TTL_DAYS * 86400
-        self._items = {k: v for k, v in self._items.items() if v.get('ts', 0) >= cutoff}
+        def _ts(item: dict) -> float:
+            try:
+                return float(item.get('ts', 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        self._items = {k: v for k, v in self._items.items() if _ts(v) >= cutoff}
         if len(self._items) > self.MAX_ITEMS:
-            oldest = sorted(self._items, key=lambda k: self._items[k].get('ts', 0))
+            oldest = sorted(self._items, key=lambda k: _ts(self._items[k]))
             for k in oldest[:len(self._items) - self.MAX_ITEMS]:
                 del self._items[k]
 
@@ -5848,14 +6769,59 @@ class PendingPosts:
         self._counter += 1
         key = str(self._counter)
         clean = {k: v for k, v in news.items() if k != 'published_parsed'}
-        self._items[key] = {'news': clean, 'ts': time.time()}
+        self._items[key] = {'news': clean, 'ts': time.time(), 'channel_state': 'pending'}
         self._cleanup()
-        self._save()
+        if not self._save():
+            self._items.pop(key, None)
+            self._counter -= 1
+            raise OSError('Не удалось сохранить pending-пост')
         return key
 
     def get(self, key: str) -> Optional[dict]:
         item = self._items.get(key)
         return item.get('news') if item else None
+
+    def channel_state(self, key: str) -> str:
+        item = self._items.get(key)
+        return str((item or {}).get('channel_state') or 'pending')
+
+    def mark_channel_sending(self, key: str, *, force: bool = False) -> bool:
+        item = self._items.get(key)
+        if not item:
+            return False
+        state = str(item.get('channel_state') or 'pending')
+        if state != 'pending' and not (force and state == 'uncertain'):
+            return False
+        item['channel_state'] = 'sending'
+        if not self._save():
+            item['channel_state'] = state
+            return False
+        return True
+
+    def mark_channel_pending(self, key: str) -> bool:
+        item = self._items.get(key)
+        if not item:
+            return False
+        old = str(item.get('channel_state') or 'pending')
+        item['channel_state'] = 'pending'
+        if not self._save():
+            item['channel_state'] = old
+            return False
+        return True
+
+    def mark_channel_uncertain(self, key: str) -> bool:
+        item = self._items.get(key)
+        if not item:
+            return False
+        item['channel_state'] = 'uncertain'
+        saved = self._save()
+        if not saved:
+            logger.critical(f'Moderation channel_state uncertain не записан: {key}')
+        return saved
+
+    def uncertain_count(self) -> int:
+        return sum(1 for item in self._items.values()
+                   if str(item.get('channel_state') or 'pending') == 'uncertain')
 
     def pop(self, key: str) -> Optional[dict]:
         item = self._items.pop(key, None)
@@ -5898,16 +6864,35 @@ def _moderation_markup(key: str) -> InlineKeyboardMarkup:
     ])
 
 
-async def _tg_call_flood_safe(coro_factory):
-    """Вызывает Telegram-метод; при флуд-лимите (RetryAfter) честно ждёт
-    указанное Telegram время и повторяет один раз вместо провала отправки."""
+def _retry_after_seconds(value) -> float:
+    """PTB может отдавать RetryAfter как число или timedelta."""
+    if isinstance(value, timedelta):
+        return max(0.0, value.total_seconds())
     try:
-        return await coro_factory()
-    except RetryAfter as e:
-        wait = int(getattr(e, 'retry_after', 5)) + 1
-        logger.warning(f"Flood-лимит Telegram: жду {wait}с и повторяю отправку")
-        await asyncio.sleep(wait)
-        return await coro_factory()
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 5.0
+
+
+async def _tg_call_flood_safe(coro_factory):
+    """Повторяет Telegram-вызов после RetryAfter, но не зависает на минуты."""
+    for attempt in range(TG_FLOOD_MAX_RETRIES + 1):
+        try:
+            return await coro_factory()
+        except RetryAfter as e:
+            if attempt >= TG_FLOOD_MAX_RETRIES:
+                raise
+            wait = _retry_after_seconds(getattr(e, 'retry_after', 5)) + 1.0
+            if wait > TG_FLOOD_MAX_WAIT_SEC:
+                logger.warning(
+                    f"Flood-лимит Telegram требует {wait:.1f}с — не блокирую джоб, "
+                    "повтор будет на следующем цикле")
+                raise
+            logger.warning(
+                f"Flood-лимит Telegram: жду {wait:.1f}с и повторяю отправку "
+                f"({attempt + 1}/{TG_FLOOD_MAX_RETRIES})")
+            await asyncio.sleep(wait)
+    raise RuntimeError('unreachable')
 
 
 def _download_media_bytes(url: str, max_mb: int = TG_VIDEO_MAX_MB) -> Optional[bytes]:
@@ -5918,8 +6903,10 @@ def _download_media_bytes(url: str, max_mb: int = TG_VIDEO_MAX_MB) -> Optional[b
     память нельзя. Дополнительно смотрим Content-Length, чтобы не начинать зря."""
     limit = max_mb * 1024 * 1024
     try:
-        r = requests.get(url, headers={'User-Agent': USER_AGENT},
-                         timeout=HTTP_TIMEOUT, stream=True)
+        r = http_get_public_with_retry(
+            url, headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT, stream=True)
+        if r is None:
+            return None
         with r:
             if r.status_code != 200:
                 logger.info(f"Медиа не скачалось: HTTP {r.status_code} — {url[:70]}")
@@ -6038,7 +7025,7 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
         return False
 
     # Caption для медиа. Telegram-лимит подписи — 1024 символа.
-    caption = fit_to_limit(html.escape(text), TG_CAPTION_LIMIT)
+    caption = _escape_to_limit(text, TG_CAPTION_LIMIT)
     caption_kw = {'caption': caption, 'parse_mode': ParseMode.HTML}
 
     # Кнопки модерации: 📢 В канал / 📅 В отложку / ✏️ Изменить / ✖ Скрыть
@@ -6061,6 +7048,7 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
             logger.info(f"🧵 {news['source']}: {news['title'][:60]} (только текст)")
             return True
         except TelegramError as e:
+            _raise_if_ambiguous_tg_error(e)
             logger.error(f"Текст в ветку не отправился: {e}")
             return False
 
@@ -6097,6 +7085,7 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
             logger.info(f"🧵 {news['source']}: {news['title'][:60]} (видео+подпись)")
             return True
         except TelegramError as e:
+            _raise_if_ambiguous_tg_error(e)
             logger.warning(f"Видео с подписью не ушло ({e}) — откат")
             return await _send_thread_media_then_text(
                 bot, news, photos, has_inline_video, video_file, video_url,
@@ -6133,13 +7122,17 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
         # Хвост с кнопками (media_group не поддерживает inline-кнопки)
         if reply_markup is not None:
             try:
-                await bot.send_message(chat_id=target, text='👆 Опубликовать этот пост?',
-                                       reply_markup=reply_markup, **thread_kw)
-            except TelegramError:
-                pass
+                await _tg_call_flood_safe(lambda: bot.send_message(
+                    chat_id=target, text='👆 Опубликовать этот пост?',
+                    reply_markup=reply_markup, **thread_kw))
+            except TelegramError as e:
+                _raise_if_ambiguous_tg_error(e)
+                logger.error(f"Альбом ушёл, но кнопки модерации не отправились: {e}")
+                return False
         logger.info(f"🧵 {news['source']}: {news['title'][:60]} (альбом {len(media)}+подпись)")
         return True
     except TelegramError as e:
+        _raise_if_ambiguous_tg_error(e)
         logger.warning(f"Альбом с подписью не прошёл ({e}) — откат на раздельную отправку")
         return await _send_thread_media_then_text(
             bot, news, photos, has_inline_video, video_file, video_media,
@@ -6170,22 +7163,26 @@ async def _send_single_photo_caption(bot, target, photo, caption_kw, reply_marku
                                      thread_kw, news, pending_key=None) -> bool:
     """Одно фото с подписью. При отказе URL — скачиваем байтами и повторяем."""
     try:
-        msg = await bot.send_photo(chat_id=target, photo=photo, reply_markup=reply_markup,
-                                   **caption_kw, **thread_kw)
+        msg = await _tg_call_flood_safe(lambda: bot.send_photo(
+            chat_id=target, photo=photo, reply_markup=reply_markup,
+            **caption_kw, **thread_kw))
         _remember_preview(pending_key, msg)
         logger.info(f"🧵 {news['source']}: {news['title'][:60]} (фото+подпись)")
         return True
     except TelegramError as e:
+        _raise_if_ambiguous_tg_error(e)
         logger.debug(f"Фото по URL не ушло ({e}), пробую байтами: {photo[:80]}")
         data = await asyncio.to_thread(_download_image_bytes, photo)
         if data:
             try:
-                msg = await bot.send_photo(chat_id=target, photo=data, reply_markup=reply_markup,
-                                           **caption_kw, **thread_kw)
+                msg = await _tg_call_flood_safe(lambda: bot.send_photo(
+                    chat_id=target, photo=data, reply_markup=reply_markup,
+                    **caption_kw, **thread_kw))
                 _remember_preview(pending_key, msg)
                 logger.info(f"🧵 {news['source']}: {news['title'][:60]} (фото байтами+подпись)")
                 return True
             except TelegramError as e2:
+                _raise_if_ambiguous_tg_error(e2)
                 logger.debug(f"И байтами фото не ушло ({e2})")
     return False
 
@@ -6194,7 +7191,7 @@ async def _send_thread_media_then_text(bot, news, photos, has_inline_video, vide
                                        video_url, text, reply_markup, thread_kw, target) -> bool:
     """Резервный режим (текст >1024 или сбой цельной отправки): медиа отдельно,
     затем текст отдельным сообщением. Сохраняет все картинки альбомом."""
-    safe_text = fit_to_limit(html.escape(text), TG_TEXT_LIMIT)
+    safe_text = _escape_to_limit(text, TG_TEXT_LIMIT)
     media_sent = False
 
     if has_inline_video:
@@ -6208,6 +7205,7 @@ async def _send_thread_media_then_text(bot, news, photos, has_inline_video, vide
                                      supports_streaming=True, **thread_kw)
             media_sent = True
         except TelegramError as e:
+            _raise_if_ambiguous_tg_error(e)
             logger.warning(f"Видео в ветку не отправилось ({e})")
 
     if photos:
@@ -6219,6 +7217,7 @@ async def _send_thread_media_then_text(bot, news, photos, has_inline_video, vide
                     chat_id=target, media=media, **thread_kw))
                 media_sent = True
             except TelegramError as e:
+                _raise_if_ambiguous_tg_error(e)
                 logger.debug(f"Альбом не прошёл ({e}), по одной")
         if not media_sent:
             for ph in resolved:
@@ -6240,8 +7239,11 @@ async def _send_thread_media_then_text(bot, news, photos, has_inline_video, vide
         logger.info(f"🧵 {news['source']}: {news['title'][:60]} (медиа+текст раздельно)")
         return True
     except TelegramError as e:
+        _raise_if_ambiguous_tg_error(e)
         logger.error(f"Текст в ветку не отправился: {e}")
-        return media_sent
+        # Без текста/кнопок пост нельзя нормально модерировать. Медиа могло уже
+        # появиться в ветке, но ledger не коммитим и pending-запись откатываем.
+        return False
 
 
 async def send_news_to_thread(bot: Bot, news: dict) -> str:
@@ -6256,7 +7258,7 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
         logger.info(f"⊘ Похожая новость уже публиковалась: {title[:60]}")
         await stats.record_skipped('duplicate', source)
         return 'skipped_dup'
-    if not await sent_links.claim(link, title):
+    if not await sent_links.claim(link, title, check_similar=True):
         await stats.record_skipped('duplicate', source)
         return 'skipped_dup'
 
@@ -6264,6 +7266,8 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
     pending_key = None
     committed = False
     rejected = False
+    send_started = False
+    preserve_ambiguous = False
     try:
         skip = await _prepare_news_for_send(news, source)
         if skip:
@@ -6272,8 +7276,14 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
             return skip
 
         video_file = await _prepare_video_file(news)
+        if not await sent_links.mark_sending(link):
+            logger.warning(f'Ledger reservation исчез перед отправкой в ветку: {link[:100]}')
+            return 'failed'
+        send_started = True
         try:
             ok = await _send_post_thread_split(bot, news, video_file)
+        except DeliveryUncertain:
+            raise
         except Exception:
             logger.exception(f"Отправка в ветку упала: {title[:60]}")
             ok = False
@@ -6290,9 +7300,25 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
         _mark_published()
         await stats.record_published(source)
         return 'sent'
+    except DeliveryUncertain as e:
+        logger.warning(f'Результат отправки в ветку неизвестен: {title[:60]} ({e})')
+        if send_started and not committed:
+            await sent_links.mark_uncertain(link)
+            _commit_image_fingerprint(news)
+            preserve_ambiguous = True
+        await stats.record_failed_send(source)
+        return 'uncertain'
+    except asyncio.CancelledError:
+        if send_started and not committed:
+            await sent_links.mark_uncertain(link)
+            _commit_image_fingerprint(news)
+            preserve_ambiguous = True
+        raise
     finally:
-        if not committed and not rejected:
+        if not committed and not rejected and not preserve_ambiguous:
             await sent_links.release(link, title)
+        if not committed and not preserve_ambiguous:
+            _release_publish_reservations(news)
         if video_file:
             try:
                 video_file.unlink(missing_ok=True)
@@ -6419,7 +7445,11 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
 
     async def _fetch(collector):
         async with sem:
-            return await asyncio.to_thread(collector)
+            # Сетевые helper'ы имеют свои timeout, но wall-time защищает цикл и
+            # от зависшего парсера/сторонней библиотеки. Отменить уже запущенный
+            # Python thread нельзя, поэтому лимит заметно больше обычного HTTP timeout.
+            return await asyncio.wait_for(
+                asyncio.to_thread(collector), timeout=SOURCE_FETCH_WALL_TIMEOUT)
 
     fetched = await asyncio.gather(*(_fetch(c) for _n, c in enabled),
                                    return_exceptions=True)
@@ -6469,10 +7499,10 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
             # === Метрики ===
             if unique_items:
                 await stats.record_collected(name, len(unique_items))
-            for _ in range(no_image_skipped):
-                await stats.record_skipped('no_image', name)
-            for _ in range(duplicate_skipped):
-                await stats.record_skipped('duplicate', name)
+            if no_image_skipped:
+                await stats.record_skipped('no_image', name, no_image_skipped)
+            if duplicate_skipped:
+                await stats.record_skipped('duplicate', name, duplicate_skipped)
         except Exception as e:
             errors.append(f"{name}: {e}")
             logger.error(f"{name} failed: {e}")
@@ -6899,7 +7929,7 @@ async def _update_preview_text(bot: Bot, key: str, new_text: str) -> bool:
     if not prev:
         return False
     chat_id, message_id = prev.get('chat_id'), prev.get('message_id')
-    caption = fit_to_limit(html.escape(new_text), TG_CAPTION_LIMIT)
+    caption = _escape_to_limit(new_text, TG_CAPTION_LIMIT)
     markup = _moderation_markup(key)
     attempts = (
         lambda: bot.edit_message_caption(chat_id=chat_id, message_id=message_id,
@@ -6909,7 +7939,7 @@ async def _update_preview_text(bot: Bot, key: str, new_text: str) -> bool:
         lambda: bot.edit_message_caption(chat_id=chat_id, message_id=message_id,
                                          caption=caption, parse_mode=ParseMode.HTML),
         lambda: bot.edit_message_text(chat_id=chat_id, message_id=message_id,
-                                      text=fit_to_limit(html.escape(new_text), TG_TEXT_LIMIT),
+                                      text=_escape_to_limit(new_text, TG_TEXT_LIMIT),
                                       parse_mode=ParseMode.HTML, reply_markup=markup),
     )
     for attempt in attempts:
@@ -7001,6 +8031,9 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action, key = data.split(':', 1)
 
         if action == 'dis':
+            if _is_publishing(f'pending:{key}'):
+                await query.answer('Пост уже публикуется — скрыть его сейчас нельзя.', show_alert=True)
+                return
             hidden = pending_posts.pop(key) if pending_posts is not None else None
             await query.answer('Скрыто')
             try:
@@ -7024,8 +8057,16 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             return
 
+        channel_uncertain = (pending_posts.channel_state(key) == 'uncertain')
+
         # 📅 В отложку — просим время текстом, ответ поймает awaiting_input_handler
         if action == 'sch':
+            if channel_uncertain:
+                await query.answer('Сначала проверь канал: результат прошлой публикации неизвестен.', show_alert=True)
+                return
+            if _is_publishing(f'pending:{key}'):
+                await query.answer('Пост уже публикуется.', show_alert=True)
+                return
             context.user_data['await_input'] = _await_ctx('schedule', key, query.message)
             await query.answer('Пришли время публикации')
             await _ask_in_thread(context.bot, query.message, _SCHEDULE_HINT.format(
@@ -7034,6 +8075,12 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ✏️ Изменить — просим новый текст поста
         if action == 'edit':
+            if channel_uncertain:
+                await query.answer('Сначала проверь канал: результат прошлой публикации неизвестен.', show_alert=True)
+                return
+            if _is_publishing(f'pending:{key}'):
+                await query.answer('Пост уже публикуется.', show_alert=True)
+                return
             context.user_data['await_input'] = _await_ctx('edit', key, query.message)
             await query.answer('Пришли новый текст')
             current = fit_to_limit(format_news_short(news), 700)
@@ -7046,7 +8093,25 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not guard.acquired:
                 await query.answer('Этот пост уже публикуется…')
                 return
-            ok = await _send_post(context.bot, news, CHANNEL_ID, None)
+            if not pending_posts.mark_channel_sending(key, force=channel_uncertain):
+                await query.answer('Не удалось надёжно зафиксировать отправку — проверь storage.',
+                                   show_alert=True)
+                return
+            try:
+                ok = await _send_channel_post(context.bot, news, None)
+            except DeliveryUncertain as e:
+                pending_posts.mark_channel_uncertain(key)
+                logger.warning(f'Ручная публикация pending {key}: ambiguous delivery ({e})')
+                await query.answer(
+                    '❓ Telegram не подтвердил результат. Проверь канал; повторная кнопка — только после проверки.',
+                    show_alert=True)
+                return
+            except asyncio.CancelledError:
+                pending_posts.mark_channel_uncertain(key)
+                raise
+            except Exception:
+                pending_posts.mark_channel_pending(key)
+                raise
         if ok:
             pending_posts.pop(key)
             if moderation_feedback is not None:
@@ -7060,6 +8125,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f'👥 {actor_name} опубликовал в канал пост из ветки:\n\n'
                     f'{_post_card(news, {})}')
         else:
+            pending_posts.mark_channel_pending(key)
             await query.answer('❌ Не удалось опубликовать — см. /logs', show_alert=True)
         return
 
@@ -7091,6 +8157,10 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton('Да, очистить', callback_data='sclearyes'),
                     InlineKeyboardButton('Отмена', callback_data='slist'),
                 ]]))
+            return
+        if any(str(k).startswith('sched:') for k in _publishing_now):
+            await query.answer('Сейчас идёт публикация отложенного поста — повтори чуть позже.',
+                               show_alert=True)
             return
         removed = scheduled_posts.clear() if scheduled_posts is not None else 0
         logger.info(f"📅 Отложка очищена вручную: снято {removed}")
@@ -7131,6 +8201,10 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             return
         if action == 'scan':
+            if _is_publishing(f'sched:{key}'):
+                await query.answer('Этот пост уже публикуется — снять его сейчас нельзя.',
+                                   show_alert=True)
+                return
             scheduled_posts.pop(key)
             await query.answer('Снято с отложки')
             text, markup = _scheduled_overview()
@@ -7140,7 +8214,24 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not guard.acquired:
                 await query.answer('Этот пост уже публикуется…')
                 return
-            ok = await _send_post(context.bot, news, CHANNEL_ID, None)
+            if not scheduled_posts.mark_sending(key, force=True):
+                await query.answer('Состояние поста изменилось — обнови список.', show_alert=True)
+                return
+            try:
+                ok = await _send_channel_post(context.bot, news, None)
+            except DeliveryUncertain as e:
+                scheduled_posts.mark_uncertain(key)
+                await query.answer(
+                    '❓ Telegram не подтвердил результат. Проверь канал перед ручным повтором.',
+                    show_alert=True)
+                logger.warning(f'Отложенный пост {key}: ambiguous delivery ({e})')
+                return
+            except asyncio.CancelledError:
+                scheduled_posts.mark_uncertain(key)
+                raise
+            except Exception:
+                logger.exception(f'Ручная отправка отложенного поста упала: {key}')
+                ok = False
         if ok:
             scheduled_posts.pop(key)
             _mark_published()
@@ -7148,6 +8239,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text, markup = _scheduled_overview()
             await _safe_edit(query, text, markup)
         else:
+            scheduled_posts.mark_pending(key)
             await query.answer('❌ Не удалось опубликовать — см. /logs', show_alert=True)
         return
 
@@ -7450,11 +8542,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if data == "hist:clear_yes":
-        async with sent_links._lock:
-            sent_links._urls.clear()
-            sent_links._url_set.clear()
-            sent_links._title_set.clear()
-            sent_links._save()
+        await sent_links.clear()
         await query.answer("История очищена")
         await query.edit_message_text(
             "✅ История ссылок очищена.",
@@ -7477,28 +8565,40 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "queue:send_now":
         next_post = await post_queue.pop_next()
         if next_post is None:
-            await query.answer("Очередь пуста", show_alert=True)
+            if await post_queue.has_inflight():
+                await query.answer("Другой пост из очереди уже отправляется", show_alert=True)
+            else:
+                await query.answer("Очередь пуста", show_alert=True)
             size = await post_queue.peek_size()
             await query.edit_message_text(
                 f"📦 Очередь постов\n\nВ очереди: {size}",
                 reply_markup=build_queue_menu(),
             )
             return
-        result = await send_news(context.bot, next_post)
+        try:
+            result = await send_news(context.bot, next_post)
+        except Exception:
+            logger.exception("Ручная отправка поста из очереди упала")
+            result = 'failed'
         if result == 'sent':
+            await post_queue.ack_done(next_post)
             await query.answer("✅ Отправлено в канал")
         elif result == 'failed':
-            # Реальная ошибка отправки — возвращаем в начало очереди
-            async with post_queue._lock:
-                post_queue._items.insert(0, {
-                    'news': {k: v for k, v in next_post.items() if k != 'published_parsed'},
-                    'queued_at': datetime.now().isoformat(),
-                })
-                post_queue._save()
-            await query.answer("Не удалось отправить, пост возвращён в очередь", show_alert=True)
+            # Реальная ошибка отправки — возвращаем без сброса TTL и с лимитом повторов.
+            requeued = await post_queue.requeue_failed(next_post)
+            if requeued:
+                await query.answer("Не удалось отправить, пост возвращён в очередь", show_alert=True)
+            else:
+                await query.answer("Пост удалён после повторяющихся ошибок отправки", show_alert=True)
+        elif result == 'uncertain':
+            await post_queue.ack_done(next_post)
+            await query.answer(
+                "❓ Telegram не подтвердил результат. Автоповтор отключён — проверь канал.",
+                show_alert=True)
         else:
             # 'skipped_dup' или 'skipped_filter' — пост уже был отправлен или не подходит,
             # в очередь НЕ возвращаем
+            await post_queue.ack_done(next_post)
             await query.answer(f"Пост пропущен ({result})", show_alert=True)
         size = await post_queue.peek_size()
         titles = await post_queue.list_titles(limit=10)
@@ -7647,7 +8747,12 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
                 '⏰ Не понял время. Примеры: 18:30 • 12.09 18:30 • завтра 10:00 • +2ч\n'
                 'Время должно быть в будущем. Отмена — /cancel')
             raise ApplicationHandlerStop
-        scheduled_posts.reschedule(key, when)
+        with _PublishGuard(f'sched:{key}') as guard:
+            if not guard.acquired:
+                await update.message.reply_text('Этот пост уже публикуется; перенести его сейчас нельзя.')
+                context.user_data.pop('await_input', None)
+                raise ApplicationHandlerStop
+            scheduled_posts.reschedule(key, when)
         context.user_data.pop('await_input', None)
         logger.info(f"📅 Пост перенесён на {_fmt_local(when)}")
         await update.message.reply_text(
@@ -7674,10 +8779,28 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text('Отложка недоступна (хранилище не готово).')
             context.user_data.pop('await_input', None)
             raise ApplicationHandlerStop
+        if _is_publishing(f'pending:{key}'):
+            context.user_data.pop('await_input', None)
+            await update.message.reply_text('Пост уже публикуется; отложить его сейчас нельзя.')
+            raise ApplicationHandlerStop
         user = update.effective_user
         by = {'id': user.id,
               'name': (user.full_name or user.username or str(user.id))} if user else None
-        scheduled_posts.add(news, when, by=by)
+        try:
+            scheduled_posts.add(news, when, by=by)
+        except OverflowError:
+            context.user_data.pop('await_input', None)
+            await update.message.reply_text(
+                f'⚠️ Отложка заполнена ({ScheduledPosts.MAX_ITEMS} постов). '
+                'Сними или опубликуй часть записей через /scheduled; этот пост остаётся в модерации.')
+            raise ApplicationHandlerStop
+        except OSError as e:
+            context.user_data.pop('await_input', None)
+            logger.error(f'Не удалось сохранить отложенный пост: {e}')
+            await update.message.reply_text(
+                '❌ Не удалось записать отложку на диск. Пост остаётся в модерации; '
+                'проверь storage/volume и /health.')
+            raise ApplicationHandlerStop
         if moderation_feedback is not None:
             moderation_feedback.record('scheduled', news, update.effective_user)
         context.user_data.pop('await_input', None)
@@ -7699,6 +8822,10 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     # === ✏️ Правка текста ===
     if mode == 'edit':
+        if _is_publishing(f'pending:{key}'):
+            context.user_data.pop('await_input', None)
+            await update.message.reply_text('Пост уже публикуется; изменить его сейчас нельзя.')
+            raise ApplicationHandlerStop
         news['_edited_text'] = text
         pending_posts.update_news(key, news)
         if moderation_feedback is not None:
@@ -7730,7 +8857,7 @@ async def _update_moderation_done(bot: Bot, key: str, suffix: str) -> None:
     if not prev or not news:
         return
     chat_id, message_id = prev.get('chat_id'), prev.get('message_id')
-    body = fit_to_limit(html.escape(format_news_short(news) + suffix), TG_CAPTION_LIMIT)
+    body = _escape_to_limit(format_news_short(news) + suffix, TG_CAPTION_LIMIT)
     attempts = (
         lambda: bot.edit_message_caption(chat_id=chat_id, message_id=message_id,
                                          caption=body, parse_mode=ParseMode.HTML,
@@ -7855,10 +8982,14 @@ def _scheduled_overview() -> tuple[str, InlineKeyboardMarkup]:
                 'Отложить: кнопка «📅 В отложку» под постом в ветке.'), None
 
     now = datetime.now(timezone.utc)
-    ripe = sum(1 for _k, _n, when in items if when <= now)
+    ripe = sum(1 for key, _n, when in items
+               if when <= now and scheduled_posts.meta(key).get('state') == 'pending')
+    uncertain = scheduled_posts.uncertain_count()
     head = f'📅 <b>В отложке: {len(items)}</b>'
     if ripe:
         head += f' · {ripe} ждёт публикации'
+    if uncertain:
+        head += f' · ❓ {uncertain} требуют проверки'
     lines = [head, f'<i>время: {_tz_label()}</i>', '']
 
     buttons, row = [], []
@@ -7873,8 +9004,14 @@ def _scheduled_overview() -> tuple[str, InlineKeyboardMarkup]:
         meta = scheduled_posts.meta(key)
         who = (meta.get('by') or {}).get('name', '')
         when_local = _utc_to_local(when).strftime('%H:%M')
-        mark = '⏳' if when <= now else '🕒'
-        tail = f' · через {_human_delta(when)}' if when > now else ' · пора'
+        state = meta.get('state', 'pending')
+        if state == 'uncertain':
+            mark, tail = '❓', ' · результат прошлой отправки неизвестен'
+        elif state == 'sending':
+            mark, tail = '📤', ' · отправляется'
+        else:
+            mark = '⏳' if when <= now else '🕒'
+            tail = f' · через {_human_delta(when)}' if when > now else ' · пора'
         line = f'{number}. {mark} {when_local}{tail}\n    {html.escape(_short_title(news))}'
         if who:
             line += f'\n    👤 {html.escape(who[:24])}'
@@ -7908,8 +9045,10 @@ def _scheduled_detail(key: str) -> tuple[str, Optional[InlineKeyboardMarkup]]:
             [[InlineKeyboardButton('⬅️ К списку', callback_data='slist')]])
     meta = scheduled_posts.meta(key)
     card = _post_card(news, meta, countdown=True, with_body=True)
+    state = meta.get('state', 'pending')
+    send_label = '📢 Повторить вручную' if state == 'uncertain' else '📢 Сейчас'
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton('📢 Сейчас', callback_data=f'snow:{key}'),
+        [InlineKeyboardButton(send_label, callback_data=f'snow:{key}'),
          InlineKeyboardButton('🕒 Перенести', callback_data=f'sedit:{key}')],
         [InlineKeyboardButton('🗑 Отменить', callback_data=f'scan:{key}'),
          InlineKeyboardButton('⬅️ К списку', callback_data='slist')],
@@ -7977,6 +9116,12 @@ def _post_card(news: dict, meta: dict, *, countdown: bool = False,
         lines.append(f'🔗 {html.escape(str(news["link"]))}')
     if news.get('_edited_text'):
         lines.append('✏️ Текст правился вручную')
+    state = meta.get('state', 'pending')
+    if state == 'uncertain':
+        lines.append('❓ Предыдущая отправка прервалась: неизвестно, успел ли Telegram принять пост. '
+                     'Автоповтор отключён; проверь канал перед ручным повтором.')
+    elif state == 'sending':
+        lines.append('📤 Пост сейчас отправляется.')
     tries = meta.get('tries') or 0
     if tries:
         lines.append(f'⚠️ Неудачных попыток: {tries}')
@@ -8016,9 +9161,20 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
             if not guard.acquired:
                 logger.info(f"Пост уже публикуется вручную, пропускаю тик: {key}")
                 continue
+            if not scheduled_posts.mark_sending(key):
+                logger.info(f'Отложенный пост сменил состояние перед отправкой: {key}')
+                continue
             try:
-                ok = await _send_post(context.bot, news, CHANNEL_ID, None)
+                ok = await _send_channel_post(context.bot, news, None)
                 err = None
+            except DeliveryUncertain as e:
+                scheduled_posts.mark_uncertain(key)
+                ok = None
+                err = f'{type(e).__name__}: {e}'
+                logger.warning(f'Отложенный пост {key}: ambiguous delivery ({e})')
+            except asyncio.CancelledError:
+                scheduled_posts.mark_uncertain(key)
+                raise
             except Exception as e:            # не даём джобу умереть молча
                 ok = False
                 err = f'{type(e).__name__}: {e}'
@@ -8033,6 +9189,12 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
                 context.bot,
                 f'📅 Опубликован отложенный пост\n\n{card}\n\n'
                 f'✅ Ушёл в канал {_fmt_local(datetime.now(timezone.utc))}')
+        elif ok is None:
+            await notify_admin(
+                context.bot,
+                f'❓ Результат отправки отложенного поста неизвестен\n\n{card}\n\n'
+                'Telegram не подтвердил доставку. Автоповтор отключён — проверь канал, '
+                'затем используй /scheduled для осознанного повтора или удаления.')
         else:
             tries = scheduled_posts.mark_try(key)
             reason = err or 'отправка вернула отказ (см. /logs)'
@@ -8093,7 +9255,7 @@ async def news_command(update, context: ContextTypes.DEFAULT_TYPE):
         return
     sent = 0
     for news in filtered[:7]:
-        result = await send_news(context.bot, news, chat_id=update.effective_chat.id)
+        result = await send_news(context.bot, news, chat_id=update.effective_chat.id, track_history=False)
         if result == 'sent':
             sent += 1
         await asyncio.sleep(1)
@@ -8230,6 +9392,7 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
         if settings.thread_mode:
             sent_count = 0
             failed_count = 0
+            uncertain_count = 0
             skipped_count = 0
             for news in fresh:
                 result = await send_news_to_thread(context.bot, news)
@@ -8237,12 +9400,14 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
                     sent_count += 1
                 elif result == 'failed':
                     failed_count += 1
+                elif result == 'uncertain':
+                    uncertain_count += 1
                 else:
                     skipped_count += 1
                 # Пауза между отправками чтобы не словить флуд-лимит Telegram
                 await asyncio.sleep(PAUSE_BETWEEN_SENDS)
 
-            has_problems = bool(errors) or failed_count > 0
+            has_problems = bool(errors) or failed_count > 0 or uncertain_count > 0
             # В тихом режиме отчёт — только если были проблемы
             if not settings.quiet_mode or has_problems:
                 message = (
@@ -8252,6 +9417,9 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
                 )
                 if failed_count:
                     message += f"⚠️ Не удалось отправить: {failed_count}\n"
+                if uncertain_count:
+                    message += (f"❓ Результат неизвестен: {uncertain_count} — "
+                                "проверь ветку перед повтором\n")
                 if errors:
                     message += "⚠️ Ошибки источников:\n" + "\n".join(errors)
                 await notify_admin(context.bot, message)
@@ -8271,24 +9439,41 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
             if next_post is None:
                 break
             post_attempted = next_post
-            sent_result = await send_news(context.bot, next_post)
+            try:
+                sent_result = await send_news(context.bot, next_post)
+            except Exception:
+                logger.exception("Отправка поста из очереди упала вне штатного обработчика")
+                sent_result = 'failed'
             if sent_result == 'sent':
+                await post_queue.ack_done(next_post)
                 break
             if sent_result == 'failed':
-                async with post_queue._lock:
-                    post_queue._items.insert(0, {
-                        'news': {k: v for k, v in next_post.items() if k != 'published_parsed'},
-                        'queued_at': datetime.now().isoformat(),
-                    })
-                    post_queue._save()
-                logger.warning(f"Возвращаю пост в очередь после ошибки отправки: {next_post.get('title', '')[:60]}")
+                requeued = await post_queue.requeue_failed(next_post)
+                if requeued:
+                    logger.warning(
+                        f"Возвращаю пост в очередь после ошибки отправки: "
+                        f"{next_post.get('title', '')[:60]}")
+                else:
+                    await notify_admin(
+                        context.bot,
+                        f"⚠️ Пост удалён из очереди после {QUEUE_MAX_SEND_RETRIES} ошибок отправки:\n"
+                        f"{next_post.get('title', '')[:180]}")
                 break
+            if sent_result == 'uncertain':
+                await post_queue.ack_done(next_post)
+                await notify_admin(
+                    context.bot,
+                    "❓ Telegram не подтвердил результат публикации. Автоповтор отключён, "
+                    "чтобы не создать дубль. Проверь канал и /health.\n\n"
+                    f"{next_post.get('title', '')[:180]}")
+                break
+            await post_queue.ack_done(next_post)
             logger.info(f"Пост из очереди пропущен ({sent_result}): {next_post.get('title', '')[:60]}")
 
         sent_ok = (sent_result == 'sent')
         queue_size = await post_queue.peek_size()
 
-        has_problems = bool(errors) or sent_result == 'failed'
+        has_problems = bool(errors) or sent_result in ('failed', 'uncertain')
         # В тихом режиме отчёт — только если были проблемы
         if not settings.quiet_mode or has_problems:
             message = (
@@ -8453,10 +9638,10 @@ LLM_API_KEY = _env('LLM_API_KEY', '').strip()
 _preset = LLM_PRESETS.get(LLM_PROVIDER, ('', ''))
 LLM_BASE_URL = (_env('LLM_BASE_URL', '').strip() or _preset[0]).rstrip('/')
 LLM_MODEL = _env('LLM_MODEL', '').strip() or _preset[1]
-LLM_TIMEOUT = _env_int('LLM_TIMEOUT', 30)
-LLM_MIN_INTERVAL = float(_env('LLM_MIN_INTERVAL', '1.2'))   # сек между запросами
-LLM_DAILY_LIMIT = _env_int('LLM_DAILY_LIMIT', 900)          # страховка от лимитов
-LLM_MAX_TOKENS = _env_int('LLM_MAX_TOKENS', 700)
+LLM_TIMEOUT = max(5, min(120, _env_int('LLM_TIMEOUT', 30)))
+LLM_MIN_INTERVAL = max(0.0, min(60.0, _env_float('LLM_MIN_INTERVAL', 1.2)))
+LLM_DAILY_LIMIT = max(1, min(10000, _env_int('LLM_DAILY_LIMIT', 900)))
+LLM_MAX_TOKENS = max(64, min(4000, _env_int('LLM_MAX_TOKENS', 700)))
 
 
 def _llm_extra_params() -> dict:
@@ -8508,10 +9693,17 @@ def _llm_count_call() -> None:
     if settings is None:
         return
     today = _local_now().strftime('%Y-%m-%d')
-    if settings.llm_day != today:
-        settings.llm_day = today
-        settings.llm_calls_today = 0
-    settings.llm_calls_today = settings.llm_calls_today + 1
+    if isinstance(settings, BotSettings):
+        settings.increment_llm_call(today)
+        return
+    # Тестовые/внешние settings-like объекты: сохраняем старый duck-typed путь.
+    try:
+        if settings.llm_day != today:
+            settings.llm_day = today
+            settings.llm_calls_today = 0
+        settings.llm_calls_today = int(settings.llm_calls_today or 0) + 1
+    except (TypeError, ValueError, AttributeError):
+        pass
 
 
 def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[str]:
@@ -8597,6 +9789,10 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optiona
         return None
 
     async with _llm_lock:
+        # Квоту обязательно перепроверяем уже ВНУТРИ lock: иначе десяток
+        # параллельных задач может одновременно увидеть "остался 1 вызов".
+        if _llm_quota_left() <= 0:
+            return None
         wait = LLM_MIN_INTERVAL - (time.time() - _llm_last_call)
         if wait > 0:
             await asyncio.sleep(wait)
@@ -8798,6 +9994,27 @@ def _llm_numbers_supported(source_text: str, output_text: str) -> bool:
     return nums(output_text).issubset(nums(source_text))
 
 
+_MONTH_FORMS = (
+    ('january', 'jan', 'январ'), ('february', 'feb', 'феврал'),
+    ('march', 'mar', 'март'), ('april', 'apr', 'апрел'),
+    ('may', 'май'), ('june', 'jun', 'июн'), ('july', 'jul', 'июл'),
+    ('august', 'aug', 'август'), ('september', 'sep', 'сентябр'),
+    ('october', 'oct', 'октябр'), ('november', 'nov', 'ноябр'),
+    ('december', 'dec', 'декабр'),
+)
+
+
+def _llm_dates_supported(source_text: str, output_text: str) -> bool:
+    """Не даёт модели подменить месяц при переводе даты словами."""
+    src = (source_text or '').lower()
+    out = (output_text or '').lower()
+    source_months = {i for i, forms in enumerate(_MONTH_FORMS)
+                     if any(form in src for form in forms)}
+    output_months = {i for i, forms in enumerate(_MONTH_FORMS)
+                     if any(form in out for form in forms)}
+    return output_months.issubset(source_months)
+
+
 def _sanity_ok(value: str, limit: int) -> bool:
     """Защита от простыни. Раньше сравнивали с длиной исходника — и это резало
     как раз то, что нужно: пост с вводными длиннее сухой новостной строки.
@@ -8901,6 +10118,8 @@ async def _llm_enrich(news: dict) -> str:
             logger.info(f"⊘ Уже {same_today} поста про «{subject[:40]}» за сутки — "
                         f"пропускаю: {title[:45]}")
             return 'skip'
+        recent_subjects.reserve(subject, kind, title)
+        news['_subject_reserved'] = True
 
     new_title = str(data.get('title') or '').strip()
     new_summary = str(data.get('summary') or '').strip()
@@ -8908,7 +10127,8 @@ async def _llm_enrich(news: dict) -> str:
     # --- Текст: только если он адекватен ---
     if settings.llm_rewrite and new_title:
         proposed_text = f'{new_title}\n{new_summary}'
-        if not _llm_numbers_supported(source_fact_text, proposed_text):
+        if not (_llm_numbers_supported(source_fact_text, proposed_text)
+                and _llm_dates_supported(source_fact_text, proposed_text)):
             logger.warning(f"LLM: обнаружены новые числа/даты — переписывание отклонено: {title[:55]}")
         elif _sanity_ok(new_title, LLM_TITLE_MAX) and _sanity_ok(new_summary, LLM_SUMMARY_MAX * 2):
             # Пересказ заголовка вместо дополнения — выбрасываем, оставляя заголовок
@@ -9320,6 +10540,11 @@ async def addsource_command(update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     src_type, value, label = parsed
+    if src_type == 'rss' and not _is_public_http_url(value):
+        await update.message.reply_text(
+            '⛔ RSS-адрес недоступен как публичный HTTP(S) ресурс. '
+            'Локальные/приватные адреса запрещены из-за SSRF-защиты.')
+        return
     if any(name.lower() == label.lower() for name, _ in SOURCES):
         await update.message.reply_text(f"⚠️ Источник с именем «{label}» уже есть.")
         return
@@ -9394,7 +10619,7 @@ class UserDirectory:
             if self.path.exists():
                 data = json.loads(self.path.read_text(encoding='utf-8'))
                 if isinstance(data, dict):
-                    self._by_id = data
+                    self._by_id = {str(k): v for k, v in data.items() if isinstance(v, dict)}
         except (OSError, ValueError) as e:
             logger.warning(f"known_users не загружен: {e}")
 
@@ -9409,8 +10634,7 @@ class UserDirectory:
         if not force and now - self._last_save < self.SAVE_EVERY_SEC:
             return
         try:
-            self.path.write_text(json.dumps(self._by_id, ensure_ascii=False),
-                                 encoding='utf-8')
+            _atomic_write_json(self.path, self._by_id)
             self._dirty = False
             self._last_save = now
         except OSError as e:
@@ -9706,12 +10930,12 @@ def _count_deepl_chars(text: str) -> None:
     if settings is None or not text:
         return
     month = datetime.now(timezone.utc).strftime('%Y-%m')
-    if settings.deepl_month != month:
-        settings.deepl_month = month
-        settings.deepl_chars = 0
-    before = settings.deepl_chars
-    after = before + len(text)
-    settings.deepl_chars = after
+    if isinstance(settings, BotSettings):
+        before, after = settings.add_deepl_chars(month, len(text))
+    else:
+        # В тестах и интеграциях settings иногда заменяют лёгким fake-объектом;
+        # учёт расхода не должен ломать сам перевод.
+        return
     for share in DEEPL_WARN_AT:
         edge = int(DEEPL_MONTHLY_LIMIT * share)
         if before < edge <= after:
@@ -9834,7 +11058,7 @@ async def send_startup_report(app) -> None:
     lines.append(f'  🔗 История ссылок: {len(sent_links._set) if sent_links else 0}')
     lines.append(f'  🧠 Помню тем за {SUBJECT_MEMORY_HOURS} ч: '
                  f'{len(recent_subjects) if recent_subjects else 0}')
-    lines.append(f'  📄 Статей в кэше: {len(_article_cache)}')
+    lines.append(f'  📄 Статей в кэше: {len(set(_article_cache) | set(_article_text_cache))}')
     lines.append(f'  🖼 Отпечатков картинок: {len(image_hashes) if image_hashes else 0}')
     lines.append('')
     lines.append('<b>Окружение</b>')
@@ -9902,6 +11126,20 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(_job_line(context, 'anime_news_check', 'Автопроверка новостей'))
     lines.append(_job_line(context, 'scheduled_publish', 'Публикация отложки'))
     lines.append(_job_line(context, 'daily_backup', 'Ежедневный бэкап'))
+    lines.append(_job_line(context, 'health_probe', 'Readiness-проверка'))
+
+    ambiguous_ledger = sent_links.uncertain_count() if sent_links is not None else 0
+    ambiguous_scheduled = scheduled_posts.uncertain_count() if scheduled_posts is not None else 0
+    ambiguous_pending = pending_posts.uncertain_count() if pending_posts is not None else 0
+    if ambiguous_ledger or ambiguous_scheduled or ambiguous_pending:
+        lines.extend(['', '<b>Требуют ручной проверки</b>'])
+        if ambiguous_ledger:
+            lines.append(f'  ❓ Публикации с неизвестным результатом: {ambiguous_ledger}')
+        if ambiguous_scheduled:
+            lines.append(f'  ❓ Отложенные с неизвестным результатом: {ambiguous_scheduled}')
+        if ambiguous_pending:
+            lines.append(f'  ❓ Ручные публикации из ветки: {ambiguous_pending}')
+        lines.append('  Проверь канал перед ручным повтором, чтобы не создать дубль.')
 
     # --- Источники ---
     enabled = [n for n, _ in SOURCES if settings.is_source_enabled(n)]
@@ -10213,6 +11451,54 @@ async def blacklist_command(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
 
 
+# ============== SINGLE-INSTANCE GUARD ==============
+_instance_lock_handle = None
+
+
+def _acquire_instance_lock() -> None:
+    """Не позволяет двум процессам одновременно писать один DATA_DIR и публиковать дубли."""
+    global _instance_lock_handle
+    if _instance_lock_handle is not None:
+        return
+    if fcntl is None:
+        logger.warning('flock недоступен: single-instance guard не поддерживается на этой ОС')
+        return
+    path = DATA_DIR / '.anime_news_bot.lock'
+    handle = path.open('a+', encoding='utf-8')
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.seek(0)
+        owner = handle.read().strip() or '?'
+        handle.close()
+        raise SystemExit(
+            f'Другой экземпляр бота уже использует DATA_DIR={DATA_DIR} (PID {owner}). '
+            'Остановите старый процесс или используйте отдельный DATA_DIR.'
+        )
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    _instance_lock_handle = handle
+
+
+def _release_instance_lock() -> None:
+    global _instance_lock_handle
+    handle = _instance_lock_handle
+    _instance_lock_handle = None
+    if handle is None:
+        return
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        handle.close()
+    except OSError:
+        pass
+
+
 # ============== HTTP HEALTH + GRACEFUL SHUTDOWN ==============
 _runtime_health = {
     'started_at': datetime.now(timezone.utc).isoformat(),
@@ -10294,6 +11580,23 @@ def _stop_health_server() -> None:
     _health_http_thread = None
 
 
+async def health_probe_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Периодически обновляет readiness, чтобы он не застывал на состоянии старта."""
+    try:
+        ok_channel, note = await _check_channel_access(context.bot)
+        _runtime_health['telegram_ok'] = bool(ok_channel)
+        _runtime_health['storage_ok'] = _storage_ready()
+        if ok_channel and _runtime_health['storage_ok']:
+            _runtime_health['last_error'] = ''
+        elif not ok_channel:
+            _runtime_health['last_error'] = f'telegram: {note}'
+    except Exception as e:
+        _runtime_health['telegram_ok'] = False
+        _runtime_health['storage_ok'] = _storage_ready()
+        _runtime_health['last_error'] = f'telegram: {type(e).__name__}: {e}'
+        logger.warning(f'Health probe Telegram не прошёл: {e}')
+
+
 async def _post_shutdown(app: Application) -> None:
     """Best-effort сброс runtime-состояния перед остановкой процесса."""
     try:
@@ -10312,6 +11615,7 @@ async def _post_shutdown(app: Application) -> None:
     except Exception:
         pass
     _stop_health_server()
+    _release_instance_lock()
     logger.info('Graceful shutdown завершён')
 
 
@@ -10343,6 +11647,11 @@ async def setup_bot_commands(app: Application) -> None:
     # Ежедневный бэкап: проверяем раз в час, срабатывает один раз в сутки
     app.job_queue.run_repeating(
         daily_backup_job, interval=3600, first=120, name='daily_backup',
+        job_kwargs=JOB_KWARGS,
+    )
+    # Readiness не должен навсегда хранить результат единственной проверки на старте.
+    app.job_queue.run_repeating(
+        health_probe_job, interval=300, first=300, name='health_probe',
         job_kwargs=JOB_KWARGS,
     )
 
@@ -10442,18 +11751,41 @@ def _init_globals() -> None:
         anilist = AniListClient(ANILIST_CACHE_FILE)
 
 
+def _valid_channel_target(value) -> bool:
+    """Telegram target: числовой chat_id либо публичный @username."""
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return bool(re.fullmatch(r'@[A-Za-z0-9_]{5,32}', value.strip()))
+    return False
+
+
 def _validate_runtime_config() -> None:
     """Не даёт новому деплою случайно использовать ID из исходной версии."""
     missing = []
+    invalid = []
     if not ADMIN_FROM_ENV:
         missing.append('ADMIN_ID')
+    elif not isinstance(ADMIN_ID, int) or ADMIN_ID <= 0:
+        invalid.append('ADMIN_ID')
     if not CHANNEL_FROM_ENV:
         missing.append('CHANNEL_ID')
+    elif not _valid_channel_target(CHANNEL_ID):
+        invalid.append('CHANNEL_ID')
     if settings is not None and settings.thread_mode:
         if not DISCUSSION_CHAT_FROM_ENV:
             missing.append('DISCUSSION_CHAT_ID')
+        elif not isinstance(DISCUSSION_CHAT_ID, int) or DISCUSSION_CHAT_ID == 0:
+            invalid.append('DISCUSSION_CHAT_ID')
         if not DISCUSSION_THREAD_FROM_ENV:
             missing.append('DISCUSSION_THREAD_ID')
+        elif not isinstance(DISCUSSION_THREAD_ID, int) or DISCUSSION_THREAD_ID <= 0:
+            invalid.append('DISCUSSION_THREAD_ID')
+    if invalid:
+        raise SystemExit(
+            'Некорректные переменные окружения: ' + ', '.join(invalid) + '. '
+            'ID должны быть целыми числами; CHANNEL_ID также может быть @username.'
+        )
     if not missing:
         return
     names = ', '.join(missing)
@@ -10484,6 +11816,7 @@ def main():
         print("❌ Токен бота не задан! Установите переменную окружения BOT_TOKEN.", flush=True)
         raise SystemExit("BOT_TOKEN не задан")
 
+    _acquire_instance_lock()
     _init_globals()
     _validate_runtime_config()
     check_video_deps()
