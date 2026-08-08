@@ -2002,6 +2002,9 @@ class BotSettings:
 
     DEFAULTS = {
         'check_interval_min': 30,
+        # Авторассылка — persistent intent. Раньше /start_auto создавал только
+        # in-memory APScheduler job, поэтому любой рестарт молча выключал её.
+        'auto_enabled': False,
         'video_enabled': True,
         'require_image': True,
         'post_max_age_hours': POST_MAX_AGE_HOURS,
@@ -2139,6 +2142,15 @@ class BotSettings:
     @check_interval_min.setter
     def check_interval_min(self, value: int) -> None:
         self._data['check_interval_min'] = max(5, int(value))
+        self.save()
+
+    @property
+    def auto_enabled(self) -> bool:
+        return bool(self._data.get('auto_enabled', False))
+
+    @auto_enabled.setter
+    def auto_enabled(self, value: bool) -> None:
+        self._data['auto_enabled'] = bool(value)
         self.save()
 
     @property
@@ -3315,8 +3327,9 @@ def _apply_adaptive_interval(context, recommended: int) -> bool:
         if jobs:
             for job in jobs:
                 job.schedule_removal()
-            job_queue.run_repeating(check_news, interval=settings.check_interval_sec, first=settings.check_interval_sec,
-                                    name='anime_news_check', job_kwargs=JOB_KWARGS)
+            _ensure_auto_news_job(job_queue, first=settings.check_interval_sec)
+        elif settings.auto_enabled:
+            _ensure_auto_news_job(job_queue, first=settings.check_interval_sec)
         _event_log('adaptive_interval_applied', interval_min=recommended)
         return True
     except Exception as e:
@@ -13124,16 +13137,18 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             return
         settings.check_interval_min = new_min
-        # Если автопроверка запущена — перезапустим с новым интервалом
+        # Если автопроверка запущена — перезапустим с новым интервалом.
+        # Если persistent-флаг включён, но job почему-то исчез, восстановим его.
         job_queue = context.application.job_queue
-        if job_queue.get_jobs_by_name('anime_news_check'):
-            for job in job_queue.get_jobs_by_name('anime_news_check'):
+        jobs = job_queue.get_jobs_by_name('anime_news_check')
+        if jobs:
+            for job in jobs:
                 job.schedule_removal()
-            job_queue.run_repeating(
-                check_news, interval=settings.check_interval_sec,
-                first=5, name='anime_news_check', job_kwargs=JOB_KWARGS,
-            )
+            _ensure_auto_news_job(job_queue, first=5)
             extra = " (автопроверка перезапущена)"
+        elif settings.auto_enabled:
+            _ensure_auto_news_job(job_queue, first=5)
+            extra = " (автопроверка восстановлена)"
         else:
             extra = ""
         await query.answer(f"Интервал: {new_min} мин{extra}")
@@ -14031,6 +14046,8 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
         return
     async with _check_news_lock:
         cycle_started = time.perf_counter()
+        _runtime_health['last_check_started_at'] = datetime.now(timezone.utc).isoformat()
+        _runtime_health['last_check_result'] = 'running'
         logger.info("🔁 Автопроверка новостей...")
         metrics.inc('anime_bot_check_cycles_total')
         _event_log('check_cycle_started', mode='thread' if settings.thread_mode else 'channel',
@@ -14093,6 +14110,8 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
             metrics.inc('anime_bot_shadow_cycles_total')
             metrics.observe('anime_bot_check_cycle_seconds', time.perf_counter() - cycle_started)
             _event_log('check_cycle_finished', shadow=True, candidates=len(fresh), errors=len(errors))
+            _runtime_health['last_check_finished_at'] = datetime.now(timezone.utc).isoformat()
+            _runtime_health['last_check_result'] = f'shadow:candidates={len(fresh)}'
             await _maybe_send_daily_summary(context.bot)
             return
 
@@ -14167,6 +14186,9 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
             metrics.observe('anime_bot_check_cycle_seconds', time.perf_counter() - cycle_started)
             _event_log('check_cycle_finished', mode='thread', sent=sent_count, failed=failed_count,
                        uncertain=uncertain_count, skipped=skipped_count, errors=len(errors))
+            _runtime_health['last_check_finished_at'] = datetime.now(timezone.utc).isoformat()
+            _runtime_health['last_check_result'] = (
+                f'thread:sent={sent_count},failed={failed_count},skipped={skipped_count}')
             return
 
         # === РЕЖИМ КАНАЛА (старый): по 1 посту за интервал через очередь ===
@@ -14241,21 +14263,46 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
         metrics.observe('anime_bot_check_cycle_seconds', time.perf_counter() - cycle_started)
         _event_log('check_cycle_finished', mode='channel', result=sent_result or 'idle',
                    queue_size=queue_size, added=added_to_queue, errors=len(errors))
+        _runtime_health['last_check_finished_at'] = datetime.now(timezone.utc).isoformat()
+        _runtime_health['last_check_result'] = (
+            f'channel:{sent_result or "idle"},fresh={len(fresh)},added={added_to_queue},queue={queue_size}')
+
+
+def _ensure_auto_news_job(job_queue, *, first: float = 5) -> bool:
+    """Ensure the persistent auto-news scheduler job exists exactly once.
+
+    Returns True when a new job was created. The user's intent lives in
+    ``settings.auto_enabled``; APScheduler jobs themselves are process-local.
+    """
+    if job_queue is None:
+        logger.error('Авторассылка: JobQueue недоступен')
+        return False
+    jobs = job_queue.get_jobs_by_name('anime_news_check')
+    if jobs:
+        # Defensive cleanup in case an old deployment accidentally left duplicates.
+        for duplicate in jobs[1:]:
+            duplicate.schedule_removal()
+        return False
+    job_queue.run_repeating(
+        check_news, interval=settings.check_interval_sec, first=first,
+        name='anime_news_check', job_kwargs=JOB_KWARGS,
+    )
+    logger.info('Авторассылка: job зарегистрирован, интервал %s мин', settings.check_interval_min)
+    return True
 
 
 @admin_only
 async def start_auto(update, context: ContextTypes.DEFAULT_TYPE):
     job_queue = context.application.job_queue
-    if job_queue.get_jobs_by_name('anime_news_check'):
-        await update.message.reply_text("Авторассылка уже работает.")
+    was_running = bool(job_queue.get_jobs_by_name('anime_news_check'))
+    settings.auto_enabled = True
+    _ensure_auto_news_job(job_queue, first=5)
+    if was_running:
+        await update.message.reply_text("Авторассылка уже работает и будет восстановлена после рестарта.")
         return
-    interval = settings.check_interval_sec
-    job_queue.run_repeating(
-        check_news, interval=interval, first=5, name='anime_news_check',
-        job_kwargs=JOB_KWARGS,
-    )
     await update.message.reply_text(
-        f"✅ Авторассылка включена (каждые {settings.check_interval_min} минут)."
+        f"✅ Авторассылка включена (каждые {settings.check_interval_min} минут). "
+        "После рестарта запустится автоматически."
     )
     await notify_admin(context.bot, "🚀 Авторассылка запущена.")
 
@@ -14264,11 +14311,12 @@ async def start_auto(update, context: ContextTypes.DEFAULT_TYPE):
 async def stop_auto(update, context: ContextTypes.DEFAULT_TYPE):
     job_queue = context.application.job_queue
     jobs = job_queue.get_jobs_by_name('anime_news_check')
-    if not jobs:
-        await update.message.reply_text("Авторассылка не была запущена.")
-        return
+    settings.auto_enabled = False
     for job in jobs:
         job.schedule_removal()
+    if not jobs:
+        await update.message.reply_text("⏸ Авторассылка уже остановлена.")
+        return
     await update.message.reply_text("⏸ Авторассылка остановлена.")
     await notify_admin(context.bot, "🛑 Авторассылка остановлена.")
 
@@ -14314,6 +14362,16 @@ async def chatinfo_command(update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update, context: ContextTypes.DEFAULT_TYPE):
     job_queue = context.application.job_queue
     is_running = bool(job_queue.get_jobs_by_name('anime_news_check'))
+    auto_saved = bool(settings.auto_enabled)
+    last_check = str(_runtime_health.get('last_check_finished_at') or '')
+    if last_check:
+        try:
+            last_dt = datetime.fromisoformat(last_check)
+            last_check_text = _fmt_local(last_dt)
+        except (TypeError, ValueError):
+            last_check_text = last_check[:19]
+    else:
+        last_check_text = 'ещё не выполнялась после старта'
     sources_list = '\n'.join(
         f'  {"🟢" if settings.is_source_enabled(name) else "🔴"} {name}'
         for name, _ in SOURCES
@@ -14329,7 +14387,10 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
         translator_name = 'Google Translate (ключ DeepL не задан)'
     queue_size = await post_queue.peek_size()
     await update.message.reply_text(
-        f"Авторассылка: {'🟢 включена' if is_running else '🔴 выключена'}\n"
+        f"Авторассылка: {'🟢 включена' if is_running else '🔴 выключена'}"
+        f"{' ⚠️ (должна быть включена)' if auto_saved and not is_running else ''}\n"
+        f"Автовосстановление: {'ВКЛ' if auto_saved else 'ВЫКЛ'}\n"
+        f"Последняя автопроверка: {last_check_text}\n"
         f"Интервал: {settings.check_interval_min} мин (1 пост за интервал)\n"
         f"🧵 Режим ветки: {'ВКЛ (всё в ветку)' if settings.thread_mode else 'ВЫКЛ (по 1 в канал)'}\n"
         f"🌐 Переводчик: {translator_name}\n"
@@ -16388,6 +16449,22 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(_job_line(context, 'scheduled_publish', 'Публикация отложки'))
     lines.append(_job_line(context, 'daily_backup', 'Ежедневный бэкап'))
     lines.append(_job_line(context, 'health_probe', 'Readiness-проверка'))
+    auto_job_live = bool(context.application.job_queue.get_jobs_by_name('anime_news_check'))
+    if settings.auto_enabled and not auto_job_live:
+        lines.append('  ❌ Авторассылка сохранена как ВКЛ, но scheduler-job отсутствует')
+    elif auto_job_live and not settings.auto_enabled:
+        lines.append('  ⚠️ Авто-job работает, но persistent-флаг выключен')
+    last_check_started = str(_runtime_health.get('last_check_started_at') or '')
+    last_check_finished = str(_runtime_health.get('last_check_finished_at') or '')
+    if last_check_finished:
+        lines.append(f'  🕓 Последняя автопроверка: {html.escape(last_check_finished[:19])}Z')
+        result = str(_runtime_health.get('last_check_result') or '')
+        if result:
+            lines.append(f'     {html.escape(result[:160])}')
+    elif last_check_started:
+        lines.append(f'  ⚠️ Автопроверка стартовала {html.escape(last_check_started[:19])}Z, но ещё не завершилась')
+    elif auto_job_live:
+        lines.append('  🕓 Авто-job зарегистрирован, первая проверка ещё не завершилась')
     if feature_enabled('lifecycle_diagnostics'):
         life = lifecycle_snapshot()
         lines.append(f'  🔄 Запусков процесса: {life.get("total_starts", 0)}')
@@ -17702,6 +17779,9 @@ _runtime_health = {
     'telegram_ok': False,
     'storage_ok': False,
     'last_error': '',
+    'last_check_started_at': '',
+    'last_check_finished_at': '',
+    'last_check_result': '',
 }
 _health_http_server: Optional[ThreadingHTTPServer] = None
 _health_http_thread: Optional[threading.Thread] = None
@@ -18208,8 +18288,19 @@ def _stop_health_server() -> None:
 
 
 async def health_probe_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Периодически обновляет readiness, чтобы он не застывал на состоянии старта."""
+    """Периодически обновляет readiness и самовосстанавливает auto-job."""
     try:
+        # APScheduler job не является durable-состоянием. Если пользователь оставил
+        # авторассылку включённой, а job исчез из-за restart/race/ошибки scheduler,
+        # watchdog восстанавливает его максимум через пять минут.
+        application = getattr(context, 'application', None)
+        job_queue = getattr(application, 'job_queue', None)
+        if (job_queue is not None and settings is not None and settings.auto_enabled
+                and not job_queue.get_jobs_by_name('anime_news_check')):
+            if _ensure_auto_news_job(job_queue, first=5):
+                logger.warning('♻️ Health watchdog восстановил пропавшую авторассылку')
+                metrics.inc('anime_bot_auto_job_recovered_total')
+                await notify_admin(context.bot, '♻️ Авторассылка была включена, но её фоновая задача пропала. Бот восстановил её автоматически.')
         ok_channel, note = await _check_channel_access(context.bot)
         _runtime_health['telegram_ok'] = bool(ok_channel)
         _runtime_health['storage_ok'] = _storage_ready()
@@ -18296,6 +18387,12 @@ async def setup_bot_commands(app: Application) -> None:
         health_probe_job, interval=300, first=300, name='health_probe',
         job_kwargs=JOB_KWARGS,
     )
+
+    # APScheduler jobs живут только в памяти процесса. Восстанавливаем
+    # пользовательское состояние авторассылки после restart/redeploy.
+    if settings.auto_enabled:
+        _ensure_auto_news_job(app.job_queue, first=5)
+        logger.info('♻️ Авторассылка восстановлена после запуска процесса')
 
     # Readiness: Telegram + хранилище. HTTP /readyz использует эти флаги.
     try:
