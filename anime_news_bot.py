@@ -3228,7 +3228,7 @@ def _adaptive_hour_stats() -> dict[int, dict[str, float]]:
     out = {h: {'published': 0, 'hidden': 0, 'samples': 0, 'acceptance': 0.5} for h in range(24)}
     if moderation_feedback is None:
         return out
-    tz = _local_tz()
+    tz = _admin_tz()
     for ev in moderation_feedback._events:
         action = ev.get('action')
         if action not in ('published', 'hidden'):
@@ -13988,6 +13988,7 @@ def _backpressure_candidates(news_list: list[dict], queue_size: int, *, thread_m
 
 # Гарантия что одновременно идёт максимум одна проверка новостей
 _check_news_lock = asyncio.Lock()
+_check_failure_streak = 0        # сколько автопроверок подряд упало
 
 
 def _find_silent_sources(hours: int = 72) -> list[str]:
@@ -14044,7 +14045,36 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
         logger.info("⏭ Пропускаю автопроверку — предыдущая ещё идёт")
         metrics.inc('anime_bot_check_skipped_total', labels={'reason': 'overlap'})
         return
+    global _check_failure_streak
     async with _check_news_lock:
+        try:
+            await _check_news_cycle(context)
+        except Exception as e:
+            # Раньше исключение из цикла просто улетало в APScheduler: задача
+            # оставалась живой, следующий тик приходил и падал там же, а бот
+            # молчал. Со стороны это выглядело как «авторассылка включена, но
+            # постов нет». Теперь падение видно в /health, /status и у админа.
+            logger.exception('Автопроверка упала')
+            metrics.inc('anime_bot_check_cycle_errors_total')
+            _runtime_health['last_check_finished_at'] = datetime.now(timezone.utc).isoformat()
+            _runtime_health['last_check_result'] = f'error: {type(e).__name__}: {e}'[:200]
+            _runtime_health['last_error'] = f'check_news: {type(e).__name__}: {e}'[:200]
+            _event_log('check_cycle_failed', error=f'{type(e).__name__}: {e}'[:200])
+            _check_failure_streak += 1
+            # Сообщаем один раз на серию, чтобы не спамить каждые полчаса.
+            if _check_failure_streak in (1, 5, 20):
+                try:
+                    await notify_admin(
+                        context.bot,
+                        f'❌ Автопроверка падает ({_check_failure_streak}-й раз подряд).\n'
+                        f'{type(e).__name__}: {e}'[:300] + '\n\nПодробности: /health и /logs')
+                except Exception:
+                    logger.exception('Не удалось сообщить админу о падении автопроверки')
+        else:
+            _check_failure_streak = 0
+
+
+async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
         cycle_started = time.perf_counter()
         _runtime_health['last_check_started_at'] = datetime.now(timezone.utc).isoformat()
         _runtime_health['last_check_result'] = 'running'
@@ -14063,7 +14093,15 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
         # Stage 9: periodic recommendation snapshot. It is deliberately evaluated
         # after collection so failed sources/backlog are reflected in the advice.
         adaptive_queue_size = 0 if settings.thread_mode else await post_queue.peek_size()
-        _evaluate_adaptive_publishing(context, adaptive_queue_size)
+        try:
+            _evaluate_adaptive_publishing(context, adaptive_queue_size)
+        except Exception:
+            # Adaptive publishing — советующая подсистема: она не публикует,
+            # а рекомендует. Её падение не должно останавливать цикл. Именно
+            # так авторассылка встала целиком из-за одной опечатки в имени
+            # функции: исключение улетало наверх ещё до отправки поста.
+            logger.exception('Adaptive publishing: снимок не построен, продолжаю цикл')
+            metrics.inc('anime_bot_advisory_errors_total', labels={'stage': 'adaptive'})
 
         _image_bytes_cache.clear()      # цикл закончился, картинки больше не нужны
 
