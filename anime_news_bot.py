@@ -5,18 +5,22 @@
 """
 
 import asyncio
+import base64
 import hashlib
+import hmac
 import html
 import ipaddress
 import io
 import json
 import logging
+import random
 import socket
 import threading
 from logging.handlers import RotatingFileHandler
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import zipfile
@@ -29,6 +33,7 @@ except ImportError:  # pragma: no cover - Windows fallback: polling сам ко�
     fcntl = None
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
@@ -292,8 +297,27 @@ DEDUP_RESERVATION_TTL_SEC = 15 * 60
 # породил автоматический дубль уже принятого поста.
 DEDUP_UNCERTAIN_TTL_SEC = 7 * 24 * 3600
 DEDUP_REJECT_TTL_SEC = 24 * 3600
-HEALTH_HOST = _env('HEALTH_HOST', '127.0.0.1')
+# На PaaS переменная PORT обычно означает публичный порт контейнера. Если она
+# задана платформой, loopback-only bind делает health endpoint недоступным снаружи
+# и некоторые платформы начинают бесконечно перезапускать контейнер.
+_PLATFORM_PORT_RAW = (os.getenv('PORT') or '').strip()
+_HEALTH_HOST_RAW = (os.getenv('HEALTH_HOST') or '').strip()
+HEALTH_HOST = _HEALTH_HOST_RAW or ('0.0.0.0' if _PLATFORM_PORT_RAW else '127.0.0.1')
 HEALTH_PORT = _env_int('HEALTH_PORT', _env_int('PORT', 0))  # 0 = HTTP health endpoint выключен
+HEALTH_STRICT_READINESS = _env_bool('HEALTH_STRICT_READINESS', False)
+# Публичный bind означает, что endpoint видит кто угодно. Без ограничений это
+# один поток на соединение без таймаута: сотня полуоткрытых сокетов держит сотню
+# потоков навсегда. Таймаут обрывает медленные соединения, лимиты держат потолок.
+HEALTH_REQUEST_TIMEOUT_SEC = max(1, min(60, _env_int('HEALTH_REQUEST_TIMEOUT_SEC', 10)))
+HEALTH_MAX_CONNECTIONS = max(4, min(256, _env_int('HEALTH_MAX_CONNECTIONS', 32)))
+HEALTH_MAX_CONNECTIONS_PER_IP = max(1, min(HEALTH_MAX_CONNECTIONS,
+                                           _env_int('HEALTH_MAX_CONNECTIONS_PER_IP', 6)))
+# Метрики раскрывают имена источников и рабочие счётчики. На loopback это
+# безобидно, наружу — только по токену. Пустой токен при публичном bind
+# означает, что /metrics просто не отдаётся.
+HEALTH_METRICS_TOKEN = _env('HEALTH_METRICS_TOKEN', '').strip()
+HEALTH_BIND_IS_PUBLIC = HEALTH_HOST not in ('127.0.0.1', 'localhost', '::1')
+LIFECYCLE_FILE = DATA_DIR / 'runtime_lifecycle.json'
 TG_CAPTION_LIMIT = 1024              # жёсткое ограничение Telegram для подписи под фото
 TG_TEXT_LIMIT = 4096                 # лимит обычного текстового сообщения
 # Внутренний лимит summary для режима КАНАЛА (одно сообщение фото+подпись).
@@ -332,6 +356,43 @@ FEATURE_FLAGS = {
     # CPU-expensive transcode is opt-in; probing/thumbnails are safe defaults.
     'video_normalize': _env_bool('FEATURE_VIDEO_NORMALIZE', False),
     'video_thumbnails': _env_bool('FEATURE_VIDEO_THUMBNAILS', True),
+    # Reliability & Cost Control — Stage 4. Все механизмы можно выключить
+    # независимо, не откатывая остальные этапы.
+    'circuit_breakers': _env_bool('FEATURE_CIRCUIT_BREAKERS', True),
+    'adaptive_retry': _env_bool('FEATURE_ADAPTIVE_RETRY', True),
+    'backpressure': _env_bool('FEATURE_BACKPRESSURE', True),
+    'llm_budget': _env_bool('FEATURE_LLM_BUDGET', True),
+    'error_fingerprinting': _env_bool('FEATURE_ERROR_FINGERPRINTING', True),
+    # Editorial Automation & Learning — Stage 5
+    'editorial_learning': _env_bool('FEATURE_EDITORIAL_LEARNING', True),
+    'editorial_rules': _env_bool('FEATURE_EDITORIAL_RULES', True),
+    'diversity_scheduler': _env_bool('FEATURE_DIVERSITY_SCHEDULER', True),
+    'breaking_news': _env_bool('FEATURE_BREAKING_NEWS', True),
+    'confidence_moderation': _env_bool('FEATURE_CONFIDENCE_MODERATION', True),
+    # Operations & Governance — Stage 6
+    'admin_audit': _env_bool('FEATURE_ADMIN_AUDIT', True),
+    'config_reload': _env_bool('FEATURE_CONFIG_RELOAD', True),
+    'backup_verify': _env_bool('FEATURE_BACKUP_VERIFY', True),
+    'canary_publish': _env_bool('FEATURE_CANARY_PUBLISH', True),
+    # Stage 7 — controlled experimentation. Default traffic share is 0%,
+    # so enabling the framework alone does not alter production posts.
+    'experiments': _env_bool('FEATURE_EXPERIMENTS', True),
+    # Stage 8 — lifecycle/deployment diagnostics.
+    'lifecycle_diagnostics': _env_bool('FEATURE_LIFECYCLE_DIAGNOSTICS', True),
+    # Stage 9 — adaptive publishing. Safe adaptation is enabled, while
+    # persistent interval/format auto-tuning remains opt-in below.
+    'adaptive_publishing': _env_bool('FEATURE_ADAPTIVE_PUBLISHING', True),
+    # Stage 10 — first-party analytics over data the bot can actually observe.
+    # No Telegram view/reaction counts are invented: this layer uses delivery,
+    # moderation, source, format and timing signals only.
+    'analytics_feedback': _env_bool('FEATURE_ANALYTICS_FEEDBACK', True),
+    # Stage 11 — runtime schema migrations + local self-tests.
+    'runtime_migrations': _env_bool('FEATURE_RUNTIME_MIGRATIONS', True),
+    # Stage 12 — evidence-based verification + Telegram-aware image framing.
+    'active_verification': _env_bool('FEATURE_ACTIVE_VERIFICATION', True),
+    'media_smart_crop': _env_bool('FEATURE_MEDIA_SMART_CROP', True),
+    # Stage 13 — authenticated read-only operations dashboard.
+    'admin_dashboard': _env_bool('FEATURE_ADMIN_DASHBOARD', True),
 }
 STORY_CLUSTER_SIMILARITY = max(0.70, min(0.98, _env_float('STORY_CLUSTER_SIMILARITY', 0.88)))
 STORY_CLUSTER_MAX_COMPARE = max(20, min(500, _env_int('STORY_CLUSTER_MAX_COMPARE', 120)))
@@ -350,8 +411,247 @@ REPLAY_BUFFER_MAX = max(20, min(2000, _env_int('REPLAY_BUFFER_MAX', 300)))
 LLM_PROMPT_VERSION = _env('LLM_PROMPT_VERSION', 'editorial-v2-2026-08').strip() or 'editorial-v2-2026-08'
 LLM_JUDGE_MAX_TOKENS = max(80, min(500, _env_int('LLM_JUDGE_MAX_TOKENS', 180)))
 
+# Verification / Telegram media framing — Stage 12
+VERIFICATION_MAX_PER_CYCLE = max(0, min(20, _env_int('VERIFICATION_MAX_PER_CYCLE', 4)))
+VERIFICATION_CONFIDENCE_BELOW = max(0.30, min(0.95, _env_float('VERIFICATION_CONFIDENCE_BELOW', 0.72)))
+VERIFICATION_TIMEOUT_SEC = max(2, min(20, _env_int('VERIFICATION_TIMEOUT_SEC', 7)))
+VERIFICATION_MAX_OFFICIAL_LINKS = max(1, min(4, _env_int('VERIFICATION_MAX_OFFICIAL_LINKS', 2)))
+VERIFICATION_PAGE_MAX_BYTES = max(64 * 1024, min(1024 * 1024, _env_int('VERIFICATION_PAGE_MAX_KB', 384) * 1024))
+MEDIA_CROP_PORTRAIT_BELOW = max(0.35, min(0.75, _env_float('MEDIA_CROP_PORTRAIT_BELOW', 0.62)))
+MEDIA_CROP_WIDE_ABOVE = max(1.8, min(3.5, _env_float('MEDIA_CROP_WIDE_ABOVE', 2.15)))
+MEDIA_CROP_MAX_LOSS = max(0.10, min(0.48, _env_float('MEDIA_CROP_MAX_LOSS', 0.38)))
+MEDIA_CROP_MAX_DIM = max(720, min(2400, _env_int('MEDIA_CROP_MAX_DIM', 1600)))
+DASHBOARD_TOKEN = (os.getenv('DASHBOARD_TOKEN') or '').strip()
+DASHBOARD_USER = (os.getenv('DASHBOARD_USER') or 'admin').strip() or 'admin'
+DASHBOARD_REFRESH_SEC = max(5, min(300, _env_int('DASHBOARD_REFRESH_SEC', 30)))
+# Basic auth без ограничений перебирается тысячами попыток в секунду. Небольшая
+# задержка на каждую неудачу плюс блокировка адреса после серии промахов делают
+# подбор непрактичным, не мешая живому админу: он ошибается пару раз, не сотню.
+DASHBOARD_FAIL_LIMIT = max(3, min(100, _env_int('DASHBOARD_FAIL_LIMIT', 10)))
+DASHBOARD_FAIL_WINDOW_SEC = max(30, min(3600, _env_int('DASHBOARD_FAIL_WINDOW_SEC', 300)))
+DASHBOARD_FAIL_DELAY_SEC = max(0.0, min(5.0, _env_float('DASHBOARD_FAIL_DELAY_SEC', 0.25)))
+
+# Reliability & Cost Control — Stage 4
+SOURCE_BREAKER_FAIL_THRESHOLD = max(2, min(20, _env_int('SOURCE_BREAKER_FAIL_THRESHOLD', 3)))
+SOURCE_BREAKER_BASE_SEC = max(15, min(24 * 3600, _env_int('SOURCE_BREAKER_BASE_SEC', 300)))
+SOURCE_BREAKER_MAX_SEC = max(SOURCE_BREAKER_BASE_SEC, min(7 * 24 * 3600,
+    _env_int('SOURCE_BREAKER_MAX_SEC', 3600)))
+HTTP_RETRY_JITTER_RATIO = max(0.0, min(1.0, _env_float('HTTP_RETRY_JITTER_RATIO', 0.20)))
+HTTP_RETRY_MAX_DELAY = max(1.0, min(120.0, _env_float('HTTP_RETRY_MAX_DELAY', 30.0)))
+ERROR_FINGERPRINT_FILE = DATA_DIR / 'error_fingerprints.json'
+ERROR_FINGERPRINT_WINDOW_SEC = max(60, min(24 * 3600,
+    _env_int('ERROR_FINGERPRINT_WINDOW_SEC', 1800)))
+ERROR_FINGERPRINT_NOTIFY_EVERY = max(2, min(1000,
+    _env_int('ERROR_FINGERPRINT_NOTIFY_EVERY', 10)))
+LLM_BUDGET_FILE = DATA_DIR / 'llm_budget.json'
+# 0 = unlimited. Это сохраняет поведение существующих деплоев; лимит можно
+# включить одной env-переменной после наблюдения за фактическим расходом.
+LLM_DAILY_TOKEN_BUDGET = max(0, _env_int('LLM_DAILY_TOKEN_BUDGET', 0))
+LLM_BUDGET_WARN_RATIO = max(0.1, min(0.99, _env_float('LLM_BUDGET_WARN_RATIO', 0.80)))
+LLM_CIRCUIT_BASE_SEC = max(15, min(24 * 3600, _env_int('LLM_CIRCUIT_BASE_SEC', 300)))
+LLM_CIRCUIT_MAX_SEC = max(LLM_CIRCUIT_BASE_SEC, min(24 * 3600,
+    _env_int('LLM_CIRCUIT_MAX_SEC', 3600)))
+
+# Editorial Automation & Learning — Stage 5
+EDITORIAL_RULES_FILE = DATA_DIR / 'editorial_rules.json'
+FRANCHISE_COOLDOWN_MIN = max(0, min(24 * 60, _env_int('FRANCHISE_COOLDOWN_MIN', 180)))
+FRANCHISE_COOLDOWN_PENALTY = max(0.0, min(20.0, _env_float('FRANCHISE_COOLDOWN_PENALTY', 7.0)))
+BREAKING_MIN_CONFIDENCE = max(0.20, min(0.99, _env_float('BREAKING_MIN_CONFIDENCE', 0.68)))
+BREAKING_PRIORITY_BOOST = max(0.0, min(30.0, _env_float('BREAKING_PRIORITY_BOOST', 10.0)))
+CONFIDENCE_AUTO_MIN = max(0.0, min(0.99, _env_float('CONFIDENCE_AUTO_MIN', 0.48)))
+CONFIDENCE_REVIEW_MAX_PER_CYCLE = max(1, min(20, _env_int('CONFIDENCE_REVIEW_MAX_PER_CYCLE', 3)))
+EDITORIAL_LEARNING_MIN_SAMPLES = max(3, min(50, _env_int('EDITORIAL_LEARNING_MIN_SAMPLES', 5)))
+
+# Operations & Governance — Stage 6
+ADMIN_AUDIT_FILE = DATA_DIR / 'admin_audit.jsonl'
+ADMIN_AUDIT_MAX_BYTES = max(1, _env_int('ADMIN_AUDIT_MAX_MB', 4)) * 1024 * 1024
+ADMIN_AUDIT_BACKUPS = max(1, min(5, _env_int('ADMIN_AUDIT_BACKUPS', 2)))
+CANARY_CHANNEL_RAW = _env('CANARY_CHANNEL_ID', '').strip()
+try:
+    CANARY_CHANNEL_ID = int(CANARY_CHANNEL_RAW) if CANARY_CHANNEL_RAW and not CANARY_CHANNEL_RAW.startswith('@') else CANARY_CHANNEL_RAW
+except ValueError:
+    CANARY_CHANNEL_ID = ''
+CANARY_MIRROR_PERCENT = max(0.0, min(100.0, _env_float('CANARY_MIRROR_PERCENT', 0.0)))
+BACKUP_VERIFY_MAX_BYTES = max(1, min(256, _env_int('BACKUP_VERIFY_MAX_MB', 64))) * 1024 * 1024
+BACKUP_VERIFY_MAX_FILES = max(10, min(10000, _env_int('BACKUP_VERIFY_MAX_FILES', 2000)))
+
+# Experimentation — Stage 7
+EXPERIMENTS_FILE = DATA_DIR / 'experiments.json'
+POST_FORMAT_COMPACT_PERCENT = max(0.0, min(100.0, _env_float('POST_FORMAT_COMPACT_PERCENT', 0.0)))
+EXPERIMENT_SALT = _env('EXPERIMENT_SALT', 'anime-news-bot-v1').strip() or 'anime-news-bot-v1'
+
+# Deployment stability — Stage 8
+POLLING_BOOTSTRAP_RETRIES = max(-1, min(100, _env_int('POLLING_BOOTSTRAP_RETRIES', -1)))
+RESTART_STORM_WINDOW_SEC = max(60, min(24 * 3600, _env_int('RESTART_STORM_WINDOW_SEC', 900)))
+RESTART_STORM_THRESHOLD = max(3, min(20, _env_int('RESTART_STORM_THRESHOLD', 4)))
+
+# Adaptive Publishing — Stage 9
+ADAPTIVE_PUBLISHING_FILE = DATA_DIR / 'adaptive_publishing.json'
+ADAPTIVE_AUTO_INTERVAL = _env_bool('ADAPTIVE_AUTO_INTERVAL', False)
+ADAPTIVE_AUTO_FORMAT = _env_bool('ADAPTIVE_AUTO_FORMAT', False)
+ADAPTIVE_EVAL_MINUTES = max(15, min(24 * 60, _env_int('ADAPTIVE_EVAL_MINUTES', 60)))
+ADAPTIVE_FORMAT_MIN_OUTCOMES = max(5, min(500, _env_int('ADAPTIVE_FORMAT_MIN_OUTCOMES', 20)))
+ADAPTIVE_FORMAT_STEP_PERCENT = max(1.0, min(25.0, _env_float('ADAPTIVE_FORMAT_STEP_PERCENT', 10.0)))
+ADAPTIVE_FORMAT_MAX_PERCENT = max(0.0, min(100.0, _env_float('ADAPTIVE_FORMAT_MAX_PERCENT', 50.0)))
+ADAPTIVE_FORMAT_MARGIN = max(0.02, min(0.40, _env_float('ADAPTIVE_FORMAT_MARGIN', 0.08)))
+ADAPTIVE_INTERVAL_MIN = max(5, min(120, _env_int('ADAPTIVE_INTERVAL_MIN', 10)))
+ADAPTIVE_INTERVAL_MAX = max(ADAPTIVE_INTERVAL_MIN, min(24 * 60, _env_int('ADAPTIVE_INTERVAL_MAX', 90)))
+ADAPTIVE_INTERVAL_STEP = max(1, min(30, _env_int('ADAPTIVE_INTERVAL_STEP', 5)))
+ADAPTIVE_DIVERSITY_WINDOW_HOURS = max(1, min(168, _env_int('ADAPTIVE_DIVERSITY_WINDOW_HOURS', 24)))
+ADAPTIVE_DIVERSITY_MIN_STORIES = max(4, min(100, _env_int('ADAPTIVE_DIVERSITY_MIN_STORIES', 8)))
+ADAPTIVE_DIVERSITY_TARGET_SHARE = max(0.15, min(0.80, _env_float('ADAPTIVE_DIVERSITY_TARGET_SHARE', 0.35)))
+ADAPTIVE_DIVERSITY_MAX_MULTIPLIER = max(1.0, min(3.0, _env_float('ADAPTIVE_DIVERSITY_MAX_MULTIPLIER', 1.75)))
+ADAPTIVE_HOUR_MIN_SAMPLES = max(2, min(50, _env_int('ADAPTIVE_HOUR_MIN_SAMPLES', 4)))
+
+# Analytics & Feedback Loop — Stage 10
+ANALYTICS_FILE = DATA_DIR / 'analytics_events.json'
+ANALYTICS_MAX_EVENTS = max(500, min(50000, _env_int('ANALYTICS_MAX_EVENTS', 6000)))
+ANALYTICS_DEFAULT_DAYS = max(1, min(180, _env_int('ANALYTICS_DEFAULT_DAYS', 30)))
+ANALYTICS_MIN_SAMPLES = max(3, min(200, _env_int('ANALYTICS_MIN_SAMPLES', 8)))
+ANALYTICS_RECOMMEND_MARGIN = max(0.02, min(0.30, _env_float('ANALYTICS_RECOMMEND_MARGIN', 0.10)))
+
+# Testing & Chaos Automation — Stage 11
+# Schema migration is deliberately conservative: only core dict/list stores whose
+# legacy shapes are already understood are rewritten. Unknown/corrupt files are
+# never guessed or truncated.
+RUNTIME_SCHEMA_FILE = DATA_DIR / 'runtime_schema.json'
+RUNTIME_SCHEMA_VERSION = 1
+CHAOS_SELFTEST_ROUNDS = max(5, min(500, _env_int('CHAOS_SELFTEST_ROUNDS', 40)))
+CHAOS_FUZZ_MAX_CHARS = max(128, min(20000, _env_int('CHAOS_FUZZ_MAX_CHARS', 4096)))
+
 def feature_enabled(name: str) -> bool:
     return bool(FEATURE_FLAGS.get(str(name), False))
+
+
+def _runtime_schema_target_specs(root: Path) -> dict[str, tuple[int, callable]]:
+    """Core runtime JSON migrations understood by this build.
+
+    A migration must be lossless for known legacy shapes. Files that are corrupt
+    or structurally unknown are reported and left byte-for-byte untouched.
+    """
+    root = Path(root)
+
+    def sent_links(raw):
+        if isinstance(raw, list):
+            return {
+                'schema_version': 1,
+                'urls': [str(x) for x in raw if x],
+                'titles': [], 'recent': [], 'reservations': {}, 'rejected': {},
+            }
+        if isinstance(raw, dict):
+            out = dict(raw)
+            out['schema_version'] = 1
+            out.setdefault('urls', [])
+            out.setdefault('titles', [])
+            out.setdefault('recent', [])
+            out.setdefault('reservations', {})
+            out.setdefault('rejected', {})
+            return out
+        raise ValueError('unknown sent_links shape')
+
+    def queue(raw):
+        if isinstance(raw, list):
+            return {'schema_version': 1, 'items': raw, 'inflight': None}
+        if isinstance(raw, dict):
+            out = dict(raw)
+            out['schema_version'] = 1
+            out.setdefault('items', [])
+            out.setdefault('inflight', None)
+            return out
+        raise ValueError('unknown post_queue shape')
+
+    def settings_file(raw):
+        if not isinstance(raw, dict):
+            raise ValueError('unknown bot_settings shape')
+        out = dict(raw)
+        out['schema_version'] = 1
+        return out
+
+    def keyed_items(raw):
+        if not isinstance(raw, dict):
+            raise ValueError('unknown keyed-items shape')
+        out = dict(raw)
+        out['schema_version'] = 1
+        out.setdefault('counter', 0)
+        out.setdefault('items', {})
+        return out
+
+    def schema_dict(raw):
+        if not isinstance(raw, dict):
+            raise ValueError('unknown schema-dict shape')
+        out = dict(raw)
+        out['schema_version'] = 1
+        return out
+
+    return {
+        'sent_links.json': (1, sent_links),
+        'post_queue.json': (1, queue),
+        'bot_settings.json': (1, settings_file),
+        'scheduled_posts.json': (1, keyed_items),
+        'pending_posts.json': (1, keyed_items),
+        'analytics_events.json': (1, schema_dict),
+        'adaptive_publishing.json': (1, schema_dict),
+        'experiments.json': (1, schema_dict),
+    }
+
+
+def _migrate_runtime_schemas(root: Path = DATA_DIR, *, dry_run: bool = False) -> dict:
+    """Idempotently migrates known runtime JSON files and writes a manifest.
+
+    This is intentionally best-effort: a corrupt unrelated JSON file must not
+    prevent the bot from starting, while a known file is never rewritten unless
+    it parses and its shape is recognized.
+    """
+    root = Path(root)
+    report = {
+        'ok': True, 'schema_version': RUNTIME_SCHEMA_VERSION,
+        'changed': [], 'current': [], 'missing': [], 'errors': [],
+    }
+    specs = _runtime_schema_target_specs(root)
+    for name, (target_version, migrator) in specs.items():
+        path = root / name
+        if not path.exists():
+            report['missing'].append(name)
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding='utf-8'))
+            if isinstance(raw, dict) and 'schema_version' in raw:
+                try:
+                    source_version = int(raw.get('schema_version'))
+                except (TypeError, ValueError):
+                    raise ValueError('invalid schema_version')
+                if source_version > target_version:
+                    raise ValueError(
+                        f'future schema {source_version} > supported {target_version}; refusing downgrade')
+            migrated = migrator(raw)
+            current_version = int(migrated.get('schema_version', 0)) if isinstance(migrated, dict) else 0
+            if current_version != target_version:
+                raise ValueError(f'migration produced schema {current_version}, expected {target_version}')
+            changed = migrated != raw
+            if changed and not dry_run:
+                _atomic_write_json(path, migrated, indent=2)
+            (report['changed'] if changed else report['current']).append(name)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+            report['ok'] = False
+            report['errors'].append(f'{name}: {type(e).__name__}: {e}')
+
+    manifest = {
+        'schema_version': RUNTIME_SCHEMA_VERSION,
+        'updated_at': datetime.now(timezone.utc).isoformat(),
+        'targets': {name: version for name, (version, _fn) in specs.items()},
+        'last_result': {
+            'ok': bool(report['ok']),
+            'changed': list(report['changed']),
+            'errors': list(report['errors'])[:20],
+        },
+    }
+    if not dry_run:
+        try:
+            _atomic_write_json(root / RUNTIME_SCHEMA_FILE.name, manifest, indent=2)
+        except OSError as e:
+            report['ok'] = False
+            report['errors'].append(f'{RUNTIME_SCHEMA_FILE.name}: {type(e).__name__}: {e}')
+    return report
 
 # APScheduler по умолчанию ставит misfire_grace_time=1с: если тик джоба опоздал
 # больше чем на секунду (цикл занят сбором новостей/отправкой), запуск МОЛЧА
@@ -373,7 +673,7 @@ LOG_TAIL_LINES = 50                  # сколько последних стр�
 
 # --- HTTP retry ---
 HTTP_RETRY_ATTEMPTS = 3              # всего попыток (включая первую)
-HTTP_RETRY_BACKOFFS = (1.0, 2.0, 4.0)  # пауза перед попытками 2, 3, 4
+HTTP_RETRY_BACKOFFS = (1.0, 2.0, 4.0)  # базовые паузы; Stage 4 добавляет bounded jitter
 HTTP_RETRY_STATUSES = (500, 502, 503, 504, 408, 429)  # коды на которых ретраим
 
 # --- Прокси (опционально). Используется для Reddit, который банит VPS-IP.
@@ -649,13 +949,66 @@ def _refresh_runtime_metrics() -> None:
                     len(entity_memory._items) if entity_memory is not None else 0)
         metrics.set('anime_bot_published_story_memory',
                     len(story_history._items) if story_history is not None else 0)
+        metrics.set('anime_bot_editorial_rules',
+                    sum(len(v) for v in editorial_rules.snapshot().values()) if editorial_rules is not None else 0)
+        if moderation_feedback is not None and feature_enabled('editorial_learning'):
+            metrics.set('anime_bot_editorial_learned_terms', len(moderation_feedback.learned_term_scores()))
+        try:
+            audit_size = ADMIN_AUDIT_FILE.stat().st_size if ADMIN_AUDIT_FILE.exists() else 0
+        except OSError:
+            audit_size = 0
+        metrics.set('anime_bot_admin_audit_bytes', audit_size)
+        metrics.set('anime_bot_canary_mirror_percent', CANARY_MIRROR_PERCENT)
+        metrics.set('anime_bot_post_format_compact_percent', POST_FORMAT_COMPACT_PERCENT)
+        metrics.set('anime_bot_post_format_effective_compact_percent', _effective_compact_percent())
+        if feature_enabled('adaptive_publishing'):
+            adaptive = (adaptive_publishing.latest() if adaptive_publishing is not None else {})
+            metrics.set('anime_bot_adaptive_auto_interval', 1 if ADAPTIVE_AUTO_INTERVAL else 0)
+            metrics.set('anime_bot_adaptive_auto_format', 1 if ADAPTIVE_AUTO_FORMAT else 0)
+            metrics.set('anime_bot_adaptive_diversity_multiplier',
+                        float(adaptive.get('diversity_multiplier', _adaptive_diversity_multiplier()) or 1.0))
+            metrics.set('anime_bot_adaptive_recommended_interval_minutes',
+                        float(adaptive.get('recommended_interval_min', settings.check_interval_min if settings else 30) or 30))
+        if experiments is not None:
+            for variant, row in experiments.snapshot().items():
+                metrics.set('anime_bot_experiment_assigned', int(row.get('assigned', 0) or 0), {'variant': variant})
+                metrics.set('anime_bot_experiment_published', int(row.get('published', 0) or 0), {'variant': variant})
+                metrics.set('anime_bot_experiment_hidden', int(row.get('hidden', 0) or 0), {'variant': variant})
+        if feature_enabled('analytics_feedback') and analytics_store is not None:
+            delivery = analytics_store.delivery_summary(30)
+            metrics.set('anime_bot_analytics_events', len(analytics_store.events()))
+            metrics.set('anime_bot_delivery_attempts_30d', int(delivery.get('attempts', 0)))
+            metrics.set('anime_bot_delivery_failed_30d', int(delivery.get('failed', 0)))
+            metrics.set('anime_bot_delivery_uncertain_30d', int(delivery.get('uncertain', 0)))
+            decisions = len([x for x in _moderation_rows(30) if x.get('action') in ('published', 'hidden')])
+            metrics.set('anime_bot_moderation_decisions_30d', decisions)
+        life = lifecycle_snapshot() if feature_enabled('lifecycle_diagnostics') else {}
+        metrics.set('anime_bot_process_starts_total', int(life.get('total_starts', 0) or 0))
+        metrics.set('anime_bot_consecutive_unclean_starts', int(life.get('consecutive_unclean', 0) or 0))
         metrics.set('anime_bot_replay_buffer_items',
                     len(replay_buffer._items) if replay_buffer is not None else 0)
         metrics.set('anime_bot_media_quality_enabled', 1 if feature_enabled('media_quality') else 0)
         metrics.set('anime_bot_video_normalize_enabled', 1 if feature_enabled('video_normalize') else 0)
         metrics.set('anime_bot_image_bytes_cache_items', len(_image_bytes_cache))
         metrics.set('anime_bot_video_thumbnail_cache_items', len(_video_thumbnail_cache))
-    except NameError:
+        if source_health is not None:
+            opened = 0
+            for source_name, _collector in SOURCES:
+                remaining = source_health.breaker_remaining(source_name)
+                metrics.set('anime_bot_circuit_breaker_remaining_seconds', remaining,
+                            {'source': source_name})
+                if remaining > 0:
+                    opened += 1
+            metrics.set('anime_bot_circuit_breakers_open', opened)
+        if llm_budget is not None:
+            snap = llm_budget.snapshot()
+            metrics.set('anime_bot_llm_budget_tokens', snap.get('tokens', 0))
+            metrics.set('anime_bot_llm_budget_remaining',
+                        snap.get('remaining') if snap.get('remaining') is not None else -1)
+            metrics.set('anime_bot_llm_budget_denied', snap.get('denied', 0))
+        if error_fingerprints is not None:
+            metrics.set('anime_bot_error_fingerprints_active', len(error_fingerprints.snapshot()))
+    except (NameError, AttributeError):
         pass
     rss = _rss_mb() if '_rss_mb' in globals() else None
     if rss is not None:
@@ -713,6 +1066,49 @@ def normalize_title(title: str) -> str:
 
 
 # ============== HTTP RETRY HELPER ==============
+def _parse_retry_after(value) -> Optional[float]:
+    """Парсит Retry-After как секунды или HTTP-date и ограничивает ожидание.
+
+    Серверы встречаются обоих типов. Никогда не разрешаем одному ответу
+    заморозить worker дольше HTTP_RETRY_MAX_DELAY.
+    """
+    if value is None:
+        return None
+    try:
+        return min(HTTP_RETRY_MAX_DELAY, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        pass
+    try:
+        dt = parsedate_to_datetime(str(value))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        seconds = (dt - datetime.now(timezone.utc)).total_seconds()
+        return min(HTTP_RETRY_MAX_DELAY, max(0.0, seconds))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _adaptive_retry_delay(attempt: int, retry_after: Optional[float] = None) -> float:
+    """Возвращает bounded retry delay с jitter.
+
+    attempt — индекс неудачной попытки с нуля. При выключенном feature flag
+    сохраняется старое детерминированное поведение.
+    """
+    server_delay = retry_after is not None
+    if server_delay:
+        base = min(HTTP_RETRY_MAX_DELAY, max(0.0, float(retry_after)))
+    else:
+        base = float(HTTP_RETRY_BACKOFFS[min(max(0, attempt), len(HTTP_RETRY_BACKOFFS) - 1)])
+        base = min(HTTP_RETRY_MAX_DELAY, max(0.0, base))
+    if not feature_enabled('adaptive_retry') or base <= 0 or HTTP_RETRY_JITTER_RATIO <= 0:
+        return base
+    spread = base * HTTP_RETRY_JITTER_RATIO
+    # Retry-After — минимальная просьба сервера: jitter может только увеличить
+    # ожидание, но не заставить нас прийти раньше. Локальный backoff jitter-им
+    # симметрично, чтобы несколько workers не просыпались в одну миллисекунду.
+    jitter = random.uniform(0.0, spread) if server_delay else random.uniform(-spread, spread)
+    return min(HTTP_RETRY_MAX_DELAY, max(0.0, base + jitter))
+
 def http_get_with_retry(
     url: str,
     *,
@@ -745,10 +1141,7 @@ def http_get_with_retry(
             logger.debug(f"HTTP {r.status_code} для {url}, попытка {attempt + 1}/{HTTP_RETRY_ATTEMPTS}")
             retry_after = None
             if r.status_code == 429:
-                try:
-                    retry_after = min(30.0, max(0.0, float(r.headers.get('Retry-After', ''))))
-                except (TypeError, ValueError):
-                    retry_after = None
+                retry_after = _parse_retry_after(r.headers.get('Retry-After'))
             try:
                 r.close()
             except Exception:
@@ -764,10 +1157,9 @@ def http_get_with_retry(
 
         # Это была не последняя попытка — пауза перед следующей
         if attempt < HTTP_RETRY_ATTEMPTS - 1:
-            backoff = HTTP_RETRY_BACKOFFS[min(attempt, len(HTTP_RETRY_BACKOFFS) - 1)]
-            # Серверный Retry-After при 429 предпочтительнее нашего backoff, но
-            # ограничиваем его, чтобы один источник не заморозил worker надолго.
-            time.sleep(retry_after if retry_after is not None else backoff)
+            # Retry-After предпочтительнее локального backoff; jitter не даёт
+            # нескольким источникам синхронно устроить retry storm после сбоя.
+            time.sleep(_adaptive_retry_delay(attempt, retry_after))
 
     if last_exc:
         logger.warning(f"HTTP не удался после {HTTP_RETRY_ATTEMPTS} попыток для {url}: {last_exc}")
@@ -914,10 +1306,7 @@ def http_post_with_retry(
             logger.debug(f"HTTP {r.status_code} для POST {url}, попытка {attempt + 1}")
             retry_after = None
             if r.status_code == 429:
-                try:
-                    retry_after = min(30.0, max(0.0, float(r.headers.get('Retry-After', ''))))
-                except (TypeError, ValueError):
-                    retry_after = None
+                retry_after = _parse_retry_after(r.headers.get('Retry-After'))
             try:
                 r.close()
             except Exception:
@@ -930,8 +1319,7 @@ def http_post_with_retry(
             return None
 
         if attempt < HTTP_RETRY_ATTEMPTS - 1:
-            backoff = HTTP_RETRY_BACKOFFS[min(attempt, len(HTTP_RETRY_BACKOFFS) - 1)]
-            time.sleep(retry_after if retry_after is not None else backoff)
+            time.sleep(_adaptive_retry_delay(attempt, retry_after))
 
     if last_exc:
         logger.warning(f"POST не удался после {HTTP_RETRY_ATTEMPTS} попыток для {url}: {last_exc}")
@@ -1027,6 +1415,7 @@ class SentLinksStore:
     def _save(self) -> bool:
         try:
             _atomic_write_json(self.path, {
+                'schema_version': 1,
                 'urls': self._urls,
                 'titles': self._titles,
                 'recent': [[ts, norm, sorted(tokens)] for ts, norm, tokens in self._recent_titles],
@@ -1280,6 +1669,17 @@ QUEUE_FILE = DATA_DIR / 'post_queue.json'
 QUEUE_MAX_SIZE = 30                  # больше — старые вытесняются
 QUEUE_POST_TTL_HOURS = 24            # пост старше — выбрасывается без отправки
 QUEUE_MAX_SEND_RETRIES = 4           # после N технических ошибок пост не блокирует очередь вечно
+# Stage 4 backpressure: когда канал физически не успевает разгребать очередь,
+# не надо каждый тик churn-ить десятки слабых кандидатов через bounded queue.
+BACKPRESSURE_SOFT_QUEUE = max(1, min(QUEUE_MAX_SIZE - 2,
+    _env_int('BACKPRESSURE_SOFT_QUEUE', 20)))
+BACKPRESSURE_HARD_QUEUE = max(BACKPRESSURE_SOFT_QUEUE + 1, min(QUEUE_MAX_SIZE,
+    _env_int('BACKPRESSURE_HARD_QUEUE', 27)))
+BACKPRESSURE_SOFT_NEW = max(1, min(QUEUE_MAX_SIZE, _env_int('BACKPRESSURE_SOFT_NEW', 6)))
+BACKPRESSURE_HARD_NEW = max(1, min(BACKPRESSURE_SOFT_NEW,
+    _env_int('BACKPRESSURE_HARD_NEW', 2)))
+BACKPRESSURE_THREAD_MAX_PER_CYCLE = max(1, min(100,
+    _env_int('BACKPRESSURE_THREAD_MAX_PER_CYCLE', 20)))
 
 # Свежесть поста (по дате публикации в источнике).
 # Посты старше этого порога вообще не попадают в очередь.
@@ -1337,6 +1737,7 @@ class PostQueue:
     def _save(self) -> None:
         try:
             _atomic_write_json(self.path, {
+                'schema_version': 1,
                 'items': self._items,
                 'inflight': self._inflight,
             }, indent=2)
@@ -1662,7 +2063,7 @@ class BotSettings:
 
     def save(self) -> None:
         try:
-            _atomic_write_json(self.path, self._data, indent=2)
+            _atomic_write_json(self.path, {'schema_version': 1, **self._data}, indent=2)
         except OSError as e:
             logger.error(f"Не удалось сохранить {self.path}: {e}")
 
@@ -2246,6 +2647,10 @@ class ModerationFeedback:
             'story_id': str(news.get('_story_id') or '')[:40],
             'prompt_version': str(news.get('_prompt_version') or '')[:80],
             'confidence': float(news.get('_confidence_score', 0.0) or 0.0),
+            'format': str(news.get('_format_variant') or 'standard')[:40],
+            'priority': float(news.get('_priority_score', 0.0) or 0.0),
+            'breaking': bool(news.get('_breaking_news')),
+            'subject': str(_franchise_key(news) if news else '')[:160],
         })
         self._events = self._events[-self.MAX_EVENTS:]
         self._save()
@@ -2259,6 +2664,54 @@ class ModerationFeedback:
                 row[action] += 1
         return sorted(((src, r['published'], r['hidden'], r['edited']) for src, r in rows.items()),
                       key=lambda x: (-(x[1] + x[2]), x[0]))
+
+    @staticmethod
+    def _learning_terms(text: str) -> set[str]:
+        stop = {
+            'anime','manga','аниме','манга','новость','новости','трейлер','trailer',
+            'season','сезон','серия','release','релиз','новый','новая','новое','official',
+            'официальный','announced','анонс','выходит','вышел','вышла','reveals','with','from',
+        }
+        return {w.casefold() for w in re.findall(r'[A-Za-zА-Яа-яЁё0-9]{4,}', text or '')
+                if w.casefold() not in stop}
+
+    def learned_term_scores(self, min_samples: int = EDITORIAL_LEARNING_MIN_SAMPLES) -> dict[str, float]:
+        """Возвращает мягкие веса терминов из реальных решений модераторов.
+
+        Положительный вес означает, что материалы с термином чаще публиковались,
+        отрицательный — чаще скрывались. Сглаживание и высокий min_samples не дают
+        одному случайному решению превратиться в автоматическое правило.
+        """
+        rows: dict[str, list[int]] = {}
+        for ev in self._events:
+            action = ev.get('action')
+            if action not in ('published', 'hidden'):
+                continue
+            for term in self._learning_terms(str(ev.get('title') or '')):
+                row = rows.setdefault(term, [0, 0])
+                row[0 if action == 'published' else 1] += 1
+        out: dict[str, float] = {}
+        for term, (published, hidden) in rows.items():
+            total = published + hidden
+            if total < min_samples:
+                continue
+            # Beta(2,2): нейтральный prior не позволяет малой выборке давать экстремум.
+            accept = (published + 2.0) / (total + 4.0)
+            weight = (accept - 0.5) * 2.0
+            if abs(weight) >= 0.20:
+                out[term] = max(-1.0, min(1.0, weight))
+        return out
+
+    def learning_adjustment(self, news: Optional[dict]) -> float:
+        if not news or not feature_enabled('editorial_learning'):
+            return 0.0
+        scores = self.learned_term_scores()
+        if not scores:
+            return 0.0
+        terms = self._learning_terms(str(news.get('title') or ''))
+        hits = sorted((scores[t] for t in terms if t in scores), key=abs, reverse=True)[:3]
+        # Это только ranking signal, не авто-blacklist. Ограничиваем влияние ±2.5 балла.
+        return max(-2.5, min(2.5, sum(hits) * 1.25))
 
     def blacklist_suggestions(self, min_hidden: int = 3) -> list[tuple[str, int]]:
         stop = {'аниме','манга','новость','трейлер','сезон','серия','выходит','анонс','новый','новая',
@@ -2276,6 +2729,736 @@ class ModerationFeedback:
 
 
 moderation_feedback: Optional['ModerationFeedback'] = None
+
+
+class ExperimentStore:
+    """Tiny persisted counters for deterministic post-format experiments."""
+    MAX_VARIANTS = 20
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._data = {'schema_version': 1, 'variants': {}}
+        try:
+            if self.path.exists():
+                raw = json.loads(self.path.read_text(encoding='utf-8'))
+                if isinstance(raw, dict) and isinstance(raw.get('variants'), dict):
+                    self._data = raw
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning(f'experiments store не загружен: {e}')
+
+    def _save(self) -> None:
+        try:
+            _atomic_write_json(self.path, self._data, indent=2)
+        except OSError as e:
+            logger.warning(f'experiments store не сохранён: {e}')
+
+    def record(self, variant: str, event: str) -> None:
+        variant = str(variant or 'standard')[:40]
+        event = str(event or 'seen')[:40]
+        variants = self._data.setdefault('variants', {})
+        row = variants.setdefault(variant, {})
+        row[event] = int(row.get(event, 0) or 0) + 1
+        self._save()
+
+    def snapshot(self) -> dict:
+        return json.loads(json.dumps(self._data.get('variants', {})))
+
+
+experiments: Optional['ExperimentStore'] = None
+
+
+class AdaptivePublishingStore:
+    """Durable Stage-9 recommendation history.
+
+    The store never overrides explicit user settings on its own. Auto-apply is
+    controlled by separate env flags and every applied change stays bounded.
+    """
+    MAX_HISTORY = 180
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._data = {'schema_version': 1, 'history': []}
+        try:
+            if path.exists():
+                raw = json.loads(path.read_text(encoding='utf-8'))
+                if isinstance(raw, dict):
+                    history = raw.get('history', [])
+                    if isinstance(history, list):
+                        self._data = {'schema_version': 1,
+                                      'history': [x for x in history if isinstance(x, dict)][-self.MAX_HISTORY:]}
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning(f'adaptive publishing store не загружен: {e}')
+
+    def _save(self) -> None:
+        try:
+            _atomic_write_json(self.path, self._data, indent=2)
+        except OSError as e:
+            logger.warning(f'adaptive publishing store не сохранён: {e}')
+
+    def record(self, snapshot: dict) -> None:
+        row = dict(snapshot or {})
+        row['at'] = datetime.now(timezone.utc).isoformat()
+        history = self._data.setdefault('history', [])
+        history.append(row)
+        self._data['history'] = history[-self.MAX_HISTORY:]
+        self._save()
+
+    def latest(self) -> dict:
+        history = self._data.get('history', [])
+        return dict(history[-1]) if history else {}
+
+    def history(self, limit: int = 20) -> list[dict]:
+        return [dict(x) for x in self._data.get('history', [])[-max(1, int(limit)):]]
+
+
+adaptive_publishing: Optional['AdaptivePublishingStore'] = None
+
+
+class AnalyticsStore:
+    """Bounded first-party analytics ledger.
+
+    Telegram Bot API does not expose channel view/reaction analytics to ordinary
+    bots, so this store deliberately records only signals we can verify:
+    delivery result, source, format, confidence, priority, timing and story
+    metadata. Editorial acceptance comes from ``ModerationFeedback`` and is
+    joined only when building reports.
+    """
+
+    def __init__(self, path: Path, max_events: int = ANALYTICS_MAX_EVENTS):
+        self.path = Path(path)
+        self.max_events = max(100, int(max_events))
+        self._data = {'schema_version': 1, 'events': []}
+        try:
+            if self.path.exists():
+                raw = json.loads(self.path.read_text(encoding='utf-8'))
+                if isinstance(raw, dict) and isinstance(raw.get('events'), list):
+                    self._data = {
+                        'schema_version': 1,
+                        'events': [x for x in raw['events'] if isinstance(x, dict)][-self.max_events:],
+                    }
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning(f'analytics store не загружен: {e}')
+
+    def _save(self) -> None:
+        try:
+            _atomic_write_json(self.path, self._data, indent=2)
+        except OSError as e:
+            logger.warning(f'analytics store не сохранён: {e}')
+
+    @staticmethod
+    def _event_from_news(kind: str, news: Optional[dict], **extra) -> dict:
+        n = news or {}
+        row = {
+            'at': datetime.now(timezone.utc).isoformat(),
+            'kind': str(kind or 'event')[:40],
+            'story_id': str(n.get('_story_id') or '')[:48],
+            'source': str(n.get('source') or 'unknown')[:120],
+            'format': str(n.get('_format_variant') or 'standard')[:40],
+            'confidence': round(float(n.get('_confidence_score', 0.0) or 0.0), 4),
+            'priority': round(float(n.get('_priority_score', 0.0) or 0.0), 3),
+            'cluster_size': max(1, _safe_nonnegative_int(n.get('_story_cluster_size'), 1)),
+            'breaking': bool(n.get('_breaking_news')),
+            'story_update': bool(n.get('_story_update_of')),
+            'subject': str(_franchise_key(n) if n else '')[:160],
+        }
+        for key, value in extra.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                row[str(key)[:40]] = value
+        return row
+
+    def record(self, kind: str, news: Optional[dict] = None, **extra) -> None:
+        if not feature_enabled('analytics_feedback'):
+            return
+        events = self._data.setdefault('events', [])
+        events.append(self._event_from_news(kind, news, **extra))
+        self._data['events'] = events[-self.max_events:]
+        self._save()
+
+    def events(self, days: Optional[int] = None, kind: Optional[str] = None) -> list[dict]:
+        rows = self._data.get('events', [])
+        cutoff = None
+        if days is not None:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
+        out: list[dict] = []
+        for row in rows:
+            if kind and row.get('kind') != kind:
+                continue
+            if cutoff is not None:
+                try:
+                    at = datetime.fromisoformat(str(row.get('at') or ''))
+                    if at.tzinfo is None:
+                        at = at.replace(tzinfo=timezone.utc)
+                    if at < cutoff:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+            out.append(dict(row))
+        return out
+
+    def delivery_summary(self, days: int = ANALYTICS_DEFAULT_DAYS) -> dict:
+        rows = self.events(days=days, kind='delivery')
+        result = {'attempts': len(rows), 'sent': 0, 'failed': 0, 'uncertain': 0, 'other': 0}
+        for row in rows:
+            key = str(row.get('result') or 'other')
+            if key not in result:
+                key = 'other'
+            result[key] += 1
+        return result
+
+    def source_delivery(self, days: int = ANALYTICS_DEFAULT_DAYS) -> list[dict]:
+        grouped: dict[str, dict] = {}
+        for row in self.events(days=days, kind='delivery'):
+            source = str(row.get('source') or 'unknown')
+            g = grouped.setdefault(source, {'source': source, 'attempts': 0, 'sent': 0,
+                                            'failed': 0, 'uncertain': 0})
+            g['attempts'] += 1
+            result = str(row.get('result') or '')
+            if result in ('sent', 'failed', 'uncertain'):
+                g[result] += 1
+        return sorted(grouped.values(), key=lambda x: (-x['attempts'], x['source']))
+
+    def publication_hours(self, days: int = ANALYTICS_DEFAULT_DAYS) -> list[tuple[int, int]]:
+        hours = {h: 0 for h in range(24)}
+        for row in self.events(days=days, kind='delivery'):
+            if row.get('result') != 'sent':
+                continue
+            try:
+                at = datetime.fromisoformat(str(row.get('at') or ''))
+                if at.tzinfo is None:
+                    at = at.replace(tzinfo=timezone.utc)
+                local = at.astimezone(_admin_tz())
+                hours[local.hour] += 1
+            except (ValueError, TypeError):
+                continue
+        return sorted(hours.items(), key=lambda x: (-x[1], x[0]))
+
+
+analytics_store: Optional['AnalyticsStore'] = None
+
+
+def _moderation_rows(days: int = ANALYTICS_DEFAULT_DAYS) -> list[dict]:
+    if moderation_feedback is None:
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
+    out = []
+    for row in moderation_feedback._events:
+        try:
+            at = datetime.fromisoformat(str(row.get('at') or ''))
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            if at < cutoff:
+                continue
+        except (ValueError, TypeError):
+            continue
+        out.append(dict(row))
+    return out
+
+
+def _beta_acceptance(published: int, hidden: int) -> float:
+    """Beta(2,2) posterior mean, shared by analytics recommendations."""
+    return (max(0, int(published)) + 2.0) / (max(0, int(published)) + max(0, int(hidden)) + 4.0)
+
+
+def _analytics_group_moderation(days: int, key: str) -> list[dict]:
+    grouped: dict[str, dict] = {}
+    for row in _moderation_rows(days):
+        action = str(row.get('action') or '')
+        if action not in ('published', 'hidden'):
+            continue
+        value = str(row.get(key) or 'unknown')[:160]
+        g = grouped.setdefault(value, {'name': value, 'published': 0, 'hidden': 0})
+        g[action] += 1
+    out = []
+    for g in grouped.values():
+        outcomes = g['published'] + g['hidden']
+        g['outcomes'] = outcomes
+        g['acceptance'] = _beta_acceptance(g['published'], g['hidden'])
+        out.append(g)
+    return sorted(out, key=lambda x: (-x['outcomes'], x['name']))
+
+
+def _analytics_feedback_report(days: int = ANALYTICS_DEFAULT_DAYS) -> dict:
+    """Build a conservative report; never mutates production settings."""
+    days = max(1, min(365, int(days)))
+    delivery = analytics_store.delivery_summary(days) if analytics_store is not None else {
+        'attempts': 0, 'sent': 0, 'failed': 0, 'uncertain': 0, 'other': 0}
+    source_rows = _analytics_group_moderation(days, 'source')
+    format_rows = _analytics_group_moderation(days, 'format')
+    prompt_rows = _analytics_group_moderation(days, 'prompt_version')
+    confidence_groups: dict[str, dict] = {}
+    for row in _moderation_rows(days):
+        action = str(row.get('action') or '')
+        if action not in ('published', 'hidden'):
+            continue
+        try:
+            conf = float(row.get('confidence', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        bucket = ('<0.50' if conf < 0.50 else '0.50–0.69' if conf < 0.70
+                  else '0.70–0.84' if conf < 0.85 else '≥0.85')
+        g = confidence_groups.setdefault(bucket, {'name': bucket, 'published': 0, 'hidden': 0})
+        g[action] += 1
+    confidence_rows = []
+    for g in confidence_groups.values():
+        g['outcomes'] = g['published'] + g['hidden']
+        g['acceptance'] = _beta_acceptance(g['published'], g['hidden'])
+        confidence_rows.append(g)
+    confidence_rows.sort(key=lambda x: ('<0.50', '0.50–0.69', '0.70–0.84', '≥0.85').index(x['name']))
+    decisions = sum(x['outcomes'] for x in source_rows)
+    total_pub = sum(x['published'] for x in source_rows)
+    total_hidden = sum(x['hidden'] for x in source_rows)
+    baseline = _beta_acceptance(total_pub, total_hidden)
+
+    source_recommendations = []
+    for row in source_rows:
+        if row['outcomes'] < ANALYTICS_MIN_SAMPLES:
+            continue
+        delta = row['acceptance'] - baseline
+        if delta >= ANALYTICS_RECOMMEND_MARGIN:
+            source_recommendations.append({'source': row['name'], 'action': 'boost', 'delta': round(delta, 3),
+                                           'samples': row['outcomes']})
+        elif delta <= -ANALYTICS_RECOMMEND_MARGIN:
+            source_recommendations.append({'source': row['name'], 'action': 'review/downrank', 'delta': round(delta, 3),
+                                           'samples': row['outcomes']})
+
+    hour_groups: dict[int, list[int]] = {}
+    for row in _moderation_rows(days):
+        action = str(row.get('action') or '')
+        if action not in ('published', 'hidden'):
+            continue
+        try:
+            at = datetime.fromisoformat(str(row.get('at') or ''))
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            hour = at.astimezone(_admin_tz()).hour
+        except (ValueError, TypeError):
+            continue
+        g = hour_groups.setdefault(hour, [0, 0])
+        g[0 if action == 'published' else 1] += 1
+    best_hours = []
+    for hour, (published, hidden) in hour_groups.items():
+        n = published + hidden
+        if n >= ANALYTICS_MIN_SAMPLES:
+            best_hours.append((hour, _beta_acceptance(published, hidden), n))
+    best_hours.sort(key=lambda x: (-x[1], -x[2], x[0]))
+    best_hours = best_hours[:5]
+    return {
+        'days': days,
+        'delivery': delivery,
+        'moderation_decisions': decisions,
+        'baseline_acceptance': round(baseline, 4),
+        'sources': source_rows,
+        'formats': format_rows,
+        'prompt_versions': prompt_rows,
+        'confidence_buckets': confidence_rows,
+        'source_recommendations': source_recommendations[:8],
+        'best_hours': [{'hour': h, 'acceptance': round(rate, 4), 'samples': n}
+                       for h, rate, n in best_hours],
+    }
+
+
+def _adaptive_format_rates() -> dict[str, dict[str, float]]:
+    rows = experiments.snapshot() if experiments is not None else {}
+    out: dict[str, dict[str, float]] = {}
+    for variant in ('standard', 'compact'):
+        row = rows.get(variant, {}) if isinstance(rows, dict) else {}
+        published = _safe_nonnegative_int(row.get('published'), 0)
+        hidden = _safe_nonnegative_int(row.get('hidden'), 0)
+        outcomes = published + hidden
+        # Beta(2,2) smoothing avoids overreacting to small samples.
+        acceptance = (published + 2.0) / (outcomes + 4.0)
+        out[variant] = {'published': published, 'hidden': hidden,
+                        'outcomes': outcomes, 'acceptance': acceptance}
+    return out
+
+
+def _adaptive_recommend_compact_percent(current: Optional[float] = None) -> tuple[float, str]:
+    current = POST_FORMAT_COMPACT_PERCENT if current is None else max(0.0, min(100.0, float(current)))
+    if not feature_enabled('adaptive_publishing'):
+        return current, 'adaptive disabled'
+    rates = _adaptive_format_rates()
+    standard = rates['standard']
+    compact = rates['compact']
+    min_n = ADAPTIVE_FORMAT_MIN_OUTCOMES
+    # No compact observations yet: recommend a small, bounded exploration slice
+    # only after standard has enough real outcomes. Never auto-seed above the configured cap.
+    if compact['outcomes'] < min_n:
+        if current <= 0 and standard['outcomes'] >= min_n:
+            return min(ADAPTIVE_FORMAT_STEP_PERCENT, ADAPTIVE_FORMAT_MAX_PERCENT), 'exploration sample needed'
+        return current, 'insufficient compact outcomes'
+    if standard['outcomes'] < min_n:
+        return current, 'insufficient standard outcomes'
+    delta = compact['acceptance'] - standard['acceptance']
+    if delta >= ADAPTIVE_FORMAT_MARGIN:
+        return min(ADAPTIVE_FORMAT_MAX_PERCENT, current + ADAPTIVE_FORMAT_STEP_PERCENT), 'compact performs better'
+    if delta <= -ADAPTIVE_FORMAT_MARGIN:
+        return max(0.0, current - ADAPTIVE_FORMAT_STEP_PERCENT), 'compact performs worse'
+    return current, 'no significant difference'
+
+
+def _effective_compact_percent() -> float:
+    if not (feature_enabled('adaptive_publishing') and ADAPTIVE_AUTO_FORMAT):
+        return POST_FORMAT_COMPACT_PERCENT
+    recommended, _reason = _adaptive_recommend_compact_percent()
+    # Auto-format cannot exceed the explicit adaptive safety cap.
+    return max(0.0, min(ADAPTIVE_FORMAT_MAX_PERCENT, recommended))
+
+
+def _adaptive_recent_franchise_concentration(now: Optional[datetime] = None) -> tuple[float, int, str]:
+    if story_history is None:
+        return 0.0, 0, ''
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=ADAPTIVE_DIVERSITY_WINDOW_HOURS)
+    counts: dict[str, int] = {}
+    total = 0
+    for row in reversed(story_history._items[-500:]):
+        try:
+            at = datetime.fromisoformat(str(row.get('at') or ''))
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+        if at < cutoff:
+            break
+        key = EntityMemory._key(row.get('subject') or '')
+        if not key:
+            key = _franchise_key({'title': row.get('title', '')})
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        total += 1
+    if total <= 0 or not counts:
+        return 0.0, total, ''
+    top_key, top_count = max(counts.items(), key=lambda kv: kv[1])
+    return top_count / total, total, top_key
+
+
+def _adaptive_diversity_multiplier(now: Optional[datetime] = None) -> float:
+    if not feature_enabled('adaptive_publishing'):
+        return 1.0
+    share, total, _key = _adaptive_recent_franchise_concentration(now)
+    if total < ADAPTIVE_DIVERSITY_MIN_STORIES or share <= ADAPTIVE_DIVERSITY_TARGET_SHARE:
+        return 1.0
+    room = max(0.01, 1.0 - ADAPTIVE_DIVERSITY_TARGET_SHARE)
+    severity = min(1.0, (share - ADAPTIVE_DIVERSITY_TARGET_SHARE) / room)
+    return 1.0 + severity * (ADAPTIVE_DIVERSITY_MAX_MULTIPLIER - 1.0)
+
+
+def _adaptive_hour_stats() -> dict[int, dict[str, float]]:
+    out = {h: {'published': 0, 'hidden': 0, 'samples': 0, 'acceptance': 0.5} for h in range(24)}
+    if moderation_feedback is None:
+        return out
+    tz = _local_tz()
+    for ev in moderation_feedback._events:
+        action = ev.get('action')
+        if action not in ('published', 'hidden'):
+            continue
+        try:
+            at = datetime.fromisoformat(str(ev.get('at') or ''))
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            hour = at.astimezone(tz).hour
+        except (ValueError, TypeError):
+            continue
+        out[hour][action] += 1
+    for row in out.values():
+        samples = int(row['published'] + row['hidden'])
+        row['samples'] = samples
+        row['acceptance'] = (row['published'] + 2.0) / (samples + 4.0)
+    return out
+
+
+def _adaptive_best_hours(limit: int = 3) -> list[tuple[int, float, int]]:
+    rows = _adaptive_hour_stats()
+    eligible = [(hour, float(row['acceptance']), int(row['samples']))
+                for hour, row in rows.items() if int(row['samples']) >= ADAPTIVE_HOUR_MIN_SAMPLES]
+    return sorted(eligible, key=lambda x: (-x[1], -x[2], x[0]))[:max(1, int(limit))]
+
+
+def _adaptive_recommend_interval(queue_size: int, current: Optional[int] = None) -> tuple[int, str]:
+    current = settings.check_interval_min if current is None and settings is not None else int(current or 30)
+    current = max(ADAPTIVE_INTERVAL_MIN, min(ADAPTIVE_INTERVAL_MAX, current))
+    if not feature_enabled('adaptive_publishing'):
+        return current, 'adaptive disabled'
+    failures = 0
+    if stats is not None:
+        failures = stats.count_events_since(datetime.now() - timedelta(hours=24), 'failed_send')
+    if failures >= 3:
+        return min(ADAPTIVE_INTERVAL_MAX, current + ADAPTIVE_INTERVAL_STEP), 'recent Telegram failures'
+    if queue_size >= BACKPRESSURE_HARD_QUEUE:
+        return max(ADAPTIVE_INTERVAL_MIN, current - 2 * ADAPTIVE_INTERVAL_STEP), 'hard queue pressure'
+    if queue_size >= BACKPRESSURE_SOFT_QUEUE:
+        return max(ADAPTIVE_INTERVAL_MIN, current - ADAPTIVE_INTERVAL_STEP), 'soft queue pressure'
+    # Empty queues during a genuinely quiet period may check a little less often,
+    # saving external API/LLM work without making a large jump.
+    recent_published = 0
+    if stats is not None:
+        recent_published = stats.count_events_since(datetime.now() - timedelta(hours=6), 'published')
+    if queue_size == 0 and recent_published == 0:
+        return min(ADAPTIVE_INTERVAL_MAX, current + ADAPTIVE_INTERVAL_STEP), 'quiet feed'
+    return current, 'stable'
+
+
+def _adaptive_snapshot(queue_size: int = 0) -> dict:
+    rec_format, format_reason = _adaptive_recommend_compact_percent()
+    rec_interval, interval_reason = _adaptive_recommend_interval(queue_size)
+    share, diversity_n, diversity_key = _adaptive_recent_franchise_concentration()
+    return {
+        'queue_size': max(0, int(queue_size)),
+        'current_interval_min': int(settings.check_interval_min if settings is not None else 30),
+        'recommended_interval_min': int(rec_interval),
+        'interval_reason': interval_reason,
+        'current_compact_percent': round(float(POST_FORMAT_COMPACT_PERCENT), 2),
+        'recommended_compact_percent': round(float(rec_format), 2),
+        'format_reason': format_reason,
+        'effective_compact_percent': round(float(_effective_compact_percent()), 2),
+        'diversity_multiplier': round(float(_adaptive_diversity_multiplier()), 3),
+        'top_franchise_share': round(float(share), 3),
+        'diversity_samples': int(diversity_n),
+        'top_franchise_key': str(diversity_key)[:120],
+        'best_hours': [{'hour': h, 'acceptance': round(rate, 3), 'samples': n}
+                       for h, rate, n in _adaptive_best_hours(4)],
+    }
+
+
+def _adaptive_should_evaluate() -> bool:
+    if adaptive_publishing is None:
+        return True
+    latest = adaptive_publishing.latest()
+    try:
+        at = datetime.fromisoformat(str(latest.get('at') or ''))
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - at >= timedelta(minutes=ADAPTIVE_EVAL_MINUTES)
+    except (ValueError, TypeError):
+        return True
+
+
+def _apply_adaptive_interval(context, recommended: int) -> bool:
+    if not (ADAPTIVE_AUTO_INTERVAL and settings is not None and context is not None):
+        return False
+    recommended = max(ADAPTIVE_INTERVAL_MIN, min(ADAPTIVE_INTERVAL_MAX, int(recommended)))
+    if recommended == settings.check_interval_min:
+        return False
+    try:
+        job_queue = context.application.job_queue
+        jobs = job_queue.get_jobs_by_name('anime_news_check')
+        settings.check_interval_min = recommended
+        if jobs:
+            for job in jobs:
+                job.schedule_removal()
+            job_queue.run_repeating(check_news, interval=settings.check_interval_sec, first=settings.check_interval_sec,
+                                    name='anime_news_check', job_kwargs=JOB_KWARGS)
+        _event_log('adaptive_interval_applied', interval_min=recommended)
+        return True
+    except Exception as e:
+        logger.warning(f'adaptive interval не применён: {e}')
+        return False
+
+
+def _evaluate_adaptive_publishing(context=None, queue_size: int = 0, *, force: bool = False) -> dict:
+    if not feature_enabled('adaptive_publishing'):
+        return {}
+    if not force and not _adaptive_should_evaluate():
+        return adaptive_publishing.latest() if adaptive_publishing is not None else _adaptive_snapshot(queue_size)
+    snap = _adaptive_snapshot(queue_size)
+    # Never auto-tune production behaviour in shadow mode.
+    applied = False
+    if not feature_enabled('shadow_mode'):
+        applied = _apply_adaptive_interval(context, int(snap['recommended_interval_min']))
+    snap['interval_applied'] = bool(applied)
+    if adaptive_publishing is not None:
+        adaptive_publishing.record(snap)
+    metrics.set('anime_bot_adaptive_diversity_multiplier', snap['diversity_multiplier'])
+    metrics.set('anime_bot_adaptive_recommended_interval_minutes', snap['recommended_interval_min'])
+    metrics.set('anime_bot_adaptive_effective_compact_percent', snap['effective_compact_percent'])
+    _event_log('adaptive_evaluation', **{k: v for k, v in snap.items() if k != 'best_hours'})
+    return snap
+
+
+def _experiment_bucket(news: dict) -> float:
+    seed = str(news.get('_story_id') or news.get('url') or news.get('title') or '')
+    raw = hashlib.sha256((EXPERIMENT_SALT + '|' + seed).encode('utf-8', errors='ignore')).digest()
+    return int.from_bytes(raw[:8], 'big') / float(2**64) * 100.0
+
+
+def _assign_format_variant(news: dict) -> str:
+    existing = str(news.get('_format_variant') or '').strip()
+    if existing:
+        return existing
+    variant = 'standard'
+    compact_percent = _effective_compact_percent()
+    if feature_enabled('experiments') and compact_percent > 0:
+        if _experiment_bucket(news) < compact_percent:
+            variant = 'compact'
+    news['_format_variant'] = variant
+    if experiments is not None:
+        experiments.record(variant, 'assigned')
+    return variant
+
+
+class AdminAuditLog:
+    """Append-only JSONL audit trail действий операторов без текста сообщений/секретов."""
+    def __init__(self, path: Path, max_bytes: int = ADMIN_AUDIT_MAX_BYTES,
+                 backups: int = ADMIN_AUDIT_BACKUPS):
+        self.path = path
+        self.max_bytes = max(1024, int(max_bytes))
+        self.backups = max(1, int(backups))
+        self._lock = threading.Lock()
+
+    def _rotate_unlocked(self) -> None:
+        try:
+            if not self.path.exists() or self.path.stat().st_size < self.max_bytes:
+                return
+            for idx in range(self.backups, 0, -1):
+                src = self.path if idx == 1 else Path(str(self.path) + f'.{idx - 1}')
+                dst = Path(str(self.path) + f'.{idx}')
+                if not src.exists():
+                    continue
+                if idx == self.backups and dst.exists():
+                    dst.unlink(missing_ok=True)
+                src.replace(dst)
+        except OSError as e:
+            logger.warning(f'audit log rotate failed: {e}')
+
+    def record(self, action: str, actor=None, **details) -> None:
+        if not feature_enabled('admin_audit'):
+            return
+        actor_id = int(getattr(actor, 'id', 0) or 0)
+        actor_name = str(getattr(actor, 'username', '') or getattr(actor, 'full_name', '') or '')[:80]
+        safe_details = {}
+        for key, value in details.items():
+            if value is None:
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                safe_details[str(key)[:60]] = str(value)[:300] if isinstance(value, str) else value
+        row = {
+            'at': datetime.now(timezone.utc).isoformat(),
+            'actor_id': actor_id,
+            'actor': actor_name,
+            'action': str(action or '')[:120],
+            'details': safe_details,
+        }
+        line = json.dumps(row, ensure_ascii=False, separators=(',', ':')) + '\n'
+        try:
+            with self._lock:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._rotate_unlocked()
+                with self.path.open('a', encoding='utf-8') as f:
+                    f.write(line)
+        except OSError as e:
+            logger.warning(f'audit log write failed: {e}')
+
+    def tail(self, limit: int = 30) -> list[dict]:
+        limit = max(1, min(200, int(limit)))
+        try:
+            if not self.path.exists():
+                return []
+            lines = deque(maxlen=limit)
+            with self.path.open('r', encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    lines.append(line)
+            out = []
+            for line in lines:
+                try:
+                    row = json.loads(line)
+                    if isinstance(row, dict):
+                        out.append(row)
+                except ValueError:
+                    continue
+            return out
+        except OSError:
+            return []
+
+
+admin_audit: Optional['AdminAuditLog'] = None
+
+
+class EditorialRulesStore:
+    """Небольшой редактируемый rules engine без выполнения произвольного кода.
+
+    Правила — только нормализованные фразы четырёх безопасных типов. Это позволяет
+    менять редакционную политику без рестарта/патча и не превращает JSON в DSL.
+    """
+    KINDS = ('block', 'downrank', 'boost', 'breaking')
+    MAX_PER_KIND = 250
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._rules: dict[str, list[str]] = {k: [] for k in self.KINDS}
+        self._load()
+
+    @staticmethod
+    def _clean(value: str) -> str:
+        return re.sub(r'\s+', ' ', str(value or '').strip()).casefold()[:160]
+
+    def _load(self) -> None:
+        try:
+            if not self.path.exists():
+                return
+            raw = json.loads(self.path.read_text(encoding='utf-8'))
+            rules = raw.get('rules', raw) if isinstance(raw, dict) else {}
+            if not isinstance(rules, dict):
+                return
+            for kind in self.KINDS:
+                vals = rules.get(kind, [])
+                if not isinstance(vals, list):
+                    continue
+                clean = []
+                for value in vals:
+                    phrase = self._clean(value)
+                    if len(phrase) >= 2 and phrase not in clean:
+                        clean.append(phrase)
+                self._rules[kind] = clean[:self.MAX_PER_KIND]
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning(f'editorial rules не загружены: {e}')
+
+    def _save(self) -> None:
+        try:
+            _atomic_write_json(self.path, {'schema_version': 1, 'rules': self._rules}, indent=2)
+        except OSError as e:
+            logger.warning(f'editorial rules не сохранены: {e}')
+
+    def add(self, kind: str, phrase: str) -> bool:
+        kind = str(kind or '').strip().lower()
+        value = self._clean(phrase)
+        if kind not in self.KINDS or len(value) < 2:
+            return False
+        rows = self._rules[kind]
+        if value not in rows:
+            rows.append(value)
+            del rows[:-self.MAX_PER_KIND]
+            self._save()
+        return True
+
+    def remove(self, kind: str, phrase: str) -> bool:
+        kind = str(kind or '').strip().lower()
+        value = self._clean(phrase)
+        if kind not in self.KINDS or value not in self._rules[kind]:
+            return False
+        self._rules[kind].remove(value)
+        self._save()
+        return True
+
+    def snapshot(self) -> dict[str, list[str]]:
+        return {k: list(v) for k, v in self._rules.items()}
+
+    def matches(self, kind: str, news: Optional[dict]) -> list[str]:
+        if not news or kind not in self.KINDS:
+            return []
+        haystack = self._clean(f"{news.get('title','')} {news.get('summary','')}")
+        return [phrase for phrase in self._rules[kind] if phrase and phrase in haystack]
+
+    def evaluate(self, news: Optional[dict]) -> dict:
+        block = self.matches('block', news)
+        down = self.matches('downrank', news)
+        boost = self.matches('boost', news)
+        breaking = self.matches('breaking', news)
+        adjustment = min(6.0, len(boost) * 2.0) - min(8.0, len(down) * 2.5)
+        return {
+            'blocked': bool(block), 'adjustment': adjustment,
+            'block': block, 'downrank': down, 'boost': boost, 'breaking': breaking,
+        }
 
 
 class EditorialGlossary:
@@ -2625,6 +3808,7 @@ class ReplayBuffer:
         return [copy.deepcopy(x) for x in reversed(self._items[-max(1, limit):])]
 
 
+editorial_rules: Optional['EditorialRulesStore'] = None
 editorial_glossary: Optional['EditorialGlossary'] = None
 entity_memory: Optional['EntityMemory'] = None
 story_history: Optional['PublishedStoryStore'] = None
@@ -4277,6 +5461,107 @@ def _media_candidate_warning(info: dict) -> str:
     return ''
 
 
+def _media_crop_plan(info: dict) -> Optional[dict]:
+    """Return a JSON-safe conservative crop plan for Telegram preview.
+
+    Only clearly awkward but recoverable aspect ratios are cropped. If reaching
+    a useful 4:5 or 16:9 frame would throw away too much of the image, the
+    original is preserved.
+    """
+    if not feature_enabled('media_smart_crop'):
+        return None
+    try:
+        width, height = int(info.get('width') or 0), int(info.get('height') or 0)
+        aspect = float(info.get('aspect') or (width / max(1, height)))
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    if width < 400 or height < 240:
+        return None
+    target = None
+    axis = None
+    if aspect < MEDIA_CROP_PORTRAIT_BELOW:
+        target, axis = 0.8, 'vertical'   # 4:5
+        keep = aspect / target
+    elif aspect > MEDIA_CROP_WIDE_ABOVE:
+        target, axis = 16 / 9, 'horizontal'
+        keep = target / aspect
+    else:
+        return None
+    loss = 1.0 - min(1.0, keep)
+    if loss <= 0 or loss > MEDIA_CROP_MAX_LOSS:
+        return None
+    return {
+        'version': 1, 'axis': axis, 'target_aspect': round(target, 5),
+        'source_width': width, 'source_height': height, 'loss': round(loss, 3),
+    }
+
+
+def _smart_crop_image_bytes(data: Optional[bytes], plan: Optional[dict]) -> Optional[bytes]:
+    """Render a center-biased, entropy-aware crop. Returns JPEG bytes."""
+    if not data or not plan or Image is None:
+        return None
+    try:
+        with Image.open(io.BytesIO(data)) as original:
+            im = original.convert('RGB')
+            width, height = im.size
+            target = float(plan.get('target_aspect') or 0)
+            axis = str(plan.get('axis') or '')
+            if target <= 0 or width < 2 or height < 2:
+                return None
+            if axis == 'vertical':
+                crop_w = width
+                crop_h = min(height, max(1, int(round(width / target))))
+                span = max(0, height - crop_h)
+                boxes = [(0, int(round(span * f)), width, int(round(span * f)) + crop_h)
+                         for f in (0.0, 0.25, 0.5, 0.75, 1.0)]
+            elif axis == 'horizontal':
+                crop_h = height
+                crop_w = min(width, max(1, int(round(height * target))))
+                span = max(0, width - crop_w)
+                boxes = [(int(round(span * f)), 0, int(round(span * f)) + crop_w, height)
+                         for f in (0.0, 0.25, 0.5, 0.75, 1.0)]
+            else:
+                return None
+            # Prefer detailed regions, but keep a meaningful centre prior so text
+            # or a noisy edge cannot drag framing completely away from the subject.
+            best = None
+            best_score = float('-inf')
+            for idx, box in enumerate(boxes):
+                region = im.crop(box)
+                try:
+                    entropy = float(region.convert('L').resize((64, 64), Image.LANCZOS).entropy())
+                except Exception:
+                    entropy = 0.0
+                centre_penalty = abs(idx - 2) * 0.22
+                score = entropy - centre_penalty
+                if score > best_score:
+                    best_score, best = score, region
+            if best is None:
+                return None
+            bw, bh = best.size
+            scale = min(1.0, MEDIA_CROP_MAX_DIM / max(bw, bh))
+            if scale < 1.0:
+                best = best.resize((max(1, int(bw * scale)), max(1, int(bh * scale))), Image.LANCZOS)
+            out = io.BytesIO()
+            best.save(out, format='JPEG', quality=90, optimize=True)
+            return out.getvalue()
+    except Exception as exc:
+        logger.debug(f'smart crop failed: {type(exc).__name__}: {exc}')
+        return None
+
+
+def _media_preview_annotation(info: dict) -> dict:
+    plan = _media_crop_plan(info)
+    aspect = info.get('aspect')
+    if plan:
+        state = 'crop-planned'
+    elif isinstance(aspect, (int, float)) and (aspect < MEDIA_CROP_PORTRAIT_BELOW or aspect > MEDIA_CROP_WIDE_ABOVE):
+        state = 'preserve-extreme'
+    else:
+        state = 'native'
+    return {'state': state, 'aspect': aspect, 'crop_plan': plan}
+
+
 async def _optimize_news_media(news: dict) -> None:
     """Ranks images and removes perceptual duplicates inside one post.
 
@@ -4361,6 +5646,17 @@ async def _optimize_news_media(news: dict) -> None:
         compact.append({k: r.get(k) for k in ('url', 'score', 'width', 'height', 'aspect', 'format', 'entropy') if r.get(k) is not None})
     news['_media_quality'] = compact
     news['_media_primary_score'] = int(kept[0].get('score', 0)) if kept else 0
+    if kept:
+        preview = _media_preview_annotation(kept[0])
+        news['_media_preview'] = preview
+        if preview.get('crop_plan'):
+            news['_media_crop_plan'] = preview['crop_plan']
+            metrics.inc('anime_bot_media_crop_planned_total')
+        else:
+            news.pop('_media_crop_plan', None)
+    else:
+        news.pop('_media_preview', None)
+        news.pop('_media_crop_plan', None)
     warnings = [w for w in (_media_candidate_warning(r) for r in kept[:1]) if w]
     if warnings:
         news['_media_warnings'] = warnings
@@ -4784,7 +6080,7 @@ def _is_too_old(published_struct, max_age_hours: Optional[int] = None) -> bool:
     if not published_struct:
         return False
     if max_age_hours is None:
-        max_age_hours = settings.post_max_age_hours
+        max_age_hours = (settings.post_max_age_hours if settings is not None else POST_MAX_AGE_HOURS)
     try:
         # published_parsed это struct_time в UTC
         pub_dt = datetime(*published_struct[:6])
@@ -4795,6 +6091,72 @@ def _is_too_old(published_struct, max_age_hours: Optional[int] = None) -> bool:
     return age > timedelta(hours=max_age_hours)
 
 
+def _parse_rss_bytes(
+    rss_data: bytes | str,
+    source_name: str,
+    fetch_og: bool = True,
+    force_og: bool = False,
+) -> list[dict]:
+    """Pure-ish RSS parser used by the network wrapper and Stage 11 fuzzing.
+
+    Malformed individual entries are skipped instead of aborting the entire feed.
+    Network access only occurs for optional og:image fallback.
+    """
+    news_list: list[dict] = []
+    try:
+        feed = feedparser.parse(rss_data)
+    except Exception as e:
+        logger.warning(f'{source_name}: RSS parse failed: {e}')
+        return []
+    entries = getattr(feed, 'entries', None) or []
+    for entry in list(entries)[:NEWS_PER_SOURCE * 3]:
+        try:
+            link = str(getattr(entry, 'link', '') or '').strip()
+            title = str(getattr(entry, 'title', '') or '').strip()
+            if not link or not title:
+                continue
+            if sent_links is not None and link in sent_links:
+                continue
+            published_parsed = (getattr(entry, 'published_parsed', None)
+                                or getattr(entry, 'updated_parsed', None))
+            if _is_too_old(published_parsed):
+                continue
+            try:
+                summary_html = entry.get('summary', '')
+            except (AttributeError, TypeError):
+                summary_html = getattr(entry, 'summary', '') or ''
+            summary_html = str(summary_html or '')
+            images = extract_all_images_from_entry(entry, summary_html, base_url=link)
+            need_og = fetch_og and (
+                force_og or not images or _looks_like_thumbnail(images[0])
+            )
+            if need_og:
+                og = fetch_og_image(link)
+                if og:
+                    og = upgrade_image_url(og)
+                    if og not in images:
+                        images.insert(0, og)
+                        images = images[:MAX_PHOTOS_PER_POST]
+            video_url = extract_video_url(entry, summary_html)
+            news_list.append({
+                'title': title,
+                'link': link,
+                'summary': clean_html(summary_html),
+                'source': source_name,
+                'image': images[0] if images else None,
+                'images': images,
+                'video': video_url,
+                'published_parsed': published_parsed,
+            })
+            if len(news_list) >= NEWS_PER_SOURCE:
+                break
+        except Exception as e:
+            # One broken item must not discard valid entries that follow it.
+            logger.debug('%s: malformed RSS entry skipped: %s', source_name, e)
+            continue
+    return news_list
+
+
 def _parse_rss_with_fallback(
     rss_url: str,
     source_name: str,
@@ -4802,12 +6164,7 @@ def _parse_rss_with_fallback(
     force_og: bool = False,
     public_only: bool = False,
 ) -> list[dict]:
-    """Парсит RSS-ленту.
-    - fetch_og: если в RSS нет картинки или она похожа на thumbnail, идём за og:image
-    - force_og: для лент, у которых RSS вообще не отдаёт нормальных картинок —
-      всегда лезем за og:image (медленнее, но качественнее)
-    """
-    news_list = []
+    """Downloads a bounded RSS feed and delegates parsing to ``_parse_rss_bytes``."""
     try:
         getter = http_get_public_with_retry if public_only else http_get_with_retry
         response = getter(
@@ -4833,45 +6190,10 @@ def _parse_rss_with_fallback(
         if not rss_data:
             logger.warning(f"{source_name}: RSS пустой или превышает лимит {HTTP_RSS_MAX_BYTES // (1024*1024)} МБ")
             return []
-        feed = feedparser.parse(rss_data)
-        for entry in feed.entries[:NEWS_PER_SOURCE * 3]:
-            link = getattr(entry, 'link', None)
-            if not link or link in sent_links:
-                continue
-            published_parsed = getattr(entry, 'published_parsed', None) or getattr(entry, 'updated_parsed', None)
-            if _is_too_old(published_parsed):
-                continue
-            summary_html = entry.get('summary', '')
-            images = extract_all_images_from_entry(entry, summary_html, base_url=link)
-            # Решаем нужно ли лезть за og:image
-            need_og = fetch_og and (
-                force_og  # для известно-проблемных лент
-                or not images
-                or _looks_like_thumbnail(images[0])
-            )
-            if need_og:
-                og = fetch_og_image(link)
-                if og:
-                    og = upgrade_image_url(og)
-                    if og not in images:
-                        images.insert(0, og)
-                        images = images[:MAX_PHOTOS_PER_POST]
-            video_url = extract_video_url(entry, summary_html)
-            news_list.append({
-                'title': entry.title,
-                'link': link,
-                'summary': clean_html(summary_html),
-                'source': source_name,
-                'image': images[0] if images else None,
-                'images': images,
-                'video': video_url,
-                'published_parsed': published_parsed,
-            })
-            if len(news_list) >= NEWS_PER_SOURCE:
-                break
+        return _parse_rss_bytes(rss_data, source_name, fetch_og=fetch_og, force_og=force_og)
     except Exception as e:
         logger.error(f"{source_name} error: {e}")
-    return news_list
+        return []
 
 
 def get_animenewsnetwork():
@@ -6010,11 +7332,14 @@ def format_news_short(news: dict) -> str:
     summary = news.get('summary') or ''
     ru_summary = ''
     if summary:
-        excerpt = _extract_sentences(summary, max_sentences=3, max_len=700)
+        compact = str(news.get('_format_variant') or '') == 'compact'
+        max_sentences = 2 if compact else 3
+        source_max = 480 if compact else 700
+        translated_max = 620 if compact else 850
+        excerpt = _extract_sentences(summary, max_sentences=max_sentences, max_len=source_max)
         if excerpt:
             ru_summary = excerpt if is_ru else translate_text(excerpt, input_limit=1200)
-            # После перевода приводим к <=3 предложениям и разумной длине
-            ru_summary = _extract_sentences(ru_summary, max_sentences=3, max_len=850)
+            ru_summary = _extract_sentences(ru_summary, max_sentences=max_sentences, max_len=translated_max)
 
     # Если предложение дублирует заголовок — не показываем
     if ru_summary and ru_title.rstrip('.').lower() in ru_summary.lower():
@@ -6168,7 +7493,9 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
     # из t.me/s/-постов), заранее качаем байтами — иначе публикация в канал падала
     # с webpage_curl_failed / "Wrong type of the web page content" все 3 попытки.
     if photos:
-        photos = await _resolve_photos_for_album(photos)
+        crop_plan = news.get('_media_crop_plan')
+        photos = (await _resolve_photos_for_album(photos, crop_plan) if crop_plan
+                  else await _resolve_photos_for_album(photos))
     media_count = len(photos) + (1 if has_inline_video else 0)
 
     # ЖЁСТКОЕ ПРАВИЛО: если включено "Только с картинками" и медиа нет — НЕ публикуем
@@ -6462,6 +7789,7 @@ async def _prepare_news_for_send(news: dict, source: str,
     пост можно отправлять."""
     await _improve_thumb(news)
     await _optimize_news_media(news)
+    _assign_format_variant(news)
 
     # Модель: перевод, чистый текст, теги, отсев непрофильного и повторов
     if await _llm_enrich(news, side_effects=llm_side_effects) == 'skip':
@@ -6567,6 +7895,8 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
         if not ok:
             if is_channel:
                 await stats.record_failed_send(source)
+                if analytics_store is not None and track_history:
+                    analytics_store.record('delivery', news, result='failed', mode='channel')
             return 'failed'
 
         if track_history and ledger_claimed:
@@ -6576,8 +7906,13 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
             _mark_published()
             if is_channel:
                 await stats.record_published(source)
+                if experiments is not None:
+                    experiments.record(str(news.get('_format_variant') or 'standard'), 'published')
                 if story_history is not None:
                     story_history.record(news, format_news_short(news))
+                if analytics_store is not None:
+                    analytics_store.record('delivery', news, result='sent', mode='channel')
+                await _maybe_mirror_canary(bot, news)
         return 'sent'
     except DeliveryUncertain as e:
         logger.warning(f'Результат отправки неизвестен, автоповтор запрещён: {title[:60]} ({e})')
@@ -6587,6 +7922,8 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
             preserve_ambiguous = True
         if is_channel:
             await stats.record_failed_send(source)
+            if analytics_store is not None and track_history:
+                analytics_store.record('delivery', news, result='uncertain', mode='channel')
         return 'uncertain'
     except asyncio.CancelledError:
         if track_history and ledger_claimed and send_started and not committed:
@@ -6602,6 +7939,48 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
             await sent_links.release(link, title)
         if not committed and not preserve_ambiguous:
             _release_publish_reservations(news)
+        if video_file:
+            try:
+                video_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+
+def _canary_configured() -> bool:
+    if not feature_enabled('canary_publish'):
+        return False
+    target = CANARY_CHANNEL_ID
+    if not target or target == CHANNEL_ID:
+        return False
+    if isinstance(target, int):
+        return target != 0
+    return bool(isinstance(target, str) and re.fullmatch(r'@[A-Za-z0-9_]{5,32}', target.strip()))
+
+
+async def _maybe_mirror_canary(bot: Bot, news: dict) -> bool:
+    """Best-effort mirror уже подготовленного production-поста в canary-канал.
+
+    Не трогает channel ledger/history. По умолчанию процент 0, так что существующий
+    деплой не получает никаких дополнительных публикаций без явной настройки.
+    """
+    if not _canary_configured() or CANARY_MIRROR_PERCENT <= 0:
+        return False
+    if random.random() * 100.0 >= CANARY_MIRROR_PERCENT:
+        return False
+    clone = copy.deepcopy(news)
+    video_file = None
+    try:
+        video_file = await _prepare_video_file(clone)
+        ok = await _send_post(bot, clone, CANARY_CHANNEL_ID, video_file)
+        metrics.inc('anime_bot_canary_mirror_total', labels={'result': 'sent' if ok else 'failed'})
+        _event_log('canary_mirror', story_id=clone.get('_story_id'), result='sent' if ok else 'failed')
+        return bool(ok)
+    except Exception as e:
+        logger.warning(f'Canary mirror failed: {type(e).__name__}: {e}')
+        metrics.inc('anime_bot_canary_mirror_total', labels={'result': 'error'})
+        return False
+    finally:
         if video_file:
             try:
                 video_file.unlink(missing_ok=True)
@@ -6930,7 +8309,7 @@ class ScheduledPosts:
 
     def _save(self) -> bool:
         try:
-            _atomic_write_json(self.path, {'counter': self._counter, 'items': self._items})
+            _atomic_write_json(self.path, {'schema_version': 1, 'counter': self._counter, 'items': self._items})
             return True
         except OSError as e:
             logger.error(f"scheduled_posts не сохранён: {e}")
@@ -7383,10 +8762,13 @@ AUTO_DISABLE_MIN_CHECKS = 3     # но не раньше, чем после ст
 
 
 class SourceHealth:
-    """Состояние источников: сколько проверок подряд прошло без новостей или
-    с ошибкой. Нужен, чтобы автоматически ставить на паузу умершие источники
-    (403 от анти-бота и т.п.) и показывать картину в /health.
-    Хранится на диске — счётчик переживает передеплой."""
+    """Durable health + temporary circuit breaker for news sources.
+
+    ``fails`` keeps the historical "silent source" semantics used by auto-pause.
+    ``hard_fails`` counts transport/parser failures only. After several hard
+    failures the source is temporarily skipped instead of hammering a dead API
+    every cycle. Empty but valid feeds do not trip the fast breaker.
+    """
 
     def __init__(self, path: Path):
         self.path = path
@@ -7409,31 +8791,99 @@ class SourceHealth:
             logger.error(f"source_health не сохранён: {e}")
 
     def _entry(self, name: str) -> dict:
-        return self._data.setdefault(
+        row = self._data.setdefault(
             name, {'fails': 0, 'last_ok': None, 'last_count': 0, 'last_error': '',
                    'silent_since': None})
+        # Stage-4 fields are added lazily for backward-compatible old JSON.
+        row.setdefault('hard_fails', 0)
+        row.setdefault('breaker_level', 0)
+        row.setdefault('breaker_until', None)
+        row.setdefault('last_failure_at', None)
+        return row
+
+    @staticmethod
+    def _utcnow() -> datetime:
+        return datetime.now(timezone.utc)
 
     def record_ok(self, name: str, count: int) -> None:
         entry = self._entry(name)
         entry['fails'] = 0
+        entry['hard_fails'] = 0
+        entry['breaker_level'] = 0
+        entry['breaker_until'] = None
         entry['silent_since'] = None
-        entry['last_ok'] = datetime.now(timezone.utc).isoformat()
+        entry['last_ok'] = self._utcnow().isoformat()
         entry['last_count'] = int(count)
         entry['last_error'] = ''
         self._save()
 
-    def record_fail(self, name: str, reason: str) -> int:
-        """Отмечает неудачу. Возвращает число неудач подряд."""
+    def _open_breaker_unlocked(self, entry: dict) -> int:
+        level = max(0, _safe_nonnegative_int(entry.get('breaker_level')))
+        seconds = min(SOURCE_BREAKER_MAX_SEC, SOURCE_BREAKER_BASE_SEC * (2 ** min(level, 8)))
+        entry['breaker_level'] = min(level + 1, 9)
+        entry['breaker_until'] = (self._utcnow() + timedelta(seconds=seconds)).isoformat()
+        entry['hard_fails'] = 0
+        return int(seconds)
+
+    def record_fail(self, name: str, reason: str, *, hard: bool = False) -> int:
+        """Отмечает неудачу и возвращает число общих неудач подряд.
+
+        hard=True означает transport/parser/API failure и участвует в быстром
+        circuit breaker. Обычный "0 постов" сохраняет прежний silent-source
+        счётчик, но breaker не открывает.
+        """
         entry = self._entry(name)
-        entry['fails'] = int(entry.get('fails', 0)) + 1
+        entry['fails'] = _safe_nonnegative_int(entry.get('fails')) + 1
         entry['last_error'] = str(reason)[:200]
+        entry['last_failure_at'] = self._utcnow().isoformat()
         if not entry.get('silent_since'):
-            # Засекаем момент, с которого источник замолчал: считать паузу
-            # по времени надёжнее, чем по числу проверок — ночью или в выходной
-            # живой источник тоже может ничего не отдать.
-            entry['silent_since'] = datetime.now(timezone.utc).isoformat()
+            entry['silent_since'] = self._utcnow().isoformat()
+        if hard:
+            entry['hard_fails'] = _safe_nonnegative_int(entry.get('hard_fails')) + 1
+            half_open_failure = bool(entry.get('breaker_until') and
+                                     _safe_nonnegative_int(entry.get('breaker_level')) > 0 and
+                                     self.breaker_remaining(name) <= 0)
+            if (feature_enabled('circuit_breakers')
+                    and (entry['hard_fails'] >= SOURCE_BREAKER_FAIL_THRESHOLD or half_open_failure)):
+                seconds = self._open_breaker_unlocked(entry)
+                logger.warning('🧯 Circuit breaker %s открыт на %s сек после ошибок', name, seconds)
+                metrics.inc('anime_bot_circuit_breaker_open_total', labels={'source': name})
+                _event_log('source_circuit_open', source=name, cooldown_sec=seconds,
+                           reason=str(reason)[:200])
+                try:
+                    _queue_admin_alert(
+                        f'🧯 Источник «{name}» временно поставлен на паузу на '
+                        f'{max(1, (seconds + 59) // 60)} мин после повторных ошибок. '
+                        'После паузы будет сделана пробная проверка.')
+                except NameError:
+                    pass
         self._save()
         return entry['fails']
+
+    def breaker_remaining(self, name: str) -> float:
+        """Сколько секунд источник ещё должен отдыхать; 0 если breaker закрыт."""
+        if not feature_enabled('circuit_breakers'):
+            return 0.0
+        entry = self._data.get(name)
+        if not entry or not entry.get('breaker_until'):
+            return 0.0
+        try:
+            until = datetime.fromisoformat(str(entry['breaker_until']))
+            if until.tzinfo is None:
+                until = until.replace(tzinfo=timezone.utc)
+            left = (until - self._utcnow()).total_seconds()
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, left)
+
+    def allow_request(self, name: str) -> bool:
+        """False only while the temporary breaker is actively open."""
+        left = self.breaker_remaining(name)
+        if left > 0:
+            return False
+        # Expired breaker stays as a half-open marker until the next request.
+        # Success resets it; a new hard failure will reopen with longer cooldown.
+        return True
 
     def silent_hours(self, name: str) -> Optional[float]:
         """Сколько часов источник не отдаёт новостей. None — если всё хорошо."""
@@ -7449,13 +8899,17 @@ class SourceHealth:
             return None
         if since.tzinfo is None:
             since = since.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - since).total_seconds() / 3600
+        return (self._utcnow() - since).total_seconds() / 3600
 
     def reset(self, name: str) -> None:
         """Сброс — например, когда источник включили вручную."""
         if name in self._data:
-            self._data[name]['fails'] = 0
-            self._data[name]['silent_since'] = None
+            row = self._entry(name)
+            row['fails'] = 0
+            row['hard_fails'] = 0
+            row['breaker_level'] = 0
+            row['breaker_until'] = None
+            row['silent_since'] = None
             self._save()
 
     def info(self, name: str) -> dict:
@@ -7468,6 +8922,201 @@ class SourceHealth:
 source_health: Optional['SourceHealth'] = None
 # Источники, которые бот выключил сам — check_news заберёт отсюда и уведомит
 _auto_disabled_pending: list[tuple[str, str]] = []
+
+
+class ErrorFingerprintStore:
+    """Сжимает повторяющиеся одинаковые ошибки в редкие уведомления.
+
+    Сама ошибка всё равно попадает в logger/metrics каждый раз. Store решает
+    только, стоит ли снова будить администратора одним и тем же сообщением.
+    """
+    MAX_ITEMS = 500
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._items: dict[str, dict] = {}
+        self._load()
+
+    @staticmethod
+    def _normalise(message: str) -> str:
+        text = str(message or '').casefold()
+        text = re.sub(r'https?://\S+', '<url>', text)
+        text = re.sub(r'\b[0-9a-f]{12,}\b', '<hex>', text)
+        text = re.sub(r'\b\d{4,}\b', '<n>', text)
+        return re.sub(r'\s+', ' ', text).strip()[:500]
+
+    @classmethod
+    def _fingerprint(cls, scope: str, message: str) -> str:
+        raw = f'{scope}|{cls._normalise(message)}'.encode('utf-8', errors='replace')
+        return hashlib.sha256(raw).hexdigest()[:24]
+
+    def _load(self) -> None:
+        try:
+            if not self.path.exists():
+                return
+            raw = json.loads(self.path.read_text(encoding='utf-8'))
+            items = raw.get('items', raw) if isinstance(raw, dict) else {}
+            if isinstance(items, dict):
+                self._items = {str(k): v for k, v in items.items() if isinstance(v, dict)}
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning(f'error fingerprints не загружены: {e}')
+
+    def _save(self) -> None:
+        try:
+            if len(self._items) > self.MAX_ITEMS:
+                newest = sorted(self._items.items(), key=lambda kv: kv[1].get('last_seen', ''))[-self.MAX_ITEMS:]
+                self._items = dict(newest)
+            _atomic_write_json(self.path, {'schema_version': 1, 'items': self._items}, indent=2)
+        except OSError as e:
+            logger.warning(f'error fingerprints не сохранены: {e}')
+
+    def record(self, scope: str, message: str) -> dict:
+        """Возвращает {notify,count,suppressed,fingerprint}."""
+        if not feature_enabled('error_fingerprinting'):
+            return {'notify': True, 'count': 1, 'suppressed': 0, 'fingerprint': ''}
+        now = datetime.now(timezone.utc)
+        fp = self._fingerprint(scope, message)
+        row = self._items.get(fp)
+        reset = True
+        if row:
+            try:
+                last = datetime.fromisoformat(str(row.get('last_seen') or ''))
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                reset = (now - last).total_seconds() > ERROR_FINGERPRINT_WINDOW_SEC
+            except (TypeError, ValueError):
+                reset = True
+        if reset:
+            count = 1
+            notify = True
+            first_seen = now.isoformat()
+        else:
+            count = _safe_nonnegative_int(row.get('count')) + 1
+            notify = (count % ERROR_FINGERPRINT_NOTIFY_EVERY == 0)
+            first_seen = str(row.get('first_seen') or now.isoformat())
+        self._items[fp] = {
+            'scope': str(scope)[:120],
+            'message': str(message)[:500],
+            'count': count,
+            'first_seen': first_seen,
+            'last_seen': now.isoformat(),
+        }
+        # Пишем первый случай и контрольные точки; подавленные ошибки не должны
+        # превращать throttling в fsync на каждом цикле.
+        if notify or count <= 2 or count % 5 == 0:
+            self._save()
+        suppressed = max(0, count - 1)
+        if not notify:
+            metrics.inc('anime_bot_error_notifications_suppressed_total', labels={'scope': str(scope)[:80]})
+        return {'notify': notify, 'count': count, 'suppressed': suppressed, 'fingerprint': fp}
+
+    def resolve_scope(self, scope: str) -> int:
+        """Удаляет активные fingerprints области после успешного запроса."""
+        keys = [k for k, v in self._items.items() if v.get('scope') == scope]
+        if not keys:
+            return 0
+        suppressed = sum(max(0, _safe_nonnegative_int(self._items[k].get('count')) - 1) for k in keys)
+        for key in keys:
+            self._items.pop(key, None)
+        self._save()
+        return suppressed
+
+    def snapshot(self) -> list[dict]:
+        return sorted((dict(v, fingerprint=k) for k, v in self._items.items()),
+                      key=lambda row: row.get('last_seen', ''), reverse=True)
+
+
+class LLMBudgetStore:
+    """Crash-safe дневной бюджет приблизительных/фактических LLM tokens."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._data = {'day': '', 'tokens': 0, 'calls': 0, 'denied': 0, 'warned': False}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if self.path.exists():
+                raw = json.loads(self.path.read_text(encoding='utf-8'))
+                if isinstance(raw, dict):
+                    self._data.update({
+                        'day': str(raw.get('day') or ''),
+                        'tokens': _safe_nonnegative_int(raw.get('tokens')),
+                        'calls': _safe_nonnegative_int(raw.get('calls')),
+                        'denied': _safe_nonnegative_int(raw.get('denied')),
+                        'warned': bool(raw.get('warned', False)),
+                    })
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning(f'LLM budget не загружен: {e}')
+
+    def _today(self) -> str:
+        try:
+            return _local_now().strftime('%Y-%m-%d')
+        except Exception:
+            return datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+    def _roll_day(self) -> None:
+        today = self._today()
+        if self._data.get('day') != today:
+            self._data = {'day': today, 'tokens': 0, 'calls': 0, 'denied': 0, 'warned': False}
+            self._save()
+
+    def _save(self) -> None:
+        try:
+            _atomic_write_json(self.path, {'schema_version': 1, **self._data}, indent=2)
+        except OSError as e:
+            logger.warning(f'LLM budget не сохранён: {e}')
+
+    def can_charge(self, estimated_tokens: int) -> bool:
+        self._roll_day()
+        if not feature_enabled('llm_budget') or LLM_DAILY_TOKEN_BUDGET <= 0:
+            return True
+        return self._data['tokens'] + max(0, int(estimated_tokens)) <= LLM_DAILY_TOKEN_BUDGET
+
+    def charge(self, estimated_tokens: int) -> int:
+        self._roll_day()
+        amount = max(0, int(estimated_tokens))
+        if feature_enabled('llm_budget') and LLM_DAILY_TOKEN_BUDGET > 0:
+            self._data['tokens'] += amount
+            self._data['calls'] += 1
+            self._save()
+        return amount
+
+    def deny(self) -> None:
+        self._roll_day()
+        self._data['denied'] += 1
+        self._save()
+
+    def reconcile(self, reserved: int, actual_tokens: Optional[int]) -> None:
+        """Заменяет консервативную оценку фактическим usage, если он известен."""
+        if not feature_enabled('llm_budget') or LLM_DAILY_TOKEN_BUDGET <= 0:
+            return
+        if actual_tokens is None:
+            return
+        self._roll_day()
+        actual = max(0, int(actual_tokens))
+        self._data['tokens'] = max(0, self._data['tokens'] - max(0, int(reserved)) + actual)
+        self._save()
+
+    def should_warn(self) -> bool:
+        self._roll_day()
+        if LLM_DAILY_TOKEN_BUDGET <= 0 or self._data.get('warned'):
+            return False
+        if self._data['tokens'] < int(LLM_DAILY_TOKEN_BUDGET * LLM_BUDGET_WARN_RATIO):
+            return False
+        self._data['warned'] = True
+        self._save()
+        return True
+
+    def snapshot(self) -> dict:
+        self._roll_day()
+        return dict(self._data, limit=LLM_DAILY_TOKEN_BUDGET,
+                    remaining=(max(0, LLM_DAILY_TOKEN_BUDGET - self._data['tokens'])
+                               if LLM_DAILY_TOKEN_BUDGET > 0 else None))
+
+
+error_fingerprints: Optional['ErrorFingerprintStore'] = None
+llm_budget: Optional['LLMBudgetStore'] = None
 
 
 IMAGE_HASHES_FILE = DATA_DIR / 'image_hashes.json'
@@ -7782,7 +9431,7 @@ class PendingPosts:
 
     def _save(self) -> bool:
         try:
-            _atomic_write_json(self.path, {'counter': self._counter, 'items': self._items})
+            _atomic_write_json(self.path, {'schema_version': 1, 'counter': self._counter, 'items': self._items})
             return True
         except OSError as e:
             logger.error(f"pending_posts не сохранён: {e}")
@@ -7993,23 +9642,38 @@ async def _resolve_video(url: Optional[str]):
     return None
 
 
-async def _resolve_photos_for_album(photos: list[str]) -> list:
-    """Готовит список картинок к отправке альбомом. Каждую, что Telegram не сможет
-    забрать по URL (cdn-telegram.org и пр.), заменяем скачанными байтами.
-    Возвращает список пригодных к отправке значений (URL-строки или bytes)."""
+async def _resolve_photos_for_album(photos: list, primary_crop_plan: Optional[dict] = None) -> list:
+    """Prepare Telegram photo values and optionally render the primary crop.
+
+    Crop bytes are generated here, immediately before delivery, so queues and
+    pending-post JSON remain serializable and small.
+    """
     resolved: list = []
-    for ph in photos[:MAX_PHOTOS_PER_POST]:
-        if _download_needed_host(ph):
-            data = await asyncio.to_thread(_cached_image_bytes, ph)
-            resolved.append(data if data else ph)
-        else:
-            resolved.append(ph)
+    for idx, ph in enumerate(photos[:MAX_PHOTOS_PER_POST]):
+        if isinstance(ph, (bytes, bytearray)):
+            resolved.append(bytes(ph))
+            continue
+        value = ph
+        if idx == 0 and primary_crop_plan and feature_enabled('media_smart_crop'):
+            data = await asyncio.to_thread(_cached_image_bytes, str(ph))
+            cropped = await asyncio.to_thread(_smart_crop_image_bytes, data, primary_crop_plan) if data else None
+            if cropped:
+                value = cropped
+                metrics.inc('anime_bot_media_crop_applied_total')
+                _event_log('media_crop_applied', source_width=primary_crop_plan.get('source_width'),
+                           source_height=primary_crop_plan.get('source_height'),
+                           target_aspect=primary_crop_plan.get('target_aspect'))
+        if isinstance(value, str) and _download_needed_host(value):
+            data = await asyncio.to_thread(_cached_image_bytes, value)
+            value = data if data else value
+        resolved.append(value)
     return resolved
 
 
-def _download_needed_host(url: str) -> bool:
-    """Хосты, с которых Bot API обычно не может скачать картинку по URL —
-    их качаем сами заранее."""
+def _download_needed_host(url) -> bool:
+    """Hosts Telegram often cannot fetch directly; bytes never need parsing."""
+    if not isinstance(url, str):
+        return False
     try:
         host = urlparse(url).netloc.lower()
     except Exception:
@@ -8064,6 +9728,11 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     if settings.require_image and media_count == 0:
         logger.info(f"⊘ Пропускаю пост без медиа (require_image): {news['title'][:60]}")
         return False
+
+    if photos:
+        crop_plan = news.get('_media_crop_plan')
+        photos = (await _resolve_photos_for_album(photos, crop_plan) if crop_plan
+                  else await _resolve_photos_for_album(photos))
 
     # Caption для медиа. Telegram-лимит подписи — 1024 символа.
     caption = _escape_to_limit(text, TG_CAPTION_LIMIT)
@@ -8214,6 +9883,9 @@ async def _send_single_photo_caption(bot, target, photo, caption_kw, reply_marku
         return True
     except TelegramError as e:
         _raise_if_ambiguous_tg_error(e)
+        if not isinstance(photo, str):
+            logger.debug(f"Фото байтами не ушло ({e})")
+            return False
         logger.debug(f"Фото по URL не ушло ({e}), пробую байтами: {photo[:80]}")
         data = await asyncio.to_thread(_download_image_bytes, photo)
         if data:
@@ -8402,12 +10074,15 @@ async def notify_admin(bot: Bot, text: str) -> int:
 
 
 # ============== СБОР ==============
-def _note_source_failure(name: str, reason: str) -> None:
-    """Отмечает неудачу источника и, если их накопилось подряд слишком много,
-    ставит его на паузу. Уведомление отправит check_news — здесь нет бота."""
+def _note_source_failure(name: str, reason: str, *, hard: bool = False) -> None:
+    """Отмечает неудачу источника.
+
+    hard=True — transport/parser failure: участвует во временном Stage-4 circuit
+    breaker. Пустой, но корректный feed остаётся только сигналом long-term silence.
+    """
     if source_health is None:
         return
-    fails = source_health.record_fail(name, reason)
+    fails = source_health.record_fail(name, reason, hard=hard)
     silent = source_health.silent_hours(name) or 0
     logger.info(f"{name}: молчит {silent:.1f} ч, проверок подряд без новостей: "
                 f"{fails} ({reason[:70]})")
@@ -8576,6 +10251,180 @@ def _story_id(news: dict, *, extra_sources: Optional[list[str]] = None) -> str:
     return hashlib.sha256(basis.encode('utf-8', errors='ignore')).hexdigest()[:16]
 
 
+def _verification_entity_query(news: dict) -> str:
+    """Best-effort franchise/title candidate for AniList entity validation.
+
+    This is deliberately weaker than event verification: AniList can confirm that
+    a title exists, but not that a trailer/date/season announcement really happened.
+    """
+    subject = str(news.get('_llm_subject') or '').strip()
+    if subject:
+        return subject[:100]
+    title = re.sub(r'\s+', ' ', str(news.get('title') or '')).strip()
+    # Cut common announcement/event tails while preserving e.g. "Season 2".
+    parts = re.split(
+        r'\s+(?:gets?|reveals?|announces?|unveils?|streams?|premieres?|releases?|shows?|получит|'
+        r'получил[аи]?|представил[аи]?|показал[аи]?|анонсировал[аи]?|вышел|вышла)\b',
+        title, maxsplit=1, flags=re.I)
+    candidate = (parts[0] if parts else title).strip(' —:|-')
+    # Headline separators often put the franchise first.
+    candidate = re.split(r'\s+[—–|:]\s+', candidate, maxsplit=1)[0].strip()
+    return candidate[:100] if len(candidate) >= 2 else title[:100]
+
+
+def _official_host(url: str) -> bool:
+    try:
+        host = (urlparse(str(url or '')).hostname or '').lower()
+    except Exception:
+        return False
+    return any(hint in host for hint in _OFFICIAL_HOST_HINTS)
+
+
+def _page_story_title(html_bytes: bytes) -> str:
+    try:
+        soup = BeautifulSoup(html_bytes, 'html.parser')
+        og = soup.find('meta', attrs={'property': 'og:title'})
+        if og and og.get('content'):
+            return re.sub(r'\s+', ' ', str(og.get('content'))).strip()[:300]
+        if soup.title and soup.title.string:
+            return re.sub(r'\s+', ' ', str(soup.title.string)).strip()[:300]
+    except Exception:
+        pass
+    return ''
+
+
+def _official_reference_candidates(html_bytes: bytes, base_url: str) -> list[tuple[str, str]]:
+    """Return bounded (url, anchor) links to known official hosts."""
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    try:
+        soup = BeautifulSoup(html_bytes, 'html.parser')
+        for tag in soup.find_all('a', href=True):
+            href = urljoin(base_url, str(tag.get('href') or '').strip())
+            if href in seen or not _official_host(href) or not _is_public_http_url(href):
+                continue
+            seen.add(href)
+            anchor = re.sub(r'\s+', ' ', tag.get_text(' ', strip=True))[:240]
+            out.append((href, anchor))
+            if len(out) >= VERIFICATION_MAX_OFFICIAL_LINKS * 4:
+                break
+    except Exception:
+        return []
+    return out
+
+
+def _verify_story_evidence_blocking(news: dict) -> list[dict]:
+    """Collect bounded verification evidence without mutating the story.
+
+    Evidence levels are explicit: ``entity`` only validates the franchise/title;
+    ``official_reference`` corroborates the actual headline against an official page.
+    """
+    evidence: list[dict] = []
+    query = _verification_entity_query(news)
+    if anilist is not None and query:
+        try:
+            found = anilist.lookup(query)
+        except Exception as exc:
+            found = None
+            _event_log('verification_probe', story_id=news.get('_story_id'), kind='anilist', status='error', error=type(exc).__name__)
+        if found:
+            titles = [str(found.get(k) or '') for k in ('romaji', 'english', 'native') if found.get(k)]
+            evidence.append({'type': 'entity', 'provider': 'AniList', 'query': query, 'titles': titles[:3]})
+
+    source_url = str(news.get('link') or '')
+    if not source_url or not _is_public_http_url(source_url):
+        return evidence
+    response = http_get_public_with_retry(source_url, headers={'User-Agent': USER_AGENT},
+                                          timeout=VERIFICATION_TIMEOUT_SEC, stream=True)
+    if response is None:
+        return evidence
+    try:
+        if response.status_code != 200:
+            return evidence
+        source_html = _read_limited_response(response, VERIFICATION_PAGE_MAX_BYTES)
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+    if not source_html:
+        return evidence
+
+    base_story = {'title': str(news.get('title') or '')}
+    checked = 0
+    for href, anchor in _official_reference_candidates(source_html, source_url):
+        # A strongly matching anchor on an official URL is useful, but fetch the
+        # target too so a generic social/footer link cannot confirm an event.
+        if anchor and _story_similarity(base_story, {'title': anchor}) < 0.55:
+            continue
+        target = http_get_public_with_retry(href, headers={'User-Agent': USER_AGENT},
+                                            timeout=VERIFICATION_TIMEOUT_SEC, stream=True)
+        if target is None:
+            continue
+        try:
+            if target.status_code != 200:
+                continue
+            body = _read_limited_response(target, VERIFICATION_PAGE_MAX_BYTES)
+        finally:
+            try:
+                target.close()
+            except Exception:
+                pass
+        checked += 1
+        if body:
+            page_title = _page_story_title(body)
+            sim = _story_similarity(base_story, {'title': page_title}) if page_title else 0.0
+            if sim >= 0.62:
+                evidence.append({'type': 'official_reference', 'url': href,
+                                 'host': (urlparse(href).hostname or '')[:120],
+                                 'title': page_title[:240], 'similarity': round(sim, 3)})
+                break
+        if checked >= VERIFICATION_MAX_OFFICIAL_LINKS:
+            break
+    return evidence
+
+
+async def _apply_active_verification(items: list[dict]) -> list[dict]:
+    if not items or not feature_enabled('active_verification') or VERIFICATION_MAX_PER_CYCLE <= 0:
+        return items
+    candidates: list[dict] = []
+    for news in items:
+        # Multi-source clusters and direct official stories are already strong
+        # evidence and do not spend extra outbound requests.
+        if _safe_nonnegative_int(news.get('_story_cluster_size'), 1) >= 2 or _is_official_news(news):
+            continue
+        confidence = float(news.get('_confidence_score', _confidence_score(news)) or 0.0)
+        # One-token/generic headlines are poor verification queries and can turn
+        # synthetic/short source items into needless AniList/network traffic.
+        if len(_story_tokens(news)) < 2:
+            continue
+        if confidence < VERIFICATION_CONFIDENCE_BELOW:
+            candidates.append(news)
+    candidates.sort(key=lambda n: float(n.get('_confidence_score', 0.0)))
+    chosen = candidates[:VERIFICATION_MAX_PER_CYCLE]
+    if not chosen:
+        return items
+
+    sem = asyncio.Semaphore(2)
+    async def _one(news: dict):
+        async with sem:
+            return news, await asyncio.to_thread(_verify_story_evidence_blocking, dict(news))
+    for result in await asyncio.gather(*(_one(n) for n in chosen), return_exceptions=True):
+        if isinstance(result, BaseException):
+            metrics.inc('anime_bot_verification_total', labels={'status': 'error'})
+            continue
+        news, evidence = result
+        news['_verification_checked'] = True
+        news['_verification_evidence'] = evidence
+        news['_confidence_score'] = round(_confidence_score(news), 3)
+        strong = any(e.get('type') == 'official_reference' for e in evidence)
+        status = 'official' if strong else ('entity' if evidence else 'unconfirmed')
+        metrics.inc('anime_bot_verification_total', labels={'status': status})
+        _event_log('story_verified', story_id=news.get('_story_id'), status=status,
+                   evidence=[e.get('type') for e in evidence], confidence=news['_confidence_score'])
+    return items
+
+
 def _confidence_score(news: dict) -> float:
     if not feature_enabled('confidence_scoring'):
         return 0.5
@@ -8591,6 +10440,11 @@ def _confidence_score(news: dict) -> float:
         score += 0.03
     if news.get('images') or news.get('video'):
         score += 0.03
+    evidence = news.get('_verification_evidence') or []
+    if any(isinstance(e, dict) and e.get('type') == 'official_reference' for e in evidence):
+        score += 0.14
+    elif any(isinstance(e, dict) and e.get('type') == 'entity' for e in evidence):
+        score += 0.04
     return max(0.10, min(0.99, score))
 
 
@@ -8676,6 +10530,108 @@ def _cluster_news(items: list[dict]) -> list[dict]:
     return result
 
 
+def _franchise_key(news: Optional[dict]) -> str:
+    """Стабильный ключ франшизы для diversity/cooldown без внешних запросов."""
+    if not news:
+        return ''
+    subject = str(news.get('_llm_subject') or '').strip()
+    if subject:
+        key = EntityMemory._key(subject)
+        if key:
+            return key[:120]
+    anchors = sorted(_story_update_anchor(news))
+    if not anchors:
+        anchors = sorted(_story_tokens(news))
+    return '|'.join(anchors[:4])[:120]
+
+
+def _recent_franchise_penalty(news: dict, now: Optional[datetime] = None) -> float:
+    if (not feature_enabled('diversity_scheduler') or FRANCHISE_COOLDOWN_MIN <= 0
+            or story_history is None or news.get('_breaking_news')):
+        return 0.0
+    key = _franchise_key(news)
+    if not key:
+        return 0.0
+    now = now or datetime.now(timezone.utc)
+    window = FRANCHISE_COOLDOWN_MIN * 60.0
+    for row in reversed(story_history._items[-250:]):
+        old_key = EntityMemory._key(row.get('subject') or '')
+        if not old_key:
+            old_key = _franchise_key({'title': row.get('title', '')})
+        if old_key != key:
+            continue
+        try:
+            at = datetime.fromisoformat(str(row.get('at') or ''))
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            age = max(0.0, (now - at).total_seconds())
+        except (ValueError, TypeError):
+            continue
+        if age >= window:
+            return 0.0
+        # Сильнее сразу после публикации, плавно отпускает к концу cooldown.
+        # Stage 9 может мягко усилить diversity, если недавняя лента заметно
+        # перекошена в одну франшизу. Breaking news по-прежнему обходит cooldown.
+        multiplier = _adaptive_diversity_multiplier(now)
+        return -FRANCHISE_COOLDOWN_PENALTY * multiplier * (1.0 - age / window)
+    return 0.0
+
+
+_BREAKING_TERMS = (
+    'release date', 'premiere date', 'official trailer', 'new season', 'season 2',
+    'season 3', 'final season', 'sequel', 'anime adaptation', 'production announced',
+    'дата выхода', 'дата премьеры', 'официальный трейлер', 'новый сезон',
+    'второй сезон', 'третий сезон', 'финальный сезон', 'продолжение', 'экранизац',
+    'анонсирован фильм', 'анонсирован сериал',
+)
+
+
+def _breaking_score(news: dict) -> float:
+    text = f"{news.get('title','')} {news.get('summary','')}".casefold()
+    hits = sum(1 for term in _BREAKING_TERMS if term in text)
+    if editorial_rules is not None and feature_enabled('editorial_rules'):
+        hits += min(2, len(editorial_rules.matches('breaking', news)))
+    if not hits:
+        return 0.0
+    confidence = float(news.get('_confidence_score', _confidence_score(news)) or 0.0)
+    corroboration = max(1, _safe_nonnegative_int(news.get('_story_cluster_size'), 1))
+    score = min(3.0, float(hits))
+    score += max(0.0, confidence - 0.5) * 3.0
+    if _is_official_news(news):
+        score += 1.5
+    elif corroboration >= 2:
+        score += 1.0
+    return score
+
+
+def _annotate_editorial_automation(items: list[dict]) -> list[dict]:
+    """Stage 5 quality annotations. Не удаляет кандидатов — только размечает."""
+    for news in items:
+        if editorial_rules is not None and feature_enabled('editorial_rules'):
+            ev = editorial_rules.evaluate(news)
+            news['_editorial_rule_adjustment'] = round(float(ev['adjustment']), 2)
+            if ev['blocked']:
+                news['_editorial_blocked'] = True
+                news['_editorial_block_matches'] = ev['block'][:5]
+        if feature_enabled('editorial_learning') and moderation_feedback is not None:
+            news['_learned_editorial_adjustment'] = round(moderation_feedback.learning_adjustment(news), 2)
+        if feature_enabled('breaking_news'):
+            bscore = _breaking_score(news)
+            confidence = float(news.get('_confidence_score', _confidence_score(news)) or 0.0)
+            if bscore >= 2.5 and confidence >= BREAKING_MIN_CONFIDENCE:
+                news['_breaking_news'] = True
+                news['_breaking_score'] = round(bscore, 2)
+        if feature_enabled('confidence_moderation') and CONFIDENCE_AUTO_MIN > 0:
+            confidence = float(news.get('_confidence_score', _confidence_score(news)) or 0.0)
+            if confidence < CONFIDENCE_AUTO_MIN and not news.get('_breaking_news'):
+                news['_needs_review'] = True
+    return items
+
+
+def _editorial_allowed(news: dict) -> bool:
+    return not bool(news.get('_editorial_blocked'))
+
+
 def _news_priority_score(news: dict) -> float:
     """Приоритет: свежесть + значимость + медиа + здоровье + quality signals."""
     score = 0.0
@@ -8711,27 +10667,44 @@ def _news_priority_score(news: dict) -> float:
         if confidence is None:
             confidence = _confidence_score(news)
         score += (float(confidence) - 0.5) * 5.0
+    score += float(news.get('_editorial_rule_adjustment', 0.0) or 0.0)
+    score += float(news.get('_learned_editorial_adjustment', 0.0) or 0.0)
+    score += _recent_franchise_penalty(news)
+    if news.get('_breaking_news'):
+        score += BREAKING_PRIORITY_BOOST
+    if news.get('_needs_review'):
+        score -= 4.0
     return score
 
 
 def _prioritize_news(items: list[dict]) -> list[dict]:
     """Сортирует по score и слегка разводит одинаковые франшизы в одном батче."""
-    ranked = sorted(items, key=_news_priority_score, reverse=True)
+    # Всё, что не зависит от хода отбора, считаем ровно один раз.
+    # Раньше score, ключ франшизы и адаптивный множитель пересчитывались на
+    # каждой итерации вложенного цикла: на батче из 60 новостей это больше
+    # секунды, и всё это время event loop стоит. Множитель зависит только от
+    # истории публикаций и внутри одного вызова не меняется, поэтому вынос
+    # за цикл поведение не меняет. Заодно весь батч оценивается одним срезом
+    # времени: свежесть в score считается от datetime.now(), и при пересчёте
+    # внутри цикла оценка одной и той же новости уплывала по ходу перебора.
+    adaptive_mult = _adaptive_diversity_multiplier()
+    rows = [(_news_priority_score(item), _franchise_key(item), item) for item in items]
+    rows.sort(key=lambda row: row[0], reverse=True)
+
     out: list[dict] = []
     seen_subjects: dict[str, int] = {}
-    while ranked:
+    while rows:
         best_i, best_value = 0, float('-inf')
-        for i, item in enumerate(ranked[:25]):
-            toks = [w for w in re.findall(r'[\w]+', (item.get('title') or '').lower()) if len(w) >= 4]
-            subject = ''.join(toks[:3])
-            value = _news_priority_score(item) - 5.0 * seen_subjects.get(subject, 0)
+        for i, (score, subject, item) in enumerate(rows[:25]):
+            diversity_penalty = (0.0 if item.get('_breaking_news') else
+                                 5.0 * adaptive_mult * seen_subjects.get(subject, 0))
+            value = score - diversity_penalty
             if value > best_value:
                 best_i, best_value = i, value
-        item = ranked.pop(best_i)
-        toks = [w for w in re.findall(r'[\w]+', (item.get('title') or '').lower()) if len(w) >= 4]
-        subject = ''.join(toks[:3])
-        seen_subjects[subject] = seen_subjects.get(subject, 0) + 1
-        item['_priority_score'] = round(_news_priority_score(item), 2)
+        score, subject, item = rows.pop(best_i)
+        if subject:
+            seen_subjects[subject] = seen_subjects.get(subject, 0) + 1
+        item['_priority_score'] = round(score, 2)
         out.append(item)
     return out
 
@@ -8747,10 +10720,20 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
 
     # Сбор идёт параллельно (сеть — самая долгая часть цикла), но результаты
     # обрабатываются в исходном порядке источников: дедуп остаётся предсказуемым.
-    enabled = [(n, c) for n, c in SOURCES if settings.is_source_enabled(n)]
-    for name, _c in SOURCES:
+    enabled = []
+    for name, collector in SOURCES:
         if not settings.is_source_enabled(name):
             stats_lines.append(f"{name}: ⏸")
+            continue
+        if source_health is not None and not source_health.allow_request(name):
+            left = source_health.breaker_remaining(name)
+            stats_lines.append(f"{name}: 🧯{max(1, int((left + 59) // 60))}м")
+            metrics.inc('anime_bot_source_fetch_skipped_total', labels={'source': name, 'reason': 'circuit_open'})
+            metrics.set('anime_bot_circuit_breaker_open', 1, {'source': name})
+            _event_log('source_fetch_skipped', source=name, reason='circuit_open', remaining_sec=round(left, 1))
+            continue
+        metrics.set('anime_bot_circuit_breaker_open', 0, {'source': name})
+        enabled.append((name, collector))
 
     sem = asyncio.Semaphore(SOURCE_FETCH_CONCURRENCY)
 
@@ -8777,6 +10760,8 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
             metrics.inc('anime_bot_source_items_total', len(items), {'source': name})
             _event_log('source_fetch', source=name, status='ok', items=len(items),
                        duration_ms=round(fetch_seconds * 1000, 1))
+            if error_fingerprints is not None:
+                error_fingerprints.resolve_scope(f'source:{name}')
             unique_items = []
             no_image_skipped = 0
             duplicate_skipped = 0
@@ -8826,15 +10811,25 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
             if duplicate_skipped:
                 await stats.record_skipped('duplicate', name, duplicate_skipped)
         except Exception as e:
-            errors.append(f"{name}: {e}")
+            message = f'{type(e).__name__}: {e}'
+            fingerprint = (error_fingerprints.record(f'source:{name}', message)
+                           if error_fingerprints is not None else {'notify': True, 'count': 1})
+            if fingerprint.get('notify', True):
+                suffix = (f" (повтор {fingerprint.get('count')})"
+                          if int(fingerprint.get('count', 1)) > 1 else '')
+                errors.append(f"{name}: {e}{suffix}")
             logger.error(f"{name} failed: {e}")
             metrics.inc('anime_bot_source_fetch_total', labels={'source': name, 'status': 'error'})
             _event_log('source_fetch', source=name, status='error',
-                       error_type=type(e).__name__, error=str(e)[:300])
+                       error_type=type(e).__name__, error=str(e)[:300],
+                       admin_notify=bool(fingerprint.get('notify', True)),
+                       repeat_count=int(fingerprint.get('count', 1)))
             await stats.record_source_error(name)
-            _note_source_failure(name, f'{type(e).__name__}: {e}')
+            _note_source_failure(name, message, hard=True)
     all_news = _cluster_news(all_news)
+    all_news = await _apply_active_verification(all_news)
     all_news = _annotate_story_updates(all_news)
+    all_news = _annotate_editorial_automation(all_news)
     all_news = _prioritize_news(all_news)
     return all_news, stats_lines, errors
 
@@ -8870,6 +10865,20 @@ def is_admin(update: Update) -> bool:
     if not user:
         return False
     return user.id in _all_admin_ids()
+
+
+def is_owner(user_or_id) -> bool:
+    try:
+        uid = int(getattr(user_or_id, 'id', user_or_id) or 0)
+    except (TypeError, ValueError):
+        return False
+    return uid == ADMIN_ID
+
+def _audit_update(update: Update, action: str, **details) -> None:
+    if admin_audit is None or not feature_enabled('admin_audit'):
+        return
+    actor = getattr(update, 'effective_user', None)
+    admin_audit.record(action, actor, **details)
 
 
 async def deny_access(update: Update) -> None:
@@ -9331,6 +11340,9 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ветке. Всё остальное (настройки, /scheduled-кнопки) — только админам."""
     query = update.callback_query
     data = query.data or ""
+    user = getattr(update, 'effective_user', None)
+    if is_admin(update):
+        _audit_update(update, 'callback', callback=data[:160])
 
     # === Кнопки модерации под постами в ветке ===
     # 📢 В канал / 📅 В отложку / ✏️ Изменить / ✖ Скрыть
@@ -9369,6 +11381,8 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             if hidden and moderation_feedback is not None:
                 moderation_feedback.record('hidden', hidden, update.effective_user)
+            if hidden and experiments is not None:
+                experiments.record(str(hidden.get('_format_variant') or 'standard'), 'hidden')
             if hidden and not actor_is_admin:
                 title = re.sub(r'\s+', ' ', hidden.get('title', ''))[:80]
                 await notify_admin(context.bot,
@@ -9443,6 +11457,8 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pending_posts.pop(key)
             if moderation_feedback is not None:
                 moderation_feedback.record('published', news, update.effective_user)
+            if experiments is not None:
+                experiments.record(str(news.get('_format_variant') or 'standard'), 'published')
             _mark_published()
             if story_history is not None:
                 story_history.record(news, format_news_short(news))
@@ -9989,15 +12005,27 @@ async def reply_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ============== КОМАНДЫ ==============
 def admin_only(handler):
-    """Декоратор: пускаем в команду только админа."""
+    """Декоратор: пускаем в команду только owner/admin, сохраняя старую модель доступа."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(update):
             await deny_access(update)
             return
+        _audit_update(update, f'command:{handler.__name__}')
         return await handler(update, context)
     wrapper.__name__ = handler.__name__
     return wrapper
 
+
+def owner_only(handler):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = getattr(update, 'effective_user', None)
+        if not is_owner(user):
+            await deny_access(update)
+            return
+        _audit_update(update, f'command:{handler.__name__}', role='owner')
+        return await handler(update, context)
+    wrapper.__name__ = handler.__name__
+    return wrapper
 
 def _await_ctx(mode: str, key: str, message) -> dict:
     """Запоминает, где именно бот ждёт ответ: чат + ветка форума.
@@ -10631,6 +12659,43 @@ async def preview_command(update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(0.5)
 
 
+def _backpressure_candidates(news_list: list[dict], queue_size: int, *, thread_mode: bool) -> tuple[list[dict], int, str]:
+    """Ограничивает admission при перегрузе, не помечая отложенные кандидаты sent.
+
+    collect_all_news уже сортирует по priority, поэтому берём начало списка.
+    Непринятые кандидаты смогут вернуться на следующем цикле, когда очередь
+    разгрузится; таким образом backpressure экономит churn, а не теряет новости.
+    """
+    items = list(news_list or [])
+    if not feature_enabled('backpressure') or not items:
+        metrics.set('anime_bot_backpressure_level', 0)
+        return items, 0, 'off'
+    if thread_mode:
+        limit = BACKPRESSURE_THREAD_MAX_PER_CYCLE
+        level = 'thread_cap' if len(items) > limit else 'normal'
+    elif queue_size >= BACKPRESSURE_HARD_QUEUE:
+        limit = BACKPRESSURE_HARD_NEW
+        level = 'hard'
+    elif queue_size >= BACKPRESSURE_SOFT_QUEUE:
+        limit = BACKPRESSURE_SOFT_NEW
+        level = 'soft'
+    else:
+        metrics.set('anime_bot_backpressure_level', 0)
+        return items, 0, 'normal'
+    if len(items) <= limit:
+        metrics.set('anime_bot_backpressure_level', {'soft': 1, 'hard': 2,
+                                                      'thread_cap': 1}.get(level, 0))
+        return items, 0, level
+    kept = items[:limit]
+    deferred = len(items) - len(kept)
+    metrics.inc('anime_bot_backpressure_deferred_total', deferred, {'level': level})
+    metrics.set('anime_bot_backpressure_level', {'normal': 0, 'soft': 1, 'hard': 2,
+                                                  'thread_cap': 1}.get(level, 0))
+    _event_log('backpressure', level=level, queue_size=queue_size,
+               candidates=len(items), admitted=len(kept), deferred=deferred)
+    return kept, deferred, level
+
+
 # Гарантия что одновременно идёт максимум одна проверка новостей
 _check_news_lock = asyncio.Lock()
 
@@ -10703,6 +12768,11 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
         # 1) Собираем свежие новости с источников
         all_news, stats_lines, errors = await collect_all_news()
 
+        # Stage 9: periodic recommendation snapshot. It is deliberately evaluated
+        # after collection so failed sources/backlog are reflected in the advice.
+        adaptive_queue_size = 0 if settings.thread_mode else await post_queue.peek_size()
+        _evaluate_adaptive_publishing(context, adaptive_queue_size)
+
         _image_bytes_cache.clear()      # цикл закончился, картинки больше не нужны
 
         # Накопленные предупреждения (квота переводчика и т.п.)
@@ -10722,6 +12792,7 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
         fresh = [
             n for n in all_news
             if matches_keywords(n)
+            and _editorial_allowed(n)
             and n['link'] not in sent_links
             and (bool(n.get('_story_update_of')) or not sent_links.has_title(n.get('title', '')))
         ]
@@ -10749,6 +12820,32 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
             _event_log('check_cycle_finished', shadow=True, candidates=len(fresh), errors=len(errors))
             await _maybe_send_daily_summary(context.bot)
             return
+
+        # Stage 4: admission control. Кандидаты не теряются — отложенные
+        # backpressure-ом просто не помечаются отправленными и вернутся позже.
+        queue_before = 0 if settings.thread_mode else await post_queue.peek_size()
+        fresh, backpressure_deferred, backpressure_level = _backpressure_candidates(
+            fresh, queue_before, thread_mode=bool(settings.thread_mode))
+
+        # Stage 5: низкая уверенность в обычном channel-mode может быть автоматически
+        # отправлена на ручную модерацию, если discussion thread реально настроен.
+        # Без настроенной ветки кандидаты НЕ теряются и идут старым путём.
+        confidence_reviewed = 0
+        if (not settings.thread_mode and feature_enabled('confidence_moderation')
+                and DISCUSSION_CHAT_FROM_ENV and DISCUSSION_THREAD_FROM_ENV):
+            review = [n for n in fresh if n.get('_needs_review')][:CONFIDENCE_REVIEW_MAX_PER_CYCLE]
+            review_ids = {id(n) for n in review}
+            fresh = [n for n in fresh if id(n) not in review_ids]
+            for news in review:
+                result = await send_news_to_thread(context.bot, news)
+                if result == 'sent':
+                    confidence_reviewed += 1
+                    metrics.inc('anime_bot_confidence_review_total', labels={'result': 'sent'})
+                    _event_log('confidence_routed_to_review', story_id=news.get('_story_id'),
+                               confidence=news.get('_confidence_score'), source=news.get('source'))
+                else:
+                    # Если ветка временно недоступна, кандидат не расходуем: вернётся из источника позже.
+                    metrics.inc('anime_bot_confidence_review_total', labels={'result': result})
 
         # === РЕЖИМ ВЕТКИ: шлём ВСЁ найденное пачкой в тему обсуждения ===
         if settings.thread_mode:
@@ -10780,6 +12877,8 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
                     f"📊 Источники: {' | '.join(stats_lines)}\n"
                     f"🧵 Отправлено в ветку: {sent_count}\n"
                 )
+                if backpressure_deferred:
+                    message += f"⏳ Отложено backpressure-ом: {backpressure_deferred}\n"
                 if failed_count:
                     message += f"⚠️ Не удалось отправить: {failed_count}\n"
                 if uncertain_count:
@@ -10855,6 +12954,10 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
                 f"📤 Отправлено в канал: {1 if sent_ok else 0}\n"
                 f"📦 Осталось в очереди: {queue_size}"
             )
+            if backpressure_deferred:
+                message += f"\n⏳ Отложено backpressure-ом: {backpressure_deferred}"
+            if confidence_reviewed:
+                message += f"\n🧠 На ручную проверку по confidence: {confidence_reviewed}"
             if errors:
                 message += "\n⚠️ Ошибки:\n" + "\n".join(errors)
             await notify_admin(context.bot, message)
@@ -11039,8 +13142,13 @@ _llm_lock = asyncio.Lock()          # запросы строго по одно�
 _llm_last_call = 0.0
 _llm_fail_streak = 0                # подряд неудачных вызовов
 LLM_FAIL_PAUSE_AFTER = 5            # столько провалов подряд → пауза до рестарта
-_llm_disabled_runtime = False       # выключено на лету из-за ошибок/лимита
+_llm_disabled_runtime = False       # permanent auth disable или временный circuit
+_llm_disabled_reason = ''            # '', 'auth', 'circuit'
+_llm_circuit_until = 0.0             # monotonic timestamp
+_llm_circuit_level = 0
 _llm_json_mode = True               # просить строгий JSON (снимаем, если провайдер против)
+_llm_last_usage_tokens: Optional[int] = None
+_llm_budget_exhausted_alert_day = ''
 
 
 def _llm_configured() -> bool:
@@ -11049,9 +13157,25 @@ def _llm_configured() -> bool:
 
 
 def _llm_active() -> bool:
-    """Можно ли прямо сейчас обращаться к модели."""
-    if not _llm_configured() or _llm_disabled_runtime:
+    """Можно ли прямо сейчас обращаться к модели.
+
+    Auth failures остаются выключенными до рестарта/исправления ключа. Временный
+    circuit после сетевых/5xx/429 ошибок сам закрывается по истечении cooldown.
+    """
+    global _llm_disabled_runtime, _llm_disabled_reason, _llm_circuit_until, _llm_fail_streak
+    if not _llm_configured():
         return False
+    if _llm_disabled_runtime:
+        if (_llm_disabled_reason == 'circuit' and _llm_circuit_until > 0
+                and time.monotonic() >= _llm_circuit_until):
+            _llm_disabled_runtime = False
+            _llm_disabled_reason = ''
+            _llm_circuit_until = 0.0
+            _llm_fail_streak = 0
+            metrics.inc('anime_bot_llm_circuit_half_open_total')
+            _event_log('llm_circuit_half_open')
+        else:
+            return False
     return bool(settings is not None and settings.llm_enabled)
 
 
@@ -11082,12 +13206,25 @@ def _llm_count_call() -> None:
         pass
 
 
+def _estimate_llm_tokens(messages: list, max_tokens: int) -> int:
+    """Conservative token estimate used only for local budget admission."""
+    chars = 0
+    for message in messages or []:
+        if isinstance(message, dict):
+            chars += len(str(message.get('content') or ''))
+        else:
+            chars += len(str(message))
+    # 4 chars/token is intentionally rough; output reservation is fully counted.
+    return max(1, (chars + 3) // 4 + max(0, int(max_tokens)) + 32)
+
+
 def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[str]:
     """Синхронный запрос к модели. Возвращает текст ответа или None.
 
     Никаких исключений наружу: если модель недоступна, бот обязан продолжить
     работать по-старому — через DeepL/Google и обычное форматирование."""
-    global _llm_fail_streak, _llm_disabled_runtime, _llm_json_mode
+    global _llm_fail_streak, _llm_disabled_runtime, _llm_disabled_reason, _llm_json_mode, _llm_last_usage_tokens
+    _llm_last_usage_tokens = None
     payload = {
         'model': LLM_MODEL,
         'messages': messages,
@@ -11118,6 +13255,7 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
         return None
     if r.status_code in (401, 403):
         _llm_disabled_runtime = True
+        _llm_disabled_reason = 'auth'
         logger.error(f"LLM: ключ отклонён (HTTP {r.status_code}) — выключаю до рестарта")
         _queue_admin_alert('🤖 Языковая модель отключена: провайдер не принял ключ '
                            f'(HTTP {r.status_code}). Проверь LLM_API_KEY. '
@@ -11135,6 +13273,11 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
 
     try:
         data = r.json()
+        usage = data.get('usage') if isinstance(data, dict) else None
+        if isinstance(usage, dict):
+            total_tokens = usage.get('total_tokens')
+            if isinstance(total_tokens, (int, float)) and total_tokens >= 0:
+                _llm_last_usage_tokens = int(total_tokens)
         content = data['choices'][0]['message']['content']
     except (ValueError, KeyError, IndexError, TypeError) as e:
         _llm_fail_streak += 1
@@ -11148,7 +13291,8 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
 async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[str]:
     """Вызов модели с соблюдением лимитов: по одному запросу за раз,
     с паузой между ними и дневным потолком."""
-    global _llm_last_call, _llm_disabled_runtime
+    global _llm_last_call, _llm_disabled_runtime, _llm_disabled_reason, _llm_circuit_until, _llm_circuit_level
+    global _llm_last_usage_tokens, _llm_budget_exhausted_alert_day, _llm_fail_streak
     if not _llm_active():
         return None
     if _llm_quota_left() <= 0:
@@ -11158,10 +13302,27 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optiona
         return None
     if _llm_fail_streak >= LLM_FAIL_PAUSE_AFTER:
         if not _llm_disabled_runtime:
-            _llm_disabled_runtime = True
-            logger.error(f"LLM: {_llm_fail_streak} ошибок подряд — выключаю до рестарта")
-            _queue_admin_alert('🤖 Языковая модель отключена: слишком много ошибок подряд. '
-                               'Бот продолжает работать на DeepL/Google. Подробности — /llm')
+            if feature_enabled('circuit_breakers'):
+                cooldown = min(LLM_CIRCUIT_MAX_SEC,
+                               LLM_CIRCUIT_BASE_SEC * (2 ** min(_llm_circuit_level, 6)))
+                _llm_circuit_level = min(_llm_circuit_level + 1, 7)
+                _llm_circuit_until = time.monotonic() + cooldown
+                _llm_disabled_reason = 'circuit'
+                _llm_disabled_runtime = True
+                metrics.inc('anime_bot_llm_circuit_open_total')
+                _event_log('llm_circuit_open', cooldown_sec=cooldown,
+                           failures=_llm_fail_streak)
+                logger.error(f"LLM: {_llm_fail_streak} ошибок подряд — пауза {cooldown}с")
+                _queue_admin_alert(
+                    f'🤖 Языковая модель временно поставлена на паузу на '
+                    f'{max(1, (cooldown + 59) // 60)} мин после повторных ошибок. '
+                    'Fallback DeepL/Google продолжает работать.')
+            else:
+                _llm_disabled_runtime = True
+                _llm_disabled_reason = 'circuit'
+                logger.error(f"LLM: {_llm_fail_streak} ошибок подряд — выключаю до рестарта")
+                _queue_admin_alert('🤖 Языковая модель отключена: слишком много ошибок подряд. '
+                                   'Бот продолжает работать на DeepL/Google. Подробности — /llm')
         return None
 
     async with _llm_lock:
@@ -11169,12 +13330,44 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optiona
         # параллельных задач может одновременно увидеть "остался 1 вызов".
         if _llm_quota_left() <= 0:
             return None
+        estimated_tokens = _estimate_llm_tokens(messages, max_tokens)
+        reserved_tokens = 0
+        if (feature_enabled('llm_budget') and LLM_DAILY_TOKEN_BUDGET > 0
+                and llm_budget is not None):
+            if not llm_budget.can_charge(estimated_tokens):
+                llm_budget.deny()
+                metrics.inc('anime_bot_llm_budget_denied_total')
+                today = _local_now().strftime('%Y-%m-%d')
+                if _llm_budget_exhausted_alert_day != today:
+                    _llm_budget_exhausted_alert_day = today
+                    _queue_admin_alert(
+                        f'💰 Дневной LLM token budget ({LLM_DAILY_TOKEN_BUDGET}) исчерпан. '
+                        'До следующего дня бот продолжит работу через fallback без LLM.')
+                return None
+            reserved_tokens = llm_budget.charge(estimated_tokens)
+            metrics.set('anime_bot_llm_budget_tokens', llm_budget.snapshot()['tokens'])
+            if llm_budget.should_warn():
+                snap = llm_budget.snapshot()
+                _queue_admin_alert(
+                    f'💰 LLM budget использован на {int(100 * snap["tokens"] / max(1, LLM_DAILY_TOKEN_BUDGET))}%. '
+                    f'Осталось примерно {snap["remaining"]} tokens.')
         wait = LLM_MIN_INTERVAL - (time.time() - _llm_last_call)
         if wait > 0:
             await asyncio.sleep(wait)
         _llm_count_call()
+        _llm_last_usage_tokens = None
         result = await asyncio.to_thread(_llm_request, messages, max_tokens)
         _llm_last_call = time.time()
+        if result is not None:
+            _llm_circuit_level = 0
+            _llm_circuit_until = 0.0
+            if _llm_disabled_reason == 'circuit':
+                _llm_disabled_reason = ''
+                _llm_disabled_runtime = False
+        if reserved_tokens and llm_budget is not None:
+            llm_budget.reconcile(reserved_tokens, _llm_last_usage_tokens)
+            snap = llm_budget.snapshot()
+            metrics.set('anime_bot_llm_budget_tokens', snap['tokens'])
     return result
 
 
@@ -12645,7 +14838,7 @@ def _doctor_local_checks() -> list[dict]:
     add('Источники', bool(enabled), f'{len(enabled)} включено')
     add('Feature flags', True,
         ', '.join(f'{name}={"on" if enabled_flag else "off"}'
-                  for name, enabled_flag in sorted(FEATURE_FLAGS.items())))
+                  for name, enabled_flag in FEATURE_FLAGS.items()))
     return checks
 
 
@@ -12695,6 +14888,73 @@ async def features_command(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def reliability_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Stage-4 status: breakers, retry policy, backpressure and LLM budget."""
+    queue_size = await post_queue.peek_size() if post_queue is not None else 0
+    lines = ['🛡 <b>Reliability & Cost Control</b>', '']
+
+    lines.append('<b>Circuit breakers</b>')
+    open_rows = []
+    if source_health is not None:
+        for name, _collector in SOURCES:
+            left = source_health.breaker_remaining(name)
+            if left > 0:
+                info = source_health.info(name)
+                open_rows.append((name, left, info.get('last_error', '')))
+    if open_rows:
+        for name, left, err in sorted(open_rows, key=lambda row: -row[1])[:12]:
+            lines.append(f'  🧯 {html.escape(name)}: ещё {max(1, int((left + 59) // 60))} мин')
+            if err:
+                lines.append(f'      {html.escape(str(err)[:90])}')
+    else:
+        lines.append('  ✅ Все временные breakers закрыты')
+
+    lines.extend(['', '<b>Backpressure</b>'])
+    if feature_enabled('backpressure'):
+        level = ('hard' if queue_size >= BACKPRESSURE_HARD_QUEUE
+                 else 'soft' if queue_size >= BACKPRESSURE_SOFT_QUEUE else 'normal')
+        lines.append(f'  Очередь: {queue_size}/{QUEUE_MAX_SIZE} · уровень: <code>{level}</code>')
+        lines.append(f'  soft ≥ {BACKPRESSURE_SOFT_QUEUE}, hard ≥ {BACKPRESSURE_HARD_QUEUE}')
+    else:
+        lines.append('  ⚪️ выключен')
+
+    lines.extend(['', '<b>Adaptive retry</b>'])
+    lines.append('  ' + ('🟢 включён' if feature_enabled('adaptive_retry') else '⚪️ выключен'))
+    lines.append(f'  jitter ±{int(HTTP_RETRY_JITTER_RATIO * 100)}% · max delay {HTTP_RETRY_MAX_DELAY:g}с')
+
+    lines.extend(['', '<b>LLM</b>'])
+    if _llm_disabled_runtime and _llm_disabled_reason == 'circuit':
+        left = max(0, int(_llm_circuit_until - time.monotonic()))
+        lines.append(f'  🧯 временная пауза: ещё {max(1, (left + 59) // 60)} мин')
+    elif _llm_disabled_runtime:
+        lines.append(f'  ⛔ runtime disabled: <code>{html.escape(_llm_disabled_reason or "unknown")}</code>')
+    else:
+        lines.append('  ✅ circuit закрыт')
+    lines.append('<b>LLM budget</b>')
+    if llm_budget is None or not feature_enabled('llm_budget'):
+        lines.append('  ⚪️ выключен')
+    else:
+        snap = llm_budget.snapshot()
+        if LLM_DAILY_TOKEN_BUDGET <= 0:
+            lines.append('  🟢 контроль включён · token limit не задан (unlimited)')
+        else:
+            lines.append(f'  {snap["tokens"]}/{LLM_DAILY_TOKEN_BUDGET} tokens · '
+                         f'осталось {snap["remaining"]}')
+            lines.append(f'  denied: {snap["denied"]} · calls: {snap["calls"]}')
+
+    lines.extend(['', '<b>Повторяющиеся ошибки</b>'])
+    rows = error_fingerprints.snapshot() if error_fingerprints is not None else []
+    repeated = [row for row in rows if _safe_nonnegative_int(row.get('count')) > 1]
+    if repeated:
+        for row in repeated[:6]:
+            lines.append(f'  • {html.escape(str(row.get("scope") or "?"))}: ×{row.get("count", 0)}')
+    else:
+        lines.append('  ✅ активных повторов нет')
+
+    await update.message.reply_text('\n'.join(lines)[:4000], parse_mode=ParseMode.HTML)
+
+
+@admin_only
 async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Сводка о состоянии бота: джобы, источники, данные, память, диск."""
     lines = ['🩺 <b>Состояние бота</b>', '', '<b>Фоновые задачи</b>']
@@ -12702,6 +14962,16 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(_job_line(context, 'scheduled_publish', 'Публикация отложки'))
     lines.append(_job_line(context, 'daily_backup', 'Ежедневный бэкап'))
     lines.append(_job_line(context, 'health_probe', 'Readiness-проверка'))
+    if feature_enabled('lifecycle_diagnostics'):
+        life = lifecycle_snapshot()
+        lines.append(f'  🔄 Запусков процесса: {life.get("total_starts", 0)}')
+        interval = life.get('last_restart_interval_sec')
+        if interval is not None:
+            mark = '⚠️' if int(interval) < RESTART_STORM_WINDOW_SEC else '🕓'
+            lines.append(f'  {mark} Интервал между последними стартами: {int(interval)} сек')
+        last_kind = str(life.get('last_exit_kind') or '')
+        if last_kind:
+            lines.append(f'  🧩 Последняя остановка: {html.escape(last_kind)}')
 
     ambiguous_ledger = sent_links.uncertain_count() if sent_links is not None else 0
     ambiguous_scheduled = scheduled_posts.uncertain_count() if scheduled_posts is not None else 0
@@ -12839,6 +15109,316 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
 
 
+def _zip_member_issue(info: zipfile.ZipInfo) -> Optional[str]:
+    """Returns a safety issue for an archive member, otherwise None."""
+    name = str(info.filename or '').replace('\\', '/')
+    parts = [x for x in name.split('/') if x not in ('', '.')]
+    if not name or name.startswith('/') or '..' in parts or '\x00' in name:
+        return f'unsafe path: {name[:120]}'
+    # Unix symlink stored inside a ZIP can escape the intended restore tree even
+    # if its own member name is harmless. Backups created by this bot contain
+    # regular files only, so links have no legitimate use here.
+    mode = (int(info.external_attr) >> 16) & 0xFFFF
+    if mode and stat.S_ISLNK(mode):
+        return f'symlink not allowed: {name[:120]}'
+    return None
+
+
+def _verify_backup_archive(data: bytes) -> dict:
+    """Проверяет ZIP, пути, размер, дубликаты и валидность runtime JSON."""
+    result = {'ok': False, 'files': 0, 'json_files': 0, 'errors': []}
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        result['errors'].append('empty archive')
+        return result
+    if len(data) > BACKUP_VERIFY_MAX_BYTES:
+        result['errors'].append('archive too large')
+        return result
+    try:
+        with zipfile.ZipFile(io.BytesIO(data), 'r') as zf:
+            infos = zf.infolist()
+            if not infos:
+                result['errors'].append('archive has no files')
+                return result
+            if len(infos) > BACKUP_VERIFY_MAX_FILES:
+                result['errors'].append('too many files')
+                return result
+            uncompressed = 0
+            seen_names: set[str] = set()
+            for info in infos:
+                name = str(info.filename or '').replace('\\', '/')
+                issue = _zip_member_issue(info)
+                if issue:
+                    result['errors'].append(issue)
+                    continue
+                normalized_name = '/'.join(x for x in name.split('/') if x not in ('', '.'))
+                if normalized_name in seen_names:
+                    result['errors'].append(f'duplicate path: {normalized_name[:120]}')
+                    continue
+                seen_names.add(normalized_name)
+                if info.is_dir():
+                    continue
+                uncompressed += max(0, int(info.file_size))
+                if uncompressed > BACKUP_VERIFY_MAX_BYTES * 4:
+                    result['errors'].append('uncompressed archive too large')
+                    break
+                if name.lower().endswith('.json'):
+                    result['json_files'] += 1
+                    raw = zf.read(info)
+                    if len(raw) > BACKUP_VERIFY_MAX_BYTES:
+                        result['errors'].append(f'json too large: {name[:120]}')
+                        continue
+                    try:
+                        json.loads(raw.decode('utf-8'))
+                    except (UnicodeDecodeError, ValueError) as e:
+                        result['errors'].append(f'invalid json {name[:80]}: {type(e).__name__}')
+            result['files'] = sum(1 for x in infos if not x.is_dir())
+    except (zipfile.BadZipFile, OSError, RuntimeError) as e:
+        result['errors'].append(f'{type(e).__name__}: {e}')
+        return result
+    result['ok'] = not result['errors']
+    return result
+
+
+def _restore_backup_archive(data: bytes, target_dir: Path, *, overwrite: bool = False) -> dict:
+    """Safely restores a verified backup into ``target_dir``.
+
+    This helper is intentionally not wired to production DATA_DIR: callers must
+    provide an explicit target. Stage 11 uses it for disposable restore tests so
+    backup verification proves not only that ZIP parses, but that it can actually
+    be materialized as files without path traversal or symlink tricks.
+    """
+    check = _verify_backup_archive(data)
+    result = {'ok': False, 'restored': 0, 'errors': list(check.get('errors') or [])}
+    if not check.get('ok'):
+        return result
+    root = Path(target_dir)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        root_real = root.resolve()
+        with zipfile.ZipFile(io.BytesIO(data), 'r') as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                issue = _zip_member_issue(info)
+                if issue:
+                    result['errors'].append(issue)
+                    continue
+                name = str(info.filename or '').replace('\\', '/')
+                rel = Path(*[x for x in name.split('/') if x not in ('', '.')])
+                dest = (root / rel).resolve()
+                try:
+                    dest.relative_to(root_real)
+                except ValueError:
+                    result['errors'].append(f'path escaped restore root: {name[:120]}')
+                    continue
+                if dest.exists() and not overwrite:
+                    result['errors'].append(f'file exists: {name[:120]}')
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                raw = zf.read(info)
+                # Atomic file materialization avoids half-restored JSON after an
+                # interrupted self-test or future offline restore utility.
+                fd, tmp_name = tempfile.mkstemp(prefix=f'.{dest.name}.', suffix='.restore', dir=str(dest.parent))
+                try:
+                    with os.fdopen(fd, 'wb') as f:
+                        f.write(raw)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp_name, dest)
+                except Exception:
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
+                    raise
+                result['restored'] += 1
+    except (OSError, RuntimeError, zipfile.BadZipFile) as e:
+        result['errors'].append(f'{type(e).__name__}: {e}')
+    result['ok'] = not result['errors'] and result['restored'] == int(check.get('files') or 0)
+    return result
+
+
+def _backup_restore_selftest(data: bytes) -> dict:
+    """Restores a backup to a temp directory and loads the critical stores."""
+    result = {'ok': False, 'restored': 0, 'stores': [], 'errors': []}
+    try:
+        with tempfile.TemporaryDirectory(prefix='anime_bot_restore_test_') as tmp:
+            root = Path(tmp)
+            restored = _restore_backup_archive(data, root)
+            result['restored'] = int(restored.get('restored') or 0)
+            if not restored.get('ok'):
+                result['errors'].extend(restored.get('errors') or [])
+                return result
+            # Parsing all JSON again catches extraction/encoding problems. Then
+            # instantiate critical stores to exercise their real migration/load
+            # paths without ever touching production DATA_DIR.
+            for path in root.rglob('*.json'):
+                json.loads(path.read_text(encoding='utf-8'))
+            migration = _migrate_runtime_schemas(root)
+            if not migration.get('ok'):
+                result['errors'].extend(migration.get('errors') or [])
+                return result
+            loaders = [
+                ('sent_links', 'sent_links.json', SentLinksStore),
+                ('queue', 'post_queue.json', PostQueue),
+                ('settings', 'bot_settings.json', BotSettings),
+                ('scheduled', 'scheduled_posts.json', ScheduledPosts),
+                ('pending', 'pending_posts.json', PendingPosts),
+                ('analytics', 'analytics_events.json', AnalyticsStore),
+            ]
+            for label, filename, cls in loaders:
+                path = root / filename
+                if path.exists():
+                    cls(path)
+                    result['stores'].append(label)
+            result['ok'] = True
+    except Exception as e:
+        result['errors'].append(f'{type(e).__name__}: {e}')
+    return result
+
+
+async def _run_chaos_selftest(rounds: int = CHAOS_SELFTEST_ROUNDS, *, seed: int = 20260808) -> dict:
+    """Local deterministic fault/property smoke suite; never calls Telegram/network."""
+    global settings
+    rounds = max(5, min(500, int(rounds)))
+    rng = random.Random(seed)
+    result = {'ok': True, 'rounds': rounds, 'checks': {}, 'errors': []}
+    original_settings = settings
+
+    def note(name: str, ok: bool, detail: str = '') -> None:
+        result['checks'][name] = {'ok': bool(ok), 'detail': str(detail)[:500]}
+        if not ok:
+            result['ok'] = False
+            result['errors'].append(f'{name}: {detail}')
+
+    try:
+        with tempfile.TemporaryDirectory(prefix='anime_bot_chaos_') as tmp:
+            root = Path(tmp)
+            if settings is None:
+                settings = BotSettings(root / 'chaos_settings.json')
+
+            # Invariant 1: concurrent claims for one story have exactly one winner.
+            ledger = SentLinksStore(root / 'sent_links.json')
+            url = 'https://example.com/story?id=42&utm_source=chaos'
+            title = 'Chaos invariant story 42'
+            claims = await asyncio.gather(*[
+                ledger.claim(url, title, check_similar=True) for _ in range(rounds)
+            ])
+            winners = sum(bool(x) for x in claims)
+            note('ledger_single_winner', winners == 1, f'winners={winners}')
+
+            # Invariant 2: crash after durable sending never becomes auto-retry.
+            sending_ok = await ledger.mark_sending(url)
+            recovered = SentLinksStore(root / 'sent_links.json')
+            note('ledger_crash_uncertain', sending_ok and recovered.uncertain_count() == 1,
+                 f'sending={sending_ok}, uncertain={recovered.uncertain_count()}')
+
+            # Invariant 3: persisted queue inflight is recovered after restart.
+            queue = PostQueue(root / 'post_queue.json')
+            news_rows = [
+                {'title': f'Queue {i}', 'link': f'https://example.com/q/{i}',
+                 'images': ['https://img.example/x.jpg'], '_priority_score': float(i)}
+                for i in range(5)
+            ]
+            added = await queue.push_many(news_rows)
+            popped = await queue.pop_next()
+            recovered_queue = PostQueue(root / 'post_queue.json')
+            recovered_size = await recovered_queue.peek_size()
+            note('queue_restart_no_loss', added == 5 and bool(popped) and recovered_size == 5,
+                 f'added={added}, recovered={recovered_size}')
+
+            # Invariant 4: known legacy runtime files migrate losslessly/idempotently.
+            schema_root = root / 'schema'
+            schema_root.mkdir()
+            _atomic_write_json(schema_root / 'sent_links.json', ['https://a.test/1'])
+            _atomic_write_json(schema_root / 'post_queue.json', news_rows[:1])
+            _atomic_write_json(schema_root / 'bot_settings.json', {'check_interval_min': 30})
+            _atomic_write_json(schema_root / 'scheduled_posts.json', {'counter': 0, 'items': {}})
+            _atomic_write_json(schema_root / 'pending_posts.json', {'counter': 0, 'items': {}})
+            first = _migrate_runtime_schemas(schema_root)
+            second = _migrate_runtime_schemas(schema_root)
+            migrated_links = json.loads((schema_root / 'sent_links.json').read_text(encoding='utf-8'))
+            note('schema_migration_idempotent',
+                 first['ok'] and second['ok'] and not second['changed']
+                 and migrated_links.get('schema_version') == 1
+                 and migrated_links.get('urls') == ['https://a.test/1'],
+                 f'first={first["changed"]}, second={second["changed"]}')
+
+            # Invariant 5: backup can be extracted and actual stores can load it.
+            backup_buf = io.BytesIO()
+            with zipfile.ZipFile(backup_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for path in sorted(schema_root.glob('*.json')):
+                    zf.write(path, arcname=path.name)
+            restore = _backup_restore_selftest(backup_buf.getvalue())
+            note('backup_restore', bool(restore.get('ok')),
+                 f'restored={restore.get("restored")}, errors={restore.get("errors")}')
+
+            # Property/fuzz smoke: arbitrary hostile-ish strings must not crash
+            # URL/HTML helpers or grow output without bound.
+            alphabet = '<>&"\'\\/?:#=%[](){}\x00\n\r\t abcXYZ0123456789Аниме日本語😀'
+            fuzz_errors = []
+            for _ in range(rounds):
+                size = rng.randint(0, min(CHAOS_FUZZ_MAX_CHARS, 1500))
+                text = ''.join(rng.choice(alphabet) for _ in range(size))
+                try:
+                    normalized = normalize_url(text)
+                    cleaned = clean_html(text)
+                    article = _extract_article_text(text)
+                    _find_video_in_html(text)
+                    rss = (f'<?xml version="1.0"?><rss><channel><item><title>{text}</title>'
+                           f'<link>https://example.test/{rng.randint(1, 9999)}</link>'
+                           f'<description>{text}</description></item></channel></rss>').encode('utf-8', errors='ignore')
+                    _parse_rss_bytes(rss, 'ChaosRSS', fetch_og=False)
+                    if len(normalized) > HTTP_URL_MAX_CHARS + 32:
+                        fuzz_errors.append('normalize_url output too long')
+                        break
+                    if len(cleaned) > max(len(text) * 2 + 32, 128):
+                        fuzz_errors.append('clean_html expanded unexpectedly')
+                        break
+                    if len(article) > max(len(text) * 2 + 32, 128):
+                        fuzz_errors.append('article parser expanded unexpectedly')
+                        break
+                except Exception as e:
+                    fuzz_errors.append(f'{type(e).__name__}: {e}')
+                    break
+            note('parser_fuzz', not fuzz_errors, fuzz_errors[0] if fuzz_errors else f'{rounds} cases')
+    except Exception as e:
+        note('suite_runtime', False, f'{type(e).__name__}: {e}')
+    finally:
+        if original_settings is None:
+            settings = None
+
+    return result
+
+
+def _validate_reload_json(path: Path) -> None:
+    if not path.exists():
+        return
+    raw = path.read_text(encoding='utf-8')
+    json.loads(raw)
+
+
+def _reload_safe_runtime_config() -> list[str]:
+    """Reload безопасных JSON-настроек. Env/ID/токены и source topology не трогаются."""
+    global settings, editorial_rules, editorial_glossary, entity_memory
+    paths = [SETTINGS_FILE, EDITORIAL_RULES_FILE, EDITORIAL_GLOSSARY_FILE,
+             ENTITY_MEMORY_FILE]
+    # Сначала проверяем все файлы. Один битый JSON => старые объекты остаются целиком.
+    for path in paths:
+        _validate_reload_json(path)
+    candidates = {
+        'settings': BotSettings(SETTINGS_FILE),
+        'editorial_rules': EditorialRulesStore(EDITORIAL_RULES_FILE),
+        'editorial_glossary': EditorialGlossary(EDITORIAL_GLOSSARY_FILE),
+        'entity_memory': EntityMemory(ENTITY_MEMORY_FILE),
+    }
+    settings = candidates['settings']
+    editorial_rules = candidates['editorial_rules']
+    editorial_glossary = candidates['editorial_glossary']
+    entity_memory = candidates['entity_memory']
+    return ['bot_settings', 'editorial_rules', 'editorial_glossary', 'entity_memory']
+
+
 def _build_backup_archive() -> Optional[tuple[bytes, str]]:
     """Собирает все файлы данных в zip в памяти. (bytes, имя файла) или None."""
     files = _data_files()
@@ -12880,6 +15460,15 @@ async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
         logger.warning("Ежедневный бэкап: нечего архивировать")
         return
     data, filename = archive
+    if feature_enabled('backup_verify'):
+        check = await asyncio.to_thread(_verify_backup_archive, data)
+        if not check['ok']:
+            logger.error(f"Ежедневный бэкап не прошёл self-check: {check['errors']}")
+            return
+        restore_check = await asyncio.to_thread(_backup_restore_selftest, data)
+        if not restore_check['ok']:
+            logger.error(f"Ежедневный бэкап не прошёл restore-test: {restore_check['errors']}")
+            return
     caption = (f'📦 Ежедневный бэкап данных бота\n'
                f'{filename} — {_fmt_size(len(data))}\n'
                f'Сохрани: при сбросе диска хостинга отсюда восстанавливается всё.')
@@ -12908,6 +15497,15 @@ async def backup_command(update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Бэкап не создан: файлов данных пока нет.")
         return
     data, filename = archive
+    if feature_enabled('backup_verify'):
+        check = await asyncio.to_thread(_verify_backup_archive, data)
+        if not check['ok']:
+            await update.message.reply_text('❌ Архив собран, но self-check не пройден: ' + '; '.join(check['errors'][:3]))
+            return
+        restore_check = await asyncio.to_thread(_backup_restore_selftest, data)
+        if not restore_check['ok']:
+            await update.message.reply_text('❌ Архив читается, но restore-test не пройден: ' + '; '.join(restore_check['errors'][:3]))
+            return
     target = update.effective_chat.id if update.effective_chat else update.effective_user.id
     try:
         await context.bot.send_document(
@@ -13001,6 +15599,156 @@ async def stats_command(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def audit_command(update, context: ContextTypes.DEFAULT_TYPE):
+    if admin_audit is None or not feature_enabled('admin_audit'):
+        await update.message.reply_text('Audit log отключён или не инициализирован.')
+        return
+    try:
+        limit = int((context.args or ['25'])[0])
+    except (TypeError, ValueError):
+        limit = 25
+    rows = admin_audit.tail(max(1, min(80, limit)))
+    lines = ['🧾 <b>Admin audit</b>', '']
+    if not rows:
+        lines.append('Записей пока нет.')
+    for row in rows:
+        try:
+            at = datetime.fromisoformat(str(row.get('at') or ''))
+            stamp = _fmt_local(at) if at else '?'
+        except (ValueError, TypeError):
+            stamp = '?'
+        actor = row.get('actor') or row.get('actor_id') or '?'
+        action = row.get('action') or '?'
+        details = row.get('details') or {}
+        tail = ''
+        if details:
+            shown = ', '.join(f'{k}={v}' for k, v in list(details.items())[:3])
+            tail = f' · {shown}'
+        lines.append(f'• {html.escape(str(stamp))} · {html.escape(str(actor))} · '
+                     f'<code>{html.escape(str(action))}</code>{html.escape(tail)}')
+    await update.message.reply_text('\n'.join(lines)[:4000], parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def reloadconfig_command(update, context: ContextTypes.DEFAULT_TYPE):
+    if not feature_enabled('config_reload'):
+        await update.message.reply_text('Safe config reload выключен feature flag.')
+        return
+    try:
+        changed = await asyncio.to_thread(_reload_safe_runtime_config)
+    except (OSError, ValueError, TypeError) as e:
+        await update.message.reply_text(
+            f'❌ Reload отменён: {type(e).__name__}: {e}\nСтарые настройки оставлены в памяти.')
+        return
+    _audit_update(update, 'config:reload', stores=','.join(changed))
+    await update.message.reply_text('✅ Безопасно перечитано: ' + ', '.join(changed) + '.\nEnv/токены/ID не менялись.')
+
+
+@admin_only
+async def verifybackup_command(update, context: ContextTypes.DEFAULT_TYPE):
+    if not feature_enabled('backup_verify'):
+        await update.message.reply_text('Backup verify выключен feature flag.')
+        return
+    archive = await asyncio.to_thread(_build_backup_archive)
+    if not archive:
+        await update.message.reply_text('Проверять нечего: файлов данных пока нет.')
+        return
+    data, filename = archive
+    result = await asyncio.to_thread(_verify_backup_archive, data)
+    if not result['ok']:
+        await update.message.reply_text('❌ Backup self-test failed: ' + '; '.join(result['errors'][:5]))
+        return
+    restore = await asyncio.to_thread(_backup_restore_selftest, data)
+    if restore['ok']:
+        stores = ', '.join(restore.get('stores') or []) or 'JSON-only'
+        await update.message.reply_text(
+            f'✅ Backup restore-test: {filename}\nФайлов: {result["files"]}, JSON: {result["json_files"]}, '
+            f'восстановлено: {restore["restored"]}\nStores: {stores}\nРазмер: {_fmt_size(len(data))}')
+    else:
+        await update.message.reply_text('❌ Restore-test failed: ' + '; '.join(restore['errors'][:5]))
+
+
+@admin_only
+async def schema_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows Stage 11 runtime schema state; does not rewrite files."""
+    report = await asyncio.to_thread(_migrate_runtime_schemas, DATA_DIR, dry_run=True)
+    lines = [
+        '🧬 <b>Runtime schema</b>',
+        f'Версия: <code>{RUNTIME_SCHEMA_VERSION}</code>',
+        f'Актуальны: {len(report.get("current") or [])}',
+        f'Требуют миграции: {len(report.get("changed") or [])}',
+        f'Отсутствуют: {len(report.get("missing") or [])}',
+    ]
+    if report.get('changed'):
+        lines.append('Миграция нужна: ' + ', '.join(report['changed'][:12]))
+    if report.get('errors'):
+        lines.append('⚠️ ' + '; '.join(report['errors'][:5]))
+    else:
+        lines.append('✅ Ошибок схемы не найдено.')
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def selftest_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs local Stage 11 invariants without Telegram publishes or external HTTP."""
+    args = list(getattr(context, 'args', None) or [])
+    try:
+        rounds = int(args[0]) if args else CHAOS_SELFTEST_ROUNDS
+    except (TypeError, ValueError):
+        rounds = CHAOS_SELFTEST_ROUNDS
+    rounds = max(5, min(200, rounds))
+    await update.message.reply_text(f'🧪 Локальный self-test: {rounds} fuzz/chaos раундов…')
+    result = await _run_chaos_selftest(rounds)
+    lines = [
+        ('✅' if result.get('ok') else '❌') + ' <b>Stage 11 self-test</b>',
+        f'Раундов: {result.get("rounds", rounds)}',
+    ]
+    for name, row in (result.get('checks') or {}).items():
+        mark = '✅' if row.get('ok') else '❌'
+        detail = html.escape(str(row.get('detail') or '')[:180])
+        lines.append(f'{mark} <code>{html.escape(name)}</code>' + (f' — {detail}' if detail else ''))
+    _audit_update(update, 'selftest:run', ok=bool(result.get('ok')), rounds=rounds)
+    await update.message.reply_text('\n'.join(lines)[:4000], parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def canary_command(update, context: ContextTypes.DEFAULT_TYPE):
+    if not _canary_configured():
+        await update.message.reply_text('Canary не настроен. Задай CANARY_CHANNEL_ID (не равный основному каналу).')
+        return
+    args = list(context.args or [])
+    if not args:
+        latest = replay_buffer.latest(5) if replay_buffer is not None else []
+        lines = ['🧪 <b>Canary publish</b>', f'Канал: <code>{html.escape(str(CANARY_CHANNEL_ID))}</code>', '']
+        if latest:
+            lines.append('Последние replay ID:')
+            lines.extend(f'• <code>{row.get("replay_id")}</code> — {html.escape(str(row.get("title") or "")[:80])}'
+                         for row in latest)
+        lines.append('\nЗапуск: <code>/canary REPLAY_ID</code>')
+        await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
+        return
+    if replay_buffer is None:
+        await update.message.reply_text('Replay buffer не инициализирован.')
+        return
+    rid = args[0].strip()
+    news = replay_buffer.get(rid)
+    if not news:
+        await update.message.reply_text('Replay ID не найден.')
+        return
+    news['_story_sources'] = [str(news.get('source') or 'unknown')]
+    news['_story_cluster_size'] = 1
+    news['_story_id'] = _story_id(news)
+    news['_confidence_score'] = round(_confidence_score(news), 3)
+    _annotate_story_updates([news])
+    _annotate_editorial_automation([news])
+    result = await send_news(
+        context.bot, news, chat_id=CANARY_CHANNEL_ID, track_history=False,
+        bypass_history_checks=True, apply_dedup=False, llm_side_effects=False)
+    _audit_update(update, 'canary:publish', replay_id=rid, result=result)
+    await update.message.reply_text(f'Canary result: <code>{html.escape(result)}</code>', parse_mode=ParseMode.HTML)
+
+
+@admin_only
 async def feedback_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает, как модераторы принимают/скрывают новости и кандидатов в blacklist."""
     if moderation_feedback is None:
@@ -13021,7 +15769,49 @@ async def feedback_command(update, context: ContextTypes.DEFAULT_TYPE):
             lines.extend(['', '<b>Кандидаты в blacklist</b>'])
             lines.extend(f'• <code>{html.escape(word)}</code> — в {count} скрытых постах'
                          for word, count in suggestions)
+        if feature_enabled('editorial_learning'):
+            learned = moderation_feedback.learned_term_scores()
+            if learned:
+                lines.extend(['', '<b>Автообучение ranking</b>'])
+                for term, weight in sorted(learned.items(), key=lambda kv: -abs(kv[1]))[:10]:
+                    arrow = '⬆️' if weight > 0 else '⬇️'
+                    lines.append(f'• {arrow} <code>{html.escape(term)}</code> {weight:+.2f}')
     await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def rules_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Редактируемые правила: /rules [list|add KIND PHRASE|del KIND PHRASE]."""
+    if editorial_rules is None or not feature_enabled('editorial_rules'):
+        await update.message.reply_text('Editorial rules отключены или не инициализированы.')
+        return
+    args = list(getattr(context, 'args', None) or [])
+    action = (args[0].lower() if args else 'list')
+    if action in ('list', 'show'):
+        snap = editorial_rules.snapshot()
+        lines = ['🧭 <b>Editorial rules</b>']
+        labels = {'block': '⛔ block', 'downrank': '⬇️ downrank',
+                  'boost': '⬆️ boost', 'breaking': '⚡ breaking'}
+        for kind in EditorialRulesStore.KINDS:
+            rows = snap[kind]
+            lines.append(f'\n<b>{labels[kind]}</b> ({len(rows)})')
+            lines.extend(f'• <code>{html.escape(x)}</code>' for x in rows[:20])
+            if not rows:
+                lines.append('—')
+        lines.append('\nДобавить: <code>/rules add boost studio trigger</code>')
+        await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
+        return
+    if action in ('add', 'del', 'delete', 'remove') and len(args) >= 3:
+        kind = args[1].lower()
+        phrase = ' '.join(args[2:]).strip()
+        if action == 'add':
+            ok = editorial_rules.add(kind, phrase)
+            await update.message.reply_text('✅ Правило добавлено.' if ok else 'Неверный тип/фраза.')
+        else:
+            ok = editorial_rules.remove(kind, phrase)
+            await update.message.reply_text('✅ Правило удалено.' if ok else 'Правило не найдено.')
+        return
+    await update.message.reply_text('Формат: /rules list | /rules add block|downrank|boost|breaking фраза | /rules del ...')
 
 
 @admin_only
@@ -13200,6 +15990,142 @@ async def replay_command(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def experiments_command(update, context: ContextTypes.DEFAULT_TYPE):
+    rows = experiments.snapshot() if experiments is not None else {}
+    lines = ['🧪 <b>Эксперименты</b>',
+             f'Compact traffic: <b>{POST_FORMAT_COMPACT_PERCENT:.1f}%</b>']
+    if not rows:
+        lines.append('Данных пока нет.')
+    for variant, data in sorted(rows.items()):
+        lines.append(f'• <code>{html.escape(str(variant))}</code>: '
+                     f'assigned={int(data.get("assigned", 0) or 0)}, '
+                     f'published={int(data.get("published", 0) or 0)}')
+    lines.append('Процент задаётся env POST_FORMAT_COMPACT_PERCENT; 0 = без изменения формата.')
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def adaptive_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Stage 9 snapshot: recommendations + bounded auto-tuning state."""
+    queue_size = await post_queue.peek_size() if post_queue is not None else 0
+    snap = _evaluate_adaptive_publishing(context, queue_size, force=True)
+    if not snap:
+        await update.message.reply_text('Adaptive publishing отключён.')
+        return
+    hours = snap.get('best_hours') or []
+    hour_text = ', '.join(f"{int(x['hour']):02d}:00 ({float(x['acceptance'])*100:.0f}%, n={int(x['samples'])})"
+                          for x in hours) or 'пока недостаточно решений модерации'
+    lines = [
+        '🧭 <b>Adaptive Publishing</b>',
+        f"Интервал: <b>{int(snap['current_interval_min'])} мин</b> → рекомендация "
+        f"<b>{int(snap['recommended_interval_min'])} мин</b> ({html.escape(str(snap['interval_reason']))})",
+        f"Compact: <b>{float(snap['current_compact_percent']):.1f}%</b> → рекомендация "
+        f"<b>{float(snap['recommended_compact_percent']):.1f}%</b> ({html.escape(str(snap['format_reason']))})",
+        f"Фактически для новых story: <b>{float(snap['effective_compact_percent']):.1f}%</b>",
+        f"Diversity multiplier: <b>{float(snap['diversity_multiplier']):.2f}×</b>",
+        f"Доля самой частой франшизы за окно: <b>{float(snap['top_franchise_share'])*100:.0f}%</b> "
+        f"(n={int(snap['diversity_samples'])})",
+        f"Лучшие часы по решениям модерации: {html.escape(hour_text)}",
+        '',
+        f"Авто-интервал: <b>{'ВКЛ' if ADAPTIVE_AUTO_INTERVAL else 'ВЫКЛ'}</b> · "
+        f"авто-format: <b>{'ВКЛ' if ADAPTIVE_AUTO_FORMAT else 'ВЫКЛ'}</b>",
+        'Автоприменение включается только через env; рекомендации доступны всегда.',
+    ]
+    await update.message.reply_text('\n'.join(lines)[:4000], parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def analytics_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Stage 10: first-party analytics without pretending to know Telegram views."""
+    if not feature_enabled('analytics_feedback'):
+        await update.message.reply_text('Analytics & feedback loop отключён feature flag.')
+        return
+    args = list(getattr(context, 'args', None) or [])
+    try:
+        days = int(args[0]) if args else ANALYTICS_DEFAULT_DAYS
+    except (TypeError, ValueError):
+        days = ANALYTICS_DEFAULT_DAYS
+    days = max(1, min(365, days))
+    report = _analytics_feedback_report(days)
+    delivery = report['delivery']
+    attempts = max(1, int(delivery.get('attempts', 0) or 0))
+    sent = int(delivery.get('sent', 0) or 0)
+    failed = int(delivery.get('failed', 0) or 0)
+    uncertain = int(delivery.get('uncertain', 0) or 0)
+    delivery_rate = sent / attempts if delivery.get('attempts') else 0.0
+    lines = [
+        f'📈 <b>Analytics · {days} дн.</b>',
+        f'Доставка в канал: <b>{sent}/{int(delivery.get("attempts", 0) or 0)}</b> '
+        f'({delivery_rate*100:.1f}%) · failed {failed} · uncertain {uncertain}',
+        f'Решений модерации: <b>{int(report["moderation_decisions"])}</b> · '
+        f'сглаженный baseline принятия {float(report["baseline_acceptance"])*100:.1f}%',
+    ]
+    formats = [x for x in report.get('formats', []) if x.get('outcomes')]
+    if formats:
+        lines.extend(['', '<b>Форматы:</b>'])
+        for row in formats[:5]:
+            lines.append(
+                f'• <code>{html.escape(str(row["name"]))}</code>: '
+                f'{float(row["acceptance"])*100:.0f}% принятия, n={int(row["outcomes"])}')
+    recs = report.get('source_recommendations') or []
+    if recs:
+        lines.extend(['', '<b>Источники — рекомендации:</b>'])
+        for row in recs[:6]:
+            sign = '+' if float(row['delta']) >= 0 else ''
+            lines.append(
+                f'• {html.escape(str(row["source"]))}: <b>{html.escape(str(row["action"]))}</b> '
+                f'({sign}{float(row["delta"])*100:.0f} п.п., n={int(row["samples"])})')
+    hours = report.get('best_hours') or []
+    if hours:
+        text = ', '.join(
+            f'{int(x["hour"]):02d}:00 ({float(x["acceptance"])*100:.0f}%, n={int(x["samples"])})'
+            for x in hours[:5])
+        lines.extend(['', '<b>Лучшие часы по решениям модерации:</b>', html.escape(text)])
+    prompts = [x for x in report.get('prompt_versions', []) if x.get('outcomes')]
+    if prompts:
+        lines.extend(['', '<b>Prompt versions:</b>'])
+        for row in prompts[:4]:
+            lines.append(
+                f'• <code>{html.escape(str(row["name"]) or "fallback")}</code>: '
+                f'{float(row["acceptance"])*100:.0f}%, n={int(row["outcomes"])}')
+    lines.extend([
+        '',
+        'ℹ️ Просмотры и реакции канала сюда не входят: Bot API не даёт их этому боту. '
+        'Отчёт использует только проверяемые delivery/moderation/pipeline-сигналы.',
+        'Период: <code>/analytics 7</code>, <code>/analytics 30</code>, <code>/analytics 90</code>.',
+    ])
+    await update.message.reply_text('\n'.join(lines)[:4000], parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def lifecycle_command(update, context: ContextTypes.DEFAULT_TYPE):
+    life = lifecycle_snapshot()
+    starts = list(life.get('starts') or [])
+    lines = ['🔄 <b>Lifecycle / рестарты</b>',
+             f'Всего стартов: <b>{int(life.get("total_starts", 0) or 0)}</b>',
+             f'Текущее состояние: <code>{html.escape(str(life.get("state") or "?"))}</code>',
+             f'Последний exit: <code>{html.escape(str(life.get("last_exit_kind") or "нет данных"))}</code>',
+             f'Health bind: <code>{html.escape(str(HEALTH_HOST))}:{HEALTH_PORT}</code>',
+             f'Polling bootstrap retries: <code>{POLLING_BOOTSTRAP_RETRIES}</code>']
+    if life.get('last_restart_interval_sec') is not None:
+        lines.append(f'Интервал последних запусков: {int(life["last_restart_interval_sec"])} сек')
+    if int(life.get('consecutive_unclean', 0) or 0):
+        lines.append(f'⚠️ Нечистых рестартов подряд: {int(life["consecutive_unclean"])}')
+    if len(starts) >= RESTART_STORM_THRESHOLD:
+        try:
+            parsed = [datetime.fromisoformat(x) for x in starts[-RESTART_STORM_THRESHOLD:]]
+            span = (parsed[-1] - parsed[0]).total_seconds()
+            if span <= RESTART_STORM_WINDOW_SEC:
+                lines.append(f'🚨 Restart storm: {RESTART_STORM_THRESHOLD} запусков за {int(span)} сек')
+        except (ValueError, TypeError):
+            pass
+    detail = str(life.get('last_exit_detail') or '')
+    if detail:
+        lines.append('Последняя причина: <code>' + html.escape(detail[:500]) + '</code>')
+    await update.message.reply_text('\n'.join(lines)[:4000], parse_mode=ParseMode.HTML)
+
+
+@admin_only
 async def blacklist_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает текущий blacklist слов."""
     if not BLACKLIST:
@@ -13266,6 +16192,84 @@ def _release_instance_lock() -> None:
         pass
 
 
+# ============== LIFECYCLE / RESTART DIAGNOSTICS ==============
+def _read_lifecycle() -> dict:
+    try:
+        if not LIFECYCLE_FILE.exists():
+            return {}
+        raw = json.loads(LIFECYCLE_FILE.read_text(encoding='utf-8'))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _write_lifecycle(data: dict) -> None:
+    try:
+        _atomic_write_json(LIFECYCLE_FILE, data, indent=2)
+    except OSError as e:
+        logger.warning(f'lifecycle state не сохранён: {e}')
+
+
+def _mark_lifecycle_start() -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    data = _read_lifecycle()
+    previous_state = str(data.get('state') or '')
+    history = list(data.get('starts') or [])[-19:]
+    history.append(now)
+    unclean = int(data.get('consecutive_unclean', 0) or 0)
+    if previous_state == 'running':
+        unclean += 1
+    else:
+        unclean = 0
+    data.update({
+        'schema_version': 1,
+        'state': 'running',
+        'pid': os.getpid(),
+        'last_start': now,
+        'starts': history,
+        'total_starts': int(data.get('total_starts', 0) or 0) + 1,
+        'consecutive_unclean': unclean,
+        'last_exit_kind': str(data.get('last_exit_kind') or ''),
+    })
+    _write_lifecycle(data)
+    if len(history) >= 4:
+        try:
+            parsed = [datetime.fromisoformat(x) for x in history[-4:]]
+            span = (parsed[-1] - parsed[0]).total_seconds()
+            if span < 15 * 60:
+                logger.warning(f'⚠️ Частые рестарты: {len(parsed)} запуска за {int(span)} сек')
+        except (ValueError, TypeError):
+            pass
+    return data
+
+
+def _mark_lifecycle_exit(kind: str, detail: str = '') -> None:
+    data = _read_lifecycle()
+    data.update({
+        'schema_version': 1,
+        'state': 'stopped',
+        'last_stop': datetime.now(timezone.utc).isoformat(),
+        'last_exit_kind': str(kind or 'unknown')[:80],
+        'last_exit_detail': str(detail or '')[:500],
+        'pid': os.getpid(),
+    })
+    _write_lifecycle(data)
+
+
+def lifecycle_snapshot() -> dict:
+    data = _read_lifecycle()
+    starts = list(data.get('starts') or [])
+    data['recent_starts'] = len(starts)
+    if len(starts) >= 2:
+        try:
+            a = datetime.fromisoformat(starts[-2])
+            b = datetime.fromisoformat(starts[-1])
+            data['last_restart_interval_sec'] = max(0, int((b - a).total_seconds()))
+        except (ValueError, TypeError):
+            pass
+    return data
+
+
 # ============== HTTP HEALTH + GRACEFUL SHUTDOWN ==============
 _runtime_health = {
     'started_at': datetime.now(timezone.utc).isoformat(),
@@ -13288,14 +16292,325 @@ def _storage_ready() -> bool:
         return False
 
 
+_dashboard_failures: dict[str, list] = {}     # ip -> [счётчик, время первой неудачи]
+_dashboard_fail_lock = threading.Lock()
+
+
+def _dashboard_blocked(ip: str, now: Optional[float] = None) -> bool:
+    """Адрес заблокирован, если промахнулся слишком много раз за окно."""
+    now = now if now is not None else time.monotonic()
+    with _dashboard_fail_lock:
+        entry = _dashboard_failures.get(ip)
+        if not entry:
+            return False
+        count, started = entry
+        if now - started > DASHBOARD_FAIL_WINDOW_SEC:
+            _dashboard_failures.pop(ip, None)
+            return False
+        return count >= DASHBOARD_FAIL_LIMIT
+
+
+def _dashboard_note_failure(ip: str, now: Optional[float] = None) -> int:
+    now = now if now is not None else time.monotonic()
+    with _dashboard_fail_lock:
+        # Словарь не должен расти бесконечно: чистим просроченные записи.
+        if len(_dashboard_failures) > 512:
+            for key in [k for k, v in _dashboard_failures.items()
+                        if now - v[1] > DASHBOARD_FAIL_WINDOW_SEC]:
+                _dashboard_failures.pop(key, None)
+        entry = _dashboard_failures.get(ip)
+        if not entry or now - entry[1] > DASHBOARD_FAIL_WINDOW_SEC:
+            _dashboard_failures[ip] = [1, now]
+            return 1
+        entry[0] += 1
+        return entry[0]
+
+
+def _dashboard_note_success(ip: str) -> None:
+    with _dashboard_fail_lock:
+        _dashboard_failures.pop(ip, None)
+
+
+def _dashboard_authorized(headers) -> bool:
+    """HTTP Basic auth using a dedicated dashboard token; never ADMIN/BOT tokens."""
+    if not feature_enabled('admin_dashboard') or not DASHBOARD_TOKEN:
+        return False
+    try:
+        raw = str(headers.get('Authorization') or '')
+        if not raw.startswith('Basic '):
+            return False
+        decoded = base64.b64decode(raw[6:].strip(), validate=True).decode('utf-8')
+        user, password = decoded.split(':', 1)
+        return hmac.compare_digest(user, DASHBOARD_USER) and hmac.compare_digest(password, DASHBOARD_TOKEN)
+    except Exception:
+        return False
+
+
+def _dashboard_snapshot() -> dict:
+    """Read-only, best-effort operational snapshot safe to call from HTTP thread."""
+    now = datetime.now(timezone.utc).isoformat()
+    queue_items = []
+    inflight = None
+    queue_total = 0
+    if post_queue is not None:
+        try:
+            raw_items = list(getattr(post_queue, '_items', []) or [])
+            queue_total = len(raw_items)
+            for item in raw_items[:20]:
+                news = (item or {}).get('news') or {}
+                queue_items.append({
+                    'title': str(news.get('title') or '')[:160],
+                    'source': str(news.get('source') or '')[:80],
+                    'priority': news.get('_priority_score'),
+                    'queued_at': str((item or {}).get('queued_at') or '')[:40],
+                })
+            raw_inflight = getattr(post_queue, '_inflight', None)
+            if isinstance(raw_inflight, dict):
+                n = raw_inflight.get('news') or {}
+                inflight = {'title': str(n.get('title') or '')[:160],
+                            'source': str(n.get('source') or '')[:80]}
+        except Exception:
+            pass
+
+    scheduled_rows = []
+    scheduled_total = 0
+    if scheduled_posts is not None:
+        try:
+            all_scheduled = scheduled_posts.all()
+            scheduled_total = len(all_scheduled)
+            for key, news, when in all_scheduled[:20]:
+                scheduled_rows.append({'key': str(key), 'title': str(news.get('title') or '')[:160],
+                                       'source': str(news.get('source') or '')[:80],
+                                       'at': when.isoformat()})
+        except Exception:
+            pass
+
+    pending_count = uncertain_pending = 0
+    if pending_posts is not None:
+        try:
+            pending_count = len(getattr(pending_posts, '_items', {}) or {})
+            uncertain_pending = pending_posts.uncertain_count()
+        except Exception:
+            pass
+    uncertain_ledger = uncertain_scheduled = 0
+    try:
+        uncertain_ledger = sent_links.uncertain_count() if sent_links is not None else 0
+    except Exception:
+        pass
+    try:
+        uncertain_scheduled = scheduled_posts.uncertain_count() if scheduled_posts is not None else 0
+    except Exception:
+        pass
+
+    delivery = {'attempts': 0, 'sent': 0, 'failed': 0, 'uncertain': 0, 'other': 0}
+    if analytics_store is not None:
+        try:
+            delivery = analytics_store.delivery_summary(30)
+        except Exception:
+            pass
+
+    sources = []
+    try:
+        rep_by_name = {r['source']: r for r in source_reputation_snapshot()} if feature_enabled('source_reputation') else {}
+        for name, _collector in SOURCES:
+            info = source_health.info(name) if source_health is not None else {}
+            left = source_health.breaker_remaining(name) if source_health is not None else 0.0
+            sources.append({
+                'name': name,
+                'enabled': bool(settings is None or settings.is_source_enabled(name)),
+                'fails': _safe_nonnegative_int(info.get('fails')),
+                'breaker_sec': round(float(left), 1),
+                'reputation': rep_by_name.get(name, {}).get('score'),
+            })
+    except Exception:
+        pass
+
+    errors = []
+    if error_fingerprints is not None:
+        try:
+            errors = [{k: row.get(k) for k in ('scope', 'message', 'count', 'last_seen')}
+                      for row in error_fingerprints.snapshot()[:12]]
+        except Exception:
+            pass
+
+    life = lifecycle_snapshot() if feature_enabled('lifecycle_diagnostics') else {}
+    config = {
+        'prompt_version': LLM_PROMPT_VERSION,
+        'blacklist': list(BLACKLIST[:80]),
+        'editorial_rules': editorial_rules.snapshot() if editorial_rules is not None else {},
+        'glossary_entries': len(editorial_glossary.items()) if editorial_glossary is not None else 0,
+        'entity_entries': len(getattr(entity_memory, '_items', {}) or {}) if entity_memory is not None else 0,
+        'custom_sources': len(custom_sources.all()) if custom_sources is not None else 0,
+        'features': {name: bool(value) for name, value in FEATURE_FLAGS.items()},
+        'adaptive_latest': adaptive_publishing.latest() if adaptive_publishing is not None else {},
+    }
+    return {
+        'generated_at': now,
+        'ready': bool(_runtime_health.get('telegram_ok') and _runtime_health.get('storage_ok')),
+        'telegram_ok': bool(_runtime_health.get('telegram_ok')),
+        'storage_ok': bool(_runtime_health.get('storage_ok')),
+        'last_error': str(_runtime_health.get('last_error') or '')[:300],
+        'queue': {'size': queue_total, 'inflight': inflight, 'items': queue_items},
+        'scheduled': {'count': scheduled_total, 'items': scheduled_rows},
+        'pending': {'count': pending_count, 'uncertain': uncertain_pending},
+        'uncertain': {'ledger': uncertain_ledger, 'scheduled': uncertain_scheduled,
+                      'pending': uncertain_pending},
+        'delivery_30d': delivery,
+        'sources': sources,
+        'errors': errors,
+        'lifecycle': life,
+        'config': config,
+    }
+
+
+def _dashboard_html(snapshot: dict) -> bytes:
+    esc = lambda value: html.escape(str(value if value is not None else ''))
+    queue = snapshot.get('queue') or {}
+    delivery = snapshot.get('delivery_30d') or {}
+    uncertain = snapshot.get('uncertain') or {}
+    lifecycle = snapshot.get('lifecycle') or {}
+    config = snapshot.get('config') or {}
+
+    def rows(items, cols):
+        if not items:
+            return f'<tr><td colspan="{len(cols)}" class="muted">нет данных</td></tr>'
+        out = []
+        for item in items:
+            out.append('<tr>' + ''.join(f'<td>{esc(item.get(key, ""))}</td>' for key, _title in cols) + '</tr>')
+        return ''.join(out)
+
+    source_rows = rows(snapshot.get('sources') or [], [
+        ('name', 'Источник'), ('enabled', 'Вкл'), ('reputation', 'Trust'),
+        ('fails', 'Ошибки'), ('breaker_sec', 'Breaker, с')])
+    queue_rows = rows(queue.get('items') or [], [
+        ('title', 'Заголовок'), ('source', 'Источник'), ('priority', 'Score'), ('queued_at', 'В очереди')])
+    sched_rows = rows((snapshot.get('scheduled') or {}).get('items') or [], [
+        ('title', 'Заголовок'), ('source', 'Источник'), ('at', 'Публикация')])
+    error_rows = rows(snapshot.get('errors') or [], [
+        ('scope', 'Область'), ('message', 'Ошибка'), ('count', '×'), ('last_seen', 'Последняя')])
+    ready_cls = 'ok' if snapshot.get('ready') else 'warn'
+    inflight = queue.get('inflight') or {}
+    uncertain_total = sum(_safe_nonnegative_int(v) for v in uncertain.values())
+    body = f'''<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="{DASHBOARD_REFRESH_SEC}">
+<title>Anime Bot - Admin</title><style>
+body{{font:14px system-ui,-apple-system,sans-serif;background:#111318;color:#e8eaf0;margin:0}}
+main{{max-width:1200px;margin:auto;padding:22px}}h1,h2{{margin:.3em 0}}.muted{{color:#9299aa}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:18px 0}}
+.card{{background:#1b1e26;border:1px solid #2a2f3b;border-radius:12px;padding:14px}}.num{{font-size:25px;font-weight:700}}
+.ok{{color:#72d59b}}.warn{{color:#ffca6a}}table{{width:100%;border-collapse:collapse;background:#181b22;margin:8px 0 22px}}
+th,td{{text-align:left;padding:9px;border-bottom:1px solid #2b303b;vertical-align:top}}th{{color:#aeb6c7}}
+code{{color:#b9d2ff}}a{{color:#91b8ff}}@media(max-width:700px){{th:nth-child(n+4),td:nth-child(n+4){{display:none}}}}
+</style></head><body><main>
+<h1>Anime News Bot <span class="{ready_cls}">{'● ready' if snapshot.get('ready') else '● degraded'}</span></h1>
+<div class="muted">read-only · обновление каждые {DASHBOARD_REFRESH_SEC}с · {esc(snapshot.get('generated_at'))}</div>
+<div class="grid">
+<div class="card"><div class="muted">Очередь</div><div class="num">{esc(queue.get('size',0))}</div><div>{esc(inflight.get('title') or 'inflight нет')}</div></div>
+<div class="card"><div class="muted">Отложено</div><div class="num">{esc((snapshot.get('scheduled') or {}).get('count',0))}</div></div>
+<div class="card"><div class="muted">Uncertain</div><div class="num">{uncertain_total}</div><div>ledger {esc(uncertain.get('ledger',0))} · scheduled {esc(uncertain.get('scheduled',0))}</div></div>
+<div class="card"><div class="muted">Доставка 30д</div><div class="num">{esc(delivery.get('sent',0))}/{esc(delivery.get('attempts',0))}</div><div>failed {esc(delivery.get('failed',0))} · uncertain {esc(delivery.get('uncertain',0))}</div></div>
+<div class="card"><div class="muted">Запуски процесса</div><div class="num">{esc(lifecycle.get('total_starts',0))}</div><div>{esc(lifecycle.get('last_exit_kind',''))}</div></div>
+</div>
+<h2>Очередь</h2><table><tr><th>Заголовок</th><th>Источник</th><th>Score</th><th>В очереди</th></tr>{queue_rows}</table>
+<h2>Отложенные</h2><table><tr><th>Заголовок</th><th>Источник</th><th>Публикация</th></tr>{sched_rows}</table>
+<h2>Источники</h2><table><tr><th>Источник</th><th>Вкл</th><th>Trust</th><th>Ошибки</th><th>Breaker, с</th></tr>{source_rows}</table>
+<h2>Повторяющиеся ошибки</h2><table><tr><th>Область</th><th>Ошибка</th><th>×</th><th>Последняя</th></tr>{error_rows}</table>
+<h2>Редакционная конфигурация</h2>
+<div class="grid">
+<div class="card"><div class="muted">Prompt</div><div><code>{esc(config.get('prompt_version',''))}</code></div></div>
+<div class="card"><div class="muted">Blacklist</div><div class="num">{len(config.get('blacklist') or [])}</div></div>
+<div class="card"><div class="muted">Glossary / Entities</div><div class="num">{esc(config.get('glossary_entries',0))} / {esc(config.get('entity_entries',0))}</div></div>
+<div class="card"><div class="muted">Custom sources</div><div class="num">{esc(config.get('custom_sources',0))}</div></div>
+</div>
+<details><summary>Rules / feature flags / adaptive state</summary><pre>{esc(json.dumps(config, ensure_ascii=False, indent=2, default=str))}</pre></details>
+<div class="muted">JSON: <a href="/admin/data.json">/admin/data.json</a> · Метрики: <a href="/metrics">/metrics</a></div>
+</main></body></html>'''
+    return body.encode('utf-8')
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
+    # Без таймаута полуоткрытое соединение держит поток вечно.
+    timeout = HEALTH_REQUEST_TIMEOUT_SEC
+    protocol_version = 'HTTP/1.0'        # ответ отдали — соединение закрыли
+
     def log_message(self, fmt, *args):
         logger.debug('health-http: ' + (fmt % args))
 
+    def _peer_ip(self) -> str:
+        try:
+            return str(self.client_address[0])
+        except Exception:
+            return ''
+
+    def _metrics_allowed(self) -> bool:
+        """На loopback метрики открыты, наружу — только по токену."""
+        if not HEALTH_BIND_IS_PUBLIC:
+            return True
+        if not HEALTH_METRICS_TOKEN:
+            return False
+        supplied = (self.headers.get('Authorization') or '').strip()
+        if supplied.lower().startswith('bearer '):
+            supplied = supplied[7:].strip()
+        return hmac.compare_digest(supplied, HEALTH_METRICS_TOKEN)
+
     def do_GET(self):
-        if self.path == '/metrics':
+        request_path = urlparse(self.path).path
+        if request_path in ('/admin', '/admin/', '/admin/data.json'):
+            # Hide the dashboard completely until a dedicated token is configured.
+            if not feature_enabled('admin_dashboard') or not DASHBOARD_TOKEN:
+                self.send_response(404)
+                self.end_headers()
+                return
+            ip = self._peer_ip()
+            if _dashboard_blocked(ip):
+                # Адрес уже отстрелялся: credentials даже не проверяем.
+                metrics.inc('anime_bot_dashboard_auth_total', labels={'result': 'blocked'})
+                self.send_response(429)
+                self.send_header('Retry-After', str(DASHBOARD_FAIL_WINDOW_SEC))
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                return
+            if not _dashboard_authorized(self.headers):
+                fails = _dashboard_note_failure(ip)
+                metrics.inc('anime_bot_dashboard_auth_total', labels={'result': 'denied'})
+                if fails == DASHBOARD_FAIL_LIMIT:
+                    logger.warning(f'Дашборд: {fails} неудачных попыток входа с {ip}, '
+                                   f'адрес заблокирован на {DASHBOARD_FAIL_WINDOW_SEC} с')
+                if DASHBOARD_FAIL_DELAY_SEC:
+                    time.sleep(DASHBOARD_FAIL_DELAY_SEC)
+                self.send_response(401)
+                self.send_header('WWW-Authenticate', 'Basic realm="Anime Bot Admin"')
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                return
+            _dashboard_note_success(ip)
+            metrics.inc('anime_bot_dashboard_auth_total', labels={'result': 'ok'})
+            snapshot = _dashboard_snapshot()
+            if request_path == '/admin/data.json':
+                raw = json.dumps(snapshot, ensure_ascii=False, default=str).encode('utf-8')
+                content_type = 'application/json; charset=utf-8'
+            else:
+                raw = _dashboard_html(snapshot)
+                content_type = 'text/html; charset=utf-8'
+            self.send_response(200)
+            self.send_header('Content-Type', content_type)
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'")
+            self.send_header('X-Frame-Options', 'DENY')
+            self.send_header('Content-Length', str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+        if request_path == '/metrics':
             if not feature_enabled('metrics'):
                 self.send_response(404)
+                self.end_headers()
+                return
+            if not self._metrics_allowed():
+                metrics.inc('anime_bot_health_metrics_denied_total')
+                self.send_response(404)     # 404, а не 401: не подтверждаем наличие endpoint
                 self.end_headers()
                 return
             _refresh_runtime_metrics()
@@ -13312,18 +16627,18 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(raw)
             return
-        if self.path not in ('/healthz', '/readyz'):
+        if request_path not in ('/', '/livez', '/healthz', '/readyz'):
             self.send_response(404)
             self.end_headers()
             return
         storage_ok = _storage_ready()
         _runtime_health['storage_ok'] = storage_ok
         ready = bool(storage_ok and _runtime_health.get('telegram_ok'))
-        if self.path == '/healthz':
+        if request_path in ('/', '/livez', '/healthz'):
             status = 200
             body = {'status': 'ok', 'ready': ready}
         else:
-            status = 200 if ready else 503
+            status = 200 if (ready or not HEALTH_STRICT_READINESS) else 503
             body = {
                 'status': 'ready' if ready else 'not_ready',
                 'telegram_ok': bool(_runtime_health.get('telegram_ok')),
@@ -13338,17 +16653,105 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
+class _BoundedHealthServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer с потолком на число одновременных соединений.
+
+    Штатный сервер поднимает поток на каждое соединение и ничем не ограничен:
+    на публичном bind сотня полуоткрытых сокетов — это сотня повисших потоков.
+    Лишние соединения закрываем сразу, не создавая поток.
+
+    Общего потолка мало: тот, кто занял все слоты, заодно отрежет и health-check
+    платформы, а это перезапуск контейнера. Поэтому есть ещё и лимит на один
+    адрес, чтобы один источник не мог выесть весь пул.
+    """
+
+    daemon_threads = True
+    request_queue_size = 64
+
+    def __init__(self, *args, max_concurrent: int = HEALTH_MAX_CONNECTIONS,
+                 max_per_ip: int = HEALTH_MAX_CONNECTIONS_PER_IP, **kwargs):
+        self._slots = threading.BoundedSemaphore(max_concurrent)
+        self._max_per_ip = max_per_ip
+        self._lock = threading.Lock()
+        self._per_ip: dict[str, int] = {}
+        # Ключ — сам сокет, а не id(): id освобождённого объекта переиспользуется,
+        # и тогда слот вернулся бы не за то соединение.
+        self._owner: dict[object, str] = {}
+        super().__init__(*args, **kwargs)
+
+    def _reject(self, request, reason: str) -> None:
+        metrics.inc('anime_bot_health_rejected_total', labels={'reason': reason})
+        logger.debug(f'health-http: соединение отклонено ({reason})')
+        self.close_request(request)
+
+    def process_request(self, request, client_address):
+        ip = str(client_address[0]) if client_address else ''
+        with self._lock:
+            if self._per_ip.get(ip, 0) >= self._max_per_ip:
+                self._reject(request, 'per_ip')
+                return
+        if not self._slots.acquire(blocking=False):
+            self._reject(request, 'global')
+            return
+        with self._lock:
+            self._per_ip[ip] = self._per_ip.get(ip, 0) + 1
+            self._owner[request] = ip
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            # Поток не стартовал — освобождаем сами, иначе слот утечёт.
+            self._release(request)
+            raise
+
+    def _release(self, request) -> None:
+        with self._lock:
+            ip = self._owner.pop(request, None)
+            if ip is None:
+                return          # уже освобождали
+            left = self._per_ip.get(ip, 1) - 1
+            if left > 0:
+                self._per_ip[ip] = left
+            else:
+                self._per_ip.pop(ip, None)
+        self._slots.release()
+
+    def shutdown_request(self, request):
+        # Вызывается ровно один раз на принятое соединение (finally в
+        # ThreadingMixIn.process_request_thread), поэтому слот вернётся всегда.
+        try:
+            super().shutdown_request(request)
+        finally:
+            self._release(request)
+
+
 def _start_health_server() -> None:
     global _health_http_server, _health_http_thread
     if HEALTH_PORT <= 0 or _health_http_server is not None:
         return
     try:
-        _health_http_server = ThreadingHTTPServer((HEALTH_HOST, HEALTH_PORT), _HealthHandler)
+        _health_http_server = _BoundedHealthServer((HEALTH_HOST, HEALTH_PORT), _HealthHandler)
         _health_http_thread = threading.Thread(
             target=_health_http_server.serve_forever,
             name='health-http', daemon=True)
         _health_http_thread.start()
-        logger.info(f'HTTP health: http://{HEALTH_HOST}:{HEALTH_PORT}/healthz' + (' + /metrics' if feature_enabled('metrics') else ''))
+        dashboard_note = (' + /admin' if feature_enabled('admin_dashboard') and DASHBOARD_TOKEN else '')
+        metrics_note = ''
+        if feature_enabled('metrics'):
+            if not HEALTH_BIND_IS_PUBLIC:
+                metrics_note = ' + /metrics'
+            elif HEALTH_METRICS_TOKEN:
+                metrics_note = ' + /metrics (по токену)'
+        logger.info(f'HTTP health: http://{HEALTH_HOST}:{HEALTH_PORT}/healthz'
+                    + metrics_note + dashboard_note)
+        if _PLATFORM_PORT_RAW and not _HEALTH_HOST_RAW:
+            logger.info('PaaS PORT обнаружен: health автоматически слушает 0.0.0.0')
+        if HEALTH_BIND_IS_PUBLIC and feature_enabled('metrics') and not HEALTH_METRICS_TOKEN:
+            logger.warning('Публичный bind без HEALTH_METRICS_TOKEN: /metrics закрыт. '
+                           'Задай токен, чтобы собирать метрики снаружи, '
+                           'или HEALTH_HOST=127.0.0.1, чтобы слушать только локально.')
+        if HEALTH_BIND_IS_PUBLIC and dashboard_note and len(DASHBOARD_TOKEN) < 24:
+            logger.warning('Дашборд открыт наружу, а DASHBOARD_TOKEN короче 24 символов. '
+                           'Возьми длинную случайную строку, например `openssl rand -hex 24`.')
     except OSError as e:
         _runtime_health['last_error'] = f'health server: {e}'
         logger.warning(f'HTTP health endpoint не запущен: {e}')
@@ -13400,9 +16803,20 @@ async def _post_shutdown(app: Application) -> None:
         cleanup_video_dir(max_age_hours=0)
     except Exception:
         pass
+    _mark_lifecycle_exit('graceful_shutdown')
     _stop_health_server()
     _release_instance_lock()
     logger.info('Graceful shutdown завершён')
+
+
+async def _global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler/job exceptions are logged but must not terminate the polling process."""
+    err = getattr(context, 'error', None)
+    if err is None:
+        return
+    logger.error('Необработанная ошибка update/job: %s: %s', type(err).__name__, err, exc_info=err)
+    _runtime_health['last_error'] = f'handler: {type(err).__name__}: {err}'[:500]
+    metrics.inc('anime_bot_unhandled_update_errors_total')
 
 
 # ============== ТОЧКА ВХОДА ==============
@@ -13479,6 +16893,7 @@ async def setup_bot_commands(app: Application) -> None:
         BotCommand("stats", "📈 Статистика"),
         BotCommand("sources", "📡 Источники"),
         BotCommand("llm", "🤖 Модель: статус и проверка"),
+        BotCommand("reliability", "🛡 Надёжность и лимиты"),
         BotCommand("admins", "👥 Администраторы"),
         BotCommand("logs", "📝 Логи"),
     ]
@@ -13495,7 +16910,8 @@ def _init_globals() -> None:
     позволяет тестам создавать свои инстансы с временными файлами,
     не затрагивая реальные данные пользователя."""
     global sent_links, translator, post_queue, settings, stats, anilist, pending_posts, moderation_feedback
-    global editorial_glossary, entity_memory, story_history, replay_buffer
+    global editorial_rules, editorial_glossary, entity_memory, story_history, replay_buffer
+    global error_fingerprints, llm_budget, admin_audit, experiments, adaptive_publishing, analytics_store
     if sent_links is None:
         sent_links = SentLinksStore(SENT_LINKS_FILE)
     if pending_posts is None:
@@ -13513,6 +16929,10 @@ def _init_globals() -> None:
         recent_subjects = RecentSubjects(SUBJECT_MEMORY_FILE)
     if source_health is None:
         source_health = SourceHealth(SOURCE_HEALTH_FILE)
+    if error_fingerprints is None:
+        error_fingerprints = ErrorFingerprintStore(ERROR_FINGERPRINT_FILE)
+    if llm_budget is None:
+        llm_budget = LLMBudgetStore(LLM_BUDGET_FILE)
     if image_hashes is None:
         image_hashes = ImageHashes(IMAGE_HASHES_FILE)
         logger.info(f"Отпечатков картинок в базе: {len(image_hashes)}"
@@ -13539,6 +16959,16 @@ def _init_globals() -> None:
         stats = BotStats(STATS_FILE)
     if moderation_feedback is None:
         moderation_feedback = ModerationFeedback(MODERATION_FEEDBACK_FILE)
+    if admin_audit is None:
+        admin_audit = AdminAuditLog(ADMIN_AUDIT_FILE)
+    if experiments is None:
+        experiments = ExperimentStore(EXPERIMENTS_FILE)
+    if adaptive_publishing is None:
+        adaptive_publishing = AdaptivePublishingStore(ADAPTIVE_PUBLISHING_FILE)
+    if analytics_store is None:
+        analytics_store = AnalyticsStore(ANALYTICS_FILE)
+    if editorial_rules is None:
+        editorial_rules = EditorialRulesStore(EDITORIAL_RULES_FILE)
     if editorial_glossary is None:
         editorial_glossary = EditorialGlossary(EDITORIAL_GLOSSARY_FILE)
     if entity_memory is None:
@@ -13612,12 +17042,20 @@ def main():
     except Exception as e:
         print(f"Файловый лог не настроен (не критично): {e}", flush=True)
 
+    _mark_lifecycle_start()
+
     # Проверка токена — на хостинге переменная окружения BOT_TOKEN обязательна
     if not TOKEN or TOKEN == '':
         print("❌ Токен бота не задан! Установите переменную окружения BOT_TOKEN.", flush=True)
         raise SystemExit("BOT_TOKEN не задан")
 
     _acquire_instance_lock()
+    if feature_enabled('runtime_migrations'):
+        migration = _migrate_runtime_schemas(DATA_DIR)
+        if migration['changed']:
+            logger.info('Runtime schema migration: %s', ', '.join(migration['changed']))
+        if migration['errors']:
+            logger.warning('Runtime schema migration warnings: %s', '; '.join(migration['errors'][:5]))
     _init_globals()
     _validate_runtime_config()
     check_video_deps()
@@ -13626,6 +17064,8 @@ def main():
     print("Создаю Application...", flush=True)
     app = (Application.builder().token(TOKEN).job_queue(JobQueue())
            .post_init(setup_bot_commands).post_shutdown(_post_shutdown).build())
+
+    app.add_error_handler(_global_error_handler)
 
     # Команды
     app.add_handler(CommandHandler("start", start))
@@ -13644,6 +17084,17 @@ def main():
     app.add_handler(CommandHandler("videocheck", videocheck_command))
     app.add_handler(CommandHandler("media", media_command))
     app.add_handler(CommandHandler("llm", llm_command))
+    app.add_handler(CommandHandler("reliability", reliability_command))
+    app.add_handler(CommandHandler("experiments", experiments_command))
+    app.add_handler(CommandHandler("adaptive", adaptive_command))
+    app.add_handler(CommandHandler("analytics", analytics_command))
+    app.add_handler(CommandHandler("lifecycle", lifecycle_command))
+    app.add_handler(CommandHandler("audit", audit_command))
+    app.add_handler(CommandHandler("reloadconfig", reloadconfig_command))
+    app.add_handler(CommandHandler("verifybackup", verifybackup_command))
+    app.add_handler(CommandHandler("schema", schema_command))
+    app.add_handler(CommandHandler("selftest", selftest_command))
+    app.add_handler(CommandHandler("canary", canary_command))
     app.add_handler(CommandHandler("scheduled", scheduled_command))
     app.add_handler(CommandHandler("tz", tz_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
@@ -13656,6 +17107,7 @@ def main():
     app.add_handler(CommandHandler("logs", logs_command))
     app.add_handler(CommandHandler("blacklist", blacklist_command))
     app.add_handler(CommandHandler("feedback", feedback_command))
+    app.add_handler(CommandHandler("rules", rules_command))
     app.add_handler(CommandHandler("glossary", glossary_command))
     app.add_handler(CommandHandler("entity", entity_command))
     app.add_handler(CommandHandler("replay", replay_command))
@@ -13685,14 +17137,18 @@ def main():
 
     print("✅ Бот запущен, начинаю polling...", flush=True)
     logger.info("✅ Бот запущен...")
-    app.run_polling()
+    app.run_polling(bootstrap_retries=POLLING_BOOTSTRAP_RETRIES)
 
 
 if __name__ == '__main__':
     try:
         main()
+    except SystemExit as e:
+        _mark_lifecycle_exit('system_exit', str(e))
+        raise
     except Exception as e:
         import traceback
+        _mark_lifecycle_exit('unhandled_exception', f'{type(e).__name__}: {e}')
         print("❌ КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ:", flush=True)
         traceback.print_exc()
         raise
