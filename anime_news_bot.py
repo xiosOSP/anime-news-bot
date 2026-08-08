@@ -393,6 +393,11 @@ FEATURE_FLAGS = {
     'media_smart_crop': _env_bool('FEATURE_MEDIA_SMART_CROP', True),
     # Stage 13 — authenticated read-only operations dashboard.
     'admin_dashboard': _env_bool('FEATURE_ADMIN_DASHBOARD', True),
+    # Cycle 2 / Stage 15 — source probation, timeliness and likely-origin signals.
+    'source_intelligence': _env_bool('FEATURE_SOURCE_INTELLIGENCE', True),
+    # Cycle 2 / Stage 16 — discover external news feeds in shadow mode.
+    # Discovery never enables a source automatically; an admin must promote it.
+    'source_discovery': _env_bool('FEATURE_SOURCE_DISCOVERY', True),
 }
 STORY_CLUSTER_SIMILARITY = max(0.70, min(0.98, _env_float('STORY_CLUSTER_SIMILARITY', 0.88)))
 STORY_CLUSTER_MAX_COMPARE = max(20, min(500, _env_int('STORY_CLUSTER_MAX_COMPARE', 120)))
@@ -430,6 +435,36 @@ DASHBOARD_REFRESH_SEC = max(5, min(300, _env_int('DASHBOARD_REFRESH_SEC', 30)))
 DASHBOARD_FAIL_LIMIT = max(3, min(100, _env_int('DASHBOARD_FAIL_LIMIT', 10)))
 DASHBOARD_FAIL_WINDOW_SEC = max(30, min(3600, _env_int('DASHBOARD_FAIL_WINDOW_SEC', 300)))
 DASHBOARD_FAIL_DELAY_SEC = max(0.0, min(5.0, _env_float('DASHBOARD_FAIL_DELAY_SEC', 0.25)))
+
+# Cycle 2 / Stage 15 — source intelligence. New sources stay neutral during
+# probation; historical sources can graduate immediately from existing stats.
+SOURCE_INTELLIGENCE_FILE = DATA_DIR / 'source_intelligence.json'
+SOURCE_PROBATION_MIN_STORIES = max(3, min(100, _env_int('SOURCE_PROBATION_MIN_STORIES', 12)))
+SOURCE_PROBATION_MIN_DAYS = max(0, min(30, _env_int('SOURCE_PROBATION_MIN_DAYS', 3)))
+SOURCE_INTEL_MIN_COMPARISONS = max(2, min(50, _env_int('SOURCE_INTEL_MIN_COMPARISONS', 4)))
+SOURCE_REPOST_LAG_HOURS = max(1.0, min(72.0, _env_float('SOURCE_REPOST_LAG_HOURS', 6.0)))
+SOURCE_TIMELINESS_WINDOW_HOURS = max(SOURCE_REPOST_LAG_HOURS, min(168.0, _env_float('SOURCE_TIMELINESS_WINDOW_HOURS', 24.0)))
+SOURCE_INTEL_WEIGHT_MAX = max(0.01, min(0.25, _env_float('SOURCE_INTEL_WEIGHT_MAX', 0.12)))
+SOURCE_INTEL_STORY_MAX = max(100, min(10000, _env_int('SOURCE_INTEL_STORY_MAX', 2500)))
+SOURCE_INTEL_STORY_TTL_DAYS = max(2, min(90, _env_int('SOURCE_INTEL_STORY_TTL_DAYS', 21)))
+
+# Cycle 2 / Stage 16 — Source Discovery & Auto-Probing. The crawler is deliberately
+# tiny: it scans only a few already-collected articles and probes at most one new
+# candidate per normal collection cycle. Candidates remain shadow-only until an
+# administrator explicitly promotes one with /discover add <id>.
+SOURCE_DISCOVERY_FILE = DATA_DIR / 'source_discovery.json'
+SOURCE_DISCOVERY_SCAN_PER_CYCLE = max(0, min(5, _env_int('SOURCE_DISCOVERY_SCAN_PER_CYCLE', 2)))
+SOURCE_DISCOVERY_PROBES_PER_CYCLE = max(0, min(3, _env_int('SOURCE_DISCOVERY_PROBES_PER_CYCLE', 1)))
+SOURCE_DISCOVERY_MAX_LINKS_PER_ARTICLE = max(2, min(30, _env_int('SOURCE_DISCOVERY_MAX_LINKS_PER_ARTICLE', 10)))
+SOURCE_DISCOVERY_MAX_CANDIDATES = max(50, min(3000, _env_int('SOURCE_DISCOVERY_MAX_CANDIDATES', 500)))
+SOURCE_DISCOVERY_MAX_SCANNED = max(100, min(10000, _env_int('SOURCE_DISCOVERY_MAX_SCANNED', 1500)))
+SOURCE_DISCOVERY_SCAN_TTL_DAYS = max(1, min(90, _env_int('SOURCE_DISCOVERY_SCAN_TTL_DAYS', 14)))
+SOURCE_DISCOVERY_PROBE_COOLDOWN_HOURS = max(1, min(168, _env_int('SOURCE_DISCOVERY_PROBE_COOLDOWN_HOURS', 24)))
+SOURCE_DISCOVERY_MIN_MENTIONS = max(1, min(10, _env_int('SOURCE_DISCOVERY_MIN_MENTIONS', 2)))
+SOURCE_DISCOVERY_SUGGEST_SCORE = max(0.35, min(0.95, _env_float('SOURCE_DISCOVERY_SUGGEST_SCORE', 0.62)))
+SOURCE_DISCOVERY_FEED_MAX_BYTES = max(64 * 1024, min(2 * 1024 * 1024,
+    _env_int('SOURCE_DISCOVERY_FEED_MAX_KB', 768) * 1024))
+SOURCE_DISCOVERY_HTTP_TIMEOUT = max(2, min(15, _env_int('SOURCE_DISCOVERY_HTTP_TIMEOUT', 6)))
 
 # Reliability & Cost Control — Stage 4
 SOURCE_BREAKER_FAIL_THRESHOLD = max(2, min(20, _env_int('SOURCE_BREAKER_FAIL_THRESHOLD', 3)))
@@ -592,6 +627,7 @@ def _runtime_schema_target_specs(root: Path) -> dict[str, tuple[int, callable]]:
         'analytics_events.json': (1, schema_dict),
         'adaptive_publishing.json': (1, schema_dict),
         'experiments.json': (1, schema_dict),
+        'source_discovery.json': (1, schema_dict),
     }
 
 
@@ -991,6 +1027,23 @@ def _refresh_runtime_metrics() -> None:
         metrics.set('anime_bot_video_normalize_enabled', 1 if feature_enabled('video_normalize') else 0)
         metrics.set('anime_bot_image_bytes_cache_items', len(_image_bytes_cache))
         metrics.set('anime_bot_video_thumbnail_cache_items', len(_video_thumbnail_cache))
+        if feature_enabled('source_intelligence') and source_intelligence is not None:
+            intel_rows = source_intelligence.snapshot()
+            metrics.set('anime_bot_source_intelligence_sources', len(intel_rows))
+            metrics.set('anime_bot_source_probation', sum(1 for r in intel_rows if r.get('probation')))
+            for row in intel_rows:
+                metrics.set('anime_bot_source_intel_adjustment', float(row.get('adjustment') or 0.0),
+                            {'source': row['source']})
+                if row.get('avg_lag_hours') is not None:
+                    metrics.set('anime_bot_source_avg_lag_hours', float(row['avg_lag_hours']),
+                                {'source': row['source']})
+        if feature_enabled('source_discovery') and source_discovery is not None:
+            discovery_rows = source_discovery.rows()
+            metrics.set('anime_bot_source_discovery_candidates', len(discovery_rows))
+            metrics.set('anime_bot_source_discovery_suggested',
+                        sum(1 for r in discovery_rows if r.get('status') == 'suggested'))
+            metrics.set('anime_bot_source_discovery_promoted',
+                        sum(1 for r in discovery_rows if r.get('status') == 'promoted'))
         if source_health is not None:
             opened = 0
             for source_name, _collector in SOURCES:
@@ -1952,7 +2005,15 @@ class BotSettings:
         'video_enabled': True,
         'require_image': True,
         'post_max_age_hours': POST_MAX_AGE_HOURS,
-        'disabled_sources': [],
+        # Known sources that are disabled in the current production profile.
+        # They remain visible in /settings so they can be re-enabled manually if
+        # their feeds recover, but a fresh deployment will not poll them.
+        'disabled_sources': [
+            'CBR Anime', 'MyAnimeList', 'ANN Newsroom', 'ANN Industry',
+            'Anime Corner', 'Anime Herald', 'Crunchyroll', "Honey's Anime",
+            'AnimeHunch', 'AnimateTimes(JP)', 'Collider', '/Film', 'Variety',
+            'ComingSoon', 'Filmix', 'TG: CurrentAnime',
+        ],
         'thread_mode': False,    # True = слать все новости пачкой в ветку обсуждения
         'translator_engine': 'deepl',  # 'deepl' (если ключ задан, с fallback) или 'google' (принудительно)
         'quiet_mode': True,      # True = уведомлять админа только при ошибках + сводка раз в день
@@ -2827,6 +2888,10 @@ class AnalyticsStore:
     def __init__(self, path: Path, max_events: int = ANALYTICS_MAX_EVENTS):
         self.path = Path(path)
         self.max_events = max(100, int(max_events))
+        # record() уходит в поток (запись на потолке в 6000 событий переписывает
+        # ~1.6 МБ и занимает под сотню миллисекунд), поэтому список событий
+        # обязан быть защищён: две отправки могут писать одновременно.
+        self._lock = threading.Lock()
         self._data = {'schema_version': 1, 'events': []}
         try:
             if self.path.exists():
@@ -2867,15 +2932,18 @@ class AnalyticsStore:
         return row
 
     def record(self, kind: str, news: Optional[dict] = None, **extra) -> None:
+        """Блокирующая: пишет весь файл целиком. Из корутин звать через to_thread."""
         if not feature_enabled('analytics_feedback'):
             return
-        events = self._data.setdefault('events', [])
-        events.append(self._event_from_news(kind, news, **extra))
-        self._data['events'] = events[-self.max_events:]
-        self._save()
+        with self._lock:
+            events = self._data.setdefault('events', [])
+            events.append(self._event_from_news(kind, news, **extra))
+            self._data['events'] = events[-self.max_events:]
+            self._save()
 
     def events(self, days: Optional[int] = None, kind: Optional[str] = None) -> list[dict]:
-        rows = self._data.get('events', [])
+        with self._lock:
+            rows = list(self._data.get('events', []))
         cutoff = None
         if days is not None:
             cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
@@ -6317,9 +6385,199 @@ def get_animation_magazine():
     return _parse_rss_with_fallback('https://www.animationmagazine.net/category/anime/feed/', 'Animation Magazine')
 
 
+def _parse_listing_html(
+    html_text: str,
+    *,
+    source_name: str,
+    base_url: str,
+    href_pattern: str,
+    lang: Optional[str] = None,
+    title_keywords: Optional[tuple[str, ...]] = None,
+) -> list[dict]:
+    """Conservative parser for simple news listing pages.
+
+    The second-cycle sources below use distinct permalink shapes.  We match only
+    those permalinks, deduplicate them, keep the closest card image/summary and
+    let the existing article/OG pipeline enrich the item later.  The helper is
+    intentionally pure enough to fuzz and unit-test without network access.
+    """
+    if not html_text:
+        return []
+    try:
+        soup = BeautifulSoup(html_text, 'html.parser')
+        link_re = re.compile(href_pattern, re.IGNORECASE)
+    except Exception:
+        return []
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for a in soup.select('a[href]'):
+        href = str(a.get('href') or '').strip()
+        if not href:
+            continue
+        link = urljoin(base_url, href)
+        if not link_re.search(link):
+            continue
+        # Drop query/fragment noise from listing links while preserving path.
+        try:
+            parsed = urlparse(link)
+            link = parsed._replace(query='', fragment='').geturl()
+        except Exception:
+            pass
+        if link in seen:
+            continue
+
+        title = re.sub(r'\s+', ' ', a.get_text(' ', strip=True)).strip()
+        if len(title) < 10:
+            # Many cards wrap the image and put the visible heading next to it.
+            card = a.find_parent(['article', 'li', 'section', 'div'])
+            if card is not None:
+                heading = card.select_one('h1, h2, h3, h4')
+                if heading is not None:
+                    title = re.sub(r'\s+', ' ', heading.get_text(' ', strip=True)).strip()
+        if len(title) < 10 or len(title) > 300:
+            continue
+        if title_keywords:
+            low = title.casefold()
+            if not any(k.casefold() in low for k in title_keywords):
+                continue
+
+        card = a.find_parent(['article', 'li', 'section']) or a.find_parent('div')
+        summary = ''
+        images: list[str] = []
+        if card is not None:
+            ptag = card.select_one('p')
+            if ptag is not None:
+                summary = re.sub(r'\s+', ' ', ptag.get_text(' ', strip=True)).strip()[:900]
+            img = card.select_one('img[src], img[data-src], img[data-lazy-src]')
+            if img is not None:
+                raw_img = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
+                if raw_img:
+                    norm = _normalize_image_url(str(raw_img), link)
+                    if norm:
+                        images.append(norm)
+
+        seen.add(link)
+        out.append({
+            'title': title[:250],
+            'link': link,
+            'summary': summary,
+            'source': source_name,
+            'image': images[0] if images else None,
+            'images': images,
+            'video': None,
+            'published_parsed': None,
+            **({'lang': lang} if lang else {}),
+        })
+        if len(out) >= NEWS_PER_SOURCE:
+            break
+    return out
+
+
+def _fetch_listing_source(
+    url: str,
+    source_name: str,
+    *,
+    base_url: str,
+    href_pattern: str,
+    lang: Optional[str] = None,
+    title_keywords: Optional[tuple[str, ...]] = None,
+) -> list[dict]:
+    """Bounded HTML fetch wrapper for listing-based sources."""
+    response = None
+    try:
+        response = http_get_with_retry(
+            url,
+            headers={'User-Agent': USER_AGENT, 'Accept-Language': 'en-US,en;q=0.9'},
+            timeout=HTTP_TIMEOUT,
+            stream=True,
+        )
+        if not response or response.status_code != 200:
+            logger.warning('%s: HTTP %s', source_name,
+                           response.status_code if response is not None else 'нет ответа')
+            return []
+        page_text = _read_limited_text(response)
+        if page_text is None:
+            logger.warning('%s: HTML слишком большой', source_name)
+            return []
+        return _parse_listing_html(
+            page_text,
+            source_name=source_name,
+            base_url=base_url,
+            href_pattern=href_pattern,
+            lang=lang,
+            title_keywords=title_keywords,
+        )
+    except Exception as e:
+        logger.error('%s error: %s', source_name, e)
+        return []
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+
 def get_anitrendz():
-    """AniTrendz — еженедельные опросы, тренды, чарты."""
-    return _parse_rss_with_fallback('https://www.anitrendz.com/feed/', 'AniTrendz')
+    """Anime Trending — current anime news listing (the old /feed is stale HTML)."""
+    return _fetch_listing_source(
+        'https://anitrendz.net/news/',
+        'Anime Trending',
+        base_url='https://anitrendz.net/',
+        href_pattern=r'/news/20\d\d/\d\d/\d\d/[^/?#]+/?$',
+    )
+
+
+def get_otakuusa():
+    """Otaku USA Magazine — anime/manga news; WordPress RSS is live."""
+    return _parse_rss_with_fallback('https://otakuusamagazine.com/feed/', 'Otaku USA', force_og=True)
+
+
+def get_anime_limited():
+    """Anime Limited / All the Anime — official UK distributor news."""
+    return _parse_rss_with_fallback('https://blog.alltheanime.com/feed/', 'Anime Limited', force_og=True)
+
+
+def get_comic_natalie():
+    """Comic Natalie — fast Japanese comic/anime news listing."""
+    return _fetch_listing_source(
+        'https://natalie.mu/comic/news',
+        'Comic Natalie(JP)',
+        base_url='https://natalie.mu/',
+        href_pattern=r'natalie\.mu/comic/news/\d+/?$',
+        lang='ja',
+    )
+
+
+def get_sevenseas_news():
+    """Seven Seas — official licensing announcements and publisher news."""
+    return _fetch_listing_source(
+        'https://sevenseasentertainment.com/category/news/',
+        'Seven Seas',
+        base_url='https://sevenseasentertainment.com/',
+        href_pattern=r'sevenseasentertainment\.com/20\d\d/\d\d/\d\d/[^/?#]+/?$',
+    )
+
+
+def get_yenpress_news():
+    """Yen Press — official announcement feed page."""
+    return _fetch_listing_source(
+        'https://yenpress.com/news/tag/announcements',
+        'Yen Press',
+        base_url='https://yenpress.com/',
+        href_pattern=r'yenpress\.com/news/[^/?#]+/?$',
+    )
+
+
+def get_gkids_news():
+    """GKIDS — official anime/animation theatrical and home-video announcements."""
+    return _fetch_listing_source(
+        'https://gkids.com/author/gkids/',
+        'GKIDS',
+        base_url='https://gkids.com/',
+        href_pattern=r'gkids\.com/20\d\d/\d\d/\d\d/[^/?#]+/?$',
+    )
 
 
 def get_myanimelist():
@@ -6594,6 +6852,14 @@ TELEGRAM_CHANNELS = [
     ('currentanimenews', 'TG: CurrentAnime'),
     ('ytkanews', 'TG: YtkaNews'),
     ('advance_emp', 'TG: Advance'),
+    # Production-green channels from the current source profile.  Keeping them
+    # built in means a clean deploy does not silently lose them if the runtime
+    # custom_sources.json is unavailable. Existing custom entries with the same
+    # labels are ignored by _attach_custom_source below.
+    ('QewbsNews', 'TG: QewbsNews'),
+    ('animetarakans', 'TG: animetarakans'),
+    ('Anilibria', 'TG: anilibria'),
+    ('VanitasNews', 'TG: VanitasNews'),
 ]
 
 
@@ -7099,6 +7365,14 @@ SOURCES = [
     ('MyAnimeList', get_myanimelist),
     # 🟡 С force_og — обещают давать картинки через og:image
     ('AnimeNewsNetwork', get_animenewsnetwork),
+    # 🆕 Second-cycle replacements for the sources that are disabled in production.
+    ('Anime Trending', get_anitrendz),
+    ('Otaku USA', get_otakuusa),
+    ('Comic Natalie(JP)', get_comic_natalie),
+    ('Anime Limited', get_anime_limited),
+    ('Seven Seas', get_sevenseas_news),
+    ('Yen Press', get_yenpress_news),
+    ('GKIDS', get_gkids_news),
     ('ANN Newsroom', get_ann_newsroom),
     ('ANN Industry', get_ann_industry),
     ('Anime Corner', get_anime_corner),
@@ -7896,7 +8170,8 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
             if is_channel:
                 await stats.record_failed_send(source)
                 if analytics_store is not None and track_history:
-                    analytics_store.record('delivery', news, result='failed', mode='channel')
+                    await asyncio.to_thread(analytics_store.record, 'delivery', news,
+                                            result='failed', mode='channel')
             return 'failed'
 
         if track_history and ledger_claimed:
@@ -7911,7 +8186,8 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
                 if story_history is not None:
                     story_history.record(news, format_news_short(news))
                 if analytics_store is not None:
-                    analytics_store.record('delivery', news, result='sent', mode='channel')
+                    await asyncio.to_thread(analytics_store.record, 'delivery', news,
+                                            result='sent', mode='channel')
                 await _maybe_mirror_canary(bot, news)
         return 'sent'
     except DeliveryUncertain as e:
@@ -7923,7 +8199,8 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
         if is_channel:
             await stats.record_failed_send(source)
             if analytics_store is not None and track_history:
-                analytics_store.record('delivery', news, result='uncertain', mode='channel')
+                await asyncio.to_thread(analytics_store.record, 'delivery', news,
+                                        result='uncertain', mode='channel')
         return 'uncertain'
     except asyncio.CancelledError:
         if track_history and ledger_claimed and send_started and not committed:
@@ -8055,9 +8332,10 @@ def _make_source_fn(src_type: str, value: str, label: str):
 
 def _attach_custom_source(item: dict) -> None:
     """Подключает динамический источник в общий список SOURCES (если ещё нет)."""
-    if any(name == item['label'] for name, _ in SOURCES):
+    label = str(item.get('label') or '').strip()
+    if any(name.casefold() == label.casefold() for name, _ in SOURCES):
         return
-    SOURCES.append((item['label'], _make_source_fn(item['type'], item['value'], item['label'])))
+    SOURCES.append((label, _make_source_fn(item['type'], item['value'], label)))
 
 
 CUSTOM_SOURCE_LABEL_MAX = 80
@@ -8095,6 +8373,638 @@ def _parse_addsource_args(args: list) :
         return 'rss', first, label
     return None
 
+
+
+# ============== SOURCE DISCOVERY / AUTO-PROBING — CYCLE 2 STAGE 16 ==============
+_DISCOVERY_BLOCKED_HOSTS = {
+    'facebook.com', 'm.facebook.com', 'instagram.com', 'twitter.com', 'x.com',
+    'youtube.com', 'youtu.be', 'tiktok.com', 'reddit.com', 'discord.com',
+    'discord.gg', 't.me', 'telegram.me', 'google.com', 'googleapis.com',
+    'googlesyndication.com', 'doubleclick.net', 'amazon.com', 'amzn.to',
+    'apple.com', 'spotify.com', 'patreon.com', 'pinterest.com', 'linkedin.com',
+    'wikipedia.org', 'wikimedia.org', 'github.com', 'cloudflare.com',
+}
+_DISCOVERY_ASSET_EXT = re.compile(
+    r'\.(?:jpg|jpeg|png|gif|webp|svg|ico|mp4|webm|mov|mp3|wav|pdf|zip|css|js|woff2?)(?:$|\?)',
+    re.IGNORECASE,
+)
+_DISCOVERY_CONTEXT_RE = re.compile(
+    r'\b(?:source|official|press\s*release|announcement|news|anime|manga|trailer|'
+    r'publisher|studio|production|website|原作|公式|ニュース|アニメ)\b', re.IGNORECASE,
+)
+_DISCOVERY_FEED_HINT_RE = re.compile(r'(?:^|/)(?:feed|rss|atom)(?:[./_-]|$)|\.(?:rss|atom|xml)(?:$|\?)', re.I)
+_DISCOVERY_ANIME_RE = re.compile(
+    r'\b(?:anime|manga|light\s*novel|crunchyroll|aniplex|kadokawa|toei|'
+    r'animation|season|trailer|visual|voice\s*cast|mangaka)\b|アニメ|漫画|声優|劇場版|新作',
+    re.IGNORECASE,
+)
+
+
+def _discovery_host(url: str) -> str:
+    try:
+        host = (urlparse(str(url or '')).hostname or '').rstrip('.').lower()
+        return host[4:] if host.startswith('www.') else host
+    except Exception:
+        return ''
+
+
+def _discovery_same_site(a: str, b: str) -> bool:
+    a, b = _discovery_host(a) if '://' in str(a) else str(a or '').lower(), _discovery_host(b) if '://' in str(b) else str(b or '').lower()
+    if not a or not b:
+        return False
+    return a == b or a.endswith('.' + b) or b.endswith('.' + a)
+
+
+
+def _is_safe_discovery_url(url: str) -> bool:
+    """Stricter than generic public HTTP: discovery never probes raw IPs/custom ports."""
+    try:
+        parsed = urlparse(str(url or ''))
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            return False
+        if parsed.port not in (None, 80, 443):
+            return False
+        try:
+            ipaddress.ip_address(parsed.hostname)
+            return False
+        except ValueError:
+            pass
+        return _is_public_http_url(str(url))
+    except (ValueError, TypeError):
+        return False
+
+
+def _discovery_blocked_host(host: str) -> bool:
+    host = str(host or '').lower().rstrip('.')
+    if not host:
+        return True
+    return any(host == blocked or host.endswith('.' + blocked) for blocked in _DISCOVERY_BLOCKED_HOSTS)
+
+
+def _extract_source_discovery_links(html_text: str, base_url: str, *, limit: int = SOURCE_DISCOVERY_MAX_LINKS_PER_ARTICLE) -> list[dict]:
+    """Pure HTML candidate extractor used by Stage 16 and fuzz/regression tests.
+
+    It does not perform DNS/network access. SSRF validation happens only when a
+    candidate is actually probed. This keeps malformed article HTML harmless.
+    """
+    if not html_text or not base_url or limit <= 0:
+        return []
+    base_host = _discovery_host(base_url)
+    if not base_host:
+        return []
+    try:
+        soup = BeautifulSoup(str(html_text), 'html.parser')
+    except Exception:
+        return []
+    by_host: dict[str, dict] = {}
+
+    def add(url: str, *, evidence: float, context: str = '', feed: bool = False):
+        try:
+            absolute = urljoin(base_url, str(url or '').strip())
+            parsed = urlparse(absolute)
+        except Exception:
+            return
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            return
+        host = _discovery_host(absolute)
+        if not host or _discovery_same_site(host, base_host) or _discovery_blocked_host(host):
+            return
+        if _DISCOVERY_ASSET_EXT.search(absolute):
+            return
+        row = by_host.get(host)
+        score = max(0.0, min(1.0, float(evidence)))
+        if row is None:
+            row = {
+                'domain': host,
+                'homepage': f'{parsed.scheme}://{parsed.netloc}/',
+                'discovered_url': absolute[:CUSTOM_SOURCE_URL_MAX],
+                'feed_url': absolute[:CUSTOM_SOURCE_URL_MAX] if feed else '',
+                'evidence': score,
+                'context': re.sub(r'\s+', ' ', str(context or '')).strip()[:180],
+            }
+            by_host[host] = row
+        else:
+            row['evidence'] = max(float(row.get('evidence') or 0.0), score)
+            if feed and not row.get('feed_url'):
+                row['feed_url'] = absolute[:CUSTOM_SOURCE_URL_MAX]
+            if context and len(str(context)) > len(str(row.get('context') or '')):
+                row['context'] = re.sub(r'\s+', ' ', str(context)).strip()[:180]
+
+    # Explicit RSS/Atom discovery links are strongest evidence.
+    for tag in soup.find_all('link', href=True):
+        rel = ' '.join(tag.get('rel') or []).lower()
+        typ = str(tag.get('type') or '').lower()
+        if 'alternate' in rel and ('rss' in typ or 'atom' in typ or 'xml' in typ):
+            add(tag.get('href'), evidence=1.0, context=str(tag.get('title') or 'feed'), feed=True)
+
+    for a in soup.find_all('a', href=True):
+        href = str(a.get('href') or '').strip()
+        if not href or href.startswith(('#', 'mailto:', 'javascript:', 'tel:')):
+            continue
+        text = re.sub(r'\s+', ' ', a.get_text(' ', strip=True))[:180]
+        parent_text = ''
+        try:
+            parent_text = re.sub(r'\s+', ' ', a.parent.get_text(' ', strip=True))[:260] if a.parent else ''
+        except Exception:
+            pass
+        context = (text + ' ' + parent_text).strip()
+        hinted_feed = bool(_DISCOVERY_FEED_HINT_RE.search(href))
+        evidence = 0.30
+        if hinted_feed:
+            evidence = 0.95
+        elif _DISCOVERY_CONTEXT_RE.search(context):
+            evidence = 0.72
+        elif any(k in href.lower() for k in ('/news/', '/anime/', '/press/', '/article/', '/blog/')):
+            evidence = 0.52
+        else:
+            # Random navigation/ads are too noisy for source discovery.
+            continue
+        add(href, evidence=evidence, context=context, feed=hinted_feed)
+
+    rows = sorted(by_host.values(), key=lambda r: (-float(r['evidence']), r['domain']))
+    return rows[:limit]
+
+
+class SourceDiscoveryStore:
+    """Durable shadow-only registry of candidate RSS/Atom sources.
+
+    Discovery is intentionally advisory: no candidate is attached to ``SOURCES``
+    until an admin explicitly promotes it. Dismissed candidates are retained so
+    the crawler does not rediscover them every cycle.
+    """
+    def __init__(self, path: Path):
+        self.path = path
+        self._data = {'schema_version': 1, 'candidates': {}, 'scanned': {}, 'configured_hosts': {}}
+        self._lock = threading.RLock()
+        self._load()
+
+    @staticmethod
+    def _now() -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _parse_dt(value) -> Optional[datetime]:
+        try:
+            dt = datetime.fromisoformat(str(value))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def candidate_id(domain: str) -> str:
+        return hashlib.sha256(str(domain or '').lower().encode('utf-8')).hexdigest()[:10]
+
+    def _load(self) -> None:
+        try:
+            if not self.path.exists():
+                return
+            raw = json.loads(self.path.read_text(encoding='utf-8'))
+            if not isinstance(raw, dict):
+                raise ValueError('ожидался объект')
+            candidates = raw.get('candidates') if isinstance(raw.get('candidates'), dict) else {}
+            scanned = raw.get('scanned') if isinstance(raw.get('scanned'), dict) else {}
+            configured = raw.get('configured_hosts') if isinstance(raw.get('configured_hosts'), dict) else {}
+            self._data = {
+                'schema_version': 1,
+                'candidates': {str(k): v for k, v in candidates.items() if isinstance(v, dict)},
+                'scanned': {str(k): str(v) for k, v in scanned.items() if k and v},
+                'configured_hosts': {str(k): str(v) for k, v in configured.items() if k and v},
+            }
+            self._prune(save=False)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+            logger.warning('source_discovery не загружен: %s', e)
+
+    def _save(self) -> None:
+        try:
+            _atomic_write_json(self.path, self._data, indent=2)
+        except OSError as e:
+            logger.error('source_discovery не сохранён: %s', e)
+
+    def _prune(self, *, save: bool = True) -> None:
+        now = self._now()
+        scan_cutoff = now - timedelta(days=SOURCE_DISCOVERY_SCAN_TTL_DAYS)
+        scanned = self._data.setdefault('scanned', {})
+        for key, value in list(scanned.items()):
+            dt = self._parse_dt(value)
+            if dt is None or dt < scan_cutoff:
+                scanned.pop(key, None)
+        if len(scanned) > SOURCE_DISCOVERY_MAX_SCANNED:
+            ordered = sorted(scanned.items(), key=lambda kv: self._parse_dt(kv[1]) or datetime.min.replace(tzinfo=timezone.utc))
+            for key, _ in ordered[:len(scanned) - SOURCE_DISCOVERY_MAX_SCANNED]:
+                scanned.pop(key, None)
+        candidates = self._data.setdefault('candidates', {})
+        if len(candidates) > SOURCE_DISCOVERY_MAX_CANDIDATES:
+            def keep_rank(item):
+                _cid, row = item
+                protected = str(row.get('status') or '') in {'suggested', 'promoted', 'dismissed'}
+                dt = self._parse_dt(row.get('last_seen')) or datetime.min.replace(tzinfo=timezone.utc)
+                return (protected, float(row.get('score') or 0.0), dt.timestamp())
+            ordered = sorted(candidates.items(), key=keep_rank)
+            removable = len(candidates) - SOURCE_DISCOVERY_MAX_CANDIDATES
+            for cid, row in ordered:
+                if removable <= 0:
+                    break
+                if str(row.get('status') or '') == 'promoted':
+                    continue
+                candidates.pop(cid, None)
+                removable -= 1
+        if save:
+            self._save()
+
+    def note_configured_source(self, source: str, url: str) -> None:
+        host = _discovery_host(url)
+        if not host:
+            return
+        key = str(source or host)[:100]
+        with self._lock:
+            if self._data.setdefault('configured_hosts', {}).get(key) != host:
+                self._data['configured_hosts'][key] = host
+                self._save()
+
+    def configured_hosts(self) -> set[str]:
+        with self._lock:
+            hosts = {str(v) for v in self._data.get('configured_hosts', {}).values() if v}
+        if custom_sources is not None:
+            for item in custom_sources.all():
+                if item.get('type') == 'rss':
+                    host = _discovery_host(item.get('value'))
+                    if host:
+                        hosts.add(host)
+        return hosts
+
+    def is_known_host(self, host: str) -> bool:
+        host = str(host or '').lower()
+        return any(_discovery_same_site(host, known) for known in self.configured_hosts())
+
+    def article_due(self, url: str) -> bool:
+        key = normalize_url(url)
+        if not key:
+            return False
+        with self._lock:
+            last = self._parse_dt(self._data.get('scanned', {}).get(key))
+        return last is None or self._now() - last >= timedelta(days=SOURCE_DISCOVERY_SCAN_TTL_DAYS)
+
+    def mark_article_scanned(self, url: str) -> None:
+        key = normalize_url(url)
+        if not key:
+            return
+        with self._lock:
+            self._data.setdefault('scanned', {})[key] = self._now().isoformat()
+            self._prune(save=True)
+
+    def observe(self, candidate: dict, *, found_by_source: str, article_url: str) -> Optional[str]:
+        domain = str(candidate.get('domain') or '').lower().strip()
+        if not domain or _discovery_blocked_host(domain) or self.is_known_host(domain):
+            return None
+        cid = self.candidate_id(domain)
+        now = self._now().isoformat()
+        with self._lock:
+            rows = self._data.setdefault('candidates', {})
+            row = rows.setdefault(cid, {
+                'id': cid, 'domain': domain, 'homepage': candidate.get('homepage') or '',
+                'discovered_url': candidate.get('discovered_url') or '', 'feed_url': '',
+                'label': domain, 'status': 'shadow', 'first_seen': now, 'last_seen': now,
+                'mentions': 0, 'found_by_sources': [], 'evidence_max': 0.0,
+                'probe_count': 0, 'probe_successes': 0, 'last_probe': None,
+                'last_probe_ok': False, 'last_probe_error': '', 'feed_items': 0, 'recent_items': 0,
+                'anime_relevance': 0.0, 'score': 0.0,
+            })
+            if row.get('status') in {'dismissed', 'promoted'}:
+                row['last_seen'] = now
+                self._save()
+                return cid
+            row['last_seen'] = now
+            row['mentions'] = _safe_nonnegative_int(row.get('mentions')) + 1
+            row['evidence_max'] = max(float(row.get('evidence_max') or 0.0), float(candidate.get('evidence') or 0.0))
+            if candidate.get('homepage'):
+                row['homepage'] = str(candidate['homepage'])[:CUSTOM_SOURCE_URL_MAX]
+            if candidate.get('discovered_url'):
+                row['discovered_url'] = str(candidate['discovered_url'])[:CUSTOM_SOURCE_URL_MAX]
+            if candidate.get('feed_url'):
+                row['feed_url'] = str(candidate['feed_url'])[:CUSTOM_SOURCE_URL_MAX]
+            sources = list(row.get('found_by_sources') or [])
+            if found_by_source and found_by_source not in sources:
+                sources.append(str(found_by_source)[:100])
+            row['found_by_sources'] = sources[-12:]
+            if candidate.get('context'):
+                row['context'] = str(candidate['context'])[:180]
+            row['last_article'] = normalize_url(article_url)[:CUSTOM_SOURCE_URL_MAX]
+            self._recompute_score(row)
+            self._prune(save=False)
+            self._save()
+        return cid
+
+    def _recompute_score(self, row: dict) -> float:
+        mentions = _safe_nonnegative_int(row.get('mentions'))
+        probes = _safe_nonnegative_int(row.get('probe_count'))
+        successes = _safe_nonnegative_int(row.get('probe_successes'))
+        success_rate = successes / probes if probes else 0.0
+        items = _safe_nonnegative_int(row.get('feed_items'))
+        relevance = max(0.0, min(1.0, float(row.get('anime_relevance') or 0.0)))
+        evidence = max(0.0, min(1.0, float(row.get('evidence_max') or 0.0)))
+        score = (0.18 * min(1.0, mentions / max(1, SOURCE_DISCOVERY_MIN_MENTIONS))
+                 + 0.22 * evidence
+                 + 0.25 * success_rate
+                 + 0.15 * min(1.0, items / 8.0)
+                 + 0.20 * relevance)
+        row['score'] = round(max(0.0, min(1.0, score)), 4)
+        if row.get('status') not in {'dismissed', 'promoted'}:
+            if (successes > 0
+                    and bool(row.get('last_probe_ok'))
+                    and mentions >= SOURCE_DISCOVERY_MIN_MENTIONS
+                    and row['score'] >= SOURCE_DISCOVERY_SUGGEST_SCORE):
+                row['status'] = 'suggested'
+            else:
+                row['status'] = 'shadow'
+        return row['score']
+
+    def due_for_probe(self, *, limit: int = SOURCE_DISCOVERY_PROBES_PER_CYCLE) -> list[dict]:
+        if limit <= 0:
+            return []
+        now = self._now()
+        out = []
+        with self._lock:
+            for row in self._data.get('candidates', {}).values():
+                if str(row.get('status') or '') in {'dismissed', 'promoted'}:
+                    continue
+                last = self._parse_dt(row.get('last_probe'))
+                if last and now - last < timedelta(hours=SOURCE_DISCOVERY_PROBE_COOLDOWN_HOURS):
+                    continue
+                out.append(dict(row))
+        out.sort(key=lambda r: (-float(r.get('evidence_max') or 0.0), -_safe_nonnegative_int(r.get('mentions')), str(r.get('domain') or '')))
+        return out[:limit]
+
+    def record_probe(self, cid: str, result: dict) -> None:
+        with self._lock:
+            row = self._data.get('candidates', {}).get(str(cid))
+            if not row:
+                return
+            row['probe_count'] = _safe_nonnegative_int(row.get('probe_count')) + 1
+            row['last_probe'] = self._now().isoformat()
+            ok = bool(result.get('ok'))
+            row['last_probe_ok'] = ok
+            if ok:
+                row['probe_successes'] = _safe_nonnegative_int(row.get('probe_successes')) + 1
+                row['last_probe_error'] = ''
+                if result.get('feed_url'):
+                    row['feed_url'] = str(result['feed_url'])[:CUSTOM_SOURCE_URL_MAX]
+                if result.get('label'):
+                    row['label'] = _clean_source_label(result['label']) or row.get('label') or row['domain']
+                row['feed_items'] = _safe_nonnegative_int(result.get('feed_items'))
+                row['recent_items'] = _safe_nonnegative_int(result.get('recent_items'))
+                row['anime_relevance'] = round(max(0.0, min(1.0, float(result.get('anime_relevance') or 0.0))), 3)
+            else:
+                row['last_probe_error'] = str(result.get('error') or 'probe failed')[:220]
+            self._recompute_score(row)
+            self._save()
+
+    def get(self, cid: str) -> Optional[dict]:
+        with self._lock:
+            row = self._data.get('candidates', {}).get(str(cid))
+            return dict(row) if row else None
+
+    def rows(self, *, include_dismissed: bool = False) -> list[dict]:
+        with self._lock:
+            rows = [dict(r) for r in self._data.get('candidates', {}).values()
+                    if include_dismissed or str(r.get('status') or '') != 'dismissed']
+        rank = {'suggested': 0, 'shadow': 1, 'promoted': 2, 'dismissed': 3}
+        return sorted(rows, key=lambda r: (rank.get(str(r.get('status')), 9), -float(r.get('score') or 0.0), str(r.get('domain') or '')))
+
+    def dismiss(self, cid: str) -> bool:
+        with self._lock:
+            row = self._data.get('candidates', {}).get(str(cid))
+            if not row:
+                return False
+            row['status'] = 'dismissed'
+            row['dismissed_at'] = self._now().isoformat()
+            self._save()
+            return True
+
+    def mark_promoted(self, cid: str, *, label: str = '') -> bool:
+        with self._lock:
+            row = self._data.get('candidates', {}).get(str(cid))
+            if not row:
+                return False
+            row['status'] = 'promoted'
+            row['promoted_at'] = self._now().isoformat()
+            if label:
+                row['label'] = _clean_source_label(label)
+            self._save()
+            return True
+
+
+source_discovery: Optional['SourceDiscoveryStore'] = None
+
+
+def _decode_discovery_html(data: bytes, response=None) -> str:
+    if not data:
+        return ''
+    encoding = getattr(response, 'encoding', None) or 'utf-8'
+    try:
+        return data.decode(encoding, errors='replace')
+    except (LookupError, AttributeError):
+        return data.decode('utf-8', errors='replace')
+
+
+def _scan_article_for_source_candidates(news: dict) -> int:
+    """Fetch one already-collected article and register promising external hosts."""
+    if source_discovery is None:
+        return 0
+    article_url = str(news.get('link') or '').strip()
+    if not article_url or not source_discovery.article_due(article_url):
+        return 0
+    source_discovery.note_configured_source(str(news.get('source') or ''), article_url)
+    count = 0
+    try:
+        r = http_get_public_with_retry(article_url, headers={'User-Agent': USER_AGENT},
+                                       timeout=SOURCE_DISCOVERY_HTTP_TIMEOUT, stream=True)
+        if r is None or r.status_code >= 400:
+            if r is not None:
+                try: r.close()
+                except Exception: pass
+            return 0
+        raw = _read_limited_response(r, VERIFICATION_PAGE_MAX_BYTES)
+        text = _decode_discovery_html(raw or b'', r)
+        try: r.close()
+        except Exception: pass
+        for candidate in _extract_source_discovery_links(text, article_url):
+            if source_discovery.observe(candidate, found_by_source=str(news.get('source') or ''), article_url=article_url):
+                count += 1
+        return count
+    except Exception as e:
+        logger.debug('source discovery scan failed for %s: %s', article_url[:100], e)
+        return 0
+    finally:
+        source_discovery.mark_article_scanned(article_url)
+
+
+def _feed_probe_stats(data: bytes | str) -> dict:
+    """Return bounded feed quality signals without fetching article pages."""
+    try:
+        feed = feedparser.parse(data)
+    except Exception as e:
+        return {'ok': False, 'error': f'feed parse: {e}'}
+    entries = list(getattr(feed, 'entries', None) or [])[:30]
+    valid = []
+    recent = 0
+    anime_hits = 0
+    now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+    for entry in entries:
+        title = str(getattr(entry, 'title', '') or '').strip()
+        link = str(getattr(entry, 'link', '') or '').strip()
+        if not title or not link:
+            continue
+        valid.append(entry)
+        if _DISCOVERY_ANIME_RE.search(title):
+            anime_hits += 1
+        pub = getattr(entry, 'published_parsed', None) or getattr(entry, 'updated_parsed', None)
+        if pub:
+            try:
+                dt = datetime(*pub[:6])
+                if now_naive - dt <= timedelta(days=21):
+                    recent += 1
+            except (TypeError, ValueError, OverflowError):
+                pass
+    if len(valid) < 2:
+        return {'ok': False, 'error': 'feed has fewer than 2 valid entries', 'feed_items': len(valid)}
+    title = ''
+    try:
+        meta = getattr(feed, 'feed', None)
+        if isinstance(meta, dict):
+            title = str(meta.get('title') or '')
+        else:
+            title = str(getattr(meta, 'title', '') or '')
+    except Exception:
+        pass
+    relevance = anime_hits / len(valid) if valid else 0.0
+    # A general entertainment feed discovered from multiple anime articles may
+    # still be useful, so relevance is a ranking signal, not a hard rejection.
+    return {
+        'ok': True, 'feed_items': len(valid), 'recent_items': recent,
+        'anime_relevance': round(relevance, 3), 'label': _clean_source_label(title),
+    }
+
+
+def _feed_links_from_html(html_text: str, base_url: str) -> list[str]:
+    try:
+        soup = BeautifulSoup(str(html_text or ''), 'html.parser')
+    except Exception:
+        return []
+    out = []
+    for tag in soup.find_all('link', href=True):
+        rel = ' '.join(tag.get('rel') or []).lower()
+        typ = str(tag.get('type') or '').lower()
+        if 'alternate' not in rel or not ('rss' in typ or 'atom' in typ or 'xml' in typ):
+            continue
+        url = urljoin(base_url, str(tag.get('href') or '').strip())
+        if url not in out:
+            out.append(url)
+    return out[:4]
+
+
+def _probe_feed_url(url: str) -> dict:
+    if not _is_safe_discovery_url(url):
+        return {'ok': False, 'error': 'unsafe/non-public feed URL'}
+    r = http_get_public_with_retry(url, headers={'User-Agent': USER_AGENT},
+                                   timeout=SOURCE_DISCOVERY_HTTP_TIMEOUT, stream=True)
+    if r is None or r.status_code >= 400:
+        status = getattr(r, 'status_code', 'no response')
+        if r is not None:
+            try: r.close()
+            except Exception: pass
+        return {'ok': False, 'error': f'HTTP {status}'}
+    data = _read_limited_response(r, SOURCE_DISCOVERY_FEED_MAX_BYTES)
+    try: r.close()
+    except Exception: pass
+    if not data:
+        return {'ok': False, 'error': 'empty/oversized feed'}
+    result = _feed_probe_stats(data)
+    if result.get('ok'):
+        result['feed_url'] = url
+    return result
+
+
+def _probe_source_discovery_candidate(row: dict) -> dict:
+    """Try explicit, autodiscovered and a few conventional feed URLs."""
+    feed_url = str(row.get('feed_url') or '').strip()
+    if feed_url:
+        result = _probe_feed_url(feed_url)
+        if result.get('ok'):
+            return result
+    page_urls = []
+    for value in (row.get('discovered_url'), row.get('homepage')):
+        value = str(value or '').strip()
+        if value and value not in page_urls and _is_safe_discovery_url(value):
+            page_urls.append(value)
+    found_feeds = []
+    for page_url in page_urls[:2]:
+        r = http_get_public_with_retry(page_url, headers={'User-Agent': USER_AGENT},
+                                       timeout=SOURCE_DISCOVERY_HTTP_TIMEOUT, stream=True)
+        if r is None or r.status_code >= 400:
+            if r is not None:
+                try: r.close()
+                except Exception: pass
+            continue
+        data = _read_limited_response(r, VERIFICATION_PAGE_MAX_BYTES)
+        text = _decode_discovery_html(data or b'', r)
+        try: r.close()
+        except Exception: pass
+        for candidate in _feed_links_from_html(text, page_url):
+            if candidate not in found_feeds:
+                found_feeds.append(candidate)
+    homepage = str(row.get('homepage') or '').strip()
+    if homepage:
+        for suffix in ('feed/', 'feed.xml', 'rss.xml', 'rss', 'atom.xml'):
+            candidate = urljoin(homepage, suffix)
+            if candidate not in found_feeds:
+                found_feeds.append(candidate)
+    errors = []
+    for candidate in found_feeds[:5]:
+        result = _probe_feed_url(candidate)
+        if result.get('ok'):
+            return result
+        errors.append(str(result.get('error') or 'failed'))
+    return {'ok': False, 'error': '; '.join(errors[:3]) or 'RSS/Atom feed not found'}
+
+
+async def _run_source_discovery(news_items: list[dict]) -> dict:
+    """Low-impact discovery pass; never mutates production source configuration."""
+    result = {'scanned': 0, 'found': 0, 'probed': 0, 'suggested': 0, 'skipped': ''}
+    if not feature_enabled('source_discovery') or source_discovery is None:
+        result['skipped'] = 'disabled'
+        return result
+    if post_queue is not None and feature_enabled('backpressure') and len(post_queue) >= BACKPRESSURE_SOFT_QUEUE:
+        result['skipped'] = 'backpressure'
+        metrics.inc('anime_bot_source_discovery_skipped_total', labels={'reason': 'backpressure'})
+        return result
+    # Learn currently configured hosts from actual source output before considering
+    # any outbound link a new source.
+    for item in news_items:
+        source_discovery.note_configured_source(str(item.get('source') or ''), str(item.get('link') or ''))
+    candidates = [item for item in news_items if item.get('link') and source_discovery.article_due(str(item.get('link')))]
+    # Prefer richer articles; deterministic order keeps tests and traffic stable.
+    candidates.sort(key=lambda n: (-len(str(n.get('summary') or '')), str(n.get('source') or ''), str(n.get('link') or '')))
+    for item in candidates[:SOURCE_DISCOVERY_SCAN_PER_CYCLE]:
+        found = await asyncio.to_thread(_scan_article_for_source_candidates, item)
+        result['scanned'] += 1
+        result['found'] += int(found)
+    for row in source_discovery.due_for_probe(limit=SOURCE_DISCOVERY_PROBES_PER_CYCLE):
+        probe = await asyncio.to_thread(_probe_source_discovery_candidate, row)
+        source_discovery.record_probe(str(row.get('id') or ''), probe)
+        result['probed'] += 1
+        after = source_discovery.get(str(row.get('id') or '')) or {}
+        if after.get('status') == 'suggested':
+            result['suggested'] += 1
+            _event_log('source_discovery_suggested', candidate_id=after.get('id'),
+                       domain=after.get('domain'), score=after.get('score'), feed_url=after.get('feed_url'))
+    metrics.inc('anime_bot_source_discovery_scans_total', result['scanned'])
+    metrics.inc('anime_bot_source_discovery_candidates_total', result['found'])
+    metrics.inc('anime_bot_source_discovery_probes_total', result['probed'])
+    rows = source_discovery.rows()
+    metrics.set('anime_bot_source_discovery_shadow', sum(1 for r in rows if r.get('status') == 'shadow'))
+    metrics.set('anime_bot_source_discovery_suggested', sum(1 for r in rows if r.get('status') == 'suggested'))
+    _event_log('source_discovery_cycle', **result)
+    return result
 
 # ============== ОТЛОЖЕННАЯ ПУБЛИКАЦИЯ ==============
 # Bot API не умеет нативную отложку Telegram (параметра schedule_date нет),
@@ -10112,6 +11022,294 @@ _OFFICIAL_HOST_HINTS = (
 )
 
 
+
+def _source_story_time(news: dict, now: Optional[datetime] = None) -> datetime:
+    """Comparable UTC timestamp for source-intelligence observations.
+
+    Prefer the publisher timestamp when available; otherwise use the time the bot
+    collected the item. The fallback makes cross-cycle late-copy detection useful
+    even for sources that do not expose a reliable publication date.
+    """
+    now = now or datetime.now(timezone.utc)
+    parsed = news.get('published_parsed')
+    if parsed:
+        try:
+            dt = datetime(*parsed[:6], tzinfo=timezone.utc)
+            # Ignore obviously corrupt/future dates instead of poisoning averages.
+            if datetime(2000, 1, 1, tzinfo=timezone.utc) <= dt <= now + timedelta(days=2):
+                return dt
+        except Exception:
+            pass
+    raw = str(news.get('_collected_at') or '').strip()
+    if raw:
+        try:
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            pass
+    return now
+
+
+class SourceIntelligenceStore:
+    """Durable, bounded intelligence about source originality/timeliness.
+
+    This deliberately does *not* auto-disable a source. It only contributes a
+    small bounded reputation adjustment after probation and enough comparisons.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._data = {'schema_version': 1, 'sources': {}, 'stories': {}}
+        self._load()
+
+    @staticmethod
+    def _source_row(raw=None) -> dict:
+        raw = raw if isinstance(raw, dict) else {}
+        try:
+            lag_sum = max(0.0, float(raw.get('lag_sum_hours') or 0.0))
+        except (TypeError, ValueError):
+            lag_sum = 0.0
+        return {
+            'first_seen': str(raw.get('first_seen') or ''),
+            'last_seen': str(raw.get('last_seen') or ''),
+            'stories_seen': _safe_nonnegative_int(raw.get('stories_seen')),
+            'comparisons': _safe_nonnegative_int(raw.get('comparisons')),
+            'earliest_count': _safe_nonnegative_int(raw.get('earliest_count')),
+            'origin_count': _safe_nonnegative_int(raw.get('origin_count')),
+            'late_count': _safe_nonnegative_int(raw.get('late_count')),
+            'lag_samples': _safe_nonnegative_int(raw.get('lag_samples')),
+            'lag_sum_hours': lag_sum,
+        }
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            raw = json.loads(self.path.read_text(encoding='utf-8'))
+            if not isinstance(raw, dict):
+                return
+            sources = raw.get('sources') if isinstance(raw.get('sources'), dict) else {}
+            stories = raw.get('stories') if isinstance(raw.get('stories'), dict) else {}
+            self._data = {
+                'schema_version': 1,
+                'sources': {str(k): self._source_row(v) for k, v in sources.items()},
+                'stories': {str(k)[:64]: v for k, v in stories.items() if isinstance(v, dict)},
+            }
+            self._prune(save=False)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+            logger.warning(f'Не удалось прочитать source intelligence {self.path}: {e}')
+
+    def _save(self) -> None:
+        try:
+            _atomic_write_json(self.path, self._data, indent=2)
+        except OSError as e:
+            logger.error(f'Не удалось сохранить source intelligence: {e}')
+
+    def _ensure_source(self, name: str, now: datetime) -> dict:
+        name = str(name or 'unknown')
+        row = self._data['sources'].get(name)
+        if not isinstance(row, dict):
+            row = self._source_row()
+            self._data['sources'][name] = row
+        stamp = now.isoformat()
+        if not row.get('first_seen'):
+            row['first_seen'] = stamp
+        row['last_seen'] = stamp
+        return row
+
+    def _prune(self, *, save: bool = False) -> None:
+        stories = self._data.get('stories', {})
+        if not isinstance(stories, dict):
+            self._data['stories'] = {}
+            return
+        cutoff = datetime.now(timezone.utc) - timedelta(days=SOURCE_INTEL_STORY_TTL_DAYS)
+        kept = []
+        for sid, row in stories.items():
+            try:
+                dt = datetime.fromisoformat(str(row.get('last_at') or row.get('first_at') or ''))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                continue
+            if dt >= cutoff:
+                kept.append((dt, sid, row))
+        kept.sort(reverse=True, key=lambda x: x[0])
+        self._data['stories'] = {sid: row for _dt, sid, row in kept[:SOURCE_INTEL_STORY_MAX]}
+        if save:
+            self._save()
+
+    def observe_story(self, story_id: str, cluster: list[dict]) -> dict:
+        now = datetime.now(timezone.utc)
+        story_id = str(story_id or '')[:64]
+        if not story_id or not cluster:
+            return {}
+        stories = self._data['stories']
+        story = stories.get(story_id)
+        if not isinstance(story, dict):
+            story = {'first_at': now.isoformat(), 'last_at': now.isoformat(),
+                     'sources': {}, 'credited': []}
+            stories[story_id] = story
+        source_map = story.get('sources') if isinstance(story.get('sources'), dict) else {}
+        story['sources'] = source_map
+        credited = set(str(x) for x in (story.get('credited') or []))
+
+        # One observation per source/story. Duplicate cards from the same source do
+        # not artificially graduate probation or improve originality.
+        current_by_source: dict[str, dict] = {}
+        for news in cluster:
+            name = str(news.get('source') or 'unknown')
+            prev = current_by_source.get(name)
+            if prev is None or _source_story_time(news, now) < _source_story_time(prev, now):
+                current_by_source[name] = news
+        for name, news in current_by_source.items():
+            at = _source_story_time(news, now)
+            old = source_map.get(name) if isinstance(source_map.get(name), dict) else None
+            is_new = old is None
+            if old:
+                try:
+                    old_at = datetime.fromisoformat(str(old.get('at') or ''))
+                    if old_at.tzinfo is None:
+                        old_at = old_at.replace(tzinfo=timezone.utc)
+                    at = min(at, old_at.astimezone(timezone.utc))
+                except (TypeError, ValueError):
+                    pass
+            source_map[name] = {'at': at.isoformat(), 'official': bool(_is_official_news(news))}
+            row = self._ensure_source(name, now)
+            if is_new:
+                row['stories_seen'] += 1
+
+        arrivals = []
+        for name, meta in source_map.items():
+            try:
+                at = datetime.fromisoformat(str(meta.get('at') or ''))
+                if at.tzinfo is None:
+                    at = at.replace(tzinfo=timezone.utc)
+                arrivals.append((at.astimezone(timezone.utc), name, bool(meta.get('official'))))
+            except (TypeError, ValueError):
+                continue
+        if not arrivals:
+            return {}
+        arrivals.sort(key=lambda x: x[0])
+        earliest_at, earliest_source, _ = arrivals[0]
+        officials = [row for row in arrivals if row[2]]
+        origin_at, origin_source, _ = (officials[0] if officials else arrivals[0])
+
+        # Only compare once at least two independent sources have appeared.
+        if len(arrivals) >= 2:
+            for at, name, _official in arrivals:
+                credit_key = name
+                if credit_key in credited:
+                    continue
+                row = self._ensure_source(name, now)
+                row['comparisons'] += 1
+                if name == earliest_source:
+                    row['earliest_count'] += 1
+                if name == origin_source:
+                    row['origin_count'] += 1
+                lag_h = max(0.0, (at - earliest_at).total_seconds() / 3600.0)
+                row['lag_samples'] += 1
+                row['lag_sum_hours'] += min(lag_h, 24.0 * 30.0)
+                if lag_h >= SOURCE_REPOST_LAG_HOURS and name != origin_source:
+                    row['late_count'] += 1
+                credited.add(credit_key)
+
+        story['credited'] = sorted(credited)
+        story['first_at'] = min(str(story.get('first_at') or now.isoformat()), earliest_at.isoformat())
+        story['last_at'] = now.isoformat()
+        story['probable_origin'] = origin_source
+        story['earliest_source'] = earliest_source
+        story['source_count'] = len(arrivals)
+        return {
+            'probable_origin': origin_source,
+            'earliest_source': earliest_source,
+            'source_count': len(arrivals),
+            'earliest_at': earliest_at.isoformat(),
+            'origin_at': origin_at.isoformat(),
+        }
+
+    def flush(self) -> None:
+        self._prune(save=False)
+        self._save()
+
+    def _historical_sample(self, source: str) -> tuple[int, int]:
+        collected = decisions = 0
+        if stats is not None:
+            try:
+                collected = _safe_nonnegative_int(stats.get_by_source().get(source, {}).get('collected'))
+            except Exception:
+                pass
+        if moderation_feedback is not None:
+            try:
+                for src, published, hidden, _edited in moderation_feedback.source_summary():
+                    if src == source:
+                        decisions = _safe_nonnegative_int(published) + _safe_nonnegative_int(hidden)
+                        break
+            except Exception:
+                pass
+        return collected, decisions
+
+    def probation_status(self, source: str, now: Optional[datetime] = None) -> dict:
+        now = now or datetime.now(timezone.utc)
+        row = self._data.get('sources', {}).get(str(source), {})
+        row = self._source_row(row)
+        collected, decisions = self._historical_sample(str(source))
+        # Existing well-observed sources should not suddenly become "new" merely
+        # because Stage 15 was deployed today.
+        if collected >= max(50, SOURCE_PROBATION_MIN_STORIES * 3) or decisions >= 12:
+            return {'probation': False, 'stories': max(row['stories_seen'], collected), 'age_days': None}
+        age_days = 0.0
+        try:
+            first = datetime.fromisoformat(row.get('first_seen') or '')
+            if first.tzinfo is None:
+                first = first.replace(tzinfo=timezone.utc)
+            age_days = max(0.0, (now - first).total_seconds() / 86400.0)
+        except (TypeError, ValueError):
+            pass
+        sample = max(row['stories_seen'], collected)
+        probation = sample < SOURCE_PROBATION_MIN_STORIES or age_days < SOURCE_PROBATION_MIN_DAYS
+        return {'probation': probation, 'stories': sample, 'age_days': round(age_days, 2)}
+
+    def source_metrics(self, source: str) -> dict:
+        row = self._source_row(self._data.get('sources', {}).get(str(source), {}))
+        comparisons = row['comparisons']
+        lag_samples = row['lag_samples']
+        avg_lag = row['lag_sum_hours'] / lag_samples if lag_samples else None
+        origin_rate = (row['origin_count'] + 2.0) / (comparisons + 5.0) if comparisons else 0.4
+        earliest_rate = (row['earliest_count'] + 2.0) / (comparisons + 4.0) if comparisons else 0.5
+        late_rate = row['late_count'] / comparisons if comparisons else 0.0
+        timeliness = 0.5 if avg_lag is None else max(0.0, 1.0 - min(avg_lag, SOURCE_TIMELINESS_WINDOW_HOURS) / SOURCE_TIMELINESS_WINDOW_HOURS)
+        probation = self.probation_status(str(source))
+        adjustment = 0.0
+        if not probation['probation'] and comparisons >= SOURCE_INTEL_MIN_COMPARISONS:
+            raw = ((origin_rate - 0.40) * 0.13
+                   + (earliest_rate - 0.50) * 0.08
+                   + (timeliness - 0.50) * 0.08
+                   - late_rate * 0.06)
+            adjustment = max(-SOURCE_INTEL_WEIGHT_MAX, min(SOURCE_INTEL_WEIGHT_MAX, raw))
+        return {
+            **row,
+            'avg_lag_hours': None if avg_lag is None else round(avg_lag, 2),
+            'origin_rate': round(origin_rate, 3),
+            'earliest_rate': round(earliest_rate, 3),
+            'late_rate': round(late_rate, 3),
+            'timeliness': round(timeliness, 3),
+            'adjustment': round(adjustment, 4),
+            **probation,
+        }
+
+    def snapshot(self) -> list[dict]:
+        names = set(self._data.get('sources', {}).keys())
+        names.update(name for name, _ in SOURCES)
+        rows = []
+        for name in sorted(names):
+            rows.append({'source': name, **self.source_metrics(name)})
+        return sorted(rows, key=lambda r: (-r['adjustment'], bool(r['probation']), r['source'].lower()))
+
+
+source_intelligence: Optional['SourceIntelligenceStore'] = None
+
 def _source_reputation_score(source: str) -> float:
     """Сглаженная репутация 0..1 из health + статистики + решений модераторов.
 
@@ -10159,6 +11357,11 @@ def _source_reputation_score(source: str) -> float:
     neutral_w = max(0.15, 1.0 - mod_w - rel_w)
     score = (moderation_accept * mod_w + reliability * rel_w + 0.65 * neutral_w)
     score *= health_factor
+    if feature_enabled('source_intelligence') and source_intelligence is not None:
+        try:
+            score += float(source_intelligence.source_metrics(source).get('adjustment') or 0.0)
+        except Exception:
+            pass
     return max(0.05, min(0.99, score))
 
 
@@ -10174,6 +11377,8 @@ def source_reputation_snapshot() -> list[dict]:
     for name in sorted(names):
         stat = stat_rows.get(name, {})
         feedback_row = feedback_rows.get(name)
+        intel = (source_intelligence.source_metrics(name)
+                 if feature_enabled('source_intelligence') and source_intelligence is not None else {})
         rows.append({
             'source': name,
             'score': round(_source_reputation_score(name), 3),
@@ -10182,6 +11387,11 @@ def source_reputation_snapshot() -> list[dict]:
             'errors': _safe_nonnegative_int(stat.get('errors')),
             'moderation_published': int(feedback_row[1]) if feedback_row else 0,
             'moderation_hidden': int(feedback_row[2]) if feedback_row else 0,
+            'probation': bool(intel.get('probation')) if intel else False,
+            'intel_adjustment': float(intel.get('adjustment') or 0.0) if intel else 0.0,
+            'avg_lag_hours': intel.get('avg_lag_hours') if intel else None,
+            'origin_rate': intel.get('origin_rate') if intel else None,
+            'comparisons': _safe_nonnegative_int(intel.get('comparisons')) if intel else 0,
         })
     return sorted(rows, key=lambda row: (-row['score'], row['source'].lower()))
 
@@ -10464,8 +11674,14 @@ def _cluster_news(items: list[dict]) -> list[dict]:
             item['_story_links'] = [str(item.get('link') or '')]
             item['_story_cluster_size'] = 1
             item['_story_id'] = _story_id(item)
+            if feature_enabled('source_intelligence') and source_intelligence is not None:
+                intel = source_intelligence.observe_story(item['_story_id'], [item])
+                if intel:
+                    item['_story_origin_source'] = intel.get('probable_origin')
             item['_confidence_score'] = round(_confidence_score(item), 3)
             out.append(item)
+        if feature_enabled('source_intelligence') and source_intelligence is not None:
+            source_intelligence.flush()
         return out
 
     clusters: list[list[dict]] = []
@@ -10517,6 +11733,11 @@ def _cluster_news(items: list[dict]) -> list[dict]:
         primary['_story_links'] = links
         primary['_story_cluster_size'] = len(cluster)
         primary['_story_id'] = _story_id(primary, extra_sources=sources)
+        if feature_enabled('source_intelligence') and source_intelligence is not None:
+            intel = source_intelligence.observe_story(primary['_story_id'], cluster)
+            if intel:
+                primary['_story_origin_source'] = intel.get('probable_origin')
+                primary['_story_earliest_source'] = intel.get('earliest_source')
         primary['_confidence_score'] = round(_confidence_score(primary), 3)
         result.append(primary)
         collapsed += max(0, len(cluster) - 1)
@@ -10524,6 +11745,8 @@ def _cluster_news(items: list[dict]) -> list[dict]:
             _event_log('story_clustered', story_id=primary['_story_id'], size=len(cluster),
                        sources=sources, confidence=primary['_confidence_score'])
 
+    if feature_enabled('source_intelligence') and source_intelligence is not None:
+        source_intelligence.flush()
     metrics.inc('anime_bot_story_clusters_total', len(result))
     if collapsed:
         metrics.inc('anime_bot_story_collapsed_total', collapsed)
@@ -10716,7 +11939,7 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
     stats_lines: list[str] = []
     errors: list[str] = []
     seen_urls: set[str] = set()
-    seen_titles: set[str] = set()
+    seen_titles: dict[str, str] = {}
 
     # Сбор идёт параллельно (сеть — самая долгая часть цикла), но результаты
     # обрабатываются в исходном порядке источников: дедуп остаётся предсказуемым.
@@ -10766,13 +11989,18 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
             no_image_skipped = 0
             duplicate_skipped = 0
             for item in items:
+                # Collection time is a fallback for source-timeliness comparisons
+                # when an RSS/listing does not expose a trustworthy publication date.
+                item['_collected_at'] = datetime.now(timezone.utc).isoformat()
                 norm_url = normalize_url(item.get('link', ''))
                 norm_title = normalize_title(item.get('title', ''))
                 if norm_url and norm_url in seen_urls:
                     duplicate_skipped += 1
                     continue
-                if norm_title and norm_title in seen_titles:
-                    logger.info(f"Дубль внутри сбора (заголовок): {item['title'][:60]}")
+                # Exact titles from *different* sources are valuable corroboration.
+                # Only collapse title duplicates within the same source before clustering.
+                if norm_title and seen_titles.get(norm_title) == name:
+                    logger.info(f"Дубль внутри источника (заголовок): {item['title'][:60]}")
                     duplicate_skipped += 1
                     continue
                 # Фильтр: посты без картинок не публикуем
@@ -10781,7 +12009,7 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
                     continue
                 seen_urls.add(norm_url)
                 if norm_title:
-                    seen_titles.add(norm_title)
+                    seen_titles.setdefault(norm_title, name)
                 unique_items.append(item)
 
             # Здоровье источника считаем по СЫРОМУ ответу: живой источник может
@@ -10826,6 +12054,12 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
                        repeat_count=int(fingerprint.get('count', 1)))
             await stats.record_source_error(name)
             _note_source_failure(name, message, hard=True)
+    try:
+        await _run_source_discovery(all_news)
+    except Exception as e:
+        # Discovery is advisory and must never break the production collection loop.
+        logger.warning('Source discovery cycle failed: %s: %s', type(e).__name__, e)
+        metrics.inc('anime_bot_source_discovery_errors_total')
     all_news = _cluster_news(all_news)
     all_news = await _apply_active_verification(all_news)
     all_news = _annotate_story_updates(all_news)
@@ -11101,23 +12335,49 @@ def _source_callback_id(name: str) -> str:
 
 
 def _source_name_from_callback(value: str) -> Optional[str]:
-    """Разрешает короткий ID; старые callback с полным именем тоже понимаем."""
+    """Разрешает короткий ID; старые callback с полным именем тоже понимаем.
+
+    Paged source buttons append ``:<page>``; accepting that suffix here keeps
+    older tests/callers and copied callback payloads backwards-compatible.
+    """
+    raw = str(value or '')
+    candidate = raw.split(':', 1)[0] if ':' in raw else raw
     for name, _ in SOURCES:
-        if value == name or value == _source_callback_id(name):
+        if raw == name or candidate == name or candidate == _source_callback_id(name):
             return name
     return None
 
 
-def build_sources_menu() -> InlineKeyboardMarkup:
-    """Меню переключения источников. Каждый источник = отдельная кнопка с текущим состоянием."""
+SOURCE_MENU_PAGE_SIZE = 10
+
+
+def _source_menu_page_count() -> int:
+    return max(1, (len(SOURCES) + SOURCE_MENU_PAGE_SIZE - 1) // SOURCE_MENU_PAGE_SIZE)
+
+
+def build_sources_menu(page: int = 0) -> InlineKeyboardMarkup:
+    """Paged source switches so the settings screen stays usable on mobile."""
+    pages = _source_menu_page_count()
+    page = max(0, min(int(page or 0), pages - 1))
+    start = page * SOURCE_MENU_PAGE_SIZE
+    subset = SOURCES[start:start + SOURCE_MENU_PAGE_SIZE]
     rows = []
-    for name, _ in SOURCES:
+    for name, _ in subset:
         is_on = settings.is_source_enabled(name)
         icon = "🟢" if is_on else "🔴"
         rows.append([InlineKeyboardButton(
             f"{icon} {name}",
-            callback_data=f"src:{_source_callback_id(name)}",
+            callback_data=f"src:{_source_callback_id(name)}:{page}",
         )])
+
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton('⬅️', callback_data=f'settings:sources:{page - 1}'))
+        nav.append(InlineKeyboardButton(f'{page + 1}/{pages}', callback_data='settings:sources:noop'))
+        if page + 1 < pages:
+            nav.append(InlineKeyboardButton('➡️', callback_data=f'settings:sources:{page + 1}'))
+        rows.append(nav)
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings:back")])
     return InlineKeyboardMarkup(rows)
 
@@ -11615,10 +12875,19 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "settings:close":
         await query.edit_message_text("Меню закрыто.")
         return
-    if data == "settings:sources":
+    if data == "settings:sources" or data.startswith("settings:sources:"):
+        if data == 'settings:sources:noop':
+            await query.answer()
+            return
+        try:
+            page = int(data.rsplit(':', 1)[1]) if data.count(':') >= 2 else 0
+        except ValueError:
+            page = 0
+        enabled_count = sum(1 for n, _ in SOURCES if settings.is_source_enabled(n))
         await query.edit_message_text(
-            "📡 Источники (нажмите чтобы переключить):",
-            reply_markup=build_sources_menu(),
+            f"📡 Источники — 🟢 {enabled_count} / 🔴 {len(SOURCES) - enabled_count}\n"
+            "Нажмите источник, чтобы переключить его:",
+            reply_markup=build_sources_menu(page),
         )
         return
     if data == "settings:interval":
@@ -11833,13 +13102,19 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # === Переключение источника ===
     if data.startswith("src:"):
-        name = _source_name_from_callback(data[4:])
+        parts = data.split(':')
+        source_id = parts[1] if len(parts) > 1 else ''
+        try:
+            page = int(parts[2]) if len(parts) > 2 else 0
+        except ValueError:
+            page = 0
+        name = _source_name_from_callback(source_id)
         if not name:
             await query.answer("Источник уже не существует", show_alert=True)
             return
         new_state = settings.toggle_source(name)
         await query.answer(f"{name}: {'включён' if new_state else 'выключен'}")
-        await query.edit_message_reply_markup(reply_markup=build_sources_menu())
+        await query.edit_message_reply_markup(reply_markup=build_sources_menu(page))
         return
 
     # === Смена интервала ===
@@ -14136,7 +15411,8 @@ async def sources_command(update, context: ContextTypes.DEFAULT_TYPE):
             "Добавить:\n"
             "/addsource https://site.com/feed/ Название\n"
             "/addsource @канал — Telegram-канал\n\n"
-            "Встроенные источники включаются/выключаются в /settings → Источники."
+            "Встроенные источники включаются/выключаются в /settings → Источники.\n"
+            "Найденные кандидаты: /discover"
         )
         return
     lines = ['📡 Динамические источники:', '']
@@ -14145,7 +15421,157 @@ async def sources_command(update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• {it['label']} [{kind}] — {it['value']}")
     lines.append('')
     lines.append('Удалить: /delsource Название')
+    if feature_enabled('source_discovery'):
+        lines.append('Кандидаты из shadow-проверок: /discover')
     await update.message.reply_text('\n'.join(lines))
+
+
+@admin_only
+async def sourceintel_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Cycle 2 source originality/timeliness snapshot."""
+    if not feature_enabled('source_intelligence') or source_intelligence is None:
+        await update.message.reply_text('🧭 Source Intelligence выключен.')
+        return
+    rows = source_intelligence.snapshot()
+    if not rows:
+        await update.message.reply_text('🧭 Пока нет наблюдений по источникам.')
+        return
+    observed = [r for r in rows if r.get('stories_seen') or r.get('comparisons')]
+    probation = [r for r in rows if r.get('probation')]
+    lines = [
+        '🧭 <b>Source Intelligence</b>', '',
+        f'Наблюдаемых источников: {len(observed)} · probation: {len(probation)}',
+        f'Для сравнения нужно ≥ {SOURCE_INTEL_MIN_COMPARISONS} общих историй.', '',
+    ]
+    ranked = sorted(observed, key=lambda r: (
+        -float(r.get('adjustment') or 0.0),
+        float(r.get('avg_lag_hours')) if r.get('avg_lag_hours') is not None else 10**6,
+        r.get('source', ''),
+    ))
+    for row in ranked[:14]:
+        mark = '🧪' if row.get('probation') else ('🟢' if float(row.get('adjustment') or 0) > 0.015
+                                                else '🟠' if float(row.get('adjustment') or 0) < -0.015 else '⚪️')
+        lag = '—' if row.get('avg_lag_hours') is None else f'{float(row["avg_lag_hours"]):.1f}ч'
+        lines.append(
+            f'{mark} {html.escape(str(row.get("source") or "?")[:34])}: '
+            f'Δ {float(row.get("adjustment") or 0):+.3f} · lag {lag} · '
+            f'origin {float(row.get("origin_rate") or 0):.0%} · n={int(row.get("comparisons") or 0)}'
+        )
+    lines.extend(['', '🧪 probation = источник ещё не влияет на вес по скорости/первоисточнику.'])
+    await update.message.reply_text('\n'.join(lines)[:4000], parse_mode=ParseMode.HTML)
+
+
+
+
+def _promote_discovered_source(cid: str, label_override: str = '') -> tuple[bool, str]:
+    """Promote one successfully probed candidate; never called automatically."""
+    if source_discovery is None or custom_sources is None:
+        return False, 'Хранилище источников не инициализировано.'
+    row = source_discovery.get(str(cid or '').strip())
+    if not row:
+        return False, 'Кандидат не найден.'
+    feed_url = str(row.get('feed_url') or '').strip()
+    if not feed_url or _safe_nonnegative_int(row.get('probe_successes')) <= 0:
+        return False, 'У кандидата ещё нет успешно проверенного RSS/Atom.'
+    if not _is_public_http_url(feed_url):
+        return False, 'Найденный feed больше не проходит public URL проверку.'
+    feed_host = _discovery_host(feed_url)
+    if feed_host and source_discovery.is_known_host(feed_host):
+        return False, 'Этот домен уже относится к подключённому источнику.'
+    label = _clean_source_label(label_override or row.get('label') or row.get('domain') or f'Discovered {cid}')
+    if any(name.casefold() == label.casefold() for name, _ in SOURCES):
+        return False, f'Источник с именем «{label}» уже подключён.'
+    if not custom_sources.add('rss', feed_url, label):
+        return False, f'Источник «{label}» уже есть в динамических источниках.'
+    _attach_custom_source({'type': 'rss', 'value': feed_url, 'label': label})
+    source_discovery.note_configured_source(label, feed_url)
+    source_discovery.mark_promoted(str(cid), label=label)
+    _event_log('source_discovery_promoted', candidate_id=str(cid), label=label,
+               domain=row.get('domain'), feed_url=feed_url)
+    return True, label
+
+
+@admin_only
+async def discover_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Stage 16: inspect/probe/promote shadow source candidates.
+
+    /discover                 — suggestions + strongest shadow candidates
+    /discover probe           — manually probe due candidates now
+    /discover add ID [Label]  — explicitly promote a successfully probed RSS
+    /discover dismiss ID      — keep candidate ignored without deleting history
+    """
+    if not feature_enabled('source_discovery') or source_discovery is None:
+        await update.message.reply_text('🔎 Source Discovery выключен.')
+        return
+    args = list(context.args or [])
+    action = str(args[0]).lower() if args else ''
+    if action == 'probe':
+        rows = source_discovery.due_for_probe(limit=max(1, SOURCE_DISCOVERY_PROBES_PER_CYCLE))
+        if not rows:
+            await update.message.reply_text('🔎 Сейчас нет кандидатов, которым нужна повторная проверка.')
+            return
+        checked = ok = 0
+        for row in rows:
+            result = await asyncio.to_thread(_probe_source_discovery_candidate, row)
+            source_discovery.record_probe(str(row.get('id') or ''), result)
+            checked += 1
+            ok += int(bool(result.get('ok')))
+        _audit_update(update, 'source_discovery_probe', checked=checked, ok=ok)
+        await update.message.reply_text(f'🔎 Проверено: {checked} · RSS/Atom найдено: {ok}.\nСписок: /discover')
+        return
+    if action in {'dismiss', 'ignore'}:
+        cid = str(args[1]).strip() if len(args) > 1 else ''
+        if not cid or not source_discovery.dismiss(cid):
+            await update.message.reply_text('Формат: /discover dismiss ID\nID виден в /discover.')
+            return
+        _audit_update(update, 'source_discovery_dismiss', candidate_id=cid)
+        await update.message.reply_text(f'🗑 Кандидат {cid} скрыт. История сохранена, повторно предлагаться не будет.')
+        return
+    if action in {'add', 'promote'}:
+        cid = str(args[1]).strip() if len(args) > 1 else ''
+        row = source_discovery.get(cid) if cid else None
+        if not row:
+            await update.message.reply_text('Формат: /discover add ID [Название]\nID виден в /discover.')
+            return
+        label_arg = ' '.join(args[2:]).strip() if len(args) > 2 else ''
+        ok, promoted = _promote_discovered_source(cid, label_arg)
+        if not ok:
+            await update.message.reply_text(f'⚠️ {promoted}\nПри необходимости сначала: /discover probe')
+            return
+        _audit_update(update, 'source_discovery_promote', candidate_id=cid, label=promoted,
+                      feed_url=(row or {}).get('feed_url'))
+        await update.message.reply_text(
+            f'✅ «{promoted}» добавлен вручную.\n'
+            'Он начинает как обычный новый источник и проходит Source Intelligence probation.\n'
+            'Отключить можно через /settings → Источники.')
+        return
+
+    rows = source_discovery.rows()
+    active = [r for r in rows if r.get('status') in {'suggested', 'shadow'}]
+    suggested = [r for r in active if r.get('status') == 'suggested']
+    lines = [
+        '🔎 <b>Source Discovery</b>', '',
+        f'Кандидатов: {len(active)} · готовы к рассмотрению: {len(suggested)}',
+        'Ничего не подключается автоматически.', '',
+    ]
+    for row in active[:15]:
+        status = '⭐' if row.get('status') == 'suggested' else '🧪'
+        probe = '✅' if _safe_nonnegative_int(row.get('probe_successes')) else '…'
+        lines.append(
+            f'{status} <code>{html.escape(str(row.get("id") or ""))}</code> {probe} '
+            f'{html.escape(str(row.get("domain") or "?")[:45])} · '
+            f'{float(row.get("score") or 0):.2f} · mentions {_safe_nonnegative_int(row.get("mentions"))}'
+        )
+        if row.get('feed_url'):
+            lines.append(f'   RSS: {html.escape(str(row["feed_url"])[:120])}')
+    lines.extend([
+        '',
+        '<code>/discover probe</code> — проверить кандидатов',
+        '<code>/discover add ID [Название]</code> — добавить вручную',
+        '<code>/discover dismiss ID</code> — больше не предлагать',
+    ])
+    await update.message.reply_text('\n'.join(lines)[:4000], parse_mode=ParseMode.HTML,
+                                    disable_web_page_preview=True)
 
 
 @admin_only
@@ -16415,12 +17841,16 @@ def _dashboard_snapshot() -> dict:
         for name, _collector in SOURCES:
             info = source_health.info(name) if source_health is not None else {}
             left = source_health.breaker_remaining(name) if source_health is not None else 0.0
+            rep_row = rep_by_name.get(name, {})
             sources.append({
                 'name': name,
                 'enabled': bool(settings is None or settings.is_source_enabled(name)),
                 'fails': _safe_nonnegative_int(info.get('fails')),
                 'breaker_sec': round(float(left), 1),
-                'reputation': rep_by_name.get(name, {}).get('score'),
+                'reputation': rep_row.get('score'),
+                'probation': bool(rep_row.get('probation')),
+                'avg_lag_h': rep_row.get('avg_lag_hours'),
+                'origin_rate': rep_row.get('origin_rate'),
             })
     except Exception:
         pass
@@ -16443,6 +17873,12 @@ def _dashboard_snapshot() -> dict:
         'custom_sources': len(custom_sources.all()) if custom_sources is not None else 0,
         'features': {name: bool(value) for name, value in FEATURE_FLAGS.items()},
         'adaptive_latest': adaptive_publishing.latest() if adaptive_publishing is not None else {},
+        'source_discovery': {
+            'enabled': feature_enabled('source_discovery'),
+            'candidates': len(source_discovery.rows()) if source_discovery is not None else 0,
+            'suggested': sum(1 for r in source_discovery.rows() if r.get('status') == 'suggested')
+                         if source_discovery is not None else 0,
+        },
     }
     return {
         'generated_at': now,
@@ -16481,6 +17917,7 @@ def _dashboard_html(snapshot: dict) -> bytes:
 
     source_rows = rows(snapshot.get('sources') or [], [
         ('name', 'Источник'), ('enabled', 'Вкл'), ('reputation', 'Trust'),
+        ('probation', 'Probation'), ('avg_lag_h', 'Lag, ч'), ('origin_rate', 'Origin'),
         ('fails', 'Ошибки'), ('breaker_sec', 'Breaker, с')])
     queue_rows = rows(queue.get('items') or [], [
         ('title', 'Заголовок'), ('source', 'Источник'), ('priority', 'Score'), ('queued_at', 'В очереди')])
@@ -16514,7 +17951,7 @@ code{{color:#b9d2ff}}a{{color:#91b8ff}}@media(max-width:700px){{th:nth-child(n+4
 </div>
 <h2>Очередь</h2><table><tr><th>Заголовок</th><th>Источник</th><th>Score</th><th>В очереди</th></tr>{queue_rows}</table>
 <h2>Отложенные</h2><table><tr><th>Заголовок</th><th>Источник</th><th>Публикация</th></tr>{sched_rows}</table>
-<h2>Источники</h2><table><tr><th>Источник</th><th>Вкл</th><th>Trust</th><th>Ошибки</th><th>Breaker, с</th></tr>{source_rows}</table>
+<h2>Источники</h2><table><tr><th>Источник</th><th>Вкл</th><th>Trust</th><th>Probation</th><th>Lag, ч</th><th>Origin</th><th>Ошибки</th><th>Breaker, с</th></tr>{source_rows}</table>
 <h2>Повторяющиеся ошибки</h2><table><tr><th>Область</th><th>Ошибка</th><th>×</th><th>Последняя</th></tr>{error_rows}</table>
 <h2>Редакционная конфигурация</h2>
 <div class="grid">
@@ -16522,6 +17959,7 @@ code{{color:#b9d2ff}}a{{color:#91b8ff}}@media(max-width:700px){{th:nth-child(n+4
 <div class="card"><div class="muted">Blacklist</div><div class="num">{len(config.get('blacklist') or [])}</div></div>
 <div class="card"><div class="muted">Glossary / Entities</div><div class="num">{esc(config.get('glossary_entries',0))} / {esc(config.get('entity_entries',0))}</div></div>
 <div class="card"><div class="muted">Custom sources</div><div class="num">{esc(config.get('custom_sources',0))}</div></div>
+<div class="card"><div class="muted">Source discovery</div><div class="num">{esc((config.get('source_discovery') or {}).get('suggested',0))}</div><div>{esc((config.get('source_discovery') or {}).get('candidates',0))} кандидатов</div></div>
 </div>
 <details><summary>Rules / feature flags / adaptive state</summary><pre>{esc(json.dumps(config, ensure_ascii=False, indent=2, default=str))}</pre></details>
 <div class="muted">JSON: <a href="/admin/data.json">/admin/data.json</a> · Метрики: <a href="/metrics">/metrics</a></div>
@@ -16924,11 +18362,15 @@ def _init_globals() -> None:
         user_directory = UserDirectory(USER_DIRECTORY_FILE)
         if len(user_directory):
             logger.info(f"Знакомых пользователей: {len(user_directory)}")
-    global source_health, image_hashes, recent_subjects
+    global source_health, image_hashes, recent_subjects, source_intelligence, source_discovery
     if recent_subjects is None:
         recent_subjects = RecentSubjects(SUBJECT_MEMORY_FILE)
     if source_health is None:
         source_health = SourceHealth(SOURCE_HEALTH_FILE)
+    if source_intelligence is None:
+        source_intelligence = SourceIntelligenceStore(SOURCE_INTELLIGENCE_FILE)
+    if source_discovery is None:
+        source_discovery = SourceDiscoveryStore(SOURCE_DISCOVERY_FILE)
     if error_fingerprints is None:
         error_fingerprints = ErrorFingerprintStore(ERROR_FINGERPRINT_FILE)
     if llm_budget is None:
@@ -16949,6 +18391,10 @@ def _init_globals() -> None:
             _attach_custom_source(_item)
         if custom_sources.all():
             logger.info(f"Динамических источников подключено: {len(custom_sources.all())}")
+        if source_discovery is not None:
+            for _item in custom_sources.all():
+                if _item.get('type') == 'rss':
+                    source_discovery.note_configured_source(str(_item.get('label') or ''), str(_item.get('value') or ''))
     if translator is None:
         translator = GoogleTranslator(source='auto', target='ru')
     if post_queue is None:
@@ -17099,6 +18545,8 @@ def main():
     app.add_handler(CommandHandler("tz", tz_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("sources", sources_command))
+    app.add_handler(CommandHandler("sourceintel", sourceintel_command))
+    app.add_handler(CommandHandler("discover", discover_command))
     app.add_handler(CommandHandler("addsource", addsource_command))
     app.add_handler(CommandHandler("delsource", delsource_command))
     app.add_handler(CommandHandler("admins", admins_command))
