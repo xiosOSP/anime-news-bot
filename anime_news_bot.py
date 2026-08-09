@@ -8986,10 +8986,14 @@ async def _run_source_discovery(news_items: list[dict]) -> dict:
     if not feature_enabled('source_discovery') or source_discovery is None:
         result['skipped'] = 'disabled'
         return result
-    if post_queue is not None and feature_enabled('backpressure') and len(post_queue) >= BACKPRESSURE_SOFT_QUEUE:
-        result['skipped'] = 'backpressure'
-        metrics.inc('anime_bot_source_discovery_skipped_total', labels={'reason': 'backpressure'})
-        return result
+    if post_queue is not None and feature_enabled('backpressure'):
+        # У PostQueue нет __len__: размер отдаёт только async peek_size(). Раньше
+        # тут стояло len(post_queue), и весь автопоиск падал в TypeError на каждом
+        # цикле. Падение ловилось выше, поэтому подсистема просто молча не работала.
+        if await post_queue.peek_size() >= BACKPRESSURE_SOFT_QUEUE:
+            result['skipped'] = 'backpressure'
+            metrics.inc('anime_bot_source_discovery_skipped_total', labels={'reason': 'backpressure'})
+            return result
     # Learn currently configured hosts from actual source output before considering
     # any outbound link a new source.
     for item in news_items:
