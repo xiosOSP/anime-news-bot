@@ -16231,6 +16231,59 @@ async def _check_channel_access(bot) -> tuple[bool, str]:
     return True, title
 
 
+def _restart_loop_note() -> str:
+    """Короткий диагноз, если процесс перезапускается по кругу.
+
+    Раньше эти данные копились в runtime_lifecycle.json и уходили строкой в лог,
+    но до админа не доходили: на хостинге лог виден не всегда, а сообщение о
+    запуске приходит в личку каждый раз. Теперь причина едет вместе с ним.
+    """
+    try:
+        data = _read_lifecycle()
+    except Exception:
+        return ''
+    history = [x for x in (data.get('starts') or []) if isinstance(x, str)]
+    if len(history) < 3:
+        return ''
+    try:
+        parsed = sorted(datetime.fromisoformat(x) for x in history[-10:])
+    except (ValueError, TypeError):
+        return ''
+    span = (parsed[-1] - parsed[0]).total_seconds()
+    if span <= 0 or span > 15 * 60:
+        return ''
+    if len(parsed) / (span / 60.0) < 1.0:
+        return ''
+
+    kind = str(data.get('last_exit_kind') or '')
+    detail = str(data.get('last_exit_detail') or '')
+    unclean = int(data.get('consecutive_unclean', 0) or 0)
+    hints = {
+        'polling_conflict': ('этим BOT_TOKEN пользуется ещё один процесс. '
+                             'Останови лишний экземпляр или заведи отдельный токен'),
+        'polling_returned': ('polling завершился сам, без ошибки. Обычно это тот же '
+                             'конфликт токена либо остановка снаружи'),
+        'system_exit': 'бот сам отказался стартовать, причина в строке ниже',
+    }
+    lines = [f'⚠️ <b>Частые перезапуски: {len(parsed)} за {int(span)} с</b>']
+    if kind:
+        lines.append(f'   Прошлый выход: <code>{html.escape(kind)}</code>')
+        if kind in hints:
+            lines.append(f'   {hints[kind]}')
+        if detail:
+            lines.append(f'   <code>{html.escape(detail[:160])}</code>')
+    else:
+        # Пустой last_exit_kind при растущем счётчике стартов означает, что
+        # прошлый процесс не успел ничего записать — то есть его убили сигналом.
+        lines.append('   Прошлый выход ничего не записал: процесс убит снаружи. '
+                     'Смотри код выхода контейнера — 137 это SIGKILL/OOM, '
+                     '143 это SIGTERM от платформы')
+    if unclean:
+        lines.append(f'   Грязных завершений подряд: {unclean}')
+    lines.append('   Подробности: /lifecycle')
+    return '\n'.join(lines)
+
+
 async def send_startup_report(app) -> None:
     """Короткий отчёт админам при запуске: что поднялось и что настроено.
 
@@ -16258,6 +16311,13 @@ async def send_startup_report(app) -> None:
             f'Если канал не тот, поправь переменную или удали её.')
 
     lines = ['🚀 <b>Бот запущен</b>', '']
+    # Если процесс перезапускается по кругу, это должно быть первым, что видит
+    # админ. Лог на хостинге доступен не всегда, а это сообщение приходит в
+    # личку при каждом старте — то есть ровно там, где проблема и заметна.
+    restart_note = _restart_loop_note()
+    if restart_note:
+        lines.append(restart_note)
+        lines.append('')
     lines.append(('📢 Канал: ' if ok_channel else '⚠️ Канал: ')
                  + html.escape(channel_note))
     lines.append(f'   ID {CHANNEL_ID} '
