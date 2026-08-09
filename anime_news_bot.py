@@ -517,6 +517,10 @@ EXPERIMENT_SALT = _env('EXPERIMENT_SALT', 'anime-news-bot-v1').strip() or 'anime
 
 # Deployment stability — Stage 8
 POLLING_BOOTSTRAP_RETRIES = max(-1, min(100, _env_int('POLLING_BOOTSTRAP_RETRIES', -1)))
+# Конфликт токена часто временный: старый контейнер ещё доживает после деплоя.
+# Пробуем переждать, прежде чем сдаваться и выходить.
+POLLING_CONFLICT_RETRIES = max(0, min(20, _env_int('POLLING_CONFLICT_RETRIES', 5)))
+POLLING_CONFLICT_BACKOFF_SEC = max(1, min(120, _env_int('POLLING_CONFLICT_BACKOFF_SEC', 15)))
 RESTART_STORM_WINDOW_SEC = max(60, min(24 * 3600, _env_int('RESTART_STORM_WINDOW_SEC', 900)))
 RESTART_STORM_THRESHOLD = max(3, min(20, _env_int('RESTART_STORM_THRESHOLD', 4)))
 
@@ -18868,27 +18872,43 @@ def main():
 
 
 def _run_polling_guarded(app) -> None:
-    """Polling с явной диагностикой выхода."""
-    try:
-        app.run_polling(bootstrap_retries=POLLING_BOOTSTRAP_RETRIES)
-    except Conflict as e:
-        # Telegram отдаёт 409, когда getUpdates по одному токену делают двое.
-        # PTB на этом останавливает polling, main() возвращается, процесс тихо
-        # выходит с кодом 0 — а платформа его перезапускает. Со стороны это
-        # выглядит как «бот перезапускается каждую минуту» без единой ошибки
-        # в логе. Пишем причину явно.
-        logger.error('❌ Конфликт polling: тот же BOT_TOKEN опрашивает ещё один '
-                     'процесс. Обычно это не убитый старый контейнер или второй '
-                     'деплой с тем же токеном. Детали: %s', e)
-        _mark_lifecycle_exit('polling_conflict', str(e)[:200])
-        raise SystemExit(
-            'Polling conflict: этим BOT_TOKEN уже пользуется другой процесс. '
-            'Остановите лишний экземпляр или заведите отдельный токен.') from e
-    # Сюда попадаем только если polling завершился сам, без исключения:
-    # штатной причины для этого нет, поэтому фиксируем как аномалию.
-    logger.warning('Polling завершился без ошибки — процесс сейчас выйдет. '
-                   'Если это не ручная остановка, смотрите /lifecycle.')
-    _mark_lifecycle_exit('polling_returned', 'run_polling вернулся без исключения')
+    """Polling с явной диагностикой выхода.
+
+    Конфликт часто временный: старый контейнер ещё доживает свои секунды после
+    передеплоя. Поэтому не выходим сразу, а ждём и пробуем снова — если второй
+    процесс уйдёт сам, бот поднимется без вмешательства. И только если конфликт
+    держится, сдаёмся с внятным сообщением.
+    """
+    attempts = max(1, POLLING_CONFLICT_RETRIES + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            app.run_polling(bootstrap_retries=POLLING_BOOTSTRAP_RETRIES)
+        except Conflict as e:
+            # Telegram отдаёт 409, когда getUpdates по одному токену делают двое.
+            # PTB на этом останавливает polling, main() возвращается, процесс
+            # тихо выходит с кодом 0 — а платформа его перезапускает. Со стороны
+            # это выглядит как «бот перезапускается каждую минуту» без единой
+            # ошибки в логе. Пишем причину явно.
+            _mark_lifecycle_exit('polling_conflict', str(e)[:200])
+            if attempt >= attempts:
+                logger.error('❌ Конфликт polling не ушёл за %d попыток: тем же '
+                             'BOT_TOKEN пользуется другой процесс. Детали: %s',
+                             attempts, e)
+                raise SystemExit(
+                    'Polling conflict: этим BOT_TOKEN уже пользуется другой процесс. '
+                    'Остановите лишний экземпляр или заведите отдельный токен.') from e
+            wait = POLLING_CONFLICT_BACKOFF_SEC * attempt
+            logger.warning('⚠️ Конфликт polling (попытка %d из %d): тем же BOT_TOKEN '
+                           'опрашивает кто-то ещё. Жду %d с и пробую снова. %s',
+                           attempt, attempts, wait, e)
+            time.sleep(wait)
+            continue
+        # Сюда попадаем только если polling завершился сам, без исключения:
+        # штатной причины для этого нет, поэтому фиксируем как аномалию.
+        logger.warning('Polling завершился без ошибки — процесс сейчас выйдет. '
+                       'Если это не ручная остановка, смотрите /lifecycle.')
+        _mark_lifecycle_exit('polling_returned', 'run_polling вернулся без исключения')
+        return
 
 
 if __name__ == '__main__':
