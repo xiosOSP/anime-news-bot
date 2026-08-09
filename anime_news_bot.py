@@ -56,7 +56,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import RetryAfter, TelegramError
+from telegram.error import Conflict, RetryAfter, TelegramError
 try:
     from telegram.error import NetworkError as _TelegramNetworkError, TimedOut as _TelegramTimedOut
     _TG_AMBIGUOUS_ERROR_TYPES = (_TelegramNetworkError, _TelegramTimedOut)
@@ -18804,7 +18804,31 @@ def main():
 
     print("✅ Бот запущен, начинаю polling...", flush=True)
     logger.info("✅ Бот запущен...")
-    app.run_polling(bootstrap_retries=POLLING_BOOTSTRAP_RETRIES)
+    _run_polling_guarded(app)
+
+
+def _run_polling_guarded(app) -> None:
+    """Polling с явной диагностикой выхода."""
+    try:
+        app.run_polling(bootstrap_retries=POLLING_BOOTSTRAP_RETRIES)
+    except Conflict as e:
+        # Telegram отдаёт 409, когда getUpdates по одному токену делают двое.
+        # PTB на этом останавливает polling, main() возвращается, процесс тихо
+        # выходит с кодом 0 — а платформа его перезапускает. Со стороны это
+        # выглядит как «бот перезапускается каждую минуту» без единой ошибки
+        # в логе. Пишем причину явно.
+        logger.error('❌ Конфликт polling: тот же BOT_TOKEN опрашивает ещё один '
+                     'процесс. Обычно это не убитый старый контейнер или второй '
+                     'деплой с тем же токеном. Детали: %s', e)
+        _mark_lifecycle_exit('polling_conflict', str(e)[:200])
+        raise SystemExit(
+            'Polling conflict: этим BOT_TOKEN уже пользуется другой процесс. '
+            'Остановите лишний экземпляр или заведите отдельный токен.') from e
+    # Сюда попадаем только если polling завершился сам, без исключения:
+    # штатной причины для этого нет, поэтому фиксируем как аномалию.
+    logger.warning('Polling завершился без ошибки — процесс сейчас выйдет. '
+                   'Если это не ручная остановка, смотрите /lifecycle.')
+    _mark_lifecycle_exit('polling_returned', 'run_polling вернулся без исключения')
 
 
 if __name__ == '__main__':
