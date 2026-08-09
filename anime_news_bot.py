@@ -13960,9 +13960,14 @@ def _backpressure_candidates(news_list: list[dict], queue_size: int, *, thread_m
     if not feature_enabled('backpressure') or not items:
         metrics.set('anime_bot_backpressure_level', 0)
         return items, 0, 'off'
+    # В режиме ветки нет persistent publication queue, которую нужно защищать.
+    # Старый thread-cap ограничивал *сырые кандидаты до финальной подготовки*.
+    # Если первые N потом отсеивались LLM/dedup/media-проверками, полезные новости
+    # за cap вообще не получали попытку отправки (например: 10 deferred / 0 sent).
+    # Flood-control для Telegram уже обеспечивают PAUSE_BETWEEN_SENDS и retry-policy.
     if thread_mode:
-        limit = BACKPRESSURE_THREAD_MAX_PER_CYCLE
-        level = 'thread_cap' if len(items) > limit else 'normal'
+        metrics.set('anime_bot_backpressure_level', 0)
+        return items, 0, 'thread_off'
     elif queue_size >= BACKPRESSURE_HARD_QUEUE:
         limit = BACKPRESSURE_HARD_NEW
         level = 'hard'
@@ -14169,7 +14174,19 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
             review_ids = {id(n) for n in review}
             fresh = [n for n in fresh if id(n) not in review_ids]
             for news in review:
-                result = await send_news_to_thread(context.bot, news)
+                try:
+                    result = await send_news_to_thread(context.bot, news)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # Один проблемный материал не должен останавливать channel-cycle
+                    # до обработки основной очереди. send_news_to_thread сам
+                    # откатывает reservations через finally.
+                    logger.exception('Confidence review: отдельный пост упал')
+                    metrics.inc('anime_bot_publish_item_errors_total',
+                                labels={'mode': 'confidence_review',
+                                        'error': type(exc).__name__})
+                    result = 'failed'
                 if result == 'sent':
                     confidence_reviewed += 1
                     metrics.inc('anime_bot_confidence_review_total', labels={'result': 'sent'})
@@ -14185,8 +14202,38 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
             failed_count = 0
             uncertain_count = 0
             skipped_count = 0
-            for news in fresh:
-                result = await send_news_to_thread(context.bot, news)
+            skipped_reasons: dict[str, int] = {}
+            # Потолок пачки считаем по фактическим обращениям к Telegram, а не по
+            # сырым кандидатам. Старый вариант резал список ДО финальных фильтров,
+            # и если первые N отсеивались дедупом или моделью, цикл заканчивался
+            # с нулём отправок при полном списке отложенных. Теперь отсеянные
+            # ничего не расходуют, а верхняя граница пачки всё же есть: без неё
+            # всплеск из 25 источников выливается в ветку одной простынёй и
+            # растягивает цикл на минуты.
+            thread_budget = (BACKPRESSURE_THREAD_MAX_PER_CYCLE
+                             if feature_enabled('backpressure') else None)
+            for position, news in enumerate(fresh):
+                if thread_budget is not None and thread_budget <= 0:
+                    remaining = len(fresh) - position
+                    backpressure_deferred += remaining
+                    backpressure_level = 'thread_send_cap'
+                    metrics.inc('anime_bot_backpressure_deferred_total', remaining,
+                                {'level': 'thread_send_cap'})
+                    logger.info(f'Ветка: достигнут потолок {BACKPRESSURE_THREAD_MAX_PER_CYCLE} '
+                                f'отправок за цикл, {remaining} кандидатов ждут следующего')
+                    break
+                try:
+                    result = await send_news_to_thread(context.bot, news)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # Ветка — batch-путь. Один повреждённый материал/временный
+                    # сбой вспомогательного store не должен отменять остальные
+                    # новости этого же цикла.
+                    logger.exception('Отправка отдельного поста в ветку упала')
+                    metrics.inc('anime_bot_publish_item_errors_total',
+                                labels={'mode': 'thread', 'error': type(exc).__name__})
+                    result = 'failed'
                 metrics.inc('anime_bot_publish_attempts_total', labels={'mode': 'thread', 'result': result})
                 _event_log('publish_result', story_id=news.get('_story_id'), mode='thread', result=result,
                            source=news.get('source'), confidence=news.get('_confidence_score'))
@@ -14198,11 +14245,21 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                     uncertain_count += 1
                 else:
                     skipped_count += 1
-                # Пауза между отправками чтобы не словить флуд-лимит Telegram
-                await asyncio.sleep(PAUSE_BETWEEN_SENDS)
+                    skipped_reasons[result] = skipped_reasons.get(result, 0) + 1
+                # Пауза нужна только после пути, который мог обратиться к
+                # Telegram. Дубликаты/фильтр физически ничего не отправляют и
+                # раньше зря растягивали цикл на минуты.
+                if result not in ('skipped_dup', 'skipped_filter'):
+                    await asyncio.sleep(PAUSE_BETWEEN_SENDS)
+                    if thread_budget is not None:
+                        thread_budget -= 1
 
-            has_problems = bool(errors) or failed_count > 0 or uncertain_count > 0
-            # В тихом режиме отчёт — только если были проблемы
+            # Если кандидаты были, но все отсеялись уже в send-pipeline, это тоже
+            # диагностически важно: иначе quiet-mode снова выглядит как «бот молчит».
+            has_problems = (bool(errors) or failed_count > 0 or uncertain_count > 0
+                            or (sent_count == 0 and skipped_count > 0))
+            # В тихом режиме обычный успешный цикл не шумит, но 0 отправок при
+            # наличии отсеянных кандидатов показываем с причинами.
             if not settings.quiet_mode or has_problems:
                 message = (
                     f"✅ Проверка завершена (режим ветки).\n"
@@ -14211,6 +14268,19 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                 )
                 if backpressure_deferred:
                     message += f"⏳ Отложено backpressure-ом: {backpressure_deferred}\n"
+                if skipped_count:
+                    dup_n = skipped_reasons.get('skipped_dup', 0)
+                    filter_n = skipped_reasons.get('skipped_filter', 0)
+                    detail = []
+                    if dup_n:
+                        detail.append(f'дубли {dup_n}')
+                    if filter_n:
+                        detail.append(f'фильтр {filter_n}')
+                    other_n = skipped_count - dup_n - filter_n
+                    if other_n:
+                        detail.append(f'прочее {other_n}')
+                    suffix = f" ({', '.join(detail)})" if detail else ''
+                    message += f"⏭ Отсеяно после подготовки: {skipped_count}{suffix}\n"
                 if failed_count:
                     message += f"⚠️ Не удалось отправить: {failed_count}\n"
                 if uncertain_count:
@@ -14226,7 +14296,8 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                        uncertain=uncertain_count, skipped=skipped_count, errors=len(errors))
             _runtime_health['last_check_finished_at'] = datetime.now(timezone.utc).isoformat()
             _runtime_health['last_check_result'] = (
-                f'thread:sent={sent_count},failed={failed_count},skipped={skipped_count}')
+                f'thread:fresh={len(fresh)},sent={sent_count},failed={failed_count},'
+                f'uncertain={uncertain_count},skipped={skipped_count}')
             return
 
         # === РЕЖИМ КАНАЛА (старый): по 1 посту за интервал через очередь ===
@@ -14424,12 +14495,15 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
     else:
         translator_name = 'Google Translate (ключ DeepL не задан)'
     queue_size = await post_queue.peek_size()
+    interval_note = (f'в ветку до {BACKPRESSURE_THREAD_MAX_PER_CYCLE} постов за цикл'
+                     if settings.thread_mode
+                     else 'до 1 публикации в канал за интервал')
     await update.message.reply_text(
         f"Авторассылка: {'🟢 включена' if is_running else '🔴 выключена'}"
         f"{' ⚠️ (должна быть включена)' if auto_saved and not is_running else ''}\n"
         f"Автовосстановление: {'ВКЛ' if auto_saved else 'ВЫКЛ'}\n"
         f"Последняя автопроверка: {last_check_text}\n"
-        f"Интервал: {settings.check_interval_min} мин (1 пост за интервал)\n"
+        f"Интервал: {settings.check_interval_min} мин ({interval_note})\n"
         f"🧵 Режим ветки: {'ВКЛ (всё в ветку)' if settings.thread_mode else 'ВЫКЛ (по 1 в канал)'}\n"
         f"🌐 Переводчик: {translator_name}\n"
         f"⏰ Свежесть постов: {settings.post_max_age_hours} ч\n"
@@ -16436,10 +16510,16 @@ async def reliability_command(update, context: ContextTypes.DEFAULT_TYPE):
 
     lines.extend(['', '<b>Backpressure</b>'])
     if feature_enabled('backpressure'):
-        level = ('hard' if queue_size >= BACKPRESSURE_HARD_QUEUE
-                 else 'soft' if queue_size >= BACKPRESSURE_SOFT_QUEUE else 'normal')
-        lines.append(f'  Очередь: {queue_size}/{QUEUE_MAX_SIZE} · уровень: <code>{level}</code>')
-        lines.append(f'  soft ≥ {BACKPRESSURE_SOFT_QUEUE}, hard ≥ {BACKPRESSURE_HARD_QUEUE}')
+        if settings is not None and settings.thread_mode:
+            lines.append('  🧵 Режим ветки: очередь не используется, поэтому '
+                         'кандидаты не режутся до фильтров')
+            lines.append(f'  Потолок пачки: {BACKPRESSURE_THREAD_MAX_PER_CYCLE} '
+                         'отправок за цикл (дубли и фильтр его не расходуют)')
+        else:
+            level = ('hard' if queue_size >= BACKPRESSURE_HARD_QUEUE
+                     else 'soft' if queue_size >= BACKPRESSURE_SOFT_QUEUE else 'normal')
+            lines.append(f'  Очередь: {queue_size}/{QUEUE_MAX_SIZE} · уровень: <code>{level}</code>')
+            lines.append(f'  soft ≥ {BACKPRESSURE_SOFT_QUEUE}, hard ≥ {BACKPRESSURE_HARD_QUEUE}')
     else:
         lines.append('  ⚪️ выключен')
 
