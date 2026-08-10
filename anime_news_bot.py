@@ -14075,7 +14075,8 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
             metrics.inc('anime_bot_check_cycle_errors_total')
             _runtime_health['last_check_finished_at'] = datetime.now(timezone.utc).isoformat()
             _runtime_health['last_check_result'] = f'error: {type(e).__name__}: {e}'[:200]
-            _runtime_health['last_error'] = f'check_news: {type(e).__name__}: {e}'[:200]
+            _runtime_health['last_error'] = _redact_secrets(
+                f'check_news: {type(e).__name__}: {e}')[:200]
             _event_log('check_cycle_failed', error=f'{type(e).__name__}: {e}'[:200])
             _check_failure_streak += 1
             # Сообщаем один раз на серию, чтобы не спамить каждые полчаса.
@@ -16264,7 +16265,7 @@ def _restart_loop_note() -> str:
         return ''
 
     kind = str(data.get('last_exit_kind') or '')
-    detail = str(data.get('last_exit_detail') or '')
+    detail = _redact_secrets(str(data.get('last_exit_detail') or ''))
     unclean = int(data.get('consecutive_unclean', 0) or 0)
     hints = {
         'polling_conflict': ('этим BOT_TOKEN пользуется ещё один процесс. '
@@ -17812,7 +17813,7 @@ async def lifecycle_command(update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f'🚨 Restart storm: {RESTART_STORM_THRESHOLD} запусков за {int(span)} сек')
         except (ValueError, TypeError):
             pass
-    detail = str(life.get('last_exit_detail') or '')
+    detail = _redact_secrets(str(life.get('last_exit_detail') or ''))
     if detail:
         lines.append('Последняя причина: <code>' + html.escape(detail[:500]) + '</code>')
     await update.message.reply_text('\n'.join(lines)[:4000], parse_mode=ParseMode.HTML)
@@ -17936,6 +17937,32 @@ def _mark_lifecycle_start() -> dict:
     return data
 
 
+# Имя намеренно длинное: _TOKEN_PATTERN уже занят системой плейсхолдеров DeepL,
+# и повторное определение молча ломало восстановление подстановок.
+_SECRET_TOKEN_RE = re.compile(r'\b\d{6,12}:[A-Za-z0-9_-]{30,}\b')
+
+
+def _redact_secrets(text: str) -> str:
+    """Убирает секреты из текста, который может уехать в лог, на диск или админу.
+
+    Библиотека вставляет токен прямо в текст ошибки: сообщение InvalidToken
+    выглядит как «The token `123:ABC...` was rejected by the server». Такой
+    текст попадал в runtime_lifecycle.json и оттуда — в сообщение о запуске,
+    то есть секрет утекал в переписку при каждой проблеме с авторизацией.
+    """
+    if not text:
+        return ''
+    out = str(text)
+    # Сначала точные значения из окружения: они могут не подходить под шаблон.
+    for secret in (TOKEN, LLM_API_KEY, DEEPL_API_KEY,
+                   DASHBOARD_TOKEN, HEALTH_METRICS_TOKEN):
+        if secret and len(str(secret)) >= 8:
+            out = out.replace(str(secret), '<скрыто>')
+    # Затем всё, что выглядит как токен бота, включая чужие и старые.
+    out = _SECRET_TOKEN_RE.sub(lambda m: f'{m.group(0).split(":")[0]}:<скрыто>', out)
+    return out
+
+
 def _mark_lifecycle_exit(kind: str, detail: str = '') -> None:
     data = _read_lifecycle()
     data.update({
@@ -17943,7 +17970,7 @@ def _mark_lifecycle_exit(kind: str, detail: str = '') -> None:
         'state': 'stopped',
         'last_stop': datetime.now(timezone.utc).isoformat(),
         'last_exit_kind': str(kind or 'unknown')[:80],
-        'last_exit_detail': str(detail or '')[:500],
+        'last_exit_detail': _redact_secrets(str(detail or ''))[:500],
         'pid': os.getpid(),
     })
     _write_lifecycle(data)
