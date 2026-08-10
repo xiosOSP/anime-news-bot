@@ -518,9 +518,13 @@ EXPERIMENT_SALT = _env('EXPERIMENT_SALT', 'anime-news-bot-v1').strip() or 'anime
 # Deployment stability — Stage 8
 POLLING_BOOTSTRAP_RETRIES = max(-1, min(100, _env_int('POLLING_BOOTSTRAP_RETRIES', -1)))
 # Конфликт токена часто временный: старый контейнер ещё доживает после деплоя.
-# Пробуем переждать, прежде чем сдаваться и выходить.
-POLLING_CONFLICT_RETRIES = max(0, min(20, _env_int('POLLING_CONFLICT_RETRIES', 5)))
+# По умолчанию ждём бесконечно: лежачий бот хуже мелькающего, а как только
+# второй процесс уйдёт, этот поднимется сам, без вмешательства. Пауза растёт
+# до потолка, чтобы не долбить Telegram.
+POLLING_CONFLICT_RETRIES = max(-1, min(1000, _env_int('POLLING_CONFLICT_RETRIES', -1)))
 POLLING_CONFLICT_BACKOFF_SEC = max(1, min(120, _env_int('POLLING_CONFLICT_BACKOFF_SEC', 15)))
+POLLING_CONFLICT_BACKOFF_MAX_SEC = max(POLLING_CONFLICT_BACKOFF_SEC,
+                                       min(600, _env_int('POLLING_CONFLICT_BACKOFF_MAX_SEC', 60)))
 RESTART_STORM_WINDOW_SEC = max(60, min(24 * 3600, _env_int('RESTART_STORM_WINDOW_SEC', 900)))
 RESTART_STORM_THRESHOLD = max(3, min(20, _env_int('RESTART_STORM_THRESHOLD', 4)))
 
@@ -18875,12 +18879,15 @@ def _run_polling_guarded(app) -> None:
     """Polling с явной диагностикой выхода.
 
     Конфликт часто временный: старый контейнер ещё доживает свои секунды после
-    передеплоя. Поэтому не выходим сразу, а ждём и пробуем снова — если второй
-    процесс уйдёт сам, бот поднимется без вмешательства. И только если конфликт
-    держится, сдаёмся с внятным сообщением.
+    передеплоя. Выходить сразу — плохо: платформа после серии падений перестаёт
+    перезапускать, и вместо мелькающего бота получается лежачий. Поэтому по
+    умолчанию ждём столько, сколько нужно, и поднимаемся сами, как только
+    второй процесс уйдёт.
     """
-    attempts = max(1, POLLING_CONFLICT_RETRIES + 1)
-    for attempt in range(1, attempts + 1):
+    unlimited = POLLING_CONFLICT_RETRIES < 0
+    attempts = 0
+    while True:
+        attempts += 1
         try:
             app.run_polling(bootstrap_retries=POLLING_BOOTSTRAP_RETRIES)
         except Conflict as e:
@@ -18890,17 +18897,19 @@ def _run_polling_guarded(app) -> None:
             # это выглядит как «бот перезапускается каждую минуту» без единой
             # ошибки в логе. Пишем причину явно.
             _mark_lifecycle_exit('polling_conflict', str(e)[:200])
-            if attempt >= attempts:
+            if not unlimited and attempts > POLLING_CONFLICT_RETRIES:
                 logger.error('❌ Конфликт polling не ушёл за %d попыток: тем же '
                              'BOT_TOKEN пользуется другой процесс. Детали: %s',
                              attempts, e)
                 raise SystemExit(
                     'Polling conflict: этим BOT_TOKEN уже пользуется другой процесс. '
                     'Остановите лишний экземпляр или заведите отдельный токен.') from e
-            wait = POLLING_CONFLICT_BACKOFF_SEC * attempt
-            logger.warning('⚠️ Конфликт polling (попытка %d из %d): тем же BOT_TOKEN '
-                           'опрашивает кто-то ещё. Жду %d с и пробую снова. %s',
-                           attempt, attempts, wait, e)
+            wait = min(POLLING_CONFLICT_BACKOFF_SEC * attempts,
+                       POLLING_CONFLICT_BACKOFF_MAX_SEC)
+            logger.warning('⚠️ Конфликт polling (попытка %d): тем же BOT_TOKEN '
+                           'опрашивает кто-то ещё. Жду %d с и пробую снова. '
+                           'Бот поднимется сам, как только второй процесс уйдёт. %s',
+                           attempts, wait, e)
             time.sleep(wait)
             continue
         # Сюда попадаем только если polling завершился сам, без исключения:
