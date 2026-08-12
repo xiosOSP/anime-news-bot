@@ -525,6 +525,10 @@ POLLING_CONFLICT_RETRIES = max(-1, min(1000, _env_int('POLLING_CONFLICT_RETRIES'
 POLLING_CONFLICT_BACKOFF_SEC = max(1, min(120, _env_int('POLLING_CONFLICT_BACKOFF_SEC', 15)))
 POLLING_CONFLICT_BACKOFF_MAX_SEC = max(POLLING_CONFLICT_BACKOFF_SEC,
                                        min(600, _env_int('POLLING_CONFLICT_BACKOFF_MAX_SEC', 60)))
+# Полный отчёт о запуске полезен один раз. Если стартов больше этого числа за
+# окно, шлём вместо него одну строку — иначе личка забивается простынями.
+STARTUP_REPORT_MAX_IN_WINDOW = max(2, min(20, _env_int('STARTUP_REPORT_MAX_IN_WINDOW', 3)))
+STARTUP_REPORT_WINDOW_SEC = max(60, min(24 * 3600, _env_int('STARTUP_REPORT_WINDOW_SEC', 1800)))
 RESTART_STORM_WINDOW_SEC = max(60, min(24 * 3600, _env_int('RESTART_STORM_WINDOW_SEC', 900)))
 RESTART_STORM_THRESHOLD = max(3, min(20, _env_int('RESTART_STORM_THRESHOLD', 4)))
 
@@ -16293,12 +16297,51 @@ def _restart_loop_note() -> str:
     return '\n'.join(lines)
 
 
-async def send_startup_report(app) -> None:
+def _startup_reports_are_spamming(now: Optional[float] = None) -> bool:
+    """True, если бот перезапускается так часто, что полный отчёт стал спамом.
+
+    Отчёт о запуске полезен ровно один раз: он говорит, что деплой поднялся.
+    В петле перезапусков он приходит десятками, забивает личку и топит в себе
+    и причину сбоя, и обычные сообщения бота.
+    """
+    try:
+        history = [x for x in (_read_lifecycle().get('starts') or []) if isinstance(x, str)]
+        if len(history) < 2:
+            return False
+        parsed = sorted(datetime.fromisoformat(x) for x in history[-6:])
+    except (ValueError, TypeError, OSError):
+        return False
+    reference = (datetime.fromtimestamp(now, timezone.utc) if now is not None
+                 else datetime.now(timezone.utc))
+    recent = [p for p in parsed if (reference - p).total_seconds() <= STARTUP_REPORT_WINDOW_SEC]
+    return len(recent) >= STARTUP_REPORT_MAX_IN_WINDOW
+
+
+async def send_startup_report(app, brief: bool = False) -> None:
     """Короткий отчёт админам при запуске: что поднялось и что настроено.
 
     Деплой идёт через GitHub, и раньше единственным способом узнать результат
-    было ждать, появятся ли посты. Теперь бот сам говорит, что он живой."""
+    было ждать, появятся ли посты. Теперь бот сам говорит, что он живой.
+
+    ``brief`` включается при петле перезапусков: полный отчёт в такой ситуации
+    приходит десятки раз подряд и превращается в спам, из которого не выудить
+    ни причину, ни обычные сообщения бота.
+    """
     if settings is None or not settings.startup_report:
+        return
+    if brief:
+        note = _restart_loop_note()
+        text = ('🔁 <b>Бот перезапустился снова</b>\n'
+                'Полный отчёт скрыт, чтобы не забивать личку.\n\n'
+                + (note or 'Причина не записана — смотри /lifecycle.')
+                + '\n\nСостояние: /health · Полный отчёт вернётся, '
+                  'когда перезапуски прекратятся.')
+        for admin_id in _all_admin_ids():
+            try:
+                await app.bot.send_message(chat_id=admin_id, text=text,
+                                           parse_mode=ParseMode.HTML)
+            except Exception:
+                logger.debug('Краткий отчёт админу %s не доставлен', admin_id)
         return
     problems: list[str] = []
     if not DISCUSSION_CHAT_ID or not DISCUSSION_THREAD_ID:
@@ -17939,7 +17982,7 @@ def _mark_lifecycle_start() -> dict:
 
 # Имя намеренно длинное: _TOKEN_PATTERN уже занят системой плейсхолдеров DeepL,
 # и повторное определение молча ломало восстановление подстановок.
-_SECRET_TOKEN_RE = re.compile(r'\b\d{6,12}:[A-Za-z0-9_-]{30,}\b')
+_SECRET_TOKEN_RE = re.compile(r'\b\d{6,12}:[A-Za-z0-9_-]{20,}\b')
 
 
 def _redact_secrets(text: str) -> str:
@@ -18622,9 +18665,12 @@ async def setup_bot_commands(app: Application) -> None:
         _runtime_health['telegram_ok'] = False
         _runtime_health['last_error'] = f'telegram: {type(e).__name__}: {e}'
 
-    # Отчёт о запуске: сразу видно, поднялся ли деплой и что настроено
+    # Отчёт о запуске: сразу видно, поднялся ли деплой и что настроено.
+    # При петле перезапусков полный отчёт превращается в спам, поэтому со
+    # второго раза за окно шлём одну короткую строку: она сообщает, что
+    # проблема продолжается, и не забивает личку простынями.
     try:
-        await send_startup_report(app)
+        await send_startup_report(app, brief=_startup_reports_are_spamming())
     except Exception as e:                     # отчёт не должен мешать старту
         logger.warning(f"Стартовый отчёт не отправлен: {e}")
     total = len(scheduled_posts.all()) if scheduled_posts is not None else 0
