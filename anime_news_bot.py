@@ -529,6 +529,8 @@ POLLING_CONFLICT_BACKOFF_MAX_SEC = max(POLLING_CONFLICT_BACKOFF_SEC,
 # окно, шлём вместо него одну строку — иначе личка забивается простынями.
 STARTUP_REPORT_MAX_IN_WINDOW = max(2, min(20, _env_int('STARTUP_REPORT_MAX_IN_WINDOW', 3)))
 STARTUP_REPORT_WINDOW_SEC = max(60, min(24 * 3600, _env_int('STARTUP_REPORT_WINDOW_SEC', 1800)))
+# Момент старта процесса: по нему видно, сколько контейнер прожил до сигнала.
+_process_started_at = time.time()
 RESTART_STORM_WINDOW_SEC = max(60, min(24 * 3600, _env_int('RESTART_STORM_WINDOW_SEC', 900)))
 RESTART_STORM_THRESHOLD = max(3, min(20, _env_int('RESTART_STORM_THRESHOLD', 4)))
 
@@ -18604,7 +18606,17 @@ async def health_probe_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _post_shutdown(app: Application) -> None:
-    """Best-effort сброс runtime-состояния перед остановкой процесса."""
+    """Best-effort сброс runtime-состояния перед остановкой процесса.
+
+    Заодно фиксируем, что остановка была штатной. `run_polling` возвращается
+    без исключения ровно в одном случае — пришёл SIGTERM/SIGINT, и PTB
+    выключился корректно. Без этой пометки в lifecycle оставалось только
+    невнятное `polling_returned`, по которому непонятно, кто именно нас
+    остановил.
+    """
+    _runtime_health['graceful_shutdown_at'] = datetime.now(timezone.utc).isoformat()
+    logger.info('Получен сигнал остановки: PTB выключается штатно. '
+                'Если это не ручная остановка, значит контейнер остановила платформа.')
     try:
         if user_directory is not None:
             user_directory.flush()
@@ -19013,11 +19025,16 @@ def _run_polling_guarded(app) -> None:
                            attempts, wait, e)
             time.sleep(wait)
             continue
-        # Сюда попадаем только если polling завершился сам, без исключения:
-        # штатной причины для этого нет, поэтому фиксируем как аномалию.
-        logger.warning('Polling завершился без ошибки — процесс сейчас выйдет. '
-                       'Если это не ручная остановка, смотрите /lifecycle.')
-        _mark_lifecycle_exit('polling_returned', 'run_polling вернулся без исключения')
+        # Сюда попадаем, если polling завершился без исключения. Так PTB
+        # реагирует на SIGTERM/SIGINT, то есть нас остановили снаружи.
+        uptime = int(time.time() - _process_started_at)
+        graceful = bool(_runtime_health.get('graceful_shutdown_at'))
+        detail = (f'SIGTERM от платформы после {uptime} с работы' if graceful
+                  else f'run_polling вернулся без исключения после {uptime} с')
+        logger.warning('Polling завершился без ошибки после %d с работы. %s', uptime,
+                       'Контейнер остановлен снаружи — обычно это неудачная '
+                       'health-проба платформы или лимит ресурсов.')
+        _mark_lifecycle_exit('polling_returned', detail)
         return
 
 
