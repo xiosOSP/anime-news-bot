@@ -18307,6 +18307,25 @@ code{{color:#b9d2ff}}a{{color:#91b8ff}}@media(max-width:700px){{th:nth-child(n+4
     return body.encode('utf-8')
 
 
+_health_probe_seen: dict[str, int] = {}
+
+
+def _note_health_probe(method: str, path: str) -> None:
+    """Запоминает, чем именно платформа проверяет живость.
+
+    Знать это важно: если проба уходит не туда, куда мы отвечаем, платформа
+    считает контейнер мёртвым и убивает его SIGTERM. Первые несколько таких
+    запросов пишем в лог, дальше только считаем — чтобы не залить лог.
+    """
+    key = f'{method} {path}'[:120]
+    seen = _health_probe_seen.get(key, 0) + 1
+    if len(_health_probe_seen) < 32 or key in _health_probe_seen:
+        _health_probe_seen[key] = seen
+    if seen <= 3:
+        logger.info('Health-проба от платформы: %s (отвечаю 200)', key)
+    metrics.inc('anime_bot_health_probe_total', labels={'path': path[:60]})
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
     # Без таймаута полуоткрытое соединение держит поток вечно.
     timeout = HEALTH_REQUEST_TIMEOUT_SEC
@@ -18405,30 +18424,39 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(raw)
             return
+        # Платформа проверяет живость своим путём, и он у всех разный:
+        # /health, /ping, /status, /up... Раньше на всё незнакомое отдавался
+        # 404, проверка считалась проваленной, и контейнер убивали SIGTERM —
+        # ровно те перезапуски раз в 15 секунд с чистым polling_returned.
+        # Поэтому любой неизвестный путь считаем liveness-проверкой.
         if request_path not in ('/', '/livez', '/healthz', '/readyz'):
-            self.send_response(404)
-            self.end_headers()
-            return
+            _note_health_probe(self.command, request_path)
         storage_ok = _storage_ready()
         _runtime_health['storage_ok'] = storage_ok
         ready = bool(storage_ok and _runtime_health.get('telegram_ok'))
-        if request_path in ('/', '/livez', '/healthz'):
-            status = 200
-            body = {'status': 'ok', 'ready': ready}
-        else:
+        if request_path == '/readyz':
             status = 200 if (ready or not HEALTH_STRICT_READINESS) else 503
             body = {
                 'status': 'ready' if ready else 'not_ready',
                 'telegram_ok': bool(_runtime_health.get('telegram_ok')),
                 'storage_ok': storage_ok,
-                'last_error': _runtime_health.get('last_error', ''),
+                'last_error': _redact_secrets(str(_runtime_health.get('last_error', ''))),
             }
+        else:
+            status = 200
+            body = {'status': 'ok', 'ready': ready}
         raw = json.dumps(body, ensure_ascii=False).encode('utf-8')
         self.send_response(status)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(raw)))
         self.end_headers()
-        self.wfile.write(raw)
+        if self.command != 'HEAD':      # на HEAD тело слать нельзя
+            self.wfile.write(raw)
+
+    def do_HEAD(self):
+        # Часть платформ проверяет живость HEAD-запросом. Без этого метода
+        # BaseHTTPRequestHandler отвечает 501, и проверка проваливается.
+        self.do_GET()
 
 
 class _BoundedHealthServer(ThreadingHTTPServer):
