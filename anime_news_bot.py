@@ -18812,10 +18812,15 @@ class _HealthHandler(BaseHTTPRequestHandler):
         # Поэтому любой неизвестный путь считаем liveness-проверкой.
         if request_path not in ('/', '/livez', '/healthz', '/readyz'):
             _note_health_probe(self.command, request_path)
-        storage_ok = _storage_ready()
-        _runtime_health['storage_ok'] = storage_ok
-        ready = bool(storage_ok and _runtime_health.get('telegram_ok'))
+        # Liveness must be a pure in-memory check.  Never touch Telegram or the
+        # persistent volume here: a temporarily slow/frozen volume would make the
+        # platform's health request hang, which in turn makes the platform send
+        # SIGTERM to an otherwise healthy polling process.  Readiness is the right
+        # place for dependency checks.
         if request_path == '/readyz':
+            storage_ok = _storage_ready()
+            _runtime_health['storage_ok'] = storage_ok
+            ready = bool(storage_ok and _runtime_health.get('telegram_ok'))
             status = 200 if (ready or not HEALTH_STRICT_READINESS) else 503
             body = {
                 'status': 'ready' if ready else 'not_ready',
@@ -18825,6 +18830,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
             }
         else:
             status = 200
+            ready = bool(_runtime_health.get('telegram_ok') and
+                         _runtime_health.get('storage_ok'))
             body = {'status': 'ok', 'ready': ready}
         raw = json.dumps(body, ensure_ascii=False).encode('utf-8')
         self.send_response(status)
@@ -19415,7 +19422,12 @@ def _run_polling_guarded(app) -> None:
         logger.warning('Polling завершился без ошибки после %d с работы. %s', uptime,
                        'Контейнер остановлен снаружи — обычно это неудачная '
                        'health-проба платформы или лимит ресурсов.')
-        _mark_lifecycle_exit('polling_returned', detail)
+        # Preserve the fact that PTB completed a graceful signal-driven
+        # shutdown instead of flattening it into the misleading
+        # `polling_returned`.  This does not pretend the bot crashed: it records
+        # that the process was asked to stop from outside.
+        exit_kind = 'external_signal' if graceful else 'polling_returned'
+        _mark_lifecycle_exit(exit_kind, detail)
         return
 
 
