@@ -312,6 +312,7 @@ HEALTH_REQUEST_TIMEOUT_SEC = max(1, min(60, _env_int('HEALTH_REQUEST_TIMEOUT_SEC
 HEALTH_MAX_CONNECTIONS = max(4, min(256, _env_int('HEALTH_MAX_CONNECTIONS', 32)))
 HEALTH_MAX_CONNECTIONS_PER_IP = max(1, min(HEALTH_MAX_CONNECTIONS,
                                            _env_int('HEALTH_MAX_CONNECTIONS_PER_IP', 6)))
+HEALTH_STORAGE_PROBE_CACHE_SEC = max(0.5, min(60.0, _env_float('HEALTH_STORAGE_PROBE_CACHE_SEC', 5.0)))
 # Метрики раскрывают имена источников и рабочие счётчики. На loopback это
 # безобидно, наружу — только по токену. Пустой токен при публичном bind
 # означает, что /metrics просто не отдаётся.
@@ -1645,9 +1646,16 @@ class SentLinksStore:
         return sum(1 for meta in self._reservations.values()
                    if str(meta.get('state') or 'claimed') == 'uncertain')
 
-    async def clear(self) -> None:
-        """Полностью очищает историю и все временные дедуп-состояния."""
+    async def clear(self) -> bool:
+        """Полностью очищает историю только после durable-записи."""
         async with self._lock:
+            old_urls = list(self._urls)
+            old_url_set = set(self._url_set)
+            old_titles = list(self._titles)
+            old_title_set = set(self._title_set)
+            old_recent = deque(self._recent_titles, maxlen=self._recent_titles.maxlen)
+            old_reservations = dict(self._reservations)
+            old_rejected = dict(self._rejected)
             self._urls.clear()
             self._url_set.clear()
             self._titles.clear()
@@ -1655,7 +1663,17 @@ class SentLinksStore:
             self._recent_titles.clear()
             self._reservations.clear()
             self._rejected.clear()
-            self._save()
+            if not self._save():
+                self._urls = old_urls
+                self._url_set = old_url_set
+                self._titles = old_titles
+                self._title_set = old_title_set
+                self._recent_titles = old_recent
+                self._reservations = old_reservations
+                self._rejected = old_rejected
+                logger.error('Ledger: очистка истории отменена — storage не принял запись')
+                return False
+            return True
 
     async def commit(self, link: str, title: str = '') -> bool:
         """Подтверждает публикацию; при disk-error оставляет in-memory uncertain."""
@@ -1801,15 +1819,17 @@ class PostQueue:
             self._items = []
             self._inflight = None
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         try:
             _atomic_write_json(self.path, {
                 'schema_version': 1,
                 'items': self._items,
                 'inflight': self._inflight,
             }, indent=2)
-        except OSError as e:
+            return True
+        except (OSError, TypeError, ValueError) as e:
             logger.error(f"Не удалось сохранить очередь: {e}")
+            return False
 
     @staticmethod
     def _item_priority(item: dict) -> float:
@@ -1860,6 +1880,7 @@ class PostQueue:
         if not news_list:
             return 0
         async with self._lock:
+            old_items = list(self._items)
             self._purge_expired_unlocked()
             now_iso = datetime.now().isoformat()
             existing_links = {i['news']['link'] for i in self._items}
@@ -1882,14 +1903,25 @@ class PostQueue:
             dropped = self._trim_overflow_unlocked()
             if dropped:
                 logger.info(f"📦 Очередь переполнена, выброшено {dropped} низкоприоритетных постов")
-            self._save()
+            if not self._save():
+                # Очередь — durable handoff. Если новое состояние не записалось,
+                # не притворяемся, что кандидаты приняты: иначе crash потеряет их.
+                self._items = old_items
+                return 0
             return added
 
     async def pop_next(self) -> Optional[dict]:
         """Достаёт следующий пост из очереди (FIFO). Возвращает news dict или None.
-        Если включён require_image — пропускает (выбрасывает) посты без картинок,
-        пока не найдёт подходящий или очередь не закончится."""
+        Выдача поста разрешена только после durable-записи ``inflight``: если
+        volume временно read-only/full, Telegram не должен получить элемент,
+        состояние которого нельзя восстановить после crash.
+        """
         async with self._lock:
+            old_items = list(self._items)
+            old_inflight = self._inflight
+            old_owner = self._inflight_owner
+            changed = False
+
             if self._inflight is not None:
                 current = asyncio.current_task()
                 owner = self._inflight_owner
@@ -1898,29 +1930,25 @@ class PostQueue:
                     # из одной coroutine считались завершением прошлого элемента.
                     self._inflight = None
                     self._inflight_owner = None
+                    changed = True
                 elif owner is not None and owner.done():
-                    # Владелец завершился, не вызвав ack_done/requeue_failed:
-                    # например, CancelledError, который не убил процесс. Раньше
-                    # inflight висел до перезапуска и очередь молча вставала —
-                    # pop_next из любой другой задачи вечно возвращал None.
-                    # Возвращаем пост в голову ровно так же, как это делает
-                    # восстановление inflight из файла при старте. Дубля не
-                    # будет: send_news на неоднозначной отмене оставляет запись
-                    # в ledger, и повторный claim по ней не пройдёт.
                     logger.warning('Очередь: владелец inflight исчез без ack, '
                                    'возвращаю пост в голову очереди')
                     if self._valid_item(self._inflight):
                         self._items.insert(0, self._inflight)
                     self._inflight = None
                     self._inflight_owner = None
-                    self._save()
+                    changed = True
                 else:
                     return None
-            self._purge_expired_unlocked()
+
+            if self._purge_expired_unlocked():
+                changed = True
             require_img = settings.require_image
             skipped = 0
             while self._items:
                 item = self._items.pop(0)
+                changed = True
                 news = item['news']
                 if require_img and not news.get('images'):
                     skipped += 1
@@ -1929,35 +1957,61 @@ class PostQueue:
                     logger.info(f"⊘ Из очереди выброшено {skipped} постов без картинок")
                 self._inflight = item
                 self._inflight_owner = asyncio.current_task()
-                self._save()
+                if not self._save():
+                    self._items = old_items
+                    self._inflight = old_inflight
+                    self._inflight_owner = old_owner
+                    logger.error('Очередь: не удалось записать inflight, публикация заблокирована')
+                    return None
                 return news
+
             if skipped:
                 logger.info(f"⊘ Из очереди выброшено {skipped} постов без картинок")
-            self._save()
+            if changed and not self._save():
+                self._items = old_items
+                self._inflight = old_inflight
+                self._inflight_owner = old_owner
             return None
 
-    async def ack_done(self, news: Optional[dict] = None) -> None:
-        """Подтверждает завершение обработки извлечённого поста."""
+    async def ack_done(self, news: Optional[dict] = None) -> bool:
+        """Подтверждает завершение обработки извлечённого поста.
+
+        При ошибке storage сохраняем ``inflight`` и в памяти: это не даст
+        очереди уйти далеко вперёд с состоянием, которое на диске выглядит
+        иначе. Ledger всё равно остаётся последней защитой от дублей.
+        """
         async with self._lock:
             if self._inflight is None:
-                return
+                return True
             if news is not None:
                 expected = str((self._inflight.get('news') or {}).get('link') or '')
                 actual = str(news.get('link') or '')
                 if expected and actual and expected != actual:
                     logger.warning("Очередь: ack не совпал с inflight (%s != %s)", actual, expected)
-                    return
+                    return False
+            old_inflight = self._inflight
+            old_owner = self._inflight_owner
             self._inflight = None
             self._inflight_owner = None
-            self._save()
+            if not self._save():
+                self._inflight = old_inflight
+                self._inflight_owner = old_owner
+                logger.error('Очередь: ack не записан; сохраняю inflight до восстановления storage')
+                return False
+            return True
 
-    async def requeue_failed(self, news: dict) -> bool:
+    async def requeue_failed(self, news: dict) -> Optional[bool]:
         """Возвращает технически неотправленный пост в начало без сброса TTL.
 
-        Возвращает False, если лимит повторов исчерпан и пост отброшен, чтобы
-        одна постоянно битая публикация не блокировала FIFO бесконечно.
+        ``True`` — retry надёжно записан; ``False`` — лимит исчерпан и удаление
+        надёжно записано; ``None`` — storage не принял новое состояние, поэтому
+        исходный ``inflight`` сохранён и автоматическое движение очереди
+        приостанавливается до восстановления хранилища.
         """
         async with self._lock:
+            old_items = list(self._items)
+            old_inflight = self._inflight
+            old_owner = self._inflight_owner
             if self._inflight is not None:
                 inflight_link = str((self._inflight.get('news') or {}).get('link') or '')
                 if not inflight_link or inflight_link == str(news.get('link') or ''):
@@ -1965,23 +2019,38 @@ class PostQueue:
                     self._inflight_owner = None
             failures = _safe_nonnegative_int(news.get('_queue_send_failures', 0)) + 1
             if failures >= QUEUE_MAX_SEND_RETRIES:
+                if not self._save():
+                    self._items = old_items
+                    self._inflight = old_inflight
+                    self._inflight_owner = old_owner
+                    logger.error('Очередь: не удалось надёжно записать исчерпание retry')
+                    return None
                 logger.error(
                     f"Пост удалён из очереди после {failures} ошибок отправки: "
                     f"{str(news.get('title', ''))[:80]}")
-                self._save()
                 return False
             clean = {k: v for k, v in news.items() if k != 'published_parsed'}
             clean['_queue_send_failures'] = failures
             first_at = str(clean.get('_queue_first_at') or datetime.now().isoformat())
             clean['_queue_first_at'] = first_at
             self._items.insert(0, {'news': clean, 'queued_at': first_at})
-            self._save()
+            if not self._save():
+                self._items = old_items
+                self._inflight = old_inflight
+                self._inflight_owner = old_owner
+                logger.error('Очередь: retry не записан; сохраняю исходный inflight')
+                return None
             return True
 
     async def peek_size(self) -> int:
         async with self._lock:
-            self._purge_expired_unlocked()
-            self._save()
+            # Это hot read-path (/health, backpressure, status). Раньше даже
+            # простое чтение размера делало fsync всего queue JSON. Пишем только
+            # если реально удалили протухшие элементы.
+            old_items = list(self._items)
+            removed = self._purge_expired_unlocked()
+            if removed and not self._save():
+                self._items = old_items
             return len(self._items)
 
     async def has_inflight(self) -> bool:
@@ -1989,12 +2058,28 @@ class PostQueue:
             return self._inflight is not None
 
     async def clear(self) -> int:
+        """Очищает очередь только после durable-записи.
+
+        Возвращает ``-1`` при ошибке storage: вызывающий код не должен
+        сообщать об успешной очистке, если старое состояние всё ещё лежит
+        на диске и вернётся после рестарта.
+        """
         async with self._lock:
             count = len(self._items) + (1 if self._inflight else 0)
+            if not count:
+                return 0
+            old_items = list(self._items)
+            old_inflight = self._inflight
+            old_owner = self._inflight_owner
             self._items.clear()
             self._inflight = None
             self._inflight_owner = None
-            self._save()
+            if not self._save():
+                self._items = old_items
+                self._inflight = old_inflight
+                self._inflight_owner = old_owner
+                logger.error('Очередь: очистка отменена — storage не принял запись')
+                return -1
             return count
 
     async def list_titles(self, limit: int = 10) -> list[str]:
@@ -2626,7 +2711,7 @@ class BotStats:
             entry['collected'] += count
             entry['last_success_at'] = datetime.now().isoformat()
             self._add_event_unlocked('collected', source)
-            self._save()
+            await asyncio.to_thread(self._save)
 
     async def record_source_error(self, source: str) -> None:
         """Источник упал при сборе."""
@@ -2635,7 +2720,7 @@ class BotStats:
             entry = self._ensure_source_unlocked(source)
             entry['errors'] += 1
             self._add_event_unlocked('source_error', source)
-            self._save()
+            await asyncio.to_thread(self._save)
 
     async def record_published(self, source: str) -> None:
         """Пост опубликован в канал."""
@@ -2644,7 +2729,7 @@ class BotStats:
             entry = self._ensure_source_unlocked(source)
             entry['published'] += 1
             self._add_event_unlocked('published', source)
-            self._save()
+            await asyncio.to_thread(self._save)
 
     async def record_skipped(self, reason: str, source: Optional[str] = None,
                              count: int = 1) -> None:
@@ -2657,14 +2742,14 @@ class BotStats:
             if key in self._data['totals']:
                 self._data['totals'][key] += count
             self._add_event_unlocked(key, source, count)
-            self._save()
+            await asyncio.to_thread(self._save)
 
     async def record_failed_send(self, source: Optional[str] = None) -> None:
         """Реальная ошибка отправки в Telegram."""
         async with self._lock:
             self._data['totals']['failed_send'] += 1
             self._add_event_unlocked('failed_send', source)
-            self._save()
+            await asyncio.to_thread(self._save)
 
     # === Чтение ===
     def get_totals(self) -> dict:
@@ -2708,6 +2793,7 @@ class ModerationFeedback:
     def __init__(self, path: Path):
         self.path = path
         self._events: list[dict] = []
+        self._lock = threading.Lock()
         try:
             if path.exists():
                 data = json.loads(path.read_text(encoding='utf-8'))
@@ -2725,7 +2811,7 @@ class ModerationFeedback:
     def record(self, action: str, news: Optional[dict], actor=None) -> None:
         if not news:
             return
-        self._events.append({
+        row = {
             'at': datetime.now(timezone.utc).isoformat(),
             'action': str(action),
             'source': str(news.get('source') or 'unknown')[:120],
@@ -2738,13 +2824,17 @@ class ModerationFeedback:
             'priority': float(news.get('_priority_score', 0.0) or 0.0),
             'breaking': bool(news.get('_breaking_news')),
             'subject': str(_franchise_key(news) if news else '')[:160],
-        })
-        self._events = self._events[-self.MAX_EVENTS:]
-        self._save()
+        }
+        with self._lock:
+            self._events.append(row)
+            self._events = self._events[-self.MAX_EVENTS:]
+            self._save()
 
     def source_summary(self) -> list[tuple[str, int, int, int]]:
         rows: dict[str, dict[str, int]] = {}
-        for ev in self._events:
+        with self._lock:
+            events = list(self._events)
+        for ev in events:
             row = rows.setdefault(ev.get('source') or 'unknown', {'published': 0, 'hidden': 0, 'edited': 0})
             action = ev.get('action')
             if action in row:
@@ -2770,7 +2860,9 @@ class ModerationFeedback:
         одному случайному решению превратиться в автоматическое правило.
         """
         rows: dict[str, list[int]] = {}
-        for ev in self._events:
+        with self._lock:
+            events = list(self._events)
+        for ev in events:
             action = ev.get('action')
             if action not in ('published', 'hidden'):
                 continue
@@ -2804,7 +2896,9 @@ class ModerationFeedback:
         stop = {'аниме','манга','новость','трейлер','сезон','серия','выходит','анонс','новый','новая',
                 'anime','manga','trailer','season','release','reveals','announced','with','from'}
         counts: dict[str, int] = {}
-        for ev in self._events:
+        with self._lock:
+            events = list(self._events)
+        for ev in events:
             if ev.get('action') != 'hidden':
                 continue
             for w in set(re.findall(r'[A-Za-zА-Яа-яЁё]{5,}', ev.get('title') or '')):
@@ -2825,6 +2919,8 @@ class ExperimentStore:
     def __init__(self, path: Path):
         self.path = path
         self._data = {'schema_version': 1, 'variants': {}}
+        self._lock = threading.Lock()
+        self._dirty = False
         try:
             if self.path.exists():
                 raw = json.loads(self.path.read_text(encoding='utf-8'))
@@ -2842,13 +2938,30 @@ class ExperimentStore:
     def record(self, variant: str, event: str) -> None:
         variant = str(variant or 'standard')[:40]
         event = str(event or 'seen')[:40]
-        variants = self._data.setdefault('variants', {})
-        row = variants.setdefault(variant, {})
-        row[event] = int(row.get(event, 0) or 0) + 1
-        self._save()
+        with self._lock:
+            variants = self._data.setdefault('variants', {})
+            row = variants.setdefault(variant, {})
+            row[event] = int(row.get(event, 0) or 0) + 1
+            # ``assigned`` happens for every candidate and is advisory. Writing
+            # experiments.json + fsync for every story used to block the event
+            # loop before any Telegram send. Persist it together with the next
+            # real outcome or graceful shutdown.
+            if event == 'assigned':
+                self._dirty = True
+            else:
+                self._save()
+                self._dirty = False
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._dirty:
+                self._save()
+                self._dirty = False
+
 
     def snapshot(self) -> dict:
-        return json.loads(json.dumps(self._data.get('variants', {})))
+        with self._lock:
+            return json.loads(json.dumps(self._data.get('variants', {})))
 
 
 experiments: Optional['ExperimentStore'] = None
@@ -3634,6 +3747,7 @@ class EntityMemory:
     def __init__(self, path: Path):
         self.path = path
         self._items: dict[str, dict] = {}
+        self._lock = threading.RLock()
         self._load()
 
     @staticmethod
@@ -3666,19 +3780,20 @@ class EntityMemory:
         key = self._key(alias)
         if not key or not preferred:
             return False
-        if key not in self._items and len(self._items) >= self.MAX_ENTITIES:
-            oldest = min(self._items, key=lambda k: self._items[k].get('last_seen', ''))
-            self._items.pop(oldest, None)
-        old = self._items.get(key, {})
-        aliases = list(dict.fromkeys([*(old.get('aliases') or []), alias, preferred]))[-12:]
-        self._items[key] = {
-            'preferred': preferred,
-            'aliases': aliases,
-            'count': _safe_nonnegative_int(old.get('count')) + 1,
-            'source': str(source or 'unknown')[:40],
-            'last_seen': datetime.now(timezone.utc).isoformat(),
-        }
-        self._save()
+        with self._lock:
+            if key not in self._items and len(self._items) >= self.MAX_ENTITIES:
+                oldest = min(self._items, key=lambda k: self._items[k].get('last_seen', ''))
+                self._items.pop(oldest, None)
+            old = self._items.get(key, {})
+            aliases = list(dict.fromkeys([*(old.get('aliases') or []), alias, preferred]))[-12:]
+            self._items[key] = {
+                'preferred': preferred,
+                'aliases': aliases,
+                'count': _safe_nonnegative_int(old.get('count')) + 1,
+                'source': str(source or 'unknown')[:40],
+                'last_seen': datetime.now(timezone.utc).isoformat(),
+            }
+            self._save()
         return True
 
     def observe(self, value: str, *, source: str = 'llm') -> str:
@@ -3686,28 +3801,32 @@ class EntityMemory:
         if not value:
             return ''
         key = self._key(value)
-        row = self._items.get(key)
-        if row is None:
-            for existing in self._items.values():
-                if any(self._key(alias) == key for alias in (existing.get('aliases') or [])):
-                    row = existing
-                    break
-        if row:
-            row['count'] = _safe_nonnegative_int(row.get('count')) + 1
-            row['last_seen'] = datetime.now(timezone.utc).isoformat()
-            aliases = list(dict.fromkeys([*(row.get('aliases') or []), value]))[-12:]
-            row['aliases'] = aliases
-            # Save only occasionally to avoid an fsync on every article.
-            if row['count'] <= 3 or row['count'] % 10 == 0:
-                self._save()
-            return str(row.get('preferred') or value)
-        self.remember(value, value, source=source)
-        return value
+        with self._lock:
+            row = self._items.get(key)
+            if row is None:
+                for existing in self._items.values():
+                    if any(self._key(alias) == key for alias in (existing.get('aliases') or [])):
+                        row = existing
+                        break
+            if row:
+                row['count'] = _safe_nonnegative_int(row.get('count')) + 1
+                row['last_seen'] = datetime.now(timezone.utc).isoformat()
+                aliases = list(dict.fromkeys([*(row.get('aliases') or []), value]))[-12:]
+                row['aliases'] = aliases
+                # Save only occasionally to avoid an fsync on every article.
+                if row['count'] <= 3 or row['count'] % 10 == 0:
+                    self._save()
+                return str(row.get('preferred') or value)
+            # RLock allows remember() to reuse the same critical section safely.
+            self.remember(value, value, source=source)
+            return value
 
     def apply(self, text: str) -> str:
         out = str(text or '')
         replacements: list[tuple[str, str]] = []
-        for row in self._items.values():
+        with self._lock:
+            rows = [dict(row) for row in self._items.values()]
+        for row in rows:
             preferred = str(row.get('preferred') or '').strip()
             for alias in row.get('aliases') or []:
                 alias = str(alias or '').strip()
@@ -3718,8 +3837,9 @@ class EntityMemory:
         return out
 
     def list_recent(self, limit: int = 20) -> list[dict]:
-        return sorted((dict(v, key=k) for k, v in self._items.items()),
-                      key=lambda r: r.get('last_seen', ''), reverse=True)[:limit]
+        with self._lock:
+            rows = [dict(v, key=k) for k, v in self._items.items()]
+        return sorted(rows, key=lambda r: r.get('last_seen', ''), reverse=True)[:limit]
 
 
 class PublishedStoryStore:
@@ -3729,6 +3849,7 @@ class PublishedStoryStore:
     def __init__(self, path: Path):
         self.path = path
         self._items: list[dict] = []
+        self._lock = threading.Lock()
         self._load()
 
     def _load(self) -> None:
@@ -3773,13 +3894,18 @@ class PublishedStoryStore:
             'prompt_version': str(news.get('_prompt_version') or '')[:80],
             'at': datetime.now(timezone.utc).isoformat(),
         }
-        self._items = [x for x in self._items if not (link and x.get('link') == link)]
-        self._items.append(row)
-        self._items = self._items[-self.MAX_ITEMS:]
-        self._save()
+        with self._lock:
+            self._items = [x for x in self._items if not (link and x.get('link') == link)]
+            self._items.append(row)
+            self._items = self._items[-self.MAX_ITEMS:]
+            self._save()
 
     def classify_update(self, news: dict) -> Optional[dict]:
-        if not feature_enabled('story_updates') or not self._items:
+        if not feature_enabled('story_updates'):
+            return None
+        with self._lock:
+            items = list(self._items)
+        if not items:
             return None
         now = datetime.now(timezone.utc)
         new_link = normalize_url(news.get('link', ''))
@@ -3788,7 +3914,7 @@ class PublishedStoryStore:
         new_nums = _story_numbers(news)
         best = None
         best_score = 0.0
-        for old in reversed(self._items[-300:]):
+        for old in reversed(items[-300:]):
             if new_link and old.get('link') == new_link:
                 continue
             try:
@@ -3840,6 +3966,7 @@ class ReplayBuffer:
         self.path = path
         self.max_items = max_items
         self._items: list[dict] = []
+        self._lock = threading.Lock()
         self._load()
 
     def _load(self) -> None:
@@ -3881,26 +4008,31 @@ class ReplayBuffer:
 
     def capture_many(self, items: list[dict]) -> list[str]:
         ids: list[str] = []
-        for news in items:
-            row = self._snapshot(news)
-            rid = row['replay_id']
-            ids.append(rid)
-            self._items = [x for x in self._items if x.get('replay_id') != rid]
-            self._items.append(row)
-        self._items = self._items[-self.max_items:]
-        if items:
-            self._save()
+        snapshots = [self._snapshot(news) for news in items]
+        with self._lock:
+            for row in snapshots:
+                rid = row['replay_id']
+                ids.append(rid)
+                self._items = [x for x in self._items if x.get('replay_id') != rid]
+                self._items.append(row)
+            self._items = self._items[-self.max_items:]
+            if snapshots:
+                self._save()
         return ids
 
     def get(self, replay_id: str) -> Optional[dict]:
         rid = str(replay_id or '').strip().lower()
-        for row in reversed(self._items):
+        with self._lock:
+            rows = list(self._items)
+        for row in reversed(rows):
             if str(row.get('replay_id', '')).lower() == rid:
                 return copy.deepcopy(row)
         return None
 
     def latest(self, limit: int = 10) -> list[dict]:
-        return [copy.deepcopy(x) for x in reversed(self._items[-max(1, limit):])]
+        with self._lock:
+            rows = list(self._items[-max(1, limit):])
+        return [copy.deepcopy(x) for x in reversed(rows)]
 
 
 editorial_rules: Optional['EditorialRulesStore'] = None
@@ -8209,9 +8341,9 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
             if is_channel:
                 await stats.record_published(source)
                 if experiments is not None:
-                    experiments.record(str(news.get('_format_variant') or 'standard'), 'published')
+                    await asyncio.to_thread(experiments.record, str(news.get('_format_variant') or 'standard'), 'published')
                 if story_history is not None:
-                    story_history.record(news, format_news_short(news))
+                    await asyncio.to_thread(story_history.record, news, format_news_short(news))
                 if analytics_store is not None:
                     await asyncio.to_thread(analytics_store.record, 'delivery', news,
                                             result='sent', mode='channel')
@@ -9303,7 +9435,9 @@ class ScheduledPosts:
         """Посты, время которых наступило и которые безопасно автоповторять."""
         now = now_utc or datetime.now(timezone.utc)
         return [(k, news) for k, news, dt in self.all()
-                if dt <= now and (self._items.get(k) or {}).get('state', 'pending') == 'pending']
+                if dt <= now
+                and (self._items.get(k) or {}).get('state', 'pending') == 'pending'
+                and _safe_nonnegative_int((self._items.get(k) or {}).get('tries', 0)) < self.MAX_TRIES]
 
     def get(self, key: str) -> Optional[dict]:
         item = self._items.get(key)
@@ -9339,16 +9473,25 @@ class ScheduledPosts:
         return True
 
     def clear(self) -> int:
-        """Снимает всю отложку. Возвращает, сколько постов убрали."""
+        """Снимает всю отложку только если удаление надёжно записалось."""
         count = len(self._items)
-        self._items.clear()
-        self._save()
+        if not count:
+            return 0
+        old_items = self._items
+        self._items = {}
+        if not self._save():
+            self._items = old_items
+            logger.error('Отложка: очистка отменена — storage не принял запись')
+            return 0
         return count
 
     def pop(self, key: str) -> Optional[dict]:
         item = self._items.pop(key, None)
         if item is not None:
-            self._save()
+            if not self._save():
+                self._items[key] = item
+                logger.error(f'Отложка: удаление {key} отменено — storage не принял запись')
+                return None
             return item.get('news')
         return None
 
@@ -9399,13 +9542,19 @@ class ScheduledPosts:
                    if str(item.get('state') or 'pending') == 'uncertain')
 
     def mark_try(self, key: str) -> int:
-        """Считает неудачные попытки и снова разрешает безопасный автоповтор."""
+        """Считает попытку только если новое состояние записалось на диск."""
         item = self._items.get(key)
         if not item:
             return 0
-        item['tries'] = _safe_nonnegative_int(item.get('tries', 0)) + 1
+        old_tries = _safe_nonnegative_int(item.get('tries', 0))
+        old_state = str(item.get('state') or 'pending')
+        item['tries'] = old_tries + 1
         item['state'] = 'pending'
-        self._save()
+        if not self._save():
+            item['tries'] = old_tries
+            item['state'] = old_state
+            logger.error(f'Отложка: не удалось записать retry-state для {key}')
+            return -1
         return item['tries']
 
 
@@ -9714,6 +9863,7 @@ class SourceHealth:
     def __init__(self, path: Path):
         self.path = path
         self._data: dict[str, dict] = {}
+        self._dirty = False
         self._load()
 
     def _load(self) -> None:
@@ -9725,11 +9875,19 @@ class SourceHealth:
         except (OSError, ValueError) as e:
             logger.warning(f"source_health не загружен: {e}")
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         try:
             _atomic_write_json(self.path, self._data)
+            self._dirty = False
+            return True
         except OSError as e:
             logger.error(f"source_health не сохранён: {e}")
+            return False
+
+    def flush(self) -> bool:
+        if not self._dirty:
+            return True
+        return self._save()
 
     def _entry(self, name: str) -> dict:
         row = self._data.setdefault(
@@ -9746,7 +9904,7 @@ class SourceHealth:
     def _utcnow() -> datetime:
         return datetime.now(timezone.utc)
 
-    def record_ok(self, name: str, count: int) -> None:
+    def record_ok(self, name: str, count: int, *, save: bool = True) -> None:
         entry = self._entry(name)
         entry['fails'] = 0
         entry['hard_fails'] = 0
@@ -9756,7 +9914,9 @@ class SourceHealth:
         entry['last_ok'] = self._utcnow().isoformat()
         entry['last_count'] = int(count)
         entry['last_error'] = ''
-        self._save()
+        self._dirty = True
+        if save:
+            self._save()
 
     def _open_breaker_unlocked(self, entry: dict) -> int:
         level = max(0, _safe_nonnegative_int(entry.get('breaker_level')))
@@ -9766,7 +9926,7 @@ class SourceHealth:
         entry['hard_fails'] = 0
         return int(seconds)
 
-    def record_fail(self, name: str, reason: str, *, hard: bool = False) -> int:
+    def record_fail(self, name: str, reason: str, *, hard: bool = False, save: bool = True) -> int:
         """Отмечает неудачу и возвращает число общих неудач подряд.
 
         hard=True означает transport/parser/API failure и участвует в быстром
@@ -9798,7 +9958,9 @@ class SourceHealth:
                         'После паузы будет сделана пробная проверка.')
                 except NameError:
                     pass
-        self._save()
+        self._dirty = True
+        if save:
+            self._save()
         return entry['fails']
 
     def breaker_remaining(self, name: str) -> float:
@@ -9851,6 +10013,7 @@ class SourceHealth:
             row['breaker_level'] = 0
             row['breaker_until'] = None
             row['silent_since'] = None
+            self._dirty = True
             self._save()
 
     def info(self, name: str) -> dict:
@@ -9876,6 +10039,7 @@ class ErrorFingerprintStore:
     def __init__(self, path: Path):
         self.path = path
         self._items: dict[str, dict] = {}
+        self._lock = threading.RLock()
         self._load()
 
     @staticmethod
@@ -9917,35 +10081,36 @@ class ErrorFingerprintStore:
             return {'notify': True, 'count': 1, 'suppressed': 0, 'fingerprint': ''}
         now = datetime.now(timezone.utc)
         fp = self._fingerprint(scope, message)
-        row = self._items.get(fp)
-        reset = True
-        if row:
-            try:
-                last = datetime.fromisoformat(str(row.get('last_seen') or ''))
-                if last.tzinfo is None:
-                    last = last.replace(tzinfo=timezone.utc)
-                reset = (now - last).total_seconds() > ERROR_FINGERPRINT_WINDOW_SEC
-            except (TypeError, ValueError):
-                reset = True
-        if reset:
-            count = 1
-            notify = True
-            first_seen = now.isoformat()
-        else:
-            count = _safe_nonnegative_int(row.get('count')) + 1
-            notify = (count % ERROR_FINGERPRINT_NOTIFY_EVERY == 0)
-            first_seen = str(row.get('first_seen') or now.isoformat())
-        self._items[fp] = {
-            'scope': str(scope)[:120],
-            'message': str(message)[:500],
-            'count': count,
-            'first_seen': first_seen,
-            'last_seen': now.isoformat(),
-        }
-        # Пишем первый случай и контрольные точки; подавленные ошибки не должны
-        # превращать throttling в fsync на каждом цикле.
-        if notify or count <= 2 or count % 5 == 0:
-            self._save()
+        with self._lock:
+            row = self._items.get(fp)
+            reset = True
+            if row:
+                try:
+                    last = datetime.fromisoformat(str(row.get('last_seen') or ''))
+                    if last.tzinfo is None:
+                        last = last.replace(tzinfo=timezone.utc)
+                    reset = (now - last).total_seconds() > ERROR_FINGERPRINT_WINDOW_SEC
+                except (TypeError, ValueError):
+                    reset = True
+            if reset:
+                count = 1
+                notify = True
+                first_seen = now.isoformat()
+            else:
+                count = _safe_nonnegative_int(row.get('count')) + 1
+                notify = (count % ERROR_FINGERPRINT_NOTIFY_EVERY == 0)
+                first_seen = str(row.get('first_seen') or now.isoformat())
+            self._items[fp] = {
+                'scope': str(scope)[:120],
+                'message': str(message)[:500],
+                'count': count,
+                'first_seen': first_seen,
+                'last_seen': now.isoformat(),
+            }
+            # Пишем первый случай и контрольные точки; подавленные ошибки не должны
+            # превращать throttling в fsync на каждом цикле.
+            if notify or count <= 2 or count % 5 == 0:
+                self._save()
         suppressed = max(0, count - 1)
         if not notify:
             metrics.inc('anime_bot_error_notifications_suppressed_total', labels={'scope': str(scope)[:80]})
@@ -9953,18 +10118,20 @@ class ErrorFingerprintStore:
 
     def resolve_scope(self, scope: str) -> int:
         """Удаляет активные fingerprints области после успешного запроса."""
-        keys = [k for k, v in self._items.items() if v.get('scope') == scope]
-        if not keys:
-            return 0
-        suppressed = sum(max(0, _safe_nonnegative_int(self._items[k].get('count')) - 1) for k in keys)
-        for key in keys:
-            self._items.pop(key, None)
-        self._save()
-        return suppressed
+        with self._lock:
+            keys = [k for k, v in self._items.items() if v.get('scope') == scope]
+            if not keys:
+                return 0
+            suppressed = sum(max(0, _safe_nonnegative_int(self._items[k].get('count')) - 1) for k in keys)
+            for key in keys:
+                self._items.pop(key, None)
+            self._save()
+            return suppressed
 
     def snapshot(self) -> list[dict]:
-        return sorted((dict(v, fingerprint=k) for k, v in self._items.items()),
-                      key=lambda row: row.get('last_seen', ''), reverse=True)
+        with self._lock:
+            rows = [dict(v, fingerprint=k) for k, v in self._items.items()]
+        return sorted(rows, key=lambda row: row.get('last_seen', ''), reverse=True)
 
 
 class LLMBudgetStore:
@@ -9973,6 +10140,7 @@ class LLMBudgetStore:
     def __init__(self, path: Path):
         self.path = path
         self._data = {'day': '', 'tokens': 0, 'calls': 0, 'denied': 0, 'warned': False}
+        self._lock = threading.RLock()
         self._load()
 
     def _load(self) -> None:
@@ -10009,51 +10177,57 @@ class LLMBudgetStore:
             logger.warning(f'LLM budget не сохранён: {e}')
 
     def can_charge(self, estimated_tokens: int) -> bool:
-        self._roll_day()
-        if not feature_enabled('llm_budget') or LLM_DAILY_TOKEN_BUDGET <= 0:
-            return True
-        return self._data['tokens'] + max(0, int(estimated_tokens)) <= LLM_DAILY_TOKEN_BUDGET
+        with self._lock:
+            self._roll_day()
+            if not feature_enabled('llm_budget') or LLM_DAILY_TOKEN_BUDGET <= 0:
+                return True
+            return self._data['tokens'] + max(0, int(estimated_tokens)) <= LLM_DAILY_TOKEN_BUDGET
 
     def charge(self, estimated_tokens: int) -> int:
-        self._roll_day()
-        amount = max(0, int(estimated_tokens))
-        if feature_enabled('llm_budget') and LLM_DAILY_TOKEN_BUDGET > 0:
-            self._data['tokens'] += amount
-            self._data['calls'] += 1
-            self._save()
-        return amount
+        with self._lock:
+            self._roll_day()
+            amount = max(0, int(estimated_tokens))
+            if feature_enabled('llm_budget') and LLM_DAILY_TOKEN_BUDGET > 0:
+                self._data['tokens'] += amount
+                self._data['calls'] += 1
+                self._save()
+            return amount
 
     def deny(self) -> None:
-        self._roll_day()
-        self._data['denied'] += 1
-        self._save()
+        with self._lock:
+            self._roll_day()
+            self._data['denied'] += 1
+            self._save()
 
     def reconcile(self, reserved: int, actual_tokens: Optional[int]) -> None:
         """Заменяет консервативную оценку фактическим usage, если он известен."""
-        if not feature_enabled('llm_budget') or LLM_DAILY_TOKEN_BUDGET <= 0:
-            return
-        if actual_tokens is None:
-            return
-        self._roll_day()
-        actual = max(0, int(actual_tokens))
-        self._data['tokens'] = max(0, self._data['tokens'] - max(0, int(reserved)) + actual)
-        self._save()
+        with self._lock:
+            if not feature_enabled('llm_budget') or LLM_DAILY_TOKEN_BUDGET <= 0:
+                return
+            if actual_tokens is None:
+                return
+            self._roll_day()
+            actual = max(0, int(actual_tokens))
+            self._data['tokens'] = max(0, self._data['tokens'] - max(0, int(reserved)) + actual)
+            self._save()
 
     def should_warn(self) -> bool:
-        self._roll_day()
-        if LLM_DAILY_TOKEN_BUDGET <= 0 or self._data.get('warned'):
-            return False
-        if self._data['tokens'] < int(LLM_DAILY_TOKEN_BUDGET * LLM_BUDGET_WARN_RATIO):
-            return False
-        self._data['warned'] = True
-        self._save()
-        return True
+        with self._lock:
+            self._roll_day()
+            if LLM_DAILY_TOKEN_BUDGET <= 0 or self._data.get('warned'):
+                return False
+            if self._data['tokens'] < int(LLM_DAILY_TOKEN_BUDGET * LLM_BUDGET_WARN_RATIO):
+                return False
+            self._data['warned'] = True
+            self._save()
+            return True
 
     def snapshot(self) -> dict:
-        self._roll_day()
-        return dict(self._data, limit=LLM_DAILY_TOKEN_BUDGET,
-                    remaining=(max(0, LLM_DAILY_TOKEN_BUDGET - self._data['tokens'])
-                               if LLM_DAILY_TOKEN_BUDGET > 0 else None))
+        with self._lock:
+            self._roll_day()
+            return dict(self._data, limit=LLM_DAILY_TOKEN_BUDGET,
+                        remaining=(max(0, LLM_DAILY_TOKEN_BUDGET - self._data['tokens'])
+                                   if LLM_DAILY_TOKEN_BUDGET > 0 else None))
 
 
 error_fingerprints: Optional['ErrorFingerprintStore'] = None
@@ -10393,14 +10567,18 @@ class PendingPosts:
 
     def add(self, news: dict) -> str:
         """Сохраняет пост, возвращает короткий ключ для callback-кнопок."""
+        old_items = dict(self._items)
+        old_counter = self._counter
         self._counter += 1
         key = str(self._counter)
         clean = {k: v for k, v in news.items() if k != 'published_parsed'}
         self._items[key] = {'news': clean, 'ts': time.time(), 'channel_state': 'pending'}
         self._cleanup()
         if not self._save():
-            self._items.pop(key, None)
-            self._counter -= 1
+            # cleanup мог удалить старые/overflow записи. При storage-сбое
+            # откатываем весь in-memory snapshot, а не только новый ключ.
+            self._items = old_items
+            self._counter = old_counter
             raise OSError('Не удалось сохранить pending-пост')
         return key
 
@@ -10453,25 +10631,39 @@ class PendingPosts:
     def pop(self, key: str) -> Optional[dict]:
         item = self._items.pop(key, None)
         if item is not None:
-            self._save()
+            if not self._save():
+                self._items[key] = item
+                logger.error(f'Модерация: удаление pending {key} отменено — storage не принял запись')
+                return None
             return item.get('news')
         return None
 
     def update_news(self, key: str, news: dict) -> bool:
-        """Заменяет сохранённый пост (используется при ручном редактировании текста)."""
+        """Заменяет пост только если новая версия надёжно записалась."""
         item = self._items.get(key)
         if not item:
             return False
+        old_news = item.get('news')
         item['news'] = {k: v for k, v in news.items() if k != 'published_parsed'}
-        self._save()
+        if not self._save():
+            item['news'] = old_news
+            return False
         return True
 
-    def set_preview(self, key: str, chat_id: int, message_id: int) -> None:
-        """Запоминает сообщение-превью в ветке, чтобы обновлять его при правках."""
+    def set_preview(self, key: str, chat_id: int, message_id: int) -> bool:
+        """Запоминает сообщение-превью; при storage-сбое откатывает память."""
         item = self._items.get(key)
-        if item:
-            item['preview'] = {'chat_id': chat_id, 'message_id': message_id}
-            self._save()
+        if not item:
+            return False
+        old_preview = item.get('preview')
+        item['preview'] = {'chat_id': chat_id, 'message_id': message_id}
+        if not self._save():
+            if old_preview is None:
+                item.pop('preview', None)
+            else:
+                item['preview'] = old_preview
+            return False
+        return True
 
     def get_preview(self, key: str) -> Optional[dict]:
         item = self._items.get(key)
@@ -11015,7 +11207,7 @@ async def notify_admin(bot: Bot, text: str) -> int:
 
 
 # ============== СБОР ==============
-def _note_source_failure(name: str, reason: str, *, hard: bool = False) -> None:
+def _note_source_failure(name: str, reason: str, *, hard: bool = False, save: bool = True) -> None:
     """Отмечает неудачу источника.
 
     hard=True — transport/parser failure: участвует во временном Stage-4 circuit
@@ -11023,7 +11215,7 @@ def _note_source_failure(name: str, reason: str, *, hard: bool = False) -> None:
     """
     if source_health is None:
         return
-    fails = source_health.record_fail(name, reason, hard=hard)
+    fails = source_health.record_fail(name, reason, hard=hard, save=save)
     silent = source_health.silent_hours(name) or 0
     logger.info(f"{name}: молчит {silent:.1f} ч, проверок подряд без новостей: "
                 f"{fails} ({reason[:70]})")
@@ -11689,7 +11881,7 @@ def _confidence_score(news: dict) -> float:
     return max(0.10, min(0.99, score))
 
 
-def _cluster_news(items: list[dict]) -> list[dict]:
+def _cluster_news(items: list[dict], *, persist_intelligence: bool = True) -> list[dict]:
     """Объединяет очень похожие события из разных источников в одну story.
 
     В primary сохраняются ``_story_sources`` и ``_story_links``. Ничего не
@@ -11711,7 +11903,8 @@ def _cluster_news(items: list[dict]) -> list[dict]:
                     item['_story_origin_source'] = intel.get('probable_origin')
             item['_confidence_score'] = round(_confidence_score(item), 3)
             out.append(item)
-        if feature_enabled('source_intelligence') and source_intelligence is not None:
+        if (persist_intelligence and feature_enabled('source_intelligence')
+                and source_intelligence is not None):
             source_intelligence.flush()
         return out
 
@@ -11776,7 +11969,8 @@ def _cluster_news(items: list[dict]) -> list[dict]:
             _event_log('story_clustered', story_id=primary['_story_id'], size=len(cluster),
                        sources=sources, confidence=primary['_confidence_score'])
 
-    if feature_enabled('source_intelligence') and source_intelligence is not None:
+    if (persist_intelligence and feature_enabled('source_intelligence')
+            and source_intelligence is not None):
         source_intelligence.flush()
     metrics.inc('anime_bot_story_clusters_total', len(result))
     if collapsed:
@@ -11963,6 +12157,77 @@ def _prioritize_news(items: list[dict]) -> list[dict]:
     return out
 
 
+_source_worker_lock = threading.Lock()
+_source_worker_active = 0
+_source_worker_names: set[str] = set()
+
+
+def _source_worker_try_acquire(name: str) -> bool:
+    global _source_worker_active
+    with _source_worker_lock:
+        if _source_worker_active >= SOURCE_FETCH_CONCURRENCY:
+            return False
+        _source_worker_active += 1
+        _source_worker_names.add(str(name))
+        return True
+
+
+def _source_worker_release(name: str) -> None:
+    global _source_worker_active
+    with _source_worker_lock:
+        _source_worker_active = max(0, _source_worker_active - 1)
+        _source_worker_names.discard(str(name))
+
+
+async def _run_source_collector_bounded(name: str, collector, timeout: float):
+    """Runs one blocking source in a bounded *daemon* thread.
+
+    ``asyncio.to_thread`` uses the process default ThreadPoolExecutor. A parser
+    that ignores network timeouts keeps that worker alive after ``wait_for`` and
+    repeated cycles can consume the shared executor used by media/LLM helpers.
+    Here hung collectors are isolated, globally capped and daemonized, so they
+    cannot block interpreter shutdown after SIGTERM.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = time.monotonic() + max(0.01, float(timeout))
+    while not _source_worker_try_acquire(name):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError('source worker pool saturated by unfinished collectors')
+        await asyncio.sleep(min(0.05, left))
+
+    fut = loop.create_future()
+
+    def worker():
+        try:
+            payload = (True, collector())
+        except BaseException as exc:  # transfer to event loop; never escape daemon thread
+            payload = (False, exc)
+        finally:
+            _source_worker_release(name)
+        try:
+            loop.call_soon_threadsafe(_finish, payload)
+        except RuntimeError:
+            pass  # loop already closed during process/test shutdown
+
+    def _finish(payload):
+        if not fut.done():
+            fut.set_result(payload)
+
+    thread = threading.Thread(target=worker, name=f'source-fetch:{str(name)[:32]}', daemon=True)
+    thread.start()
+    left = max(0.01, deadline - time.monotonic())
+    try:
+        ok, value = await asyncio.wait_for(asyncio.shield(fut), timeout=left)
+    except asyncio.TimeoutError as exc:
+        # The daemon thread may still finish later. Its result is a plain tuple,
+        # not an exception Future, so abandoning it cannot emit task warnings.
+        raise TimeoutError(f'source collector exceeded {timeout:.1f}s wall-time') from exc
+    if ok:
+        return value
+    raise value
+
+
 async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
     """Собирает свежие новости со всех включённых источников.
     Возвращает (all_news, stats_lines, errors)."""
@@ -11989,19 +12254,13 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
         metrics.set('anime_bot_circuit_breaker_open', 0, {'source': name})
         enabled.append((name, collector))
 
-    sem = asyncio.Semaphore(SOURCE_FETCH_CONCURRENCY)
+    async def _fetch(name, collector):
+        started = time.perf_counter()
+        items = await _run_source_collector_bounded(
+            name, collector, SOURCE_FETCH_WALL_TIMEOUT)
+        return items, (time.perf_counter() - started)
 
-    async def _fetch(collector):
-        async with sem:
-            # Сетевые helper'ы имеют свои timeout, но wall-time защищает цикл и
-            # от зависшего парсера/сторонней библиотеки. Отменить уже запущенный
-            # Python thread нельзя, поэтому лимит заметно больше обычного HTTP timeout.
-            started = time.perf_counter()
-            items = await asyncio.wait_for(
-                asyncio.to_thread(collector), timeout=SOURCE_FETCH_WALL_TIMEOUT)
-            return items, (time.perf_counter() - started)
-
-    fetched = await asyncio.gather(*(_fetch(c) for _n, c in enabled),
+    fetched = await asyncio.gather(*(_fetch(n, c) for n, c in enabled),
                                    return_exceptions=True)
 
     for (name, _collector), result in zip(enabled, fetched):
@@ -12015,7 +12274,7 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
             _event_log('source_fetch', source=name, status='ok', items=len(items),
                        duration_ms=round(fetch_seconds * 1000, 1))
             if error_fingerprints is not None:
-                error_fingerprints.resolve_scope(f'source:{name}')
+                await asyncio.to_thread(error_fingerprints.resolve_scope, f'source:{name}')
             unique_items = []
             no_image_skipped = 0
             duplicate_skipped = 0
@@ -12047,12 +12306,12 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
             # отдать одни дубли, а мёртвый не отдаёт вообще ничего.
             if source_health is not None:
                 if items:
-                    source_health.record_ok(name, len(items))
+                    source_health.record_ok(name, len(items), save=False)
                 else:
-                    _note_source_failure(name, 'вернул 0 постов')
+                    _note_source_failure(name, 'вернул 0 постов', save=False)
 
             if feature_enabled('replay') and replay_buffer is not None and unique_items:
-                replay_ids = replay_buffer.capture_many(unique_items)
+                replay_ids = await asyncio.to_thread(replay_buffer.capture_many, unique_items)
                 for replay_item, replay_id in zip(unique_items, replay_ids):
                     replay_item['_replay_id'] = replay_id
             all_news.extend(unique_items)
@@ -12071,7 +12330,7 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
                 await stats.record_skipped('duplicate', name, duplicate_skipped)
         except Exception as e:
             message = f'{type(e).__name__}: {e}'
-            fingerprint = (error_fingerprints.record(f'source:{name}', message)
+            fingerprint = (await asyncio.to_thread(error_fingerprints.record, f'source:{name}', message)
                            if error_fingerprints is not None else {'notify': True, 'count': 1})
             if fingerprint.get('notify', True):
                 suffix = (f" (повтор {fingerprint.get('count')})"
@@ -12084,14 +12343,18 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
                        admin_notify=bool(fingerprint.get('notify', True)),
                        repeat_count=int(fingerprint.get('count', 1)))
             await stats.record_source_error(name)
-            _note_source_failure(name, message, hard=True)
+            _note_source_failure(name, message, hard=True, save=False)
+    if source_health is not None:
+        await asyncio.to_thread(source_health.flush)
     try:
         await _run_source_discovery(all_news)
     except Exception as e:
         # Discovery is advisory and must never break the production collection loop.
         logger.warning('Source discovery cycle failed: %s: %s', type(e).__name__, e)
         metrics.inc('anime_bot_source_discovery_errors_total')
-    all_news = _cluster_news(all_news)
+    all_news = _cluster_news(all_news, persist_intelligence=False)
+    if feature_enabled('source_intelligence') and source_intelligence is not None:
+        await asyncio.to_thread(source_intelligence.flush)
     all_news = await _apply_active_verification(all_news)
     all_news = _annotate_story_updates(all_news)
     all_news = _annotate_editorial_automation(all_news)
@@ -12664,16 +12927,24 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if _is_publishing(f'pending:{key}'):
                 await query.answer('Пост уже публикуется — скрыть его сейчас нельзя.', show_alert=True)
                 return
+            existing = pending_posts.get(key) if pending_posts is not None else None
+            if existing is None:
+                await query.answer('Пост устарел или уже удалён', show_alert=True)
+                return
             hidden = pending_posts.pop(key) if pending_posts is not None else None
+            if hidden is None:
+                await query.answer('❌ Не удалось сохранить удаление на диск. Проверь /health.',
+                                   show_alert=True)
+                return
             await query.answer('Скрыто')
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
             except TelegramError:
                 pass
             if hidden and moderation_feedback is not None:
-                moderation_feedback.record('hidden', hidden, update.effective_user)
+                await asyncio.to_thread(moderation_feedback.record, 'hidden', hidden, update.effective_user)
             if hidden and experiments is not None:
-                experiments.record(str(hidden.get('_format_variant') or 'standard'), 'hidden')
+                await asyncio.to_thread(experiments.record, str(hidden.get('_format_variant') or 'standard'), 'hidden')
             if hidden and not actor_is_admin:
                 title = re.sub(r'\s+', ' ', hidden.get('title', ''))[:80]
                 await notify_admin(context.bot,
@@ -12745,15 +13016,22 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pending_posts.mark_channel_pending(key)
                 raise
         if ok:
-            pending_posts.pop(key)
+            pending_cleanup_ok = pending_posts.pop(key) is not None
+            if not pending_cleanup_ok:
+                logger.error('Модерация: пост %s отправлен, но pending cleanup не записался', key)
             if moderation_feedback is not None:
-                moderation_feedback.record('published', news, update.effective_user)
+                await asyncio.to_thread(moderation_feedback.record, 'published', news, update.effective_user)
             if experiments is not None:
-                experiments.record(str(news.get('_format_variant') or 'standard'), 'published')
+                await asyncio.to_thread(experiments.record, str(news.get('_format_variant') or 'standard'), 'published')
             _mark_published()
             if story_history is not None:
-                story_history.record(news, format_news_short(news))
-            await query.answer('📢 Опубликовано в канал!')
+                await asyncio.to_thread(story_history.record, news, format_news_short(news))
+            if pending_cleanup_ok:
+                await query.answer('📢 Опубликовано в канал!')
+            else:
+                await query.answer(
+                    '⚠️ Опубликовано, но storage не удалил pending-запись. Проверь /health.',
+                    show_alert=True)
             await _mark_post_done(query, '\n\n✅ Опубликовано в канал')
             if not actor_is_admin:
                 await notify_admin(
@@ -12798,7 +13076,12 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer('Сейчас идёт публикация отложенного поста — повтори чуть позже.',
                                show_alert=True)
             return
+        total_before = len(scheduled_posts.all()) if scheduled_posts is not None else 0
         removed = scheduled_posts.clear() if scheduled_posts is not None else 0
+        if total_before and removed == 0:
+            await query.answer('❌ Не удалось записать очистку на диск. Проверь /health.',
+                               show_alert=True)
+            return
         logger.info(f"📅 Отложка очищена вручную: снято {removed}")
         await query.answer(f'Снято постов: {removed}')
         text, markup = _scheduled_overview()
@@ -12841,7 +13124,11 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer('Этот пост уже публикуется — снять его сейчас нельзя.',
                                    show_alert=True)
                 return
-            scheduled_posts.pop(key)
+            removed_news = scheduled_posts.pop(key)
+            if removed_news is None:
+                await query.answer('❌ Не удалось записать удаление на диск. Проверь /health.',
+                                   show_alert=True)
+                return
             await query.answer('Снято с отложки')
             text, markup = _scheduled_overview()
             await _safe_edit(query, text, markup)
@@ -12869,11 +13156,18 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.exception(f'Ручная отправка отложенного поста упала: {key}')
                 ok = False
         if ok:
-            scheduled_posts.pop(key)
+            scheduled_cleanup_ok = scheduled_posts.pop(key) is not None
+            if not scheduled_cleanup_ok:
+                logger.error('Отложка: ручной пост %s отправлен, но cleanup не записался', key)
             _mark_published()
             if story_history is not None:
-                story_history.record(news, format_news_short(news))
-            await query.answer('📢 Опубликовано!')
+                await asyncio.to_thread(story_history.record, news, format_news_short(news))
+            if scheduled_cleanup_ok:
+                await query.answer('📢 Опубликовано!')
+            else:
+                await query.answer(
+                    '⚠️ Опубликовано, но storage не удалил запись из отложки. Проверь /health.',
+                    show_alert=True)
             text, markup = _scheduled_overview()
             await _safe_edit(query, text, markup)
         else:
@@ -13197,7 +13491,10 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if data == "hist:clear_yes":
-        await sent_links.clear()
+        if not await sent_links.clear():
+            await query.answer('❌ Не удалось записать очистку на диск. Проверь /health.',
+                               show_alert=True)
+            return
         await query.answer("История очищена")
         await query.edit_message_text(
             "✅ История ссылок очищена.",
@@ -13241,10 +13538,14 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif result == 'failed':
             # Реальная ошибка отправки — возвращаем без сброса TTL и с лимитом повторов.
             requeued = await post_queue.requeue_failed(next_post)
-            if requeued:
+            if requeued is True:
                 await query.answer("Не удалось отправить, пост возвращён в очередь", show_alert=True)
-            else:
+            elif requeued is False:
                 await query.answer("Пост удалён после повторяющихся ошибок отправки", show_alert=True)
+            else:
+                await query.answer(
+                    "❌ Storage не принял retry-state. Пост оставлен inflight; проверь /health.",
+                    show_alert=True)
         elif result == 'uncertain':
             await post_queue.ack_done(next_post)
             await query.answer(
@@ -13276,6 +13577,10 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "queue:clear_yes":
         count = await post_queue.clear()
+        if count < 0:
+            await query.answer('❌ Не удалось записать очистку на диск. Проверь /health.',
+                               show_alert=True)
+            return
         await query.answer(f"Удалено {count} постов")
         await query.edit_message_text(
             f"✅ Очередь очищена ({count} постов).",
@@ -13469,12 +13774,14 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
                 'проверь storage/volume и /health.')
             raise ApplicationHandlerStop
         if moderation_feedback is not None:
-            moderation_feedback.record('scheduled', news, update.effective_user)
+            await asyncio.to_thread(moderation_feedback.record, 'scheduled', news, update.effective_user)
         context.user_data.pop('await_input', None)
         # Пометку ставим ДО pop: после удаления записи превью уже не найти
         await _update_moderation_done(context.bot, key,
                                       f'\n\n📅 В отложке на {_fmt_local(when)}')
-        pending_posts.pop(key)
+        pending_cleanup_ok = pending_posts.pop(key) is not None
+        if not pending_cleanup_ok:
+            logger.error('Модерация: пост %s добавлен в отложку, но pending cleanup не записался', key)
         logger.info(f"📅 Отложен пост «{news.get('title', '')[:60]}» на {_fmt_local(when)} "
                     f"(отложил: {(by or {}).get('name', '?')})")
         if user and user.id not in _all_admin_ids():
@@ -13482,9 +13789,13 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
                 context.bot,
                 f'👥 {(by or {}).get("name", "?")} отложил пост на {_fmt_local(when)}:\n\n'
                 f'{_post_card(news, {"by": by, "at": when})}')
-        await update.message.reply_text(
+        reply = (
             f'📅 Опубликую {_fmt_local(when)} — через {_human_delta(when)}.\n'
             f'Список: /scheduled')
+        if not pending_cleanup_ok:
+            reply += ('\n\n⚠️ Storage не удалил исходную pending-запись. Отложка сохранена, '
+                      'но проверь /health перед следующими действиями.')
+        await update.message.reply_text(reply)
         raise ApplicationHandlerStop
 
     # === ✏️ Правка текста ===
@@ -13494,9 +13805,14 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text('Пост уже публикуется; изменить его сейчас нельзя.')
             raise ApplicationHandlerStop
         news['_edited_text'] = text
-        pending_posts.update_news(key, news)
+        if not pending_posts.update_news(key, news):
+            context.user_data.pop('await_input', None)
+            await update.message.reply_text(
+                '❌ Не удалось надёжно сохранить правку на диск. Старый текст оставлен; '
+                'проверь storage/volume и /health.')
+            raise ApplicationHandlerStop
         if moderation_feedback is not None:
-            moderation_feedback.record('edited', news, update.effective_user)
+            await asyncio.to_thread(moderation_feedback.record, 'edited', news, update.effective_user)
         context.user_data.pop('await_input', None)
         editor = update.effective_user
         if editor and editor.id not in _all_admin_ids():
@@ -13849,10 +14165,16 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
                     f"Отложенный пост упал с ошибкой: {news.get('title', '')[:60]}")
 
         if ok:
-            scheduled_posts.pop(key)
+            removed = scheduled_posts.pop(key)
+            if removed is None:
+                logger.error('Отложка: пост %s отправлен, но cleanup не записался', key)
+                await notify_admin(
+                    context.bot,
+                    f'⚠️ Пост уже отправлен в канал, но storage не подтвердил удаление из отложки.\n'
+                    f'ID: {key}. Автоповтор заблокирован состоянием sending; проверь /health и /scheduled.')
             _mark_published()
             if story_history is not None:
-                story_history.record(news, format_news_short(news))
+                await asyncio.to_thread(story_history.record, news, format_news_short(news))
             logger.info(f"📅 Опубликован отложенный пост: {news.get('title', '')[:60]}")
             await notify_admin(
                 context.bot,
@@ -13867,12 +14189,24 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
         else:
             tries = scheduled_posts.mark_try(key)
             reason = err or 'отправка вернула отказ (см. /logs)'
-            if tries >= ScheduledPosts.MAX_TRIES:
-                scheduled_posts.pop(key)
+            if tries < 0:
                 await notify_admin(
                     context.bot,
-                    f'⚠️ Отложенный пост снят после {tries} неудачных попыток\n\n'
-                    f'{card}\n\n❌ Причина: {reason}')
+                    f'⚠️ Отложенный пост не отправлен, а storage не принял retry-state.\n\n'
+                    f'{card}\n\nАвтоповтор приостановлен до восстановления хранилища; проверь /health.')
+            elif tries >= ScheduledPosts.MAX_TRIES:
+                removed = scheduled_posts.pop(key)
+                if removed is None:
+                    await notify_admin(
+                        context.bot,
+                        f'⚠️ Отложенный пост достиг лимита {tries} попыток, но storage не позволил '
+                        f'удалить запись. Автоповтор остановлен; проверь /health и удали запись вручную '
+                        f'после восстановления storage.\n\n{card}\n\n❌ Причина: {reason}')
+                else:
+                    await notify_admin(
+                        context.bot,
+                        f'⚠️ Отложенный пост снят после {tries} неудачных попыток\n\n'
+                        f'{card}\n\n❌ Причина: {reason}')
             else:
                 logger.warning(f"Отложенный пост не ушёл (попытка {tries}/"
                                f"{ScheduledPosts.MAX_TRIES}): {reason}")
@@ -14345,14 +14679,21 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                 break
             if sent_result == 'failed':
                 requeued = await post_queue.requeue_failed(next_post)
-                if requeued:
+                if requeued is True:
                     logger.warning(
                         f"Возвращаю пост в очередь после ошибки отправки: "
                         f"{next_post.get('title', '')[:60]}")
-                else:
+                elif requeued is False:
                     await notify_admin(
                         context.bot,
                         f"⚠️ Пост удалён из очереди после {QUEUE_MAX_SEND_RETRIES} ошибок отправки:\n"
+                        f"{next_post.get('title', '')[:180]}")
+                else:
+                    await notify_admin(
+                        context.bot,
+                        "⚠️ Ошибка отправки + storage не принял retry-state. "
+                        "Пост оставлен inflight и очередь приостановлена до восстановления storage. "
+                        "Проверь /health.\n\n"
                         f"{next_post.get('title', '')[:180]}")
                 break
             if sent_result == 'uncertain':
@@ -15192,7 +15533,7 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True) -> str:
     # --- Предмет новости: ловим повторы и однообразие ---
     subject = str(data.get('subject') or '').strip()[:120]
     if side_effects and subject and feature_enabled('entity_memory') and entity_memory is not None:
-        subject = entity_memory.observe(subject, source='llm')
+        subject = await asyncio.to_thread(entity_memory.observe, subject, source='llm')
     news['_llm_subject'] = subject
     if side_effects and subject and recent_subjects is not None:
         if settings.llm_dedup_subject and recent_subjects.seen_same_news(subject, kind):
@@ -15971,8 +16312,8 @@ async def _resolve_user(update, context) -> tuple[Optional[int], str, str]:
         user = reply.from_user
         if user_directory is not None:
             user_directory.remember(user)
-        return user.id, (user.full_name or f'@{user.username}' if user.username
-                         else str(user.id)), ''
+        display = user.full_name or (f'@{user.username}' if user.username else str(user.id))
+        return user.id, display, ''
 
     args = context.args or []
     if not args:
@@ -18047,17 +18388,38 @@ _runtime_health = {
 }
 _health_http_server: Optional[ThreadingHTTPServer] = None
 _health_http_thread: Optional[threading.Thread] = None
+_storage_probe_lock = threading.Lock()
+_storage_probe_cached_at = 0.0
+_storage_probe_cached_ok = False
 
 
 def _storage_ready() -> bool:
-    try:
-        probe = DATA_DIR / '.health_write_probe'
-        probe.write_text('ok', encoding='utf-8')
-        probe.unlink(missing_ok=True)
-        return True
-    except OSError as e:
-        _runtime_health['last_error'] = f'storage: {e}'
-        return False
+    """Проверяет write-access к DATA_DIR с коротким cache.
+
+    Liveness/readiness могут опрашиваться несколько раз в секунду. Раньше каждый
+    GET создавал файл, fsync-ил metadata и удалял его — бессмысленная нагрузка
+    на persistent volume. Ошибка всё равно будет замечена максимум через несколько
+    секунд либо очередным periodic health job.
+    """
+    global _storage_probe_cached_at, _storage_probe_cached_ok
+    now = time.monotonic()
+    if now - _storage_probe_cached_at <= HEALTH_STORAGE_PROBE_CACHE_SEC:
+        return bool(_storage_probe_cached_ok)
+    with _storage_probe_lock:
+        now = time.monotonic()
+        if now - _storage_probe_cached_at <= HEALTH_STORAGE_PROBE_CACHE_SEC:
+            return bool(_storage_probe_cached_ok)
+        try:
+            probe = DATA_DIR / '.health_write_probe'
+            probe.write_text('ok', encoding='utf-8')
+            probe.unlink(missing_ok=True)
+            ok = True
+        except OSError as e:
+            _runtime_health['last_error'] = f'storage: {e}'
+            ok = False
+        _storage_probe_cached_ok = ok
+        _storage_probe_cached_at = now
+        return ok
 
 
 _dashboard_failures: dict[str, list] = {}     # ip -> [счётчик, время первой неудачи]
@@ -18086,6 +18448,13 @@ def _dashboard_note_failure(ip: str, now: Optional[float] = None) -> int:
             for key in [k for k, v in _dashboard_failures.items()
                         if now - v[1] > DASHBOARD_FAIL_WINDOW_SEC]:
                 _dashboard_failures.pop(key, None)
+            # При распределённом brute-force все записи могут быть свежими.
+            # В таком случае одного удаления expired недостаточно: словарь рос бы
+            # без верхней границы. Оставляем только самые свежие адреса.
+            if len(_dashboard_failures) > 512:
+                newest = sorted(_dashboard_failures.items(), key=lambda kv: kv[1][1], reverse=True)[:512]
+                _dashboard_failures.clear()
+                _dashboard_failures.update(newest)
         entry = _dashboard_failures.get(ip)
         if not entry or now - entry[1] > DASHBOARD_FAIL_WINDOW_SEC:
             _dashboard_failures[ip] = [1, now]
@@ -18342,6 +18711,16 @@ class _HealthHandler(BaseHTTPRequestHandler):
         except Exception:
             return ''
 
+    def _write_body(self, raw: bytes) -> bool:
+        """Best-effort body write: health clients often disconnect early."""
+        try:
+            self.wfile.write(raw)
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            metrics.inc('anime_bot_health_client_disconnect_total')
+            logger.debug('health-http: клиент закрыл соединение до ответа: %s', e)
+            return False
+
     def _metrics_allowed(self) -> bool:
         """На loopback метрики открыты, наружу — только по токену."""
         if not HEALTH_BIND_IS_PUBLIC:
@@ -18400,7 +18779,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.send_header('X-Frame-Options', 'DENY')
             self.send_header('Content-Length', str(len(raw)))
             self.end_headers()
-            self.wfile.write(raw)
+            self._write_body(raw)
             return
         if request_path == '/metrics':
             if not feature_enabled('metrics'):
@@ -18424,7 +18803,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'text/plain; version=0.0.4; charset=utf-8')
             self.send_header('Content-Length', str(len(raw)))
             self.end_headers()
-            self.wfile.write(raw)
+            self._write_body(raw)
             return
         # Платформа проверяет живость своим путём, и он у всех разный:
         # /health, /ping, /status, /up... Раньше на всё незнакомое отдавался
@@ -18453,7 +18832,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(raw)))
         self.end_headers()
         if self.command != 'HEAD':      # на HEAD тело слать нельзя
-            self.wfile.write(raw)
+            self._write_body(raw)
 
     def do_HEAD(self):
         # Часть платформ проверяет живость HEAD-запросом. Без этого метода
@@ -18622,6 +19001,8 @@ async def _post_shutdown(app: Application) -> None:
             user_directory.flush()
         if settings is not None:
             settings.save()
+        if experiments is not None:
+            experiments.flush()
         for store in (post_queue, scheduled_posts, pending_posts, sent_links):
             saver = getattr(store, '_save', None)
             if callable(saver):
