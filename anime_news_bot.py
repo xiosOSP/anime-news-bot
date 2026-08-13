@@ -308,10 +308,10 @@ HEALTH_STRICT_READINESS = _env_bool('HEALTH_STRICT_READINESS', False)
 # Публичный bind означает, что endpoint видит кто угодно. Без ограничений это
 # один поток на соединение без таймаута: сотня полуоткрытых сокетов держит сотню
 # потоков навсегда. Таймаут обрывает медленные соединения, лимиты держат потолок.
-HEALTH_REQUEST_TIMEOUT_SEC = max(1, min(60, _env_int('HEALTH_REQUEST_TIMEOUT_SEC', 10)))
+HEALTH_REQUEST_TIMEOUT_SEC = max(1, min(60, _env_int('HEALTH_REQUEST_TIMEOUT_SEC', 3)))
 HEALTH_MAX_CONNECTIONS = max(4, min(256, _env_int('HEALTH_MAX_CONNECTIONS', 32)))
 HEALTH_MAX_CONNECTIONS_PER_IP = max(1, min(HEALTH_MAX_CONNECTIONS,
-                                           _env_int('HEALTH_MAX_CONNECTIONS_PER_IP', 6)))
+                                           _env_int('HEALTH_MAX_CONNECTIONS_PER_IP', HEALTH_MAX_CONNECTIONS)))
 HEALTH_STORAGE_PROBE_CACHE_SEC = max(0.5, min(60.0, _env_float('HEALTH_STORAGE_PROBE_CACHE_SEC', 5.0)))
 # Метрики раскрывают имена источников и рабочие счётчики. На loopback это
 # безобидно, наружу — только по токену. Пустой токен при публичном bind
@@ -319,6 +319,7 @@ HEALTH_STORAGE_PROBE_CACHE_SEC = max(0.5, min(60.0, _env_float('HEALTH_STORAGE_P
 HEALTH_METRICS_TOKEN = _env('HEALTH_METRICS_TOKEN', '').strip()
 HEALTH_BIND_IS_PUBLIC = HEALTH_HOST not in ('127.0.0.1', 'localhost', '::1')
 LIFECYCLE_FILE = DATA_DIR / 'runtime_lifecycle.json'
+BUILD_TAG = 'restart-cadence-v2-20260813'
 TG_CAPTION_LIMIT = 1024              # жёсткое ограничение Telegram для подписи под фото
 TG_TEXT_LIMIT = 4096                 # лимит обычного текстового сообщения
 # Внутренний лимит summary для режима КАНАЛА (одно сообщение фото+подпись).
@@ -14404,6 +14405,7 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
         return
     global _check_failure_streak
     async with _check_news_lock:
+        _mark_auto_cycle_started()
         try:
             await _check_news_cycle(context)
         except Exception as e:
@@ -14419,6 +14421,7 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
                 f'check_news: {type(e).__name__}: {e}')[:200]
             _event_log('check_cycle_failed', error=f'{type(e).__name__}: {e}'[:200])
             _check_failure_streak += 1
+            _mark_auto_cycle_finished(f'error:{type(e).__name__}')
             # Сообщаем один раз на серию, чтобы не спамить каждые полчаса.
             if _check_failure_streak in (1, 5, 20):
                 try:
@@ -14430,6 +14433,7 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
                     logger.exception('Не удалось сообщить админу о падении автопроверки')
         else:
             _check_failure_streak = 0
+            _mark_auto_cycle_finished('ok')
 
 
 async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
@@ -14617,7 +14621,7 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                 message = (
                     f"✅ Проверка завершена (режим ветки).\n"
                     f"📊 Источники: {' | '.join(stats_lines)}\n"
-                    f"🧵 Отправлено в ветку: {sent_count}\n"
+                    f"🧵 Новых отправлено этой проверкой: {sent_count}\n"
                 )
                 if backpressure_deferred:
                     message += f"⏳ Отложено backpressure-ом: {backpressure_deferred}\n"
@@ -14626,14 +14630,16 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                     filter_n = skipped_reasons.get('skipped_filter', 0)
                     detail = []
                     if dup_n:
-                        detail.append(f'дубли {dup_n}')
+                        message += f"♻️ Уже были опубликованы / распознаны как дубли: {dup_n}\n"
                     if filter_n:
                         detail.append(f'фильтр {filter_n}')
                     other_n = skipped_count - dup_n - filter_n
                     if other_n:
                         detail.append(f'прочее {other_n}')
-                    suffix = f" ({', '.join(detail)})" if detail else ''
-                    message += f"⏭ Отсеяно после подготовки: {skipped_count}{suffix}\n"
+                    non_dup_skipped = skipped_count - dup_n
+                    if non_dup_skipped:
+                        suffix = f" ({', '.join(detail)})" if detail else ''
+                        message += f"⏭ Отсеяно после подготовки: {non_dup_skipped}{suffix}\n"
                 if failed_count:
                     message += f"⚠️ Не удалось отправить: {failed_count}\n"
                 if uncertain_count:
@@ -18182,10 +18188,12 @@ async def lifecycle_command(update, context: ContextTypes.DEFAULT_TYPE):
     life = lifecycle_snapshot()
     starts = list(life.get('starts') or [])
     lines = ['🔄 <b>Lifecycle / рестарты</b>',
+             f'Build: <code>{BUILD_TAG}</code>',
              f'Всего стартов: <b>{int(life.get("total_starts", 0) or 0)}</b>',
              f'Текущее состояние: <code>{html.escape(str(life.get("state") or "?"))}</code>',
              f'Последний exit: <code>{html.escape(str(life.get("last_exit_kind") or "нет данных"))}</code>',
              f'Health bind: <code>{html.escape(str(HEALTH_HOST))}:{HEALTH_PORT}</code>',
+             f'Health server: <code>{"listening" if _runtime_health.get("health_server_ok") else "not_listening"}</code>',
              f'Polling bootstrap retries: <code>{POLLING_BOOTSTRAP_RETRIES}</code>']
     if life.get('last_restart_interval_sec') is not None:
         lines.append(f'Интервал последних запусков: {int(life["last_restart_interval_sec"])} сек')
@@ -18198,6 +18206,27 @@ async def lifecycle_command(update, context: ContextTypes.DEFAULT_TYPE):
             if span <= RESTART_STORM_WINDOW_SEC:
                 lines.append(f'🚨 Restart storm: {RESTART_STORM_THRESHOLD} запусков за {int(span)} сек')
         except (ValueError, TypeError):
+            pass
+    probe_at = str(life.get('last_health_probe_at') or '')
+    probe_method = str(life.get('last_health_probe_method') or '')
+    probe_path = str(life.get('last_health_probe_path') or '')
+    if probe_at:
+        try:
+            probe_dt = datetime.fromisoformat(probe_at)
+            age = max(0, int((datetime.now(timezone.utc) - probe_dt).total_seconds()))
+            lines.append('Последняя HTTP-проба прошлого процесса: '
+                         f'<code>{html.escape(probe_method)} {html.escape(probe_path)}</code> '
+                         f'({age} сек назад)')
+        except (ValueError, TypeError):
+            pass
+    auto_state = str(life.get('last_auto_cycle_state') or '')
+    if auto_state:
+        lines.append('Последняя автопроверка: <code>' + html.escape(auto_state[:80]) + '</code>')
+    rss_exit = life.get('rss_mb_at_exit')
+    if rss_exit is not None:
+        try:
+            lines.append(f'Память прошлого процесса при exit: <code>{int(rss_exit)} МБ</code>')
+        except (TypeError, ValueError):
             pass
     detail = _redact_secrets(str(life.get('last_exit_detail') or ''))
     if detail:
@@ -18357,9 +18386,71 @@ def _mark_lifecycle_exit(kind: str, detail: str = '') -> None:
         'last_stop': datetime.now(timezone.utc).isoformat(),
         'last_exit_kind': str(kind or 'unknown')[:80],
         'last_exit_detail': _redact_secrets(str(detail or ''))[:500],
+        'last_health_probe_at': str(_runtime_health.get('last_http_probe_at') or ''),
+        'last_health_probe_method': str(_runtime_health.get('last_http_probe_method') or '')[:16],
+        'last_health_probe_path': str(_runtime_health.get('last_http_probe_path') or '')[:160],
+        'health_server_ok_at_exit': bool(_runtime_health.get('health_server_ok')),
+        'rss_mb_at_exit': _rss_mb(),
+        'last_check_result_at_exit': str(_runtime_health.get('last_check_result') or '')[:240],
+        'last_check_started_at_exit': str(_runtime_health.get('last_check_started_at') or ''),
         'pid': os.getpid(),
     })
     _write_lifecycle(data)
+
+
+def _mark_auto_cycle_started() -> None:
+    """Persist auto-cycle cadence so a process restart does not reset it to +5s."""
+    data = _read_lifecycle()
+    previous_state = str(data.get('last_auto_cycle_state') or '')
+    if previous_state:
+        data['previous_auto_cycle_state'] = previous_state[:80]
+        data['previous_auto_cycle_started_at'] = str(data.get('last_auto_cycle_started_at') or '')
+        data['previous_auto_cycle_finished_at'] = str(data.get('last_auto_cycle_finished_at') or '')
+    data['last_auto_cycle_started_at'] = datetime.now(timezone.utc).isoformat()
+    data['last_auto_cycle_state'] = 'running'
+    _write_lifecycle(data)
+
+
+def _mark_auto_cycle_finished(result: str) -> None:
+    data = _read_lifecycle()
+    data['last_auto_cycle_finished_at'] = datetime.now(timezone.utc).isoformat()
+    data['last_auto_cycle_state'] = str(result or 'finished')[:80]
+    _write_lifecycle(data)
+
+
+def _auto_restore_first_delay(default: float = 5.0) -> float:
+    """Keep the configured interval across process restarts.
+
+    Previously every boot recreated the auto job with ``first=5``. During a
+    restart storm that meant a full source/LLM/media cycle every minute, often
+    before the previous process' work was even cold. The persisted *start* time
+    is intentionally used even if the previous cycle was interrupted: this
+    avoids immediately replaying the same expensive cycle and producing a
+    misleading all-duplicates report.
+    """
+    try:
+        data = _read_lifecycle()
+        stamp = str(data.get('last_auto_cycle_started_at') or '')
+        if not stamp or settings is None:
+            return float(default)
+        started = datetime.fromisoformat(stamp)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        elapsed = max(0.0, (datetime.now(timezone.utc) - started).total_seconds())
+        interval = max(5.0, float(settings.check_interval_sec))
+        if elapsed >= interval:
+            return float(default)
+        remaining = max(float(default), interval - elapsed)
+        if str(data.get('last_auto_cycle_state') or '') == 'running':
+            logger.warning('Авторассылка: предыдущий процесс прервал проверку; '
+                           'не повторяю её через 5 секунд, следующий запуск через %.0f с',
+                           remaining)
+        else:
+            logger.info('Авторассылка: сохраняю расписание после рестарта; '
+                        'следующая проверка через %.0f с', remaining)
+        return remaining
+    except (TypeError, ValueError, OverflowError):
+        return float(default)
 
 
 def lifecycle_snapshot() -> dict:
@@ -18381,6 +18472,10 @@ _runtime_health = {
     'started_at': datetime.now(timezone.utc).isoformat(),
     'telegram_ok': False,
     'storage_ok': False,
+    'health_server_ok': False,
+    'last_http_probe_at': '',
+    'last_http_probe_method': '',
+    'last_http_probe_path': '',
     'last_error': '',
     'last_check_started_at': '',
     'last_check_finished_at': '',
@@ -18682,12 +18777,10 @@ _health_probe_seen: dict[str, int] = {}
 
 
 def _note_health_probe(method: str, path: str) -> None:
-    """Запоминает, чем именно платформа проверяет живость.
-
-    Знать это важно: если проба уходит не туда, куда мы отвечаем, платформа
-    считает контейнер мёртвым и убивает его SIGTERM. Первые несколько таких
-    запросов пишем в лог, дальше только считаем — чтобы не залить лог.
-    """
+    """Запоминает последнюю liveness/readiness-пробу без обращения к диску."""
+    _runtime_health['last_http_probe_at'] = datetime.now(timezone.utc).isoformat()
+    _runtime_health['last_http_probe_method'] = str(method or '')[:16]
+    _runtime_health['last_http_probe_path'] = str(path or '')[:160]
     key = f'{method} {path}'[:120]
     seen = _health_probe_seen.get(key, 0) + 1
     if len(_health_probe_seen) < 32 or key in _health_probe_seen:
@@ -18810,8 +18903,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
         # 404, проверка считалась проваленной, и контейнер убивали SIGTERM —
         # ровно те перезапуски раз в 15 секунд с чистым polling_returned.
         # Поэтому любой неизвестный путь считаем liveness-проверкой.
-        if request_path not in ('/', '/livez', '/healthz', '/readyz'):
-            _note_health_probe(self.command, request_path)
+        _note_health_probe(self.command, request_path)
         # Liveness must be a pure in-memory check.  Never touch Telegram or the
         # persistent volume here: a temporarily slow/frozen volume would make the
         # platform's health request hang, which in turn makes the platform send
@@ -18846,6 +18938,11 @@ class _HealthHandler(BaseHTTPRequestHandler):
         # BaseHTTPRequestHandler отвечает 501, и проверка проваливается.
         self.do_GET()
 
+    def do_OPTIONS(self):
+        # Некоторые reverse-proxy делают служебный OPTIONS перед основной
+        # проверкой. Для liveness это такой же безопасный in-memory ответ.
+        self.do_GET()
+
 
 class _BoundedHealthServer(ThreadingHTTPServer):
     """ThreadingHTTPServer с потолком на число одновременных соединений.
@@ -18860,6 +18957,7 @@ class _BoundedHealthServer(ThreadingHTTPServer):
     """
 
     daemon_threads = True
+    allow_reuse_address = True
     request_queue_size = 64
 
     def __init__(self, *args, max_concurrent: int = HEALTH_MAX_CONNECTIONS,
@@ -18928,6 +19026,7 @@ def _start_health_server() -> None:
             target=_health_http_server.serve_forever,
             name='health-http', daemon=True)
         _health_http_thread.start()
+        _runtime_health['health_server_ok'] = True
         dashboard_note = (' + /admin' if feature_enabled('admin_dashboard') and DASHBOARD_TOKEN else '')
         metrics_note = ''
         if feature_enabled('metrics'):
@@ -18947,6 +19046,7 @@ def _start_health_server() -> None:
             logger.warning('Дашборд открыт наружу, а DASHBOARD_TOKEN короче 24 символов. '
                            'Возьми длинную случайную строку, например `openssl rand -hex 24`.')
     except OSError as e:
+        _runtime_health['health_server_ok'] = False
         _runtime_health['last_error'] = f'health server: {e}'
         logger.warning(f'HTTP health endpoint не запущен: {e}')
 
@@ -18961,6 +19061,7 @@ def _stop_health_server() -> None:
             pass
     _health_http_server = None
     _health_http_thread = None
+    _runtime_health['health_server_ok'] = False
 
 
 async def health_probe_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -18973,7 +19074,7 @@ async def health_probe_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         job_queue = getattr(application, 'job_queue', None)
         if (job_queue is not None and settings is not None and settings.auto_enabled
                 and not job_queue.get_jobs_by_name('anime_news_check')):
-            if _ensure_auto_news_job(job_queue, first=5):
+            if _ensure_auto_news_job(job_queue, first=_auto_restore_first_delay()):
                 logger.warning('♻️ Health watchdog восстановил пропавшую авторассылку')
                 metrics.inc('anime_bot_auto_job_recovered_total')
                 await notify_admin(context.bot, '♻️ Авторассылка была включена, но её фоновая задача пропала. Бот восстановил её автоматически.')
@@ -19001,6 +19102,23 @@ async def _post_shutdown(app: Application) -> None:
     остановил.
     """
     _runtime_health['graceful_shutdown_at'] = datetime.now(timezone.utc).isoformat()
+    uptime = int(time.time() - _process_started_at)
+    probe_note = ''
+    life_before_stop = _read_lifecycle()
+    auto_note = ('; автопроверка была активна'
+                 if str(life_before_stop.get('last_auto_cycle_state') or '') == 'running' else '')
+    rss_now = _rss_mb()
+    rss_note = f'; RSS {rss_now} МБ' if rss_now is not None else ''
+    raw_probe_at = str(_runtime_health.get('last_http_probe_at') or '')
+    if raw_probe_at:
+        try:
+            probe_dt = datetime.fromisoformat(raw_probe_at)
+            probe_age = max(0, int((datetime.now(timezone.utc) - probe_dt).total_seconds()))
+            probe_note = (f'; последняя HTTP-проба {probe_age} с назад: '
+                          f'{_runtime_health.get("last_http_probe_method", "")} '
+                          f'{_runtime_health.get("last_http_probe_path", "")}')
+        except (ValueError, TypeError):
+            pass
     logger.info('Получен сигнал остановки: PTB выключается штатно. '
                 'Если это не ручная остановка, значит контейнер остановила платформа.')
     try:
@@ -19020,7 +19138,8 @@ async def _post_shutdown(app: Application) -> None:
         cleanup_video_dir(max_age_hours=0)
     except Exception:
         pass
-    _mark_lifecycle_exit('graceful_shutdown')
+    _mark_lifecycle_exit('external_signal',
+                         f'Внешняя остановка после {uptime} с работы{auto_note}{rss_note}{probe_note}')
     _stop_health_server()
     _release_instance_lock()
     logger.info('Graceful shutdown завершён')
@@ -19079,7 +19198,7 @@ async def setup_bot_commands(app: Application) -> None:
     # APScheduler jobs живут только в памяти процесса. Восстанавливаем
     # пользовательское состояние авторассылки после restart/redeploy.
     if settings.auto_enabled:
-        _ensure_auto_news_job(app.job_queue, first=5)
+        _ensure_auto_news_job(app.job_queue, first=_auto_restore_first_delay())
         logger.info('♻️ Авторассылка восстановлена после запуска процесса')
 
     # Readiness: Telegram + хранилище. HTTP /readyz использует эти флаги.
@@ -19413,21 +19532,18 @@ def _run_polling_guarded(app) -> None:
                            attempts, wait, e)
             time.sleep(wait)
             continue
-        # Сюда попадаем, если polling завершился без исключения. Так PTB
-        # реагирует на SIGTERM/SIGINT, то есть нас остановили снаружи.
+        # Normal PTB signal shutdown runs post_shutdown before run_polling returns.
+        # Do not overwrite that stronger evidence with the vague polling_returned.
+        life = _read_lifecycle()
+        if (str(life.get('state') or '') == 'stopped'
+                and int(life.get('pid') or 0) == os.getpid()
+                and str(life.get('last_exit_kind') or '') == 'external_signal'):
+            logger.warning('Polling завершился после внешнего сигнала; lifecycle уже сохранён.')
+            return
         uptime = int(time.time() - _process_started_at)
-        graceful = bool(_runtime_health.get('graceful_shutdown_at'))
-        detail = (f'SIGTERM от платформы после {uptime} с работы' if graceful
-                  else f'run_polling вернулся без исключения после {uptime} с')
-        logger.warning('Polling завершился без ошибки после %d с работы. %s', uptime,
-                       'Контейнер остановлен снаружи — обычно это неудачная '
-                       'health-проба платформы или лимит ресурсов.')
-        # Preserve the fact that PTB completed a graceful signal-driven
-        # shutdown instead of flattening it into the misleading
-        # `polling_returned`.  This does not pretend the bot crashed: it records
-        # that the process was asked to stop from outside.
-        exit_kind = 'external_signal' if graceful else 'polling_returned'
-        _mark_lifecycle_exit(exit_kind, detail)
+        detail = f'run_polling вернулся без post_shutdown после {uptime} с'
+        logger.warning('Polling завершился без ошибки после %d с работы без post_shutdown.', uptime)
+        _mark_lifecycle_exit('polling_returned', detail)
         return
 
 
