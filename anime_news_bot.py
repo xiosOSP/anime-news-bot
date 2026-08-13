@@ -319,7 +319,7 @@ HEALTH_STORAGE_PROBE_CACHE_SEC = max(0.5, min(60.0, _env_float('HEALTH_STORAGE_P
 HEALTH_METRICS_TOKEN = _env('HEALTH_METRICS_TOKEN', '').strip()
 HEALTH_BIND_IS_PUBLIC = HEALTH_HOST not in ('127.0.0.1', 'localhost', '::1')
 LIFECYCLE_FILE = DATA_DIR / 'runtime_lifecycle.json'
-BUILD_TAG = 'restart-cadence-v2-20260813'
+BUILD_TAG = 'reliability-v3-20260813'
 TG_CAPTION_LIMIT = 1024              # жёсткое ограничение Telegram для подписи под фото
 TG_TEXT_LIMIT = 4096                 # лимит обычного текстового сообщения
 # Внутренний лимит summary для режима КАНАЛА (одно сообщение фото+подпись).
@@ -1035,8 +1035,8 @@ def _refresh_runtime_metrics() -> None:
             decisions = len([x for x in _moderation_rows(30) if x.get('action') in ('published', 'hidden')])
             metrics.set('anime_bot_moderation_decisions_30d', decisions)
         life = lifecycle_snapshot() if feature_enabled('lifecycle_diagnostics') else {}
-        metrics.set('anime_bot_process_starts_total', int(life.get('total_starts', 0) or 0))
-        metrics.set('anime_bot_consecutive_unclean_starts', int(life.get('consecutive_unclean', 0) or 0))
+        metrics.set('anime_bot_process_starts_total', _safe_nonnegative_int(life.get('total_starts')))
+        metrics.set('anime_bot_consecutive_unclean_starts', _safe_nonnegative_int(life.get('consecutive_unclean')))
         metrics.set('anime_bot_replay_buffer_items',
                     len(replay_buffer._items) if replay_buffer is not None else 0)
         metrics.set('anime_bot_media_quality_enabled', 1 if feature_enabled('media_quality') else 0)
@@ -8095,10 +8095,16 @@ async def _send_post_fallback(
     caption: str, safe_text: str, has_inline_video: bool,
     thread_id: Optional[int] = None,
 ) -> bool:
-    """Если media group не прошла — шлём первый медиа-объект с caption, остальные следом без."""
+    """Если media group не прошла — шлём первый медиа-объект с caption, остальные следом без.
+
+    После успешной отправки первого элемента весь пост уже нельзя считать безопасно
+    повторяемым: следующий exception может оставить в Telegram частично доставленный
+    пост. В таком случае поднимаем DeliveryUncertain и fail-closed ledger запрещает
+    автоматический дубль на следующем цикле.
+    """
     thread_kw = {'message_thread_id': thread_id} if thread_id is not None else {}
+    sent_first = False
     try:
-        sent_first = False
         if has_inline_video:
             video_url = news.get('video')
             if video_file:
@@ -8129,7 +8135,10 @@ async def _send_post_fallback(
                     parse_mode=ParseMode.HTML,
                     **thread_kw,
                 )
-            except TelegramError:
+            except TelegramError as e:
+                # NetworkError/TimedOut не означает, что Telegram точно отверг фото:
+                # повтор байтами в таком случае способен создать точный дубль.
+                _raise_if_ambiguous_tg_error(e)
                 # URL не принят — качаем байтами (типично для cdn-telegram.org)
                 data = None
                 if isinstance(photos[0], str):
@@ -8160,9 +8169,19 @@ async def _send_post_fallback(
         )
         return True
     except TelegramError as e:
+        if sent_first:
+            raise DeliveryUncertain(
+                f'primary media already sent; fallback tail failed: {type(e).__name__}: {e}'
+            ) from e
         _raise_if_ambiguous_tg_error(e)
         logger.error(f"Fallback провалился: {e}")
         return False
+    except Exception as e:
+        if sent_first:
+            raise DeliveryUncertain(
+                f'primary media already sent; fallback tail crashed: {type(e).__name__}: {e}'
+            ) from e
+        raise
 
 
 # Посты, которые прямо сейчас отправляются. Отправка занимает секунды, и за это
@@ -10971,10 +10990,17 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
                 await _tg_call_flood_safe(lambda: bot.send_message(
                     chat_id=target, text='👆 Опубликовать этот пост?',
                     reply_markup=reply_markup, **thread_kw))
-            except TelegramError as e:
-                _raise_if_ambiguous_tg_error(e)
-                logger.error(f"Альбом ушёл, но кнопки модерации не отправились: {e}")
-                return False
+            except asyncio.CancelledError:
+                # Альбом уже физически отправлен; вызывающий код переведёт ledger
+                # в uncertain при отмене процесса.
+                raise
+            except Exception as e:
+                # Даже детерминированный отказ кнопок не делает безопасным повтор
+                # всего поста: альбом уже существует в ветке.
+                raise DeliveryUncertain(
+                    f'thread album already sent; moderation tail failed: '
+                    f'{type(e).__name__}: {e}'
+                ) from e
         logger.info(f"🧵 {news['source']}: {news['title'][:60]} (альбом {len(media)}+подпись)")
         return True
     except TelegramError as e:
@@ -11060,7 +11086,20 @@ async def _send_thread_media_then_text(bot, news, photos, has_inline_video, vide
             logger.warning(f"Видео в ветку не отправилось ({e})")
 
     if photos:
-        resolved = await _resolve_photos_for_album(photos)
+        try:
+            resolved = await _resolve_photos_for_album(photos)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if media_sent:
+                # Видео уже ушло. Ошибка подготовки дополнительных фото не должна
+                # превращать успешную первичную доставку в повтор всего поста.
+                logger.warning(
+                    "Дополнительные фото не подготовились после отправки видео (%s: %s); "
+                    "продолжаю с текстом", type(e).__name__, e)
+                resolved = []
+            else:
+                raise
         if len(resolved) > 1:
             try:
                 media = [InputMediaPhoto(media=ph) for ph in resolved[:10]]
@@ -11076,7 +11115,10 @@ async def _send_thread_media_then_text(bot, news, photos, has_inline_video, vide
                     await bot.send_photo(chat_id=target, photo=ph, **thread_kw)
                     media_sent = True
                     break
-                except TelegramError:
+                except TelegramError as e:
+                    # При timeout Telegram мог принять фото. Переход к следующему
+                    # кандидату тогда создаёт скрытый дубль медиа.
+                    _raise_if_ambiguous_tg_error(e)
                     continue
 
     if settings.require_image and not media_sent:
@@ -11090,11 +11132,21 @@ async def _send_thread_media_then_text(bot, news, photos, has_inline_video, vide
         logger.info(f"🧵 {news['source']}: {news['title'][:60]} (медиа+текст раздельно)")
         return True
     except TelegramError as e:
+        if media_sent:
+            # Медиа уже подтверждённо существует. Повтор целого поста после ошибки
+            # текста задублирует его, поэтому оставляем durable uncertain-state.
+            raise DeliveryUncertain(
+                f'thread media already sent; text failed: {type(e).__name__}: {e}'
+            ) from e
         _raise_if_ambiguous_tg_error(e)
         logger.error(f"Текст в ветку не отправился: {e}")
-        # Без текста/кнопок пост нельзя нормально модерировать. Медиа могло уже
-        # появиться в ветке, но ledger не коммитим и pending-запись откатываем.
         return False
+    except Exception as e:
+        if media_sent:
+            raise DeliveryUncertain(
+                f'thread media already sent; text crashed: {type(e).__name__}: {e}'
+            ) from e
+        raise
 
 
 async def send_news_to_thread(bot: Bot, news: dict) -> str:
@@ -14398,6 +14450,25 @@ async def _maybe_send_daily_summary(bot: Bot) -> None:
         settings.last_daily_summary = today
 
 
+def _update_check_progress(**values) -> None:
+    """Обновляет только in-memory прогресс текущей автопроверки.
+
+    На каждом посте намеренно НЕ пишем на диск: это не создаёт лишний fsync в
+    publish-path. Снимок один раз попадает в lifecycle при SIGTERM/shutdown.
+    """
+    try:
+        progress = _runtime_health.get('current_check_progress')
+        if not isinstance(progress, dict):
+            progress = {}
+            _runtime_health['current_check_progress'] = progress
+        for key, value in values.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                progress[str(key)[:48]] = value
+    except Exception:
+        # Диагностика никогда не должна влиять на публикацию.
+        pass
+
+
 async def check_news(context: ContextTypes.DEFAULT_TYPE):
     if _check_news_lock.locked():
         logger.info("⏭ Пропускаю автопроверку — предыдущая ещё идёт")
@@ -14417,6 +14488,7 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
             metrics.inc('anime_bot_check_cycle_errors_total')
             _runtime_health['last_check_finished_at'] = datetime.now(timezone.utc).isoformat()
             _runtime_health['last_check_result'] = f'error: {type(e).__name__}: {e}'[:200]
+            _update_check_progress(phase='error', error=f'{type(e).__name__}: {e}'[:160])
             _runtime_health['last_error'] = _redact_secrets(
                 f'check_news: {type(e).__name__}: {e}')[:200]
             _event_log('check_cycle_failed', error=f'{type(e).__name__}: {e}'[:200])
@@ -14438,8 +14510,17 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
 
 async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
         cycle_started = time.perf_counter()
-        _runtime_health['last_check_started_at'] = datetime.now(timezone.utc).isoformat()
+        cycle_started_iso = datetime.now(timezone.utc).isoformat()
+        _runtime_health['last_check_started_at'] = cycle_started_iso
         _runtime_health['last_check_result'] = 'running'
+        _runtime_health['current_check_progress'] = {
+            'started_at': cycle_started_iso,
+            'mode': 'thread' if settings.thread_mode else 'channel',
+            'phase': 'collect',
+            'collected': 0, 'fresh': 0, 'processed': 0,
+            'sent': 0, 'failed': 0, 'uncertain': 0, 'skipped': 0,
+            'source_errors': 0,
+        }
         logger.info("🔁 Автопроверка новостей...")
         metrics.inc('anime_bot_check_cycles_total')
         _event_log('check_cycle_started', mode='thread' if settings.thread_mode else 'channel',
@@ -14451,6 +14532,8 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
 
         # 1) Собираем свежие новости с источников
         all_news, stats_lines, errors = await collect_all_news()
+        _update_check_progress(phase='filter', collected=len(all_news),
+                               source_errors=len(errors))
 
         # Stage 9: periodic recommendation snapshot. It is deliberately evaluated
         # after collection so failed sources/backlog are reflected in the advice.
@@ -14489,6 +14572,7 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
             and (bool(n.get('_story_update_of')) or not sent_links.has_title(n.get('title', '')))
         ]
         metrics.set('anime_bot_fresh_candidates', len(fresh))
+        _update_check_progress(phase='admission', fresh=len(fresh))
 
         # Shadow mode прогоняет полный collect/rank pipeline, но принципиально не
         # меняет очередь/ledger и не вызывает Telegram publication API.
@@ -14512,6 +14596,7 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
             _event_log('check_cycle_finished', shadow=True, candidates=len(fresh), errors=len(errors))
             _runtime_health['last_check_finished_at'] = datetime.now(timezone.utc).isoformat()
             _runtime_health['last_check_result'] = f'shadow:candidates={len(fresh)}'
+            _update_check_progress(phase='finished', fresh=len(fresh), processed=0)
             await _maybe_send_daily_summary(context.bot)
             return
 
@@ -14603,6 +14688,10 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                 else:
                     skipped_count += 1
                     skipped_reasons[result] = skipped_reasons.get(result, 0) + 1
+                _update_check_progress(
+                    phase='publish_thread', processed=position + 1,
+                    sent=sent_count, failed=failed_count, uncertain=uncertain_count,
+                    skipped=skipped_count, current_title=str(news.get('title') or '')[:100])
                 # Пауза нужна только после пути, который мог обратиться к
                 # Telegram. Дубликаты/фильтр физически ничего не отправляют и
                 # раньше зря растягивали цикл на минуты.
@@ -14657,11 +14746,17 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
             _runtime_health['last_check_result'] = (
                 f'thread:fresh={len(fresh)},sent={sent_count},failed={failed_count},'
                 f'uncertain={uncertain_count},skipped={skipped_count}')
+            _update_check_progress(phase='finished', processed=sent_count + failed_count +
+                                   uncertain_count + skipped_count, sent=sent_count,
+                                   failed=failed_count, uncertain=uncertain_count,
+                                   skipped=skipped_count, current_title='')
             return
 
         # === РЕЖИМ КАНАЛА (старый): по 1 посту за интервал через очередь ===
         # 2) Кладём в очередь (push_many сам отсеит то, что уже там лежит)
         added_to_queue = await post_queue.push_many(fresh)
+        _update_check_progress(phase='publish_channel', fresh=len(fresh),
+                               queued=added_to_queue)
 
         # 3) Достаём ОДИН пост из очереди и отправляем в канал.
         sent_result = None
@@ -14677,6 +14772,13 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                 logger.exception("Отправка поста из очереди упала вне штатного обработчика")
                 sent_result = 'failed'
             metrics.inc('anime_bot_publish_attempts_total', labels={'mode': 'channel', 'result': sent_result})
+            _update_check_progress(
+                phase='publish_channel', processed=_attempt + 1,
+                sent=1 if sent_result == 'sent' else 0,
+                failed=1 if sent_result == 'failed' else 0,
+                uncertain=1 if sent_result == 'uncertain' else 0,
+                skipped=1 if sent_result not in ('sent', 'failed', 'uncertain') else 0,
+                current_title=str(next_post.get('title') or '')[:100])
             _event_log('publish_result', story_id=next_post.get('_story_id'), mode='channel',
                        result=sent_result, source=next_post.get('source'),
                        confidence=next_post.get('_confidence_score'))
@@ -14741,6 +14843,10 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
         _runtime_health['last_check_finished_at'] = datetime.now(timezone.utc).isoformat()
         _runtime_health['last_check_result'] = (
             f'channel:{sent_result or "idle"},fresh={len(fresh)},added={added_to_queue},queue={queue_size}')
+        _update_check_progress(phase='finished', current_title='',
+                               sent=1 if sent_result == 'sent' else 0,
+                               failed=1 if sent_result == 'failed' else 0,
+                               uncertain=1 if sent_result == 'uncertain' else 0)
 
 
 def _ensure_auto_news_job(job_queue, *, first: float = 5) -> bool:
@@ -16619,7 +16725,7 @@ def _restart_loop_note() -> str:
 
     kind = str(data.get('last_exit_kind') or '')
     detail = _redact_secrets(str(data.get('last_exit_detail') or ''))
-    unclean = int(data.get('consecutive_unclean', 0) or 0)
+    unclean = _safe_nonnegative_int(data.get('consecutive_unclean'))
     hints = {
         'polling_conflict': ('этим BOT_TOKEN пользуется ещё один процесс. '
                              'Останови лишний экземпляр или заведи отдельный токен'),
@@ -18189,7 +18295,7 @@ async def lifecycle_command(update, context: ContextTypes.DEFAULT_TYPE):
     starts = list(life.get('starts') or [])
     lines = ['🔄 <b>Lifecycle / рестарты</b>',
              f'Build: <code>{BUILD_TAG}</code>',
-             f'Всего стартов: <b>{int(life.get("total_starts", 0) or 0)}</b>',
+             f'Всего стартов: <b>{_safe_nonnegative_int(life.get("total_starts"))}</b>',
              f'Текущее состояние: <code>{html.escape(str(life.get("state") or "?"))}</code>',
              f'Последний exit: <code>{html.escape(str(life.get("last_exit_kind") or "нет данных"))}</code>',
              f'Health bind: <code>{html.escape(str(HEALTH_HOST))}:{HEALTH_PORT}</code>',
@@ -18197,8 +18303,8 @@ async def lifecycle_command(update, context: ContextTypes.DEFAULT_TYPE):
              f'Polling bootstrap retries: <code>{POLLING_BOOTSTRAP_RETRIES}</code>']
     if life.get('last_restart_interval_sec') is not None:
         lines.append(f'Интервал последних запусков: {int(life["last_restart_interval_sec"])} сек')
-    if int(life.get('consecutive_unclean', 0) or 0):
-        lines.append(f'⚠️ Нечистых рестартов подряд: {int(life["consecutive_unclean"])}')
+    if _safe_nonnegative_int(life.get('consecutive_unclean')):
+        lines.append(f'⚠️ Нечистых рестартов подряд: {_safe_nonnegative_int(life.get("consecutive_unclean"))}')
     if len(starts) >= RESTART_STORM_THRESHOLD:
         try:
             parsed = [datetime.fromisoformat(x) for x in starts[-RESTART_STORM_THRESHOLD:]]
@@ -18222,6 +18328,20 @@ async def lifecycle_command(update, context: ContextTypes.DEFAULT_TYPE):
     auto_state = str(life.get('last_auto_cycle_state') or '')
     if auto_state:
         lines.append('Последняя автопроверка: <code>' + html.escape(auto_state[:80]) + '</code>')
+    previous_build = str(life.get('last_exit_build_tag') or '')
+    if previous_build and previous_build != BUILD_TAG:
+        lines.append('Build прошлого процесса: <code>' + html.escape(previous_build[:80]) + '</code>')
+    progress = life.get('check_progress_at_exit')
+    if isinstance(progress, dict) and progress:
+        phase = html.escape(str(progress.get('phase') or '?')[:40])
+        mode = html.escape(str(progress.get('mode') or '?')[:20])
+        lines.append(
+            'Прогресс проверки прошлого процесса при exit: '
+            f'<code>{mode}/{phase}</code> · обработано {_safe_nonnegative_int(progress.get("processed"))} · '
+            f'отправлено {_safe_nonnegative_int(progress.get("sent"))} · '
+            f'ошибок {_safe_nonnegative_int(progress.get("failed"))} · '
+            f'unknown {_safe_nonnegative_int(progress.get("uncertain"))} · '
+            f'пропущено {_safe_nonnegative_int(progress.get("skipped"))}')
     rss_exit = life.get('rss_mb_at_exit')
     if rss_exit is not None:
         try:
@@ -18323,9 +18443,11 @@ def _mark_lifecycle_start() -> dict:
     now = datetime.now(timezone.utc).isoformat()
     data = _read_lifecycle()
     previous_state = str(data.get('state') or '')
-    history = list(data.get('starts') or [])[-19:]
+    raw_history = data.get('starts')
+    history = ([x for x in raw_history if isinstance(x, str)][-19:]
+               if isinstance(raw_history, list) else [])
     history.append(now)
-    unclean = int(data.get('consecutive_unclean', 0) or 0)
+    unclean = _safe_nonnegative_int(data.get('consecutive_unclean'))
     if previous_state == 'running':
         unclean += 1
     else:
@@ -18336,7 +18458,7 @@ def _mark_lifecycle_start() -> dict:
         'pid': os.getpid(),
         'last_start': now,
         'starts': history,
-        'total_starts': int(data.get('total_starts', 0) or 0) + 1,
+        'total_starts': _safe_nonnegative_int(data.get('total_starts')) + 1,
         'consecutive_unclean': unclean,
         'last_exit_kind': str(data.get('last_exit_kind') or ''),
     })
@@ -18393,6 +18515,8 @@ def _mark_lifecycle_exit(kind: str, detail: str = '') -> None:
         'rss_mb_at_exit': _rss_mb(),
         'last_check_result_at_exit': str(_runtime_health.get('last_check_result') or '')[:240],
         'last_check_started_at_exit': str(_runtime_health.get('last_check_started_at') or ''),
+        'check_progress_at_exit': dict(_runtime_health.get('current_check_progress') or {}),
+        'last_exit_build_tag': BUILD_TAG,
         'pid': os.getpid(),
     })
     _write_lifecycle(data)
@@ -18455,7 +18579,10 @@ def _auto_restore_first_delay(default: float = 5.0) -> float:
 
 def lifecycle_snapshot() -> dict:
     data = _read_lifecycle()
-    starts = list(data.get('starts') or [])
+    raw_starts = data.get('starts')
+    starts = ([x for x in raw_starts if isinstance(x, str)]
+              if isinstance(raw_starts, list) else [])
+    data['starts'] = starts
     data['recent_starts'] = len(starts)
     if len(starts) >= 2:
         try:
@@ -18480,6 +18607,7 @@ _runtime_health = {
     'last_check_started_at': '',
     'last_check_finished_at': '',
     'last_check_result': '',
+    'current_check_progress': {},
 }
 _health_http_server: Optional[ThreadingHTTPServer] = None
 _health_http_thread: Optional[threading.Thread] = None
@@ -19064,6 +19192,21 @@ def _stop_health_server() -> None:
     _runtime_health['health_server_ok'] = False
 
 
+async def health_listener_watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Восстанавливает HTTP listener после временной ошибки bind/thread exit.
+
+    На rolling restart старый процесс может ещё несколько секунд держать порт.
+    Одной попытки bind на старте недостаточно: новый процесс продолжит polling,
+    но останется без liveness и платформа вскоре пришлёт ему SIGTERM.
+    """
+    thread_alive = bool(_health_http_thread is not None and _health_http_thread.is_alive())
+    if _health_http_server is not None and not thread_alive:
+        logger.warning('HTTP health thread остановился; пересоздаю listener')
+        _stop_health_server()
+    if HEALTH_PORT > 0 and (_health_http_server is None or not thread_alive):
+        _start_health_server()
+
+
 async def health_probe_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Периодически обновляет readiness и самовосстанавливает auto-job."""
     try:
@@ -19179,6 +19322,13 @@ def check_video_deps():
 async def setup_bot_commands(app: Application) -> None:
     """post_init: меню команд + джоб отложки. Джоб регистрируем здесь (после
     initialize) — канонично для PTB и сразу видно в логах, что он поднялся."""
+    # Повторяем bind после transient EADDRINUSE/rolling restart. Сам watchdog
+    # ничего не проверяет по сети и не трогает диск, поэтому безопасен для liveness.
+    await health_listener_watchdog_job(None)
+    app.job_queue.run_repeating(
+        health_listener_watchdog_job, interval=15, first=5, name='health_listener_watchdog',
+        job_kwargs=JOB_KWARGS,
+    )
     # Публикация отложенных постов: проверяем раз в минуту
     app.job_queue.run_repeating(
         publish_scheduled, interval=60, first=15, name='scheduled_publish',
@@ -19403,6 +19553,9 @@ def main():
         raise SystemExit("BOT_TOKEN не задан")
 
     _acquire_instance_lock()
+    # Liveness должен появиться как можно раньше. Инициализация persistent stores
+    # и миграции могут быть медленными, но не должны выглядеть для PaaS как dead app.
+    _start_health_server()
     if feature_enabled('runtime_migrations'):
         migration = _migrate_runtime_schemas(DATA_DIR)
         if migration['changed']:
@@ -19412,7 +19565,6 @@ def main():
     _init_globals()
     _validate_runtime_config()
     check_video_deps()
-    _start_health_server()
 
     print("Создаю Application...", flush=True)
     app = (Application.builder().token(TOKEN).job_queue(JobQueue())
@@ -19512,12 +19664,12 @@ def _run_polling_guarded(app) -> None:
             app.run_polling(bootstrap_retries=POLLING_BOOTSTRAP_RETRIES)
         except Conflict as e:
             # Telegram отдаёт 409, когда getUpdates по одному токену делают двое.
-            # PTB на этом останавливает polling, main() возвращается, процесс
-            # тихо выходит с кодом 0 — а платформа его перезапускает. Со стороны
-            # это выглядит как «бот перезапускается каждую минуту» без единой
-            # ошибки в логе. Пишем причину явно.
-            _mark_lifecycle_exit('polling_conflict', str(e)[:200])
+            # Временный конфликт НЕ является exit: процесс остаётся жив и ждёт
+            # следующую попытку. Раньше lifecycle ошибочно становился ``stopped``
+            # уже на первом 409, хотя бот продолжал работать в этом же PID.
+            _runtime_health['last_error'] = f'polling conflict: {str(e)[:160]}'
             if not unlimited and attempts > POLLING_CONFLICT_RETRIES:
+                _mark_lifecycle_exit('polling_conflict', str(e)[:200])
                 logger.error('❌ Конфликт polling не ушёл за %d попыток: тем же '
                              'BOT_TOKEN пользуется другой процесс. Детали: %s',
                              attempts, e)
@@ -19536,7 +19688,7 @@ def _run_polling_guarded(app) -> None:
         # Do not overwrite that stronger evidence with the vague polling_returned.
         life = _read_lifecycle()
         if (str(life.get('state') or '') == 'stopped'
-                and int(life.get('pid') or 0) == os.getpid()
+                and _safe_nonnegative_int(life.get('pid')) == os.getpid()
                 and str(life.get('last_exit_kind') or '') == 'external_signal'):
             logger.warning('Polling завершился после внешнего сигнала; lifecycle уже сохранён.')
             return
@@ -19551,7 +19703,14 @@ if __name__ == '__main__':
     try:
         main()
     except SystemExit as e:
-        _mark_lifecycle_exit('system_exit', str(e))
+        # Если нижний уровень уже сохранил более точную причину (например,
+        # polling_conflict), не затираем её общим ``system_exit``.
+        life = _read_lifecycle()
+        already_marked = (str(life.get('state') or '') == 'stopped'
+                          and _safe_nonnegative_int(life.get('pid')) == os.getpid()
+                          and bool(str(life.get('last_exit_kind') or '')))
+        if not already_marked:
+            _mark_lifecycle_exit('system_exit', str(e))
         raise
     except Exception as e:
         import traceback
