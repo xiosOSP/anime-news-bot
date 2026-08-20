@@ -795,11 +795,36 @@ DIRECT_VIDEO_EXTENSIONS = ('.mp4', '.webm', '.mov', '.m4v')
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 REDDIT_USER_AGENT = 'windows:anime-news-bot:v1.0 (personal use)'
 
+class _AdminTZFormatter(logging.Formatter):
+    """Пишет время лога в часовом поясе админа, а не в UTC контейнера.
+
+    Раньше `/health`, `/lifecycle` и расписание публикаций показывали время по
+    настройке `timezone_name` (Europe/Moscow), а файл лога — по времени
+    контейнера, то есть по UTC. Разница в три часа заставляла сравнивать
+    события из разных систем координат: лог выглядел «отставшим», хотя был
+    свежим. Метка пояса в конце строки убирает двусмысленность окончательно.
+    """
+
+    def formatTime(self, record, datefmt=None):
+        try:
+            tz = _admin_tz()
+        except Exception:
+            tz = timezone.utc
+        moment = datetime.fromtimestamp(record.created, tz)
+        return moment.strftime(datefmt or '%Y-%m-%d %H:%M:%S %Z')
+
+
+def _log_formatter() -> logging.Formatter:
+    return _AdminTZFormatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S %Z',
+    )
+
+
 def _setup_logging() -> logging.Logger:
     """Настройка логирования в консоль. Файловый handler добавляется отдельно
     через _setup_file_logging() в main() — чтобы тесты не создавали bot.log."""
-    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    formatter = logging.Formatter(log_format, datefmt='%Y-%m-%d %H:%M:%S')
+    formatter = _log_formatter()
 
     root = logging.getLogger()
     root.setLevel(logging.INFO)
@@ -822,10 +847,7 @@ def _setup_logging() -> logging.Logger:
 
 def _setup_file_logging() -> None:
     """Добавляет файловый handler с ротацией. Вызывается из main()."""
-    formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
-    )
+    formatter = _log_formatter()
     root = logging.getLogger()
     # Проверяем чтобы не было дублирования
     for h in root.handlers:
@@ -15152,6 +15174,22 @@ _llm_fail_streak = 0                # подряд неудачных вызов
 LLM_FAIL_PAUSE_AFTER = 5            # столько провалов подряд → пауза до рестарта
 _llm_disabled_runtime = False       # permanent auth disable или временный circuit
 _llm_disabled_reason = ''            # '', 'auth', 'circuit'
+_llm_last_provider_error = ''        # последний ответ провайдера, для /llm
+
+
+def _remember_provider_error(status: int, body: str) -> None:
+    """Запоминает, что именно ответил провайдер.
+
+    Раньше наружу шла только наша трактовка («ключ отклонён»), а текст
+    провайдера терялся. У бесплатных роутеров это разные вещи: 401 может
+    значить и неверный ключ, и исчерпанную квоту, и приостановленный
+    аккаунт — а чинится всё по-разному. Держим короткий фрагмент ответа,
+    пропущенный через маскировку секретов.
+    """
+    global _llm_last_provider_error
+    text = ' '.join(str(body or '').split())[:300]
+    _llm_last_provider_error = _redact_secrets(f'HTTP {status}: {text}' if text
+                                              else f'HTTP {status}')
 _llm_circuit_until = 0.0             # monotonic timestamp
 _llm_circuit_level = 0
 _llm_json_mode = True               # просить строгий JSON (снимаем, если провайдер против)
@@ -15285,6 +15323,7 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
     if r.status_code in (401, 403):
         _llm_disabled_runtime = True
         _llm_disabled_reason = 'auth'
+        _remember_provider_error(r.status_code, r.text)
         logger.error(f"LLM: ключ отклонён (HTTP {r.status_code}) — выключаю до рестарта")
         _queue_admin_alert('🤖 Языковая модель отключена: провайдер не принял ключ '
                            f'(HTTP {r.status_code}). Проверь LLM_API_KEY. '
@@ -15298,6 +15337,7 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
     if fatal:
         _llm_disabled_runtime = True
         _llm_disabled_reason = fatal['reason']
+        _remember_provider_error(r.status_code, r.text)
         logger.error('LLM: %s (HTTP %s) — выключаю до рестарта', fatal['log'], r.status_code)
         _queue_admin_alert(f'🤖 Языковая модель отключена: {fatal["admin"]}\n'
                            f'HTTP {r.status_code}. Бот продолжает работать на DeepL/Google.')
@@ -17234,6 +17274,12 @@ async def reliability_command(update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f'  ⛔ выключена до рестарта: <code>{html.escape(reason)}</code>')
         if reason in hints:
             lines.append(f'     {hints[reason]}')
+        # Своя трактовка может не совпадать с реальностью: у бесплатных роутеров
+        # 401 нередко означает исчерпанную квоту, а не плохой ключ. Показываем,
+        # что провайдер ответил на самом деле.
+        if _llm_last_provider_error:
+            lines.append(f'     Ответ провайдера: <code>'
+                         f'{html.escape(_llm_last_provider_error[:200])}</code>')
     else:
         lines.append('  ✅ circuit закрыт')
     lines.append('<b>LLM budget</b>')
