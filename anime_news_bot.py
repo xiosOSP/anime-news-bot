@@ -14962,6 +14962,32 @@ LLM_DAILY_LIMIT = max(1, min(10000, _env_int('LLM_DAILY_LIMIT', 900)))
 LLM_MAX_TOKENS = max(64, min(4000, _env_int('LLM_MAX_TOKENS', 700)))
 
 
+def _llm_fatal_reason(status: int, body: str) -> Optional[dict]:
+    """Ошибка провайдера, которую не исправит повтор.
+
+    Появилось после реального случая: роутер отвечал 402 «недостаточно средств»,
+    а бот считал это обычной ошибкой и повторял запрос каждым циклом. В логе
+    копились одинаковые строки, провайдер получал лишние запросы, а понять,
+    что чинить, было можно только прочитав тело ответа целиком — на китайском.
+
+    Возвращает None для временных ошибок: их повторять как раз нужно.
+    """
+    text = (body or '').lower()
+    if status == 402 or 'insufficient_balance' in text or 'insufficient balance' in text:
+        return {'reason': 'billing',
+                'log': 'у провайдера кончился баланс/лимит',
+                'admin': 'на счету провайдера нет средств или исчерпан бесплатный '
+                         'тариф. Пополни баланс либо переключись на другого '
+                         'провайдера через LLM_BASE_URL.'}
+    if status == 404 or 'model_not_found' in text or 'model not found' in text:
+        return {'reason': 'model',
+                'log': f'провайдер не знает модель {LLM_MODEL!r} или адрес',
+                'admin': f'провайдер не нашёл модель <code>{html.escape(LLM_MODEL or "?")}</code>. '
+                         'Проверь LLM_MODEL и LLM_BASE_URL: у роутеров имена '
+                         'отличаются, например с префиксом или суффиксом -free.'}
+    return None
+
+
 def _llm_extra_params() -> dict:
     """Необязательные параметры запроса из LLM_EXTRA_PARAMS (JSON-строка).
     Нужны для моделей с режимом рассуждений: например
@@ -15099,6 +15125,18 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
         _queue_admin_alert('🤖 Языковая модель отключена: провайдер не принял ключ '
                            f'(HTTP {r.status_code}). Проверь LLM_API_KEY. '
                            'Бот продолжает работать на DeepL/Google.')
+        return None
+    # Неустранимые ошибки конфигурации: сами не рассосутся, повторять бессмысленно.
+    # Раньше они попадали в общую ветку и ретраились каждым циклом — провайдер
+    # получал десятки запросов подряд, а в логе копились одинаковые предупреждения
+    # без единой подсказки, что именно чинить.
+    fatal = _llm_fatal_reason(r.status_code, r.text)
+    if fatal:
+        _llm_disabled_runtime = True
+        _llm_disabled_reason = fatal['reason']
+        logger.error('LLM: %s (HTTP %s) — выключаю до рестарта', fatal['log'], r.status_code)
+        _queue_admin_alert(f'🤖 Языковая модель отключена: {fatal["admin"]}\n'
+                           f'HTTP {r.status_code}. Бот продолжает работать на DeepL/Google.')
         return None
     if r.status_code in (400, 422) and _llm_json_mode:
         # Скорее всего провайдер не знает response_format — пробуем без него
@@ -17022,7 +17060,16 @@ async def reliability_command(update, context: ContextTypes.DEFAULT_TYPE):
         left = max(0, int(_llm_circuit_until - time.monotonic()))
         lines.append(f'  🧯 временная пауза: ещё {max(1, (left + 59) // 60)} мин')
     elif _llm_disabled_runtime:
-        lines.append(f'  ⛔ runtime disabled: <code>{html.escape(_llm_disabled_reason or "unknown")}</code>')
+        hints = {
+            'auth': 'провайдер не принял ключ — проверь LLM_API_KEY',
+            'billing': 'нет средств или исчерпан бесплатный тариф — пополни баланс '
+                       'или смени провайдера через LLM_BASE_URL',
+            'model': 'провайдер не знает эту модель — проверь LLM_MODEL и LLM_BASE_URL',
+        }
+        reason = _llm_disabled_reason or 'unknown'
+        lines.append(f'  ⛔ выключена до рестарта: <code>{html.escape(reason)}</code>')
+        if reason in hints:
+            lines.append(f'     {hints[reason]}')
     else:
         lines.append('  ✅ circuit закрыт')
     lines.append('<b>LLM budget</b>')
