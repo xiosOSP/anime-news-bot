@@ -371,6 +371,9 @@ FEATURE_FLAGS = {
     'diversity_scheduler': _env_bool('FEATURE_DIVERSITY_SCHEDULER', True),
     'breaking_news': _env_bool('FEATURE_BREAKING_NEWS', True),
     'confidence_moderation': _env_bool('FEATURE_CONFIDENCE_MODERATION', True),
+    # Доставка независимо от сбора: очередь публикуется, даже если обход
+    # источников завис или упал. Выключается одной переменной.
+    'independent_publisher': _env_bool('FEATURE_INDEPENDENT_PUBLISHER', True),
     # Operations & Governance — Stage 6
     'admin_audit': _env_bool('FEATURE_ADMIN_AUDIT', True),
     'config_reload': _env_bool('FEATURE_CONFIG_RELOAD', True),
@@ -523,6 +526,9 @@ POLLING_BOOTSTRAP_RETRIES = max(-1, min(100, _env_int('POLLING_BOOTSTRAP_RETRIES
 # По умолчанию ждём бесконечно: лежачий бот хуже мелькающего, а как только
 # второй процесс уйдёт, этот поднимется сам, без вмешательства. Пауза растёт
 # до потолка, чтобы не долбить Telegram.
+# Publisher тикает часто, но публикует только когда пришло время: сам темп
+# публикаций задаётся check_interval, тик лишь проверяет, не пора ли.
+PUBLISHER_TICK_SEC = max(15, min(600, _env_int('PUBLISHER_TICK_SEC', 60)))
 POLLING_CONFLICT_RETRIES = max(-1, min(1000, _env_int('POLLING_CONFLICT_RETRIES', -1)))
 POLLING_CONFLICT_BACKOFF_SEC = max(1, min(120, _env_int('POLLING_CONFLICT_BACKOFF_SEC', 15)))
 POLLING_CONFLICT_BACKOFF_MAX_SEC = max(POLLING_CONFLICT_BACKOFF_SEC,
@@ -12184,23 +12190,55 @@ def _prioritize_news(items: list[dict]) -> list[dict]:
 _source_worker_lock = threading.Lock()
 _source_worker_active = 0
 _source_worker_names: set[str] = set()
+_source_worker_since: dict[str, float] = {}   # имя -> момент захвата слота
+
+
+class SourceWorkerBusy(RuntimeError):
+    """Предыдущий сбор этого же источника ещё не завершился."""
 
 
 def _source_worker_try_acquire(name: str) -> bool:
+    """Выдаёт слот под сбор источника.
+
+    Раньше проверялся только общий счётчик, а имя клалось в set — то есть
+    повторный запуск уже зависшего источника ничем не запрещался. Зависший
+    парсер держит слот до конца своей жизни (убить поток в Python нельзя),
+    поэтому каждый цикл добавлял ещё одну копию того же источника: за пять
+    циклов один сломанный сайт забивал весь пул, и здоровые источники
+    переставали собираться вовсе.
+    """
     global _source_worker_active
+    key = str(name)
     with _source_worker_lock:
+        if key in _source_worker_names:
+            raise SourceWorkerBusy(key)
         if _source_worker_active >= SOURCE_FETCH_CONCURRENCY:
             return False
         _source_worker_active += 1
-        _source_worker_names.add(str(name))
+        _source_worker_names.add(key)
+        _source_worker_since[key] = time.monotonic()
         return True
+
+
+def _source_worker_stuck() -> list[tuple[str, int]]:
+    """Источники, чей сбор идёт дольше разумного: имя и секунды. Для /health."""
+    now = time.monotonic()
+    with _source_worker_lock:
+        rows = [(name, int(now - started))
+                for name, started in _source_worker_since.items()
+                if now - started > SOURCE_FETCH_WALL_TIMEOUT]
+    return sorted(rows, key=lambda row: row[1], reverse=True)
 
 
 def _source_worker_release(name: str) -> None:
     global _source_worker_active
+    key = str(name)
     with _source_worker_lock:
+        if key not in _source_worker_names:
+            return          # уже освобождали: счётчик не должен уехать в минус
         _source_worker_active = max(0, _source_worker_active - 1)
-        _source_worker_names.discard(str(name))
+        _source_worker_names.discard(key)
+        _source_worker_since.pop(key, None)
 
 
 async def _run_source_collector_bounded(name: str, collector, timeout: float):
@@ -12214,7 +12252,18 @@ async def _run_source_collector_bounded(name: str, collector, timeout: float):
     """
     loop = asyncio.get_running_loop()
     deadline = time.monotonic() + max(0.01, float(timeout))
-    while not _source_worker_try_acquire(name):
+    while True:
+        try:
+            if _source_worker_try_acquire(name):
+                break
+        except SourceWorkerBusy:
+            # Тот же источник ещё висит с прошлого цикла. Ждать его бесполезно:
+            # поток живёт своей жизнью, а мы только потратим бюджет цикла.
+            # Пропускаем источник, но не считаем это его виной — hard-ошибку не
+            # начисляем, чтобы breaker не наказал сайт за наше же зависание.
+            metrics.inc('anime_bot_source_worker_busy_total', labels={'source': str(name)})
+            logger.warning('Источник %s пропущен: предыдущий сбор ещё не завершился', name)
+            raise TimeoutError(f'previous collector for {name} still running') from None
         left = deadline - time.monotonic()
         if left <= 0:
             raise TimeoutError('source worker pool saturated by unfinished collectors')
@@ -14688,55 +14737,8 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
         # 2) Кладём в очередь (push_many сам отсеит то, что уже там лежит)
         added_to_queue = await post_queue.push_many(fresh)
 
-        # 3) Достаём ОДИН пост из очереди и отправляем в канал.
-        sent_result = None
-        post_attempted = None
-        for _attempt in range(5):  # макс 5 попыток за один tick
-            next_post = await post_queue.pop_next()
-            if next_post is None:
-                break
-            post_attempted = next_post
-            try:
-                sent_result = await send_news(context.bot, next_post)
-            except Exception:
-                logger.exception("Отправка поста из очереди упала вне штатного обработчика")
-                sent_result = 'failed'
-            metrics.inc('anime_bot_publish_attempts_total', labels={'mode': 'channel', 'result': sent_result})
-            _event_log('publish_result', story_id=next_post.get('_story_id'), mode='channel',
-                       result=sent_result, source=next_post.get('source'),
-                       confidence=next_post.get('_confidence_score'))
-            if sent_result == 'sent':
-                await post_queue.ack_done(next_post)
-                break
-            if sent_result == 'failed':
-                requeued = await post_queue.requeue_failed(next_post)
-                if requeued is True:
-                    logger.warning(
-                        f"Возвращаю пост в очередь после ошибки отправки: "
-                        f"{next_post.get('title', '')[:60]}")
-                elif requeued is False:
-                    await notify_admin(
-                        context.bot,
-                        f"⚠️ Пост удалён из очереди после {QUEUE_MAX_SEND_RETRIES} ошибок отправки:\n"
-                        f"{next_post.get('title', '')[:180]}")
-                else:
-                    await notify_admin(
-                        context.bot,
-                        "⚠️ Ошибка отправки + storage не принял retry-state. "
-                        "Пост оставлен inflight и очередь приостановлена до восстановления storage. "
-                        "Проверь /health.\n\n"
-                        f"{next_post.get('title', '')[:180]}")
-                break
-            if sent_result == 'uncertain':
-                await post_queue.ack_done(next_post)
-                await notify_admin(
-                    context.bot,
-                    "❓ Telegram не подтвердил результат публикации. Автоповтор отключён, "
-                    "чтобы не создать дубль. Проверь канал и /health.\n\n"
-                    f"{next_post.get('title', '')[:180]}")
-                break
-            await post_queue.ack_done(next_post)
-            logger.info(f"Пост из очереди пропущен ({sent_result}): {next_post.get('title', '')[:60]}")
+        # 3) Отправляем один пост из очереди.
+        sent_result, post_attempted = await _publish_one_from_queue(context.bot)
 
         sent_ok = (sent_result == 'sent')
         queue_size = await post_queue.peek_size()
@@ -14766,6 +14768,147 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
         _runtime_health['last_check_finished_at'] = datetime.now(timezone.utc).isoformat()
         _runtime_health['last_check_result'] = (
             f'channel:{sent_result or "idle"},fresh={len(fresh)},added={added_to_queue},queue={queue_size}')
+
+
+async def _publish_one_from_queue(bot_api) -> tuple[Optional[str], Optional[dict]]:
+    """Отправляет один готовый пост из очереди в канал.
+
+    Вынесено из цикла проверки, чтобы доставка не зависела от сбора: раньше
+    готовый пост лежал в очереди до тех пор, пока очередная проверка всех
+    источников не дойдёт до конца. Зависший парсер или упавший цикл
+    останавливали и публикацию уже найденного.
+
+    Возвращает (результат, пост) — результат None, если очередь пуста.
+    """
+    if post_queue is None:
+        return None, None
+    sent_result = None
+    post_attempted = None
+    for _attempt in range(5):  # макс 5 попыток за один tick
+        next_post = await post_queue.pop_next()
+        if next_post is None:
+            break
+        post_attempted = next_post
+        try:
+            sent_result = await send_news(bot_api, next_post)
+        except Exception:
+            logger.exception("Отправка поста из очереди упала вне штатного обработчика")
+            sent_result = 'failed'
+        metrics.inc('anime_bot_publish_attempts_total', labels={'mode': 'channel', 'result': sent_result})
+        _event_log('publish_result', story_id=next_post.get('_story_id'), mode='channel',
+                   result=sent_result, source=next_post.get('source'),
+                   confidence=next_post.get('_confidence_score'))
+        if sent_result == 'sent':
+            await post_queue.ack_done(next_post)
+            break
+        if sent_result == 'failed':
+            requeued = await post_queue.requeue_failed(next_post)
+            if requeued is True:
+                logger.warning(
+                    f"Возвращаю пост в очередь после ошибки отправки: "
+                    f"{next_post.get('title', '')[:60]}")
+            elif requeued is False:
+                await notify_admin(
+                    bot_api,
+                    f"⚠️ Пост удалён из очереди после {QUEUE_MAX_SEND_RETRIES} ошибок отправки:\n"
+                    f"{next_post.get('title', '')[:180]}")
+            else:
+                await notify_admin(
+                    bot_api,
+                    "⚠️ Ошибка отправки + storage не принял retry-state. "
+                    "Пост оставлен inflight и очередь приостановлена до восстановления storage. "
+                    "Проверь /health.\n\n"
+                    f"{next_post.get('title', '')[:180]}")
+            break
+        if sent_result == 'uncertain':
+            await post_queue.ack_done(next_post)
+            await notify_admin(
+                bot_api,
+                "❓ Telegram не подтвердил результат публикации. Автоповтор отключён, "
+                "чтобы не создать дубль. Проверь канал и /health.\n\n"
+                f"{next_post.get('title', '')[:180]}")
+            break
+        await post_queue.ack_done(next_post)
+        logger.info(f"Пост из очереди пропущен ({sent_result}): {next_post.get('title', '')[:60]}")
+    return sent_result, post_attempted
+
+
+_publisher_lock = asyncio.Lock()
+
+
+async def publisher_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Разгружает очередь независимо от сбора новостей.
+
+    Раньше публикация жила внутри цикла проверки: пока обход всех источников не
+    дойдёт до конца, готовый пост из очереди не уходил. Зависший парсер или
+    упавший цикл останавливали и доставку уже найденного.
+
+    Темп публикаций не меняется: тик частый, но пост уходит, только когда с
+    прошлой публикации прошёл настроенный интервал. Решение о времени берётся
+    из того же ``settings.last_publish_at``, что и раньше.
+    """
+    if (settings is None or post_queue is None or settings.thread_mode
+            or not settings.auto_enabled or not feature_enabled('independent_publisher')):
+        return
+    if _publisher_lock.locked():
+        return          # предыдущий тик ещё идёт
+    async with _publisher_lock:
+        if not _publish_due():
+            return
+        if _check_news_lock.locked():
+            # Цикл проверки сам публикует в конце. Не лезем параллельно, чтобы
+            # два пути не тянули из очереди одновременно.
+            return
+        try:
+            result, post = await _publish_one_from_queue(context.bot)
+        except Exception:
+            logger.exception('Publisher: отправка из очереди упала')
+            metrics.inc('anime_bot_publisher_errors_total')
+            return
+        if result is None:
+            return          # очередь пуста, ждём следующего тика
+        metrics.inc('anime_bot_publisher_ticks_total', labels={'result': result})
+        if result == 'sent':
+            _mark_published_now()
+            logger.info('Publisher: пост отправлен независимо от цикла сбора: %s',
+                        str((post or {}).get('title', ''))[:60])
+
+
+def _publish_due(now: Optional[datetime] = None) -> bool:
+    """Пора ли публиковать следующий пост."""
+    now = now or datetime.now(timezone.utc)
+    raw = str(getattr(settings, 'last_publish_at', '') or '')
+    if not raw:
+        return True
+    try:
+        last = datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return (now - last).total_seconds() >= settings.check_interval_sec
+
+
+def _mark_published_now() -> None:
+    try:
+        settings.last_publish_at = datetime.now(timezone.utc).isoformat()
+        settings.save()
+    except Exception:
+        logger.exception('Publisher: не удалось сохранить время публикации')
+
+
+def _ensure_publisher_job(job_queue) -> bool:
+    """Регистрирует независимый publisher ровно один раз."""
+    if job_queue is None or not feature_enabled('independent_publisher'):
+        return False
+    if job_queue.get_jobs_by_name('anime_publisher'):
+        return False
+    job_queue.run_repeating(
+        publisher_tick, interval=PUBLISHER_TICK_SEC, first=PUBLISHER_TICK_SEC,
+        name='anime_publisher', job_kwargs=JOB_KWARGS,
+    )
+    logger.info('Publisher: независимая доставка включена, тик раз в %s с', PUBLISHER_TICK_SEC)
+    return True
 
 
 def _ensure_auto_news_job(job_queue, *, first: float = 5) -> bool:
@@ -17149,6 +17292,17 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
     disabled = [n for n, _ in SOURCES if not settings.is_source_enabled(n)]
     lines.append('')
     lines.append(f'<b>Источники: {len(enabled)} вкл / {len(disabled)} на паузе</b>')
+    # Зависший парсер держит слот в пуле до конца своей жизни: поток в Python
+    # не убить. Раньше это было видно только по косвенным таймаутам, поэтому
+    # показываем прямо — с именем и тем, сколько он уже висит.
+    stuck = _source_worker_stuck()
+    if stuck:
+        lines.append(f'  ⚠️ занятых слотов зависшими сборами: '
+                     f'{len(stuck)} из {SOURCE_FETCH_CONCURRENCY}')
+        for name, seconds in stuck[:5]:
+            lines.append(f'     🧊 {html.escape(str(name))} — висит {seconds // 60} мин')
+        lines.append('     Эти источники пропускаются, пока не завершатся сами. '
+                     'Остальные собираются как обычно.')
     problem = []
     if source_health is not None:
         for name in enabled:
@@ -19167,6 +19321,10 @@ async def health_probe_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 logger.warning('♻️ Health watchdog восстановил пропавшую авторассылку')
                 metrics.inc('anime_bot_auto_job_recovered_total')
                 await notify_admin(context.bot, '♻️ Авторассылка была включена, но её фоновая задача пропала. Бот восстановил её автоматически.')
+        # Publisher восстанавливаем тем же watchdog: он должен жить ровно
+        # столько же, сколько авторассылка, и переживать пропажу задачи.
+        if job_queue is not None and settings is not None and settings.auto_enabled:
+            _ensure_publisher_job(job_queue)
         ok_channel, note = await _check_channel_access(context.bot)
         _runtime_health['telegram_ok'] = bool(ok_channel)
         _runtime_health['storage_ok'] = _storage_ready()
@@ -19289,6 +19447,9 @@ async def setup_bot_commands(app: Application) -> None:
     if settings.auto_enabled:
         _ensure_auto_news_job(app.job_queue, first=_auto_restore_first_delay())
         logger.info('♻️ Авторассылка восстановлена после запуска процесса')
+        # Доставка поднимается вместе с ней и работает независимо: даже если
+        # сбор источников зависнет, накопленное в очереди продолжит уходить.
+        _ensure_publisher_job(app.job_queue)
 
     # Readiness: Telegram + хранилище. HTTP /readyz использует эти флаги.
     try:
