@@ -15231,7 +15231,7 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
 
     Никаких исключений наружу: если модель недоступна, бот обязан продолжить
     работать по-старому — через DeepL/Google и обычное форматирование."""
-    global _llm_fail_streak, _llm_disabled_runtime, _llm_disabled_reason, _llm_json_mode, _llm_last_usage_tokens
+    global _llm_fail_streak, _llm_disabled_runtime, _llm_disabled_reason, _llm_json_mode, _llm_last_usage_tokens, _llm_circuit_until
     _llm_last_usage_tokens = None
     payload = {
         'model': LLM_MODEL,
@@ -15258,8 +15258,29 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
         return None
 
     if r.status_code == 429:
-        _llm_fail_streak += 1
-        logger.warning("LLM: провайдер вернул 429 (лимит запросов) — притормаживаю")
+        # Провайдер в Retry-After прямо говорит, сколько ждать. Раньше слой
+        # модели этот заголовок игнорировал: бот просто увеличивал счётчик
+        # неудач и шёл дальше, а следующий запрос упирался в тот же лимит.
+        # На бесплатных тарифах с жёстким лимитом запросов в минуту это
+        # означало серию 429 подряд и выключение модели по счётчику ошибок —
+        # хотя достаточно было подождать несколько секунд.
+        wait = _parse_retry_after(r.headers.get('Retry-After'))
+        if wait and wait > 0:
+            pause = min(LLM_CIRCUIT_MAX_SEC, float(wait))
+            _llm_circuit_until = max(_llm_circuit_until, time.monotonic() + pause)
+            _llm_disabled_runtime = True
+            _llm_disabled_reason = 'circuit'
+            # Счётчик провалов намеренно не трогаем: это не отказ провайдера, а
+            # просьба сбавить темп. Мы её выполняем, значит следующий запрос
+            # должен пройти — наказывать модель длинной паузой не за что.
+            metrics.inc('anime_bot_llm_rate_limited_total', labels={'source': 'retry_after'})
+            logger.warning('LLM: провайдер просит подождать %.0f с (429) — жду ровно столько', pause)
+        else:
+            # Без заголовка мы не знаем, сколько ждать, поэтому обычная защита
+            # по счётчику провалов остаётся: она не даст долбить провайдера.
+            _llm_fail_streak += 1
+            metrics.inc('anime_bot_llm_rate_limited_total', labels={'source': 'no_header'})
+            logger.warning('LLM: провайдер вернул 429 (лимит запросов) — притормаживаю')
         return None
     if r.status_code in (401, 403):
         _llm_disabled_runtime = True
