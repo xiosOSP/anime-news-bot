@@ -15937,6 +15937,44 @@ def _post_number(link: str) -> str:
     return (link or '').rstrip('/').split('/')[-1] or '?'
 
 
+def _llm_off_reason() -> str:
+    """Почему модель сейчас не ответила — человеческим языком.
+
+    Отказ бывает разный: лимит запросов, исчерпанная квота, неверное имя
+    модели, недоступность провайдера. Раньше на всё отвечали «проверь
+    LLM_API_KEY», и это уводило в сторону — ключ мог быть совершенно исправен.
+    """
+    if not _llm_configured():
+        return ('Модель не настроена: не заданы LLM_API_KEY, LLM_BASE_URL '
+                'или LLM_MODEL.')
+    parts: list[str] = []
+    if _llm_disabled_reason == 'circuit' and _llm_circuit_until > time.monotonic():
+        left = int(_llm_circuit_until - time.monotonic())
+        parts.append(f'⏳ Провайдер попросил подождать. Осталось около {left} с — '
+                     'обычно это лимит запросов в минуту, а не проблема с ключом.')
+    elif _llm_disabled_reason == 'auth':
+        parts.append('🔑 Провайдер не принял ключ. Но у бесплатных роутеров тот же '
+                     'ответ приходит и при исчерпанной квоте — смотри ответ провайдера ниже.')
+    elif _llm_disabled_reason == 'billing':
+        parts.append('💳 Нет средств или исчерпан бесплатный тариф.')
+    elif _llm_disabled_reason == 'model':
+        parts.append('📦 Провайдер не знает такую модель — проверь LLM_MODEL.')
+    elif _llm_disabled_runtime:
+        parts.append('⛔ Модель временно выключена.')
+    else:
+        parts.append('Провайдер не ответил. Возможно, сеть или временный сбой.')
+    if _llm_quota_left() <= 0:
+        parts.append('📉 Дневной лимит запросов исчерпан (LLM_DAILY_LIMIT).')
+    if _llm_last_provider_error:
+        parts.append(f'\nОтвет провайдера: <code>'
+                     f'{html.escape(_llm_last_provider_error[:200])}</code>')
+    if _llm_using_fallback:
+        parts.append(f'\nСейчас работает запасной: <code>'
+                     f'{html.escape(LLM_FALLBACK_MODEL)}</code>')
+    parts.append('\nПодробности: /logs LLM')
+    return '\n'.join(parts)
+
+
 @admin_only
 async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Состояние языковой модели и живая проверка связи."""
@@ -16006,11 +16044,11 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
     before_disabled = _llm_disabled_runtime
     result = await _llm_enrich(probe)
     if result == 'off':
-        await update.message.reply_text(
-            '❌ Ответа нет.\n\n'
-            + ('Ключ отклонён провайдером — проверь LLM_API_KEY.'
-               if _llm_disabled_runtime and not before_disabled
-               else 'Причина в логах: /logs LLM'))
+        # Раньше здесь всегда предлагалось «проверь LLM_API_KEY», даже когда
+        # ключ был в порядке: отказ мог быть лимитом запросов, исчерпанной
+        # квотой или недоступностью провайдера. Показываем настоящую причину.
+        await update.message.reply_text('❌ Ответа нет.\n\n' + _llm_off_reason(),
+                                        parse_mode=ParseMode.HTML)
         return
     if result == 'skip':
         await update.message.reply_text(
