@@ -15121,6 +15121,15 @@ LLM_API_KEY = _env('LLM_API_KEY', '').strip()
 _preset = LLM_PRESETS.get(LLM_PROVIDER, ('', ''))
 LLM_BASE_URL = (_env('LLM_BASE_URL', '').strip() or _preset[0]).rstrip('/')
 LLM_MODEL = _env('LLM_MODEL', '').strip() or _preset[1]
+# Запасной провайдер. Бесплатные роутеры кончаются без предупреждения: квота,
+# приостановка аккаунта, снятая модель. Раньше это выключало обогащение целиком
+# до перезапуска. Если запасной задан, бот один раз переключается на него и
+# продолжает работать; при следующем старте снова пробует основной.
+_fallback_preset = LLM_PRESETS.get(_env('LLM_FALLBACK_PROVIDER', '').strip().lower(), ('', ''))
+LLM_FALLBACK_API_KEY = _env('LLM_FALLBACK_API_KEY', '').strip()
+LLM_FALLBACK_BASE_URL = (_env('LLM_FALLBACK_BASE_URL', '').strip()
+                         or _fallback_preset[0]).rstrip('/')
+LLM_FALLBACK_MODEL = _env('LLM_FALLBACK_MODEL', '').strip() or _fallback_preset[1]
 LLM_TIMEOUT = max(5, min(120, _env_int('LLM_TIMEOUT', 30)))
 LLM_MIN_INTERVAL = max(0.0, min(60.0, _env_float('LLM_MIN_INTERVAL', 1.2)))
 LLM_DAILY_LIMIT = max(1, min(10000, _env_int('LLM_DAILY_LIMIT', 900)))
@@ -15175,6 +15184,41 @@ LLM_FAIL_PAUSE_AFTER = 5            # столько провалов подря
 _llm_disabled_runtime = False       # permanent auth disable или временный circuit
 _llm_disabled_reason = ''            # '', 'auth', 'circuit'
 _llm_last_provider_error = ''        # последний ответ провайдера, для /llm
+_llm_using_fallback = False          # переключились ли на запасного провайдера
+_llm_failover_at = ''                # когда переключились, для /llm
+
+
+def _llm_fallback_configured() -> bool:
+    return bool(LLM_FALLBACK_API_KEY and LLM_FALLBACK_BASE_URL and LLM_FALLBACK_MODEL)
+
+
+def _llm_current() -> tuple[str, str, str]:
+    """Адрес, ключ и модель провайдера, который используется прямо сейчас."""
+    if _llm_using_fallback:
+        return LLM_FALLBACK_BASE_URL, LLM_FALLBACK_API_KEY, LLM_FALLBACK_MODEL
+    return LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
+
+
+def _llm_try_failover(reason: str) -> bool:
+    """Переключает на запасного провайдера. True, если переключились.
+
+    Только на неустранимых ошибках основного: временные проходят сами, и
+    менять из-за них провайдера значило бы терять основной на пустом месте.
+    Переключение одноразовое: если запасной тоже отказал, модель выключается,
+    как раньше. При следующем запуске бот снова начнёт с основного.
+    """
+    global _llm_using_fallback, _llm_failover_at
+    if _llm_using_fallback or not _llm_fallback_configured():
+        return False
+    _llm_using_fallback = True
+    _llm_failover_at = datetime.now(timezone.utc).isoformat()
+    metrics.inc('anime_bot_llm_failover_total', labels={'reason': reason})
+    logger.warning('LLM: основной провайдер отказал (%s) — перехожу на запасного %s',
+                   reason, LLM_FALLBACK_MODEL)
+    _queue_admin_alert(f'🤖 Основной провайдер модели отказал ({reason}). '
+                       f'Перешёл на запасного: <code>{html.escape(LLM_FALLBACK_MODEL)}</code>.\n'
+                       'При следующем перезапуске бот снова попробует основного.')
+    return True
 
 
 def _remember_provider_error(status: int, body: str) -> None:
@@ -15198,8 +15242,9 @@ _llm_budget_exhausted_alert_day = ''
 
 
 def _llm_configured() -> bool:
-    """Заданы ли ключ, адрес и модель."""
-    return bool(LLM_API_KEY and LLM_BASE_URL and LLM_MODEL)
+    """Заданы ли ключ, адрес и модель у провайдера, который сейчас используется."""
+    base_url, api_key, model = _llm_current()
+    return bool(api_key and base_url and model)
 
 
 def _llm_active() -> bool:
@@ -15271,8 +15316,9 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
     работать по-старому — через DeepL/Google и обычное форматирование."""
     global _llm_fail_streak, _llm_disabled_runtime, _llm_disabled_reason, _llm_json_mode, _llm_last_usage_tokens, _llm_circuit_until
     _llm_last_usage_tokens = None
+    base_url, api_key, model = _llm_current()
     payload = {
-        'model': LLM_MODEL,
+        'model': model,
         'messages': messages,
         'temperature': 0.2,           # факты важнее фантазии
         'max_tokens': max_tokens,
@@ -15284,8 +15330,8 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
         payload.setdefault('response_format', {'type': 'json_object'})
     try:
         r = requests.post(
-            f'{LLM_BASE_URL}/chat/completions',
-            headers={'Authorization': f'Bearer {LLM_API_KEY}',
+            f'{base_url}/chat/completions',
+            headers={'Authorization': f'Bearer {api_key}',
                      'Content-Type': 'application/json'},
             json=payload,
             timeout=LLM_TIMEOUT,
@@ -15321,9 +15367,11 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
             logger.warning('LLM: провайдер вернул 429 (лимит запросов) — притормаживаю')
         return None
     if r.status_code in (401, 403):
+        _remember_provider_error(r.status_code, r.text)
+        if _llm_try_failover('auth'):
+            return None          # следующий вызов пойдёт к запасному провайдеру
         _llm_disabled_runtime = True
         _llm_disabled_reason = 'auth'
-        _remember_provider_error(r.status_code, r.text)
         logger.error(f"LLM: ключ отклонён (HTTP {r.status_code}) — выключаю до рестарта")
         _queue_admin_alert('🤖 Языковая модель отключена: провайдер не принял ключ '
                            f'(HTTP {r.status_code}). Проверь LLM_API_KEY. '
@@ -15335,9 +15383,11 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
     # без единой подсказки, что именно чинить.
     fatal = _llm_fatal_reason(r.status_code, r.text)
     if fatal:
+        _remember_provider_error(r.status_code, r.text)
+        if _llm_try_failover(fatal['reason']):
+            return None          # следующий вызов пойдёт к запасному провайдеру
         _llm_disabled_runtime = True
         _llm_disabled_reason = fatal['reason']
-        _remember_provider_error(r.status_code, r.text)
         logger.error('LLM: %s (HTTP %s) — выключаю до рестарта', fatal['log'], r.status_code)
         _queue_admin_alert(f'🤖 Языковая модель отключена: {fatal["admin"]}\n'
                            f'HTTP {r.status_code}. Бот продолжает работать на DeepL/Google.')
@@ -15908,7 +15958,20 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
 
     used = settings.llm_calls_today if settings.llm_day == _local_now().strftime('%Y-%m-%d') else 0
     lines.append(f'Провайдер: {html.escape(LLM_PROVIDER or "свой адрес")}')
-    lines.append(f'Модель: <code>{html.escape(LLM_MODEL)}</code>')
+    _, _, current_model = _llm_current()
+    lines.append(f'Модель: <code>{html.escape(current_model)}</code>')
+    # Видно сразу, кто отвечает: иначе при молчаливом переходе на запасного
+    # непонятно, чьи ответы приходят и почему они другого качества.
+    if _llm_using_fallback:
+        lines.append('  ⚠️ работает ЗАПАСНОЙ провайдер'
+                     + (f' (с {html.escape(_llm_failover_at[:16])})' if _llm_failover_at else ''))
+        lines.append('     основной вернётся при следующем перезапуске')
+    elif _llm_fallback_configured():
+        lines.append(f'  🅱️ запасной наготове: <code>'
+                     f'{html.escape(LLM_FALLBACK_MODEL)}</code>')
+    else:
+        lines.append('  ℹ️ запасной не задан: при отказе провайдера обогащение '
+                     'выключится до перезапуска')
     lines.append(f'Prompt version: <code>{html.escape(LLM_PROMPT_VERSION)}</code>')
     lines.append('LLM judge: ' + ('ВКЛ' if feature_enabled('llm_judge') else 'выкл'))
     lines.append(f'Адрес: <code>{html.escape(LLM_BASE_URL)}</code>')
