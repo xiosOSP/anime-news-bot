@@ -529,6 +529,11 @@ POLLING_BOOTSTRAP_RETRIES = max(-1, min(100, _env_int('POLLING_BOOTSTRAP_RETRIES
 # Publisher тикает часто, но публикует только когда пришло время: сам темп
 # публикаций задаётся check_interval, тик лишь проверяет, не пора ли.
 PUBLISHER_TICK_SEC = max(15, min(600, _env_int('PUBLISHER_TICK_SEC', 60)))
+# После обрыва цикла ждём короткую растущую паузу, а не полный интервал:
+# иначе при частых перезапусках сбор новостей не случается вовсе.
+AUTO_CYCLE_RETRY_BASE_SEC = max(30, min(1800, _env_int('AUTO_CYCLE_RETRY_BASE_SEC', 120)))
+AUTO_CYCLE_RETRY_MAX_SEC = max(AUTO_CYCLE_RETRY_BASE_SEC,
+                              min(3600, _env_int('AUTO_CYCLE_RETRY_MAX_SEC', 900)))
 POLLING_CONFLICT_RETRIES = max(-1, min(1000, _env_int('POLLING_CONFLICT_RETRIES', -1)))
 POLLING_CONFLICT_BACKOFF_SEC = max(1, min(120, _env_int('POLLING_CONFLICT_BACKOFF_SEC', 15)))
 POLLING_CONFLICT_BACKOFF_MAX_SEC = max(POLLING_CONFLICT_BACKOFF_SEC,
@@ -18802,6 +18807,11 @@ def _mark_auto_cycle_started() -> None:
     # Бот перезапускается именно во время цикла, а не по таймеру платформы.
     # Запоминаем RSS на входе, чтобы потом увидеть, чего цикл стоит по памяти.
     data['last_auto_cycle_rss_start_mb'] = _rss_mb() or 0.0
+    # Если прошлый цикл остался в running, значит его оборвали. Считаем обрывы
+    # подряд, чтобы пауза перед повтором росла, а не била в одну точку.
+    if str(data.get('last_auto_cycle_state') or '') == 'running':
+        data['auto_cycle_interrupted_streak'] = int(
+            data.get('auto_cycle_interrupted_streak', 0) or 0) + 1
     previous_state = str(data.get('last_auto_cycle_state') or '')
     if previous_state:
         data['previous_auto_cycle_state'] = previous_state[:80]
@@ -18816,6 +18826,7 @@ def _mark_auto_cycle_finished(result: str) -> None:
     data = _read_lifecycle()
     data['last_auto_cycle_finished_at'] = datetime.now(timezone.utc).isoformat()
     data['last_auto_cycle_state'] = str(result or 'finished')[:80]
+    data['auto_cycle_interrupted_streak'] = 0      # цикл дошёл до конца
     # Бот перезапускается именно во время цикла, а не по таймеру платформы.
     # Значит важно знать, чего цикл стоит по памяти: пик и прирост переживают
     # перезапуск и видны в /lifecycle, даже если процесс убили молча.
@@ -18834,10 +18845,14 @@ def _auto_restore_first_delay(default: float = 5.0) -> float:
 
     Previously every boot recreated the auto job with ``first=5``. During a
     restart storm that meant a full source/LLM/media cycle every minute, often
-    before the previous process' work was even cold. The persisted *start* time
-    is intentionally used even if the previous cycle was interrupted: this
-    avoids immediately replaying the same expensive cycle and producing a
-    misleading all-duplicates report.
+    before the previous process' work was even cold.
+
+    Но у прерванного цикла судьба другая, чем у завершённого. Если процесс
+    умирает раньше, чем цикл успевает закончиться, откладывать следующую
+    попытку на полный интервал — значит вовсе не собирать новости: очередная
+    попытка снова не доживёт, снова запишет новое время старта, и так по кругу.
+    Поэтому после обрыва ждём короткую паузу, растущую с числом обрывов: она
+    не даёт замкнуть цикл в шторм, но и не отодвигает сбор на полчаса.
     """
     try:
         data = _read_lifecycle()
@@ -18851,14 +18866,19 @@ def _auto_restore_first_delay(default: float = 5.0) -> float:
         interval = max(5.0, float(settings.check_interval_sec))
         if elapsed >= interval:
             return float(default)
+        interrupted = str(data.get('last_auto_cycle_state') or '') == 'running'
+        if interrupted:
+            attempts = max(1, int(data.get('auto_cycle_interrupted_streak', 0) or 0))
+            backoff = min(AUTO_CYCLE_RETRY_MAX_SEC,
+                          AUTO_CYCLE_RETRY_BASE_SEC * attempts)
+            # Дальше полного интервала не уходим: незачем ждать дольше обычного.
+            remaining = min(max(float(default), backoff), max(float(default), interval - elapsed))
+            logger.warning('Авторассылка: предыдущий процесс прервал проверку (обрывов подряд: %d); '
+                           'повторю через %.0f с, а не через полный интервал', attempts, remaining)
+            return remaining
         remaining = max(float(default), interval - elapsed)
-        if str(data.get('last_auto_cycle_state') or '') == 'running':
-            logger.warning('Авторассылка: предыдущий процесс прервал проверку; '
-                           'не повторяю её через 5 секунд, следующий запуск через %.0f с',
-                           remaining)
-        else:
-            logger.info('Авторассылка: сохраняю расписание после рестарта; '
-                        'следующая проверка через %.0f с', remaining)
+        logger.info('Авторассылка: сохраняю расписание после рестарта; '
+                    'следующая проверка через %.0f с', remaining)
         return remaining
     except (TypeError, ValueError, OverflowError):
         return float(default)
