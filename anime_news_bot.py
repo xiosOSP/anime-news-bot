@@ -15942,6 +15942,29 @@ def _post_number(link: str) -> str:
     return (link or '').rstrip('/').split('/')[-1] or '?'
 
 
+def _llm_probe_blocked() -> str:
+    """Ответ без обращения к провайдеру, если состояние уже известно.
+
+    Пустая строка — можно слать настоящий запрос.
+    """
+    if not _llm_configured():
+        return '⚙️ Модель не настроена.\n\n' + _llm_off_reason()
+    if _llm_disabled_reason == 'circuit' and _llm_circuit_until > time.monotonic():
+        left = int(_llm_circuit_until - time.monotonic())
+        return ('⏳ <b>Модель жива, но сейчас на паузе</b>\n\n'
+                f'Провайдер попросил подождать, осталось около {left} с. '
+                'Это лимит запросов в минуту, а не поломка.\n\n'
+                'Пробный запрос не отправляю: он бы только упёрся в тот же лимит. '
+                'Повтори /llm чуть позже.')
+    if _llm_disabled_runtime:
+        return '⛔ <b>Модель выключена</b>\n\n' + _llm_off_reason()
+    if _llm_quota_left() <= 0:
+        return ('📉 <b>Дневной лимит исчерпан</b>\n\n'
+                f'Израсходовано {LLM_DAILY_LIMIT} вызовов за сутки (LLM_DAILY_LIMIT). '
+                'Пробный запрос не отправляю, чтобы не тратить лимит завтрашнего дня.')
+    return ''
+
+
 def _llm_off_reason() -> str:
     """Почему модель сейчас не ответила — человеческим языком.
 
@@ -16036,6 +16059,16 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
 
     # Живая проверка. С аргументом — на своём тексте: /llm <заголовок>
     custom = ' '.join(context.args or []).strip()
+
+    # Проверка не должна ломать то, что проверяет. Раньше /llm всегда слал
+    # настоящий запрос — и на бесплатном тарифе сам упирался в лимит запросов,
+    # после чего отвечал «ответа нет», хотя модель была совершенно жива.
+    # Если состояние и так известно, отвечаем по нему, не тратя запрос.
+    blocked = _llm_probe_blocked()
+    if blocked:
+        await update.message.reply_text(blocked, parse_mode=ParseMode.HTML)
+        return
+
     await update.message.reply_text('Проверяю…')
     if custom:
         probe = {'title': custom[:300], 'summary': '', 'source': 'проверка', 'lang': 'ru'}
