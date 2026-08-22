@@ -319,7 +319,7 @@ HEALTH_STORAGE_PROBE_CACHE_SEC = max(0.5, min(60.0, _env_float('HEALTH_STORAGE_P
 HEALTH_METRICS_TOKEN = _env('HEALTH_METRICS_TOKEN', '').strip()
 HEALTH_BIND_IS_PUBLIC = HEALTH_HOST not in ('127.0.0.1', 'localhost', '::1')
 LIFECYCLE_FILE = DATA_DIR / 'runtime_lifecycle.json'
-BUILD_TAG = 'restart-cadence-v2-20260813'
+BUILD_TAG = 'editorial-intelligence-stage17-20260822'
 TG_CAPTION_LIMIT = 1024              # жёсткое ограничение Telegram для подписи под фото
 TG_TEXT_LIMIT = 4096                 # лимит обычного текстового сообщения
 # Внутренний лимит summary для режима КАНАЛА (одно сообщение фото+подпись).
@@ -403,6 +403,10 @@ FEATURE_FLAGS = {
     # Cycle 2 / Stage 16 — discover external news feeds in shadow mode.
     # Discovery never enables a source automatically; an admin must promote it.
     'source_discovery': _env_bool('FEATURE_SOURCE_DISCOVERY', True),
+    'source_yield': _env_bool('FEATURE_SOURCE_YIELD', True),
+    'story_registry': _env_bool('FEATURE_STORY_REGISTRY', True),
+    'value_moderation_queue': _env_bool('FEATURE_VALUE_MODERATION_QUEUE', True),
+    'llm_quality_routing': _env_bool('FEATURE_LLM_QUALITY_ROUTING', True),
 }
 STORY_CLUSTER_SIMILARITY = max(0.70, min(0.98, _env_float('STORY_CLUSTER_SIMILARITY', 0.88)))
 STORY_CLUSTER_MAX_COMPARE = max(20, min(500, _env_int('STORY_CLUSTER_MAX_COMPARE', 120)))
@@ -413,6 +417,10 @@ DOCTOR_MIN_FREE_MB = max(32, _env_int('DOCTOR_MIN_FREE_MB', 256))
 EDITORIAL_GLOSSARY_FILE = DATA_DIR / 'editorial_glossary.json'
 ENTITY_MEMORY_FILE = DATA_DIR / 'entity_memory.json'
 PUBLISHED_STORIES_FILE = DATA_DIR / 'published_stories.json'
+STORY_REGISTRY_FILE = DATA_DIR / 'story_registry.json'
+SOURCE_YIELD_FILE = DATA_DIR / 'source_yield.json'
+STORY_REGISTRY_MAX = max(200, min(10000, _env_int('STORY_REGISTRY_MAX', 2500)))
+STORY_REGISTRY_TTL_DAYS = max(1, min(90, _env_int('STORY_REGISTRY_TTL_DAYS', 14)))
 REPLAY_BUFFER_FILE = DATA_DIR / 'replay_buffer.json'
 GOLDEN_DATASET_FILE = Path(__file__).with_name('golden') / 'editorial_cases.json'
 STORY_UPDATE_LOOKBACK_DAYS = max(1, min(90, _env_int('STORY_UPDATE_LOOKBACK_DAYS', 21)))
@@ -3893,6 +3901,167 @@ class EntityMemory:
         with self._lock:
             rows = [dict(v, key=k) for k, v in self._items.items()]
         return sorted(rows, key=lambda r: r.get('last_seen', ''), reverse=True)[:limit]
+
+
+class SourceYieldStore:
+    """Durable, explainable source usefulness counters."""
+    def __init__(self, path: Path):
+        self.path = path
+        self._rows: dict[str, dict] = {}
+        self._story_credits: dict[str, list[str]] = {}
+        self._lock = threading.RLock()
+        self._load()
+
+    @staticmethod
+    def _default() -> dict:
+        return {'fetches': 0, 'raw': 0, 'fresh': 0, 'duplicates': 0, 'no_image': 0,
+                'unique_stories': 0, 'moderation_sent': 0, 'published': 0,
+                'errors': 0, 'fetch_ms_sum': 0.0, 'last_seen': ''}
+
+    def _load(self) -> None:
+        try:
+            if not self.path.exists(): return
+            raw = json.loads(self.path.read_text(encoding='utf-8'))
+            rows = raw.get('sources', {}) if isinstance(raw, dict) else {}
+            credits = raw.get('story_credits', {}) if isinstance(raw, dict) else {}
+            if isinstance(credits, dict):
+                self._story_credits = {str(k): [str(x) for x in v if x][-50:]
+                                       for k, v in list(credits.items())[-5000:] if isinstance(v, list)}
+            for name, row in rows.items() if isinstance(rows, dict) else []:
+                if not isinstance(row, dict): continue
+                clean = self._default()
+                for key in clean:
+                    if key == 'last_seen': clean[key] = str(row.get(key) or '')
+                    elif key == 'fetch_ms_sum':
+                        try: clean[key] = max(0.0, float(row.get(key, 0) or 0))
+                        except (TypeError, ValueError): pass
+                    else: clean[key] = _safe_nonnegative_int(row.get(key))
+                self._rows[str(name)] = clean
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning(f'source yield не загружен: {e}')
+
+    def _save(self) -> None:
+        try: _atomic_write_json(self.path, {'schema_version': 1, 'sources': self._rows,
+                                               'story_credits': dict(list(self._story_credits.items())[-5000:])}, indent=2)
+        except OSError as e: logger.warning(f'source yield не сохранён: {e}')
+
+    def _row(self, source: str) -> dict:
+        source = str(source or 'unknown')
+        if source not in self._rows: self._rows[source] = self._default()
+        return self._rows[source]
+
+    def record_fetch(self, source: str, *, raw: int, fresh: int, duplicates: int, no_image: int, duration_sec: float) -> None:
+        with self._lock:
+            row = self._row(source); row['fetches'] += 1
+            row['raw'] += max(0, int(raw)); row['fresh'] += max(0, int(fresh))
+            row['duplicates'] += max(0, int(duplicates)); row['no_image'] += max(0, int(no_image))
+            row['fetch_ms_sum'] += max(0.0, float(duration_sec or 0.0) * 1000.0)
+            row['last_seen'] = datetime.now(timezone.utc).isoformat(); self._save()
+
+    def record_error(self, source: str) -> None:
+        with self._lock:
+            row = self._row(source); row['errors'] += 1
+            row['last_seen'] = datetime.now(timezone.utc).isoformat(); self._save()
+
+    def record_story(self, story_key: str, sources: list[str]) -> None:
+        story_key = str(story_key or '').strip()[:160]
+        if not story_key:
+            return
+        with self._lock:
+            credited = set(self._story_credits.get(story_key) or [])
+            current = list(dict.fromkeys(str(x or 'unknown') for x in sources))
+            changed = False
+            for source in current:
+                if source not in credited:
+                    self._row(source)['unique_stories'] += 1
+                    credited.add(source); changed = True
+            if changed:
+                self._story_credits[story_key] = sorted(credited)[:50]
+                if len(self._story_credits) > 5000:
+                    self._story_credits = dict(list(self._story_credits.items())[-5000:])
+                self._save()
+
+    def record_moderation_sent(self, source: str) -> None:
+        with self._lock: self._row(source)['moderation_sent'] += 1; self._save()
+
+    def record_published(self, source: str) -> None:
+        with self._lock: self._row(source)['published'] += 1; self._save()
+
+    def snapshot(self) -> list[dict]:
+        with self._lock: rows = [(name, dict(row)) for name, row in self._rows.items()]
+        out = []
+        for name, row in rows:
+            fetches=max(1,_safe_nonnegative_int(row.get('fetches'))); raw=_safe_nonnegative_int(row.get('raw'))
+            fresh=_safe_nonnegative_int(row.get('fresh')); stories=_safe_nonnegative_int(row.get('unique_stories'))
+            useful=(stories + 1.0)/(raw + 8.0) if raw else 0.0
+            out.append({'source':name, **row, 'avg_fetch_ms':round(float(row.get('fetch_ms_sum') or 0.0)/fetches,1),
+                        'fresh_rate':round(fresh/max(1,raw),3), 'useful_yield':round(useful,4)})
+        return sorted(out,key=lambda x:(-x['useful_yield'],-x['unique_stories'],x['source'].lower()))
+
+
+class StoryRegistry:
+    """Cross-cycle evidence memory for stories before publication."""
+    def __init__(self, path: Path):
+        self.path=path; self._items:list[dict]=[]; self._lock=threading.RLock(); self._load()
+
+    def _load(self) -> None:
+        try:
+            if not self.path.exists(): return
+            raw=json.loads(self.path.read_text(encoding='utf-8')); items=raw.get('stories',raw) if isinstance(raw,dict) else raw
+            if isinstance(items,list): self._items=[x for x in items if isinstance(x,dict)][-STORY_REGISTRY_MAX:]
+            self._prune(save=False)
+        except (OSError,ValueError,TypeError) as e: logger.warning(f'story registry не загружен: {e}')
+
+    def _save(self) -> None:
+        try: _atomic_write_json(self.path,{'schema_version':1,'stories':self._items[-STORY_REGISTRY_MAX:]},indent=2)
+        except OSError as e: logger.warning(f'story registry не сохранён: {e}')
+
+    def _prune(self, *, save: bool=True) -> None:
+        cutoff=datetime.now(timezone.utc)-timedelta(days=STORY_REGISTRY_TTL_DAYS); kept=[]
+        for row in self._items:
+            try:
+                dt=datetime.fromisoformat(str(row.get('last_seen') or '')); dt=dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+                if dt>=cutoff: kept.append(row)
+            except (ValueError,TypeError): pass
+        self._items=kept[-STORY_REGISTRY_MAX:]
+        if save: self._save()
+
+    @staticmethod
+    def _match(news:dict,row:dict)->float:
+        sim=_story_similarity(news,{'title':row.get('title','')})
+        subject=EntityMemory._key(news.get('_llm_subject') or ''); old=EntityMemory._key(row.get('subject') or '')
+        if subject and old and subject==old: sim=max(sim,0.94)
+        a=_story_update_anchor(news); b=set(row.get('anchors') or [])
+        if a and b and len(a&b)/max(1,min(len(a),len(b)))>=0.70: sim=max(sim,0.90)
+        return sim
+
+    def observe(self, news:dict, sources:list[str], links:list[str])->dict:
+        now=datetime.now(timezone.utc).isoformat(); sources=list(dict.fromkeys(str(x or 'unknown') for x in sources))
+        links=list(dict.fromkeys(normalize_url(x) for x in links if x))
+        with self._lock:
+            self._prune(save=False); best=None; score=0.0
+            for row in reversed(self._items[-500:]):
+                cur=self._match(news,row)
+                if cur>score: best,score=row,cur
+            if best is None or score<min(STORY_CLUSTER_SIMILARITY,0.86):
+                best={'registry_id':hashlib.sha1(f"{news.get('title','')}|{now}".encode()).hexdigest()[:16],
+                      'title':str(news.get('title') or '')[:300], 'subject':str(news.get('_llm_subject') or '')[:160],
+                      'anchors':sorted(_story_update_anchor(news))[:40], 'sources':[], 'links':[], 'first_seen':now}
+                self._items.append(best)
+            before=set(best.get('sources') or []); merged=list(dict.fromkeys([*best.get('sources',[]),*sources]))
+            best.update({'title':str(news.get('title') or best.get('title') or '')[:300],
+                         'subject':str(news.get('_llm_subject') or best.get('subject') or '')[:160],
+                         'anchors':sorted(set(best.get('anchors') or [])|_story_update_anchor(news))[:40],
+                         'sources':merged, 'links':list(dict.fromkeys([*best.get('links',[]),*links]))[-30:],
+                         'last_seen':now, 'observations':_safe_nonnegative_int(best.get('observations'))+1})
+            self._items=self._items[-STORY_REGISTRY_MAX:]; self._save()
+            return {'registry_id':best['registry_id'],'sources':merged,'links':best['links'],'source_count':len(merged),
+                    'new_sources':[x for x in merged if x not in before],'first_seen':best.get('first_seen'),
+                    'observations':best.get('observations',1)}
+
+
+source_yield: Optional['SourceYieldStore'] = None
+story_registry: Optional['StoryRegistry'] = None
 
 
 class PublishedStoryStore:
@@ -8397,6 +8566,8 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
             _mark_published()
             if is_channel:
                 await stats.record_published(source)
+                if feature_enabled('source_yield') and source_yield is not None:
+                    await asyncio.to_thread(source_yield.record_published, source)
                 if experiments is not None:
                     await asyncio.to_thread(experiments.record, str(news.get('_format_variant') or 'standard'), 'published')
                 if story_history is not None:
@@ -10618,9 +10789,23 @@ class PendingPosts:
                 return 0.0
         self._items = {k: v for k, v in self._items.items() if _ts(v) >= cutoff}
         if len(self._items) > self.MAX_ITEMS:
-            oldest = sorted(self._items, key=lambda k: _ts(self._items[k]))
-            for k in oldest[:len(self._items) - self.MAX_ITEMS]:
-                del self._items[k]
+            overflow = len(self._items) - self.MAX_ITEMS
+            if feature_enabled('value_moderation_queue'):
+                now = time.time()
+                def _value(k: str) -> tuple[float, float]:
+                    item = self._items[k]
+                    if str(item.get('channel_state') or 'pending') == 'uncertain': return (1e9, _ts(item))
+                    news = item.get('news') or {}
+                    try: score = float(_news_priority_score(news))
+                    except Exception: score = 0.0
+                    score -= min(12.0, max(0.0, (now - _ts(item)) / 3600.0) * 0.12)
+                    if news.get('_breaking_news'): score += 8.0
+                    if _is_official_news(news): score += 3.0
+                    return (score, _ts(item))
+                victims = sorted(self._items, key=_value)[:overflow]
+            else:
+                victims = sorted(self._items, key=lambda k: _ts(self._items[k]))[:overflow]
+            for k in victims: del self._items[k]
 
     def add(self, news: dict) -> str:
         """Сохраняет пост, возвращает короткий ключ для callback-кнопок."""
@@ -10631,12 +10816,19 @@ class PendingPosts:
         clean = {k: v for k, v in news.items() if k != 'published_parsed'}
         self._items[key] = {'news': clean, 'ts': time.time(), 'channel_state': 'pending'}
         self._cleanup()
+        # Under value-based overflow the new candidate itself may be the weakest.
+        # Do not return a callback key that no longer exists; reject it explicitly.
+        if key not in self._items:
+            self._save()
+            raise OverflowError('Модерационная очередь заполнена более ценными кандидатами')
         if not self._save():
             # cleanup мог удалить старые/overflow записи. При storage-сбое
             # откатываем весь in-memory snapshot, а не только новый ключ.
             self._items = old_items
             self._counter = old_counter
             raise OSError('Не удалось сохранить pending-пост')
+        if feature_enabled('source_yield') and source_yield is not None:
+            source_yield.record_moderation_sent(clean.get('source', 'unknown'))
         return key
 
     def get(self, key: str) -> Optional[dict]:
@@ -10932,7 +11124,12 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     reply_markup = None
     pending_key = None
     if pending_posts is not None:
-        pending_key = pending_posts.add(news)
+        try:
+            pending_key = pending_posts.add(news)
+        except OverflowError:
+            metrics.inc('anime_bot_moderation_value_rejected_total')
+            logger.info(f"⊘ Модерационная очередь сохранила более сильные кандидаты: {news.get('title','')[:60]}")
+            return False
         # Временная метка нужна вызывающему коду для отката, если Telegram не
         # принял пост. В сохранённую запись она не попадает: add() уже выполнен.
         news['_pending_key'] = pending_key
@@ -11211,6 +11408,8 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
         _commit_image_fingerprint(news)
         _mark_published()
         await stats.record_published(source)
+        if feature_enabled('source_yield') and source_yield is not None:
+            await asyncio.to_thread(source_yield.record_published, source)
         return 'sent'
     except DeliveryUncertain as e:
         logger.warning(f'Результат отправки в ветку неизвестен: {title[:60]} ({e})')
@@ -11654,14 +11853,20 @@ def source_reputation_snapshot() -> list[dict]:
     names.update(stat_rows.keys())
     names.update(feedback_rows.keys())
     rows = []
+    yield_map = ({row['source']: row for row in source_yield.snapshot()}
+                 if feature_enabled('source_yield') and source_yield is not None else {})
     for name in sorted(names):
         stat = stat_rows.get(name, {})
         feedback_row = feedback_rows.get(name)
         intel = (source_intelligence.source_metrics(name)
                  if feature_enabled('source_intelligence') and source_intelligence is not None else {})
+        y = yield_map.get(name, {})
         rows.append({
             'source': name,
             'score': round(_source_reputation_score(name), 3),
+            'useful_yield': float(y.get('useful_yield') or 0.0),
+            'unique_stories': _safe_nonnegative_int(y.get('unique_stories')),
+            'avg_fetch_ms': y.get('avg_fetch_ms'),
             'collected': _safe_nonnegative_int(stat.get('collected')),
             'published': _safe_nonnegative_int(stat.get('published')),
             'errors': _safe_nonnegative_int(stat.get('errors')),
@@ -12014,6 +12219,17 @@ def _cluster_news(items: list[dict], *, persist_intelligence: bool = True) -> li
         primary['_story_links'] = links
         primary['_story_cluster_size'] = len(cluster)
         primary['_story_id'] = _story_id(primary, extra_sources=sources)
+        if feature_enabled('story_registry') and story_registry is not None:
+            memory = story_registry.observe(primary, sources, links)
+            primary['_story_registry_id'] = memory.get('registry_id')
+            primary['_story_sources'] = memory.get('sources') or sources
+            primary['_story_links'] = memory.get('links') or links
+            primary['_story_cluster_size'] = max(len(cluster), _safe_nonnegative_int(memory.get('source_count'), 1))
+            primary['_story_cross_cycle'] = bool(memory.get('observations', 1) > 1)
+            primary['_story_first_seen'] = memory.get('first_seen')
+        if feature_enabled('source_yield') and source_yield is not None:
+            source_yield.record_story(primary.get('_story_registry_id') or primary.get('_story_id') or '',
+                                      primary.get('_story_sources') or sources)
         if feature_enabled('source_intelligence') and source_intelligence is not None:
             intel = source_intelligence.observe_story(primary['_story_id'], cluster)
             if intel:
@@ -12428,6 +12644,9 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
                 await stats.record_skipped('no_image', name, no_image_skipped)
             if duplicate_skipped:
                 await stats.record_skipped('duplicate', name, duplicate_skipped)
+            if feature_enabled('source_yield') and source_yield is not None:
+                await asyncio.to_thread(source_yield.record_fetch, name, raw=len(items), fresh=len(unique_items),
+                                        duplicates=duplicate_skipped, no_image=no_image_skipped, duration_sec=fetch_seconds)
         except Exception as e:
             message = f'{type(e).__name__}: {e}'
             fingerprint = (await asyncio.to_thread(error_fingerprints.record, f'source:{name}', message)
@@ -12443,6 +12662,8 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
                        admin_notify=bool(fingerprint.get('notify', True)),
                        repeat_count=int(fingerprint.get('count', 1)))
             await stats.record_source_error(name)
+            if feature_enabled('source_yield') and source_yield is not None:
+                await asyncio.to_thread(source_yield.record_error, name)
             _note_source_failure(name, message, hard=True, save=False)
     if source_health is not None:
         await asyncio.to_thread(source_health.flush)
@@ -15135,6 +15356,12 @@ LLM_FALLBACK_API_KEY = _env('LLM_FALLBACK_API_KEY', '').strip()
 LLM_FALLBACK_BASE_URL = (_env('LLM_FALLBACK_BASE_URL', '').strip()
                          or _fallback_preset[0]).rstrip('/')
 LLM_FALLBACK_MODEL = _env('LLM_FALLBACK_MODEL', '').strip() or _fallback_preset[1]
+_route_provider = _env('LLM_FAST_PROVIDER', '').strip().lower()
+_route_preset = LLM_PRESETS.get(_route_provider, ('', ''))
+LLM_FAST_API_KEY = _env('LLM_FAST_API_KEY', '').strip()
+LLM_FAST_BASE_URL = (_env('LLM_FAST_BASE_URL', '').strip() or _route_preset[0]).rstrip('/')
+LLM_FAST_MODEL = _env('LLM_FAST_MODEL', '').strip() or _route_preset[1]
+LLM_FAST_TASKS = {x.strip().lower() for x in _env('LLM_FAST_TASKS', 'judge').split(',') if x.strip()}
 LLM_TIMEOUT = max(5, min(120, _env_int('LLM_TIMEOUT', 30)))
 LLM_MIN_INTERVAL = max(0.0, min(60.0, _env_float('LLM_MIN_INTERVAL', 1.2)))
 LLM_DAILY_LIMIT = max(1, min(10000, _env_int('LLM_DAILY_LIMIT', 900)))
@@ -15314,14 +15541,17 @@ def _estimate_llm_tokens(messages: list, max_tokens: int) -> int:
     return max(1, (chars + 3) // 4 + max(0, int(max_tokens)) + 32)
 
 
-def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[str]:
+def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_config: Optional[tuple[str, str, str]] = None) -> Optional[str]:
     """Синхронный запрос к модели. Возвращает текст ответа или None.
 
     Никаких исключений наружу: если модель недоступна, бот обязан продолжить
     работать по-старому — через DeepL/Google и обычное форматирование."""
     global _llm_fail_streak, _llm_disabled_runtime, _llm_disabled_reason, _llm_json_mode, _llm_last_usage_tokens, _llm_circuit_until
     _llm_last_usage_tokens = None
-    base_url, api_key, model = _llm_current()
+    # route_config задаёт отдельный провайдер под конкретную задачу (fast route).
+    # Без этого маршрут вычислялся, но запрос всё равно уходил к основному —
+    # то есть дешёвая модель не использовалась вовсе.
+    base_url, api_key, model = route_config or _llm_current()
     payload = {
         'model': model,
         'messages': messages,
@@ -15333,6 +15563,7 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
     # Если провайдер параметр не понял — снимаем его и дальше работаем без него.
     if _llm_json_mode:
         payload.setdefault('response_format', {'type': 'json_object'})
+    routed_task = route_config is not None
     try:
         r = requests.post(
             f'{base_url}/chat/completions',
@@ -15342,8 +15573,16 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
             timeout=LLM_TIMEOUT,
         )
     except Exception as e:
-        _llm_fail_streak += 1
+        if not routed_task:
+            _llm_fail_streak += 1
         logger.warning(f"LLM: запрос не удался ({type(e).__name__}: {e})")
+        return None
+
+    # A task-specific fast route is an optimization. Its health must never open
+    # the global circuit, trigger provider failover, or disable the quality route.
+    if routed_task and r.status_code != 200:
+        metrics.inc('anime_bot_llm_route_error_total', labels={'status': str(r.status_code)})
+        logger.warning('LLM fast route: HTTP %s — fallback to quality route', r.status_code)
         return None
 
     if r.status_code == 429:
@@ -15401,7 +15640,7 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
         # Скорее всего провайдер не знает response_format — пробуем без него
         _llm_json_mode = False
         logger.info("LLM: провайдер не принял строгий JSON — повторяю без него")
-        return _llm_request(messages, max_tokens)
+        return _llm_request(messages, max_tokens, route_config=route_config)
     if r.status_code != 200:
         _llm_fail_streak += 1
         logger.warning(f"LLM: HTTP {r.status_code} — {r.text[:150]}")
@@ -15416,15 +15655,28 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[s
                 _llm_last_usage_tokens = int(total_tokens)
         content = data['choices'][0]['message']['content']
     except (ValueError, KeyError, IndexError, TypeError) as e:
-        _llm_fail_streak += 1
+        if not routed_task:
+            _llm_fail_streak += 1
         logger.warning(f"LLM: непонятный ответ ({e})")
         return None
 
-    _llm_fail_streak = 0
+    if not routed_task:
+        _llm_fail_streak = 0
     return (content or '').strip()
 
 
-async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optional[str]:
+def _llm_fast_configured() -> bool:
+    return bool(LLM_FAST_API_KEY and LLM_FAST_BASE_URL and LLM_FAST_MODEL)
+
+
+def _llm_route_for(task: str) -> Optional[tuple[str, str, str]]:
+    task = str(task or 'editorial').strip().lower()
+    if feature_enabled('llm_quality_routing') and task in LLM_FAST_TASKS and _llm_fast_configured():
+        return (LLM_FAST_BASE_URL, LLM_FAST_API_KEY, LLM_FAST_MODEL)
+    return None
+
+
+async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: str = 'editorial') -> Optional[str]:
     """Вызов модели с соблюдением лимитов: по одному запросу за раз,
     с паузой между ними и дневным потолком."""
     global _llm_last_call, _llm_disabled_runtime, _llm_disabled_reason, _llm_circuit_until, _llm_circuit_level
@@ -15492,7 +15744,17 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS) -> Optiona
             await asyncio.sleep(wait)
         _llm_count_call()
         _llm_last_usage_tokens = None
-        result = await asyncio.to_thread(_llm_request, messages, max_tokens)
+        route_config = _llm_route_for(task)
+        if route_config is not None:
+            metrics.inc('anime_bot_llm_route_total', labels={'task': task, 'route': 'fast'})
+            result = await asyncio.to_thread(_llm_request, messages, max_tokens, route_config=route_config)
+            if result is None and _llm_active() and _llm_quota_left() > 0:
+                metrics.inc('anime_bot_llm_route_fallback_total', labels={'task': task})
+                _llm_count_call()
+                result = await asyncio.to_thread(_llm_request, messages, max_tokens)
+        else:
+            metrics.inc('anime_bot_llm_route_total', labels={'task': task, 'route': 'quality'})
+            result = await asyncio.to_thread(_llm_request, messages, max_tokens)
         _llm_last_call = time.time()
         if result is not None:
             _llm_circuit_level = 0
@@ -15767,7 +16029,7 @@ async def _llm_judge_generated(news: dict, source_fact_text: str) -> str:
     raw = await _llm_call([
         {'role': 'system', 'content': LLM_JUDGE_SYSTEM_PROMPT},
         {'role': 'user', 'content': payload},
-    ], max_tokens=LLM_JUDGE_MAX_TOKENS)
+    ], max_tokens=LLM_JUDGE_MAX_TOKENS, task='judge')
     data = _llm_parse_json(raw or '')
     if not isinstance(data, dict) or not isinstance(data.get('approved'), bool):
         news['_llm_judge_status'] = 'unavailable'
@@ -15831,7 +16093,7 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True) -> str:
     raw = await _llm_call([
         {'role': 'system', 'content': LLM_SYSTEM_PROMPT},
         {'role': 'user', 'content': payload},
-    ])
+    ], task='editorial')
     data = _llm_parse_json(raw or '')
     if not data:
         if raw:
@@ -16040,6 +16302,11 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
                      'выключится до перезапуска')
     lines.append(f'Prompt version: <code>{html.escape(LLM_PROMPT_VERSION)}</code>')
     lines.append('LLM judge: ' + ('ВКЛ' if feature_enabled('llm_judge') else 'выкл'))
+    if feature_enabled('llm_quality_routing') and _llm_fast_configured():
+        lines.append(f'Fast route: <code>{html.escape(LLM_FAST_MODEL)}</code> для '
+                     f'<code>{html.escape(",".join(sorted(LLM_FAST_TASKS)) or "judge")}</code>')
+    else:
+        lines.append('Fast route: не настроен (основная модель выполняет все задачи)')
     lines.append(f'Адрес: <code>{html.escape(LLM_BASE_URL)}</code>')
     lines.append('')
     lines.append('Включено: ' + ('ДА' if settings.llm_enabled else 'НЕТ'))
@@ -17341,8 +17608,9 @@ async def doctor_command(update, context: ContextTypes.DEFAULT_TYPE):
         if rep:
             lines.extend(['', '<b>Source reputation</b>'])
             for row in rep[:8]:
-                lines.append(f'• {html.escape(row["source"][:42])}: {row["score"]:.2f} '
-                             f'(pub {row["published"]}, err {row["errors"]})')
+                lines.append(f'• {html.escape(row["source"][:42])}: trust {row["score"]:.2f}, '
+                             f'yield {row.get("useful_yield", 0.0):.3f} '
+                             f'(stories {row.get("unique_stories", 0)}, pub {row["published"]}, err {row["errors"]})')
     text = '\n'.join(lines)
     await update.message.reply_text(text[:4000], parse_mode=ParseMode.HTML)
 
@@ -19118,6 +19386,9 @@ def _dashboard_snapshot() -> dict:
                 'fails': _safe_nonnegative_int(info.get('fails')),
                 'breaker_sec': round(float(left), 1),
                 'reputation': rep_row.get('score'),
+                'useful_yield': rep_row.get('useful_yield'),
+                'unique_stories': rep_row.get('unique_stories'),
+                'avg_fetch_ms': rep_row.get('avg_fetch_ms'),
                 'probation': bool(rep_row.get('probation')),
                 'avg_lag_h': rep_row.get('avg_lag_hours'),
                 'origin_rate': rep_row.get('origin_rate'),
@@ -19726,7 +19997,7 @@ def _init_globals() -> None:
     позволяет тестам создавать свои инстансы с временными файлами,
     не затрагивая реальные данные пользователя."""
     global sent_links, translator, post_queue, settings, stats, anilist, pending_posts, moderation_feedback
-    global editorial_rules, editorial_glossary, entity_memory, story_history, replay_buffer
+    global editorial_rules, editorial_glossary, entity_memory, story_history, replay_buffer, story_registry, source_yield
     global error_fingerprints, llm_budget, admin_audit, experiments, adaptive_publishing, analytics_store
     if sent_links is None:
         sent_links = SentLinksStore(SENT_LINKS_FILE)
@@ -19799,6 +20070,10 @@ def _init_globals() -> None:
         entity_memory = EntityMemory(ENTITY_MEMORY_FILE)
     if story_history is None:
         story_history = PublishedStoryStore(PUBLISHED_STORIES_FILE)
+    if story_registry is None:
+        story_registry = StoryRegistry(STORY_REGISTRY_FILE)
+    if source_yield is None:
+        source_yield = SourceYieldStore(SOURCE_YIELD_FILE)
     if replay_buffer is None:
         replay_buffer = ReplayBuffer(REPLAY_BUFFER_FILE)
     if anilist is None:
