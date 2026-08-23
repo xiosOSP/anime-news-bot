@@ -319,7 +319,7 @@ HEALTH_STORAGE_PROBE_CACHE_SEC = max(0.5, min(60.0, _env_float('HEALTH_STORAGE_P
 HEALTH_METRICS_TOKEN = _env('HEALTH_METRICS_TOKEN', '').strip()
 HEALTH_BIND_IS_PUBLIC = HEALTH_HOST not in ('127.0.0.1', 'localhost', '::1')
 LIFECYCLE_FILE = DATA_DIR / 'runtime_lifecycle.json'
-BUILD_TAG = 'editorial-intelligence-stage17-20260822'
+BUILD_TAG = 'stability-dedup-stage18-20260823'
 TG_CAPTION_LIMIT = 1024              # жёсткое ограничение Telegram для подписи под фото
 TG_TEXT_LIMIT = 4096                 # лимит обычного текстового сообщения
 # Внутренний лимит summary для режима КАНАЛА (одно сообщение фото+подпись).
@@ -546,6 +546,12 @@ POLLING_CONFLICT_RETRIES = max(-1, min(1000, _env_int('POLLING_CONFLICT_RETRIES'
 POLLING_CONFLICT_BACKOFF_SEC = max(1, min(120, _env_int('POLLING_CONFLICT_BACKOFF_SEC', 15)))
 POLLING_CONFLICT_BACKOFF_MAX_SEC = max(POLLING_CONFLICT_BACKOFF_SEC,
                                        min(600, _env_int('POLLING_CONFLICT_BACKOFF_MAX_SEC', 60)))
+# Blue/green deploys can briefly run the old and new containers against one
+# persistent DATA_DIR.  Exiting immediately on the flock conflict makes the
+# platform restart the new container in a tight loop.  Keep liveness up and
+# wait for the old owner instead; 0 restores the old fail-fast behaviour.
+INSTANCE_LOCK_WAIT_SEC = max(-1, min(3600, _env_int('INSTANCE_LOCK_WAIT_SEC', -1)))
+INSTANCE_LOCK_POLL_SEC = max(0.2, min(30.0, _env_float('INSTANCE_LOCK_POLL_SEC', 2.0)))
 # Полный отчёт о запуске полезен один раз. Если стартов больше этого числа за
 # окно, шлём вместо него одну строку — иначе личка забивается простынями.
 STARTUP_REPORT_MAX_IN_WINDOW = max(2, min(20, _env_int('STARTUP_REPORT_MAX_IN_WINDOW', 3)))
@@ -1156,6 +1162,10 @@ def normalize_url(url: str) -> str:
         scheme = parsed.scheme.lower()
         if scheme not in ('http', 'https') or not parsed.netloc:
             return raw
+        # HTTP and HTTPS variants almost always identify the same article and
+        # commonly alternate between RSS and canonical HTML.  The normalized
+        # value is only a dedup key; the original URL is still used for fetches.
+        scheme = 'https'
         netloc = parsed.netloc.lower()
         if netloc.startswith('www.'):
             netloc = netloc[4:]
@@ -1490,7 +1500,8 @@ class SentLinksStore:
                 return
             if not isinstance(data, dict):
                 return
-            self._urls = [str(u) for u in data.get('urls', []) if u]
+            self._urls = list(dict.fromkeys(
+                normalize_url(str(u)) for u in data.get('urls', []) if u))
             self._url_set = set(self._urls)
             self._titles = [str(t) for t in data.get('titles', []) if t]
             self._title_set = set(self._titles)
@@ -1502,7 +1513,10 @@ class SentLinksStore:
                     continue
             raw_res = data.get('reservations', {})
             if isinstance(raw_res, dict):
-                self._reservations = {str(k): v for k, v in raw_res.items() if isinstance(v, dict)}
+                self._reservations = {
+                    normalize_url(str(k)): v for k, v in raw_res.items()
+                    if isinstance(v, dict) and normalize_url(str(k))
+                }
                 recovered_uncertain = False
                 for meta in self._reservations.values():
                     state = str(meta.get('state') or 'claimed')
@@ -1516,7 +1530,10 @@ class SentLinksStore:
                                    'в uncertain, автоматический повтор заблокирован')
             raw_rej = data.get('rejected', {})
             if isinstance(raw_rej, dict):
-                self._rejected = {str(k): v for k, v in raw_rej.items() if isinstance(v, dict)}
+                self._rejected = {
+                    normalize_url(str(k)): v for k, v in raw_rej.items()
+                    if isinstance(v, dict) and normalize_url(str(k))
+                }
             if self._purge_transient_unlocked():
                 self._save()
         except (json.JSONDecodeError, OSError) as e:
@@ -1925,13 +1942,20 @@ class PostQueue:
             old_items = list(self._items)
             self._purge_expired_unlocked()
             now_iso = datetime.now().isoformat()
-            existing_links = {i['news']['link'] for i in self._items}
+            existing_links = {normalize_url(i['news']['link']) for i in self._items}
+            existing_story_ids = {str(i['news'].get('_story_registry_id') or '')
+                                  for i in self._items}
             if self._inflight is not None:
-                existing_links.add(self._inflight['news']['link'])
+                existing_links.add(normalize_url(self._inflight['news']['link']))
+                existing_story_ids.add(str(
+                    self._inflight['news'].get('_story_registry_id') or ''))
             added = 0
             require_img = settings.require_image
             for news in news_list:
-                if news['link'] in existing_links:
+                norm_link = normalize_url(news['link'])
+                story_registry_id = str(news.get('_story_registry_id') or '')
+                if norm_link in existing_links or (
+                        story_registry_id and story_registry_id in existing_story_ids):
                     continue
                 # Доп. фильтр: посты без картинок не пускаем в очередь
                 if require_img and not news.get('images'):
@@ -1940,7 +1964,9 @@ class PostQueue:
                 clean_news.setdefault('_queue_first_at', now_iso)
                 clean_news.setdefault('_queue_send_failures', 0)
                 self._items.append({'news': clean_news, 'queued_at': clean_news['_queue_first_at']})
-                existing_links.add(news['link'])
+                existing_links.add(norm_link)
+                if story_registry_id:
+                    existing_story_ids.add(story_registry_id)
                 added += 1
             dropped = self._trim_overflow_unlocked()
             if dropped:
@@ -4035,6 +4061,36 @@ class StoryRegistry:
         if a and b and len(a&b)/max(1,min(len(a),len(b)))>=0.70: sim=max(sim,0.90)
         return sim
 
+    @staticmethod
+    def _delivery_match(news: dict, row: dict) -> bool:
+        """Conservative match against the story already sent by the bot.
+
+        The general registry intentionally groups related evidence rather
+        broadly.  Delivery dedup is stricter: a trailer and a key visual for the
+        same franchise must remain separate editorial events.
+        """
+        old_title = str(row.get('delivered_title') or '')
+        if not old_title:
+            return False
+        new_numbers = _story_numbers(news)
+        old_numbers = set(str(x) for x in (row.get('delivered_numbers') or []))
+        if new_numbers and old_numbers and new_numbers != old_numbers:
+            return False
+        new_markers = _story_event_markers(news)
+        old_markers = set(str(x) for x in (row.get('delivered_markers') or []))
+        if new_markers and old_markers and new_markers != old_markers:
+            return False
+        similarity = _story_similarity(news, {'title': old_title})
+        if similarity >= max(0.88, STORY_CLUSTER_SIMILARITY):
+            return True
+        new_subject = EntityMemory._key(news.get('_llm_subject') or '')
+        old_subject = EntityMemory._key(row.get('delivered_subject') or '')
+        return bool(
+            new_subject and old_subject and new_subject == old_subject
+            and new_markers == old_markers
+            and (not new_numbers or not old_numbers or new_numbers == old_numbers)
+        )
+
     def observe(self, news:dict, sources:list[str], links:list[str])->dict:
         now=datetime.now(timezone.utc).isoformat(); sources=list(dict.fromkeys(str(x or 'unknown') for x in sources))
         links=list(dict.fromkeys(normalize_url(x) for x in links if x))
@@ -4055,9 +4111,35 @@ class StoryRegistry:
                          'sources':merged, 'links':list(dict.fromkeys([*best.get('links',[]),*links]))[-30:],
                          'last_seen':now, 'observations':_safe_nonnegative_int(best.get('observations'))+1})
             self._items=self._items[-STORY_REGISTRY_MAX:]; self._save()
+            delivered_duplicate = self._delivery_match(news, best)
             return {'registry_id':best['registry_id'],'sources':merged,'links':best['links'],'source_count':len(merged),
                     'new_sources':[x for x in merged if x not in before],'first_seen':best.get('first_seen'),
-                    'observations':best.get('observations',1)}
+                    'observations':best.get('observations',1),
+                    'moderated_at':best.get('moderated_at'), 'published_at':best.get('published_at'),
+                    'delivery_duplicate':delivered_duplicate}
+
+    def mark_delivery(self, news: dict, *, published: bool = False,
+                      uncertain: bool = False) -> bool:
+        """Persist a confirmed/ambiguous Telegram delivery for cross-cycle dedup."""
+        registry_id = str(news.get('_story_registry_id') or '')
+        if not registry_id:
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            row = next((item for item in reversed(self._items)
+                        if str(item.get('registry_id') or '') == registry_id), None)
+            if row is None:
+                return False
+            row['moderated_at'] = str(row.get('moderated_at') or now)
+            if published:
+                row['published_at'] = str(row.get('published_at') or now)
+            row['delivery_uncertain'] = bool(uncertain)
+            row['delivered_title'] = str(news.get('title') or row.get('title') or '')[:300]
+            row['delivered_subject'] = str(news.get('_llm_subject') or row.get('subject') or '')[:160]
+            row['delivered_markers'] = sorted(_story_event_markers(news))[:20]
+            row['delivered_numbers'] = sorted(_story_numbers(news))[:20]
+            self._save()
+            return True
 
 
 source_yield: Optional['SourceYieldStore'] = None
@@ -8565,9 +8647,13 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
             _commit_image_fingerprint(news)
             _mark_published()
             if is_channel:
-                await stats.record_published(source)
+                if stats is not None:
+                    await stats.record_published(source)
                 if feature_enabled('source_yield') and source_yield is not None:
                     await asyncio.to_thread(source_yield.record_published, source)
+                if feature_enabled('story_registry') and story_registry is not None:
+                    await asyncio.to_thread(
+                        story_registry.mark_delivery, news, published=True)
                 if experiments is not None:
                     await asyncio.to_thread(experiments.record, str(news.get('_format_variant') or 'standard'), 'published')
                 if story_history is not None:
@@ -8583,6 +8669,10 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
             await sent_links.mark_uncertain(link)
             _commit_image_fingerprint(news)
             preserve_ambiguous = True
+            if feature_enabled('story_registry') and story_registry is not None:
+                await asyncio.to_thread(
+                    story_registry.mark_delivery, news, published=True,
+                    uncertain=True)
         if is_channel:
             await stats.record_failed_send(source)
             if analytics_store is not None and track_history:
@@ -8597,6 +8687,10 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
             await sent_links.mark_uncertain(link)
             _commit_image_fingerprint(news)
             preserve_ambiguous = True
+            if feature_enabled('story_registry') and story_registry is not None:
+                await asyncio.to_thread(
+                    story_registry.mark_delivery, news, published=True,
+                    uncertain=True)
         raise
     finally:
         if ledger_claimed and not committed and not rejected and not preserve_ambiguous:
@@ -10827,8 +10921,6 @@ class PendingPosts:
             self._items = old_items
             self._counter = old_counter
             raise OSError('Не удалось сохранить pending-пост')
-        if feature_enabled('source_yield') and source_yield is not None:
-            source_yield.record_moderation_sent(clean.get('source', 'unknown'))
         return key
 
     def get(self, key: str) -> Optional[dict]:
@@ -11407,9 +11499,10 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
         committed = True
         _commit_image_fingerprint(news)
         _mark_published()
-        await stats.record_published(source)
         if feature_enabled('source_yield') and source_yield is not None:
-            await asyncio.to_thread(source_yield.record_published, source)
+            await asyncio.to_thread(source_yield.record_moderation_sent, source)
+        if feature_enabled('story_registry') and story_registry is not None:
+            await asyncio.to_thread(story_registry.mark_delivery, news)
         return 'sent'
     except DeliveryUncertain as e:
         logger.warning(f'Результат отправки в ветку неизвестен: {title[:60]} ({e})')
@@ -11417,6 +11510,9 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
             await sent_links.mark_uncertain(link)
             _commit_image_fingerprint(news)
             preserve_ambiguous = True
+            if feature_enabled('story_registry') and story_registry is not None:
+                await asyncio.to_thread(
+                    story_registry.mark_delivery, news, uncertain=True)
         await stats.record_failed_send(source)
         return 'uncertain'
     except asyncio.CancelledError:
@@ -11424,6 +11520,9 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
             await sent_links.mark_uncertain(link)
             _commit_image_fingerprint(news)
             preserve_ambiguous = True
+            if feature_enabled('story_registry') and story_registry is not None:
+                await asyncio.to_thread(
+                    story_registry.mark_delivery, news, uncertain=True)
         raise
     finally:
         if not committed and not rejected and not preserve_ambiguous:
@@ -11495,6 +11594,23 @@ _STORY_STOPWORDS = {
     'аниме', 'манга', 'новый', 'новая', 'новое', 'анонс', 'анонсирован', 'показали',
     'представили', 'вышел', 'вышла', 'трейлер', 'тизер', 'постер', 'опубликован',
 }
+_STORY_EVENT_MARKERS = {
+    'trailer', 'teaser', 'visual', 'poster', 'cast', 'staff', 'release', 'premiere',
+    'delay', 'delayed', 'canceled', 'cancelled', 'episode', 'season', 'movie', 'film',
+    'game', 'manga', 'novel', 'adaptation', 'streaming',
+    'трейлер', 'тизер', 'постер', 'каст', 'состав', 'релиз', 'премьера', 'перенос',
+    'отложен', 'отменен', 'отменён', 'эпизод', 'сезон', 'фильм', 'игра', 'манга',
+    'новелла', 'экранизация',
+}
+
+
+def _story_event_markers(news_or_title) -> set[str]:
+    title = (news_or_title.get('title', '')
+             if isinstance(news_or_title, dict) else str(news_or_title or ''))
+    words = set(re.findall(r'[A-Za-zА-Яа-яЁё]+', title.casefold()))
+    return words & _STORY_EVENT_MARKERS
+
+
 _OFFICIAL_HOST_HINTS = (
     'aniplex', 'kadokawa', 'toei-anim', 'toei-animation', 'shueisha', 'kodansha',
     'crunchyroll.com', 'netflix.com', 'disneyplus.com', 'youtube.com', 'youtu.be',
@@ -12227,6 +12343,7 @@ def _cluster_news(items: list[dict], *, persist_intelligence: bool = True) -> li
             primary['_story_cluster_size'] = max(len(cluster), _safe_nonnegative_int(memory.get('source_count'), 1))
             primary['_story_cross_cycle'] = bool(memory.get('observations', 1) > 1)
             primary['_story_first_seen'] = memory.get('first_seen')
+            primary['_story_registry_duplicate'] = bool(memory.get('delivery_duplicate'))
         if feature_enabled('source_yield') and source_yield is not None:
             source_yield.record_story(primary.get('_story_registry_id') or primary.get('_story_id') or '',
                                       primary.get('_story_sources') or sources)
@@ -13326,6 +13443,10 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ok = await _send_channel_post(context.bot, news, None)
             except DeliveryUncertain as e:
                 pending_posts.mark_channel_uncertain(key)
+                if feature_enabled('story_registry') and story_registry is not None:
+                    await asyncio.to_thread(
+                        story_registry.mark_delivery, news, published=True,
+                        uncertain=True)
                 logger.warning(f'Ручная публикация pending {key}: ambiguous delivery ({e})')
                 await query.answer(
                     '❓ Telegram не подтвердил результат. Проверь канал; повторная кнопка — только после проверки.',
@@ -13333,6 +13454,10 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             except asyncio.CancelledError:
                 pending_posts.mark_channel_uncertain(key)
+                if feature_enabled('story_registry') and story_registry is not None:
+                    await asyncio.to_thread(
+                        story_registry.mark_delivery, news, published=True,
+                        uncertain=True)
                 raise
             except Exception:
                 pending_posts.mark_channel_pending(key)
@@ -13346,6 +13471,14 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if experiments is not None:
                 await asyncio.to_thread(experiments.record, str(news.get('_format_variant') or 'standard'), 'published')
             _mark_published()
+            source = str(news.get('source') or 'unknown')
+            if stats is not None:
+                await stats.record_published(source)
+            if feature_enabled('source_yield') and source_yield is not None:
+                await asyncio.to_thread(source_yield.record_published, source)
+            if feature_enabled('story_registry') and story_registry is not None:
+                await asyncio.to_thread(
+                    story_registry.mark_delivery, news, published=True)
             if story_history is not None:
                 await asyncio.to_thread(story_history.record, news, format_news_short(news))
             if pending_cleanup_ok:
@@ -14475,11 +14608,19 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
                 err = None
             except DeliveryUncertain as e:
                 scheduled_posts.mark_uncertain(key)
+                if feature_enabled('story_registry') and story_registry is not None:
+                    await asyncio.to_thread(
+                        story_registry.mark_delivery, news, published=True,
+                        uncertain=True)
                 ok = None
                 err = f'{type(e).__name__}: {e}'
                 logger.warning(f'Отложенный пост {key}: ambiguous delivery ({e})')
             except asyncio.CancelledError:
                 scheduled_posts.mark_uncertain(key)
+                if feature_enabled('story_registry') and story_registry is not None:
+                    await asyncio.to_thread(
+                        story_registry.mark_delivery, news, published=True,
+                        uncertain=True)
                 raise
             except Exception as e:            # не даём джобу умереть молча
                 ok = False
@@ -14496,6 +14637,14 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
                     f'⚠️ Пост уже отправлен в канал, но storage не подтвердил удаление из отложки.\n'
                     f'ID: {key}. Автоповтор заблокирован состоянием sending; проверь /health и /scheduled.')
             _mark_published()
+            source = str(news.get('source') or 'unknown')
+            if stats is not None:
+                await stats.record_published(source)
+            if feature_enabled('source_yield') and source_yield is not None:
+                await asyncio.to_thread(source_yield.record_published, source)
+            if feature_enabled('story_registry') and story_registry is not None:
+                await asyncio.to_thread(
+                    story_registry.mark_delivery, news, published=True)
             if story_history is not None:
                 await asyncio.to_thread(story_history.record, news, format_news_short(news))
             logger.info(f"📅 Опубликован отложенный пост: {news.get('title', '')[:60]}")
@@ -14809,6 +14958,7 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
             and _editorial_allowed(n)
             and n['link'] not in sent_links
             and (bool(n.get('_story_update_of')) or not sent_links.has_title(n.get('title', '')))
+            and (bool(n.get('_story_update_of')) or not n.get('_story_registry_duplicate'))
         ]
         metrics.set('anime_bot_fresh_candidates', len(fresh))
 
@@ -17477,7 +17627,7 @@ BACKUP_HOUR = 5                 # во сколько по времени адм
 
 
 def _rss_mb() -> Optional[int]:
-    """Сколько памяти занимает процесс, МБ (Linux). None — если не прочиталось."""
+    """Сколько памяти занимает процесс, МБ. None — если не прочиталось."""
     try:
         with open('/proc/self/status', encoding='utf-8') as f:
             for line in f:
@@ -17485,6 +17635,32 @@ def _rss_mb() -> Optional[int]:
                     return int(line.split()[1]) // 1024
     except (OSError, ValueError, IndexError):
         pass
+    if os.name == 'nt':
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _ProcessMemoryCounters(ctypes.Structure):
+                _fields_ = [
+                    ('cb', wintypes.DWORD), ('PageFaultCount', wintypes.DWORD),
+                    ('PeakWorkingSetSize', ctypes.c_size_t),
+                    ('WorkingSetSize', ctypes.c_size_t),
+                    ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                    ('PagefileUsage', ctypes.c_size_t),
+                    ('PeakPagefileUsage', ctypes.c_size_t),
+                ]
+
+            counters = _ProcessMemoryCounters()
+            counters.cb = ctypes.sizeof(counters)
+            process = ctypes.windll.kernel32.GetCurrentProcess()
+            if ctypes.windll.psapi.GetProcessMemoryInfo(
+                    process, ctypes.byref(counters), counters.cb):
+                return int(counters.WorkingSetSize // (1024 * 1024))
+        except (AttributeError, OSError, ValueError):
+            pass
     return None
 
 
@@ -18959,33 +19135,62 @@ async def blacklist_command(update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============== SINGLE-INSTANCE GUARD ==============
 _instance_lock_handle = None
+_lifecycle_started = False
 
 
-def _acquire_instance_lock() -> None:
-    """Не позволяет двум процессам одновременно писать один DATA_DIR и публиковать дубли."""
+def _acquire_instance_lock(wait_seconds: Optional[float] = None) -> None:
+    """Serialise processes sharing DATA_DIR without creating a restart loop.
+
+    During a rolling deploy the old container can hold the lock for a short
+    time.  The replacement stays alive and waits instead of exiting and being
+    relaunched by the platform.  No lifecycle/runtime file is written before
+    this function succeeds.
+    """
     global _instance_lock_handle
     if _instance_lock_handle is not None:
         return
     if fcntl is None:
         logger.warning('flock недоступен: single-instance guard не поддерживается на этой ОС')
         return
+    if wait_seconds is None:
+        wait_seconds = float(INSTANCE_LOCK_WAIT_SEC)
     path = DATA_DIR / '.anime_news_bot.lock'
     handle = path.open('a+', encoding='utf-8')
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        handle.seek(0)
-        owner = handle.read().strip() or '?'
-        handle.close()
-        raise SystemExit(
-            f'Другой экземпляр бота уже использует DATA_DIR={DATA_DIR} (PID {owner}). '
-            'Остановите старый процесс или используйте отдельный DATA_DIR.'
-        )
+    started = time.monotonic()
+    next_log = started
+    owner = '?'
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            try:
+                handle.seek(0)
+                owner = handle.read().strip() or '?'
+            except OSError:
+                owner = '?'
+            elapsed = time.monotonic() - started
+            timed_out = wait_seconds >= 0 and elapsed >= wait_seconds
+            if wait_seconds == 0 or timed_out:
+                handle.close()
+                raise SystemExit(
+                    f'Другой экземпляр бота уже использует DATA_DIR={DATA_DIR} '
+                    f'(PID {owner}); ожидание {elapsed:.0f} с исчерпано.')
+            _runtime_health['last_error'] = f'waiting_instance_lock: pid={owner}'
+            now = time.monotonic()
+            if now >= next_log:
+                logger.warning(
+                    'Другой экземпляр (PID %s) ещё держит DATA_DIR; жду освобождения '
+                    'lock вместо перезапуска контейнера', owner)
+                next_log = now + 30.0
+            time.sleep(INSTANCE_LOCK_POLL_SEC)
     handle.seek(0)
     handle.truncate()
     handle.write(str(os.getpid()))
     handle.flush()
     _instance_lock_handle = handle
+    if str(_runtime_health.get('last_error') or '').startswith('waiting_instance_lock:'):
+        _runtime_health['last_error'] = ''
 
 
 def _release_instance_lock() -> None:
@@ -19024,6 +19229,7 @@ def _write_lifecycle(data: dict) -> None:
 
 
 def _mark_lifecycle_start() -> dict:
+    global _lifecycle_started
     now = datetime.now(timezone.utc).isoformat()
     data = _read_lifecycle()
     previous_state = str(data.get('state') or '')
@@ -19045,6 +19251,7 @@ def _mark_lifecycle_start() -> dict:
         'last_exit_kind': str(data.get('last_exit_kind') or ''),
     })
     _write_lifecycle(data)
+    _lifecycle_started = True
     if len(history) >= 4:
         try:
             parsed = [datetime.fromisoformat(x) for x in history[-4:]]
@@ -19054,6 +19261,19 @@ def _mark_lifecycle_start() -> dict:
         except (ValueError, TypeError):
             pass
     return data
+
+
+def _mark_polling_conflict(detail: str, attempts: int) -> None:
+    """Record a recoverable 409 without pretending the process exited."""
+    if not _lifecycle_started:
+        return
+    data = _read_lifecycle()
+    data['last_polling_conflict_at'] = datetime.now(timezone.utc).isoformat()
+    data['last_polling_conflict_detail'] = _redact_secrets(str(detail or ''))[:300]
+    data['polling_conflict_attempts'] = max(1, int(attempts))
+    if int(data.get('pid') or 0) == os.getpid():
+        data['state'] = 'running'
+    _write_lifecycle(data)
 
 
 # Имя намеренно длинное: _TOKEN_PATTERN уже занят системой плейсхолдеров DeepL,
@@ -19083,6 +19303,7 @@ def _redact_secrets(text: str) -> str:
 
 
 def _mark_lifecycle_exit(kind: str, detail: str = '') -> None:
+    global _lifecycle_started
     data = _read_lifecycle()
     data.update({
         'schema_version': 1,
@@ -19100,6 +19321,7 @@ def _mark_lifecycle_exit(kind: str, detail: str = '') -> None:
         'pid': os.getpid(),
     })
     _write_lifecycle(data)
+    _lifecycle_started = False
 
 
 def _mark_auto_cycle_started() -> None:
@@ -19131,8 +19353,11 @@ def _mark_auto_cycle_finished(result: str) -> None:
     # Бот перезапускается именно во время цикла, а не по таймеру платформы.
     # Значит важно знать, чего цикл стоит по памяти: пик и прирост переживают
     # перезапуск и видны в /lifecycle, даже если процесс убили молча.
-    rss_now = (_rss_mb() or 0.0)
-    if rss_now:
+    rss_value = _rss_mb()
+    rss_now = float(rss_value or 0.0)
+    data['last_auto_cycle_rss_end_mb'] = rss_now
+    data.setdefault('peak_rss_mb', 0.0)
+    if rss_value is not None:
         data['last_auto_cycle_rss_end_mb'] = rss_now
         start_rss = float(data.get('last_auto_cycle_rss_start_mb') or 0.0)
         if start_rss:
@@ -20141,14 +20366,20 @@ def main():
     except Exception as e:
         print(f"Файловый лог не настроен (не критично): {e}", flush=True)
 
-    _mark_lifecycle_start()
-
     # Проверка токена — на хостинге переменная окружения BOT_TOKEN обязательна
     if not TOKEN or TOKEN == '':
         print("❌ Токен бота не задан! Установите переменную окружения BOT_TOKEN.", flush=True)
         raise SystemExit("BOT_TOKEN не задан")
 
+    # Liveness must come up before a rolling-deploy lock wait or potentially
+    # slow runtime-state loading.  Otherwise the platform can kill and restart
+    # a healthy replacement while the previous container is still draining.
+    _start_health_server()
     _acquire_instance_lock()
+    # On a same-host rolling deploy the old owner can temporarily occupy both
+    # the data lock and HEALTH_PORT. Retry the bind after the lock is ours.
+    _start_health_server()
+    _mark_lifecycle_start()
     if feature_enabled('runtime_migrations'):
         migration = _migrate_runtime_schemas(DATA_DIR)
         if migration['changed']:
@@ -20158,7 +20389,6 @@ def main():
     _init_globals()
     _validate_runtime_config()
     check_video_deps()
-    _start_health_server()
 
     print("Создаю Application...", flush=True)
     app = (Application.builder().token(TOKEN).job_queue(JobQueue())
@@ -20262,8 +20492,9 @@ def _run_polling_guarded(app) -> None:
             # тихо выходит с кодом 0 — а платформа его перезапускает. Со стороны
             # это выглядит как «бот перезапускается каждую минуту» без единой
             # ошибки в логе. Пишем причину явно.
-            _mark_lifecycle_exit('polling_conflict', str(e)[:200])
+            _mark_polling_conflict(str(e)[:200], attempts)
             if not unlimited and attempts > POLLING_CONFLICT_RETRIES:
+                _mark_lifecycle_exit('polling_conflict', str(e)[:200])
                 logger.error('❌ Конфликт polling не ушёл за %d попыток: тем же '
                              'BOT_TOKEN пользуется другой процесс. Детали: %s',
                              attempts, e)
@@ -20297,11 +20528,17 @@ if __name__ == '__main__':
     try:
         main()
     except SystemExit as e:
-        _mark_lifecycle_exit('system_exit', str(e))
+        if _lifecycle_started:
+            _mark_lifecycle_exit('system_exit', str(e))
+        _stop_health_server()
+        _release_instance_lock()
         raise
     except Exception as e:
         import traceback
-        _mark_lifecycle_exit('unhandled_exception', f'{type(e).__name__}: {e}')
+        if _lifecycle_started:
+            _mark_lifecycle_exit('unhandled_exception', f'{type(e).__name__}: {e}')
+        _stop_health_server()
+        _release_instance_lock()
         print("❌ КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ:", flush=True)
         traceback.print_exc()
         raise
