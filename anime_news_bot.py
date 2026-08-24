@@ -319,7 +319,7 @@ HEALTH_STORAGE_PROBE_CACHE_SEC = max(0.5, min(60.0, _env_float('HEALTH_STORAGE_P
 HEALTH_METRICS_TOKEN = _env('HEALTH_METRICS_TOKEN', '').strip()
 HEALTH_BIND_IS_PUBLIC = HEALTH_HOST not in ('127.0.0.1', 'localhost', '::1')
 LIFECYCLE_FILE = DATA_DIR / 'runtime_lifecycle.json'
-BUILD_TAG = 'stability-dedup-stage18-20260823'
+BUILD_TAG = 'media-reliability-stage19-20260823'
 TG_CAPTION_LIMIT = 1024              # жёсткое ограничение Telegram для подписи под фото
 TG_TEXT_LIMIT = 4096                 # лимит обычного текстового сообщения
 # Внутренний лимит summary для режима КАНАЛА (одно сообщение фото+подпись).
@@ -1018,6 +1018,56 @@ class MetricsRegistry:
 
 
 metrics = MetricsRegistry()
+
+
+_MEDIA_FAILURE_LABELS = {
+    'article_video_not_found': 'в статье не найдена ссылка на ролик',
+    'video_download_failed': 'не удалось скачать ролик',
+    'unsupported_host': 'видеохостинг не поддерживается',
+    'dependency_missing': 'нет yt-dlp',
+    'direct_video_unavailable': 'прямой URL ролика недоступен Telegram',
+    'telegram_rejected': 'Telegram отклонил видео',
+    'cover_fallback': 'вместо ролика использован кадр/обложка',
+}
+_media_failure_lock = threading.Lock()
+_media_failure_counts: dict[str, int] = {}
+_media_failures: deque[dict] = deque(maxlen=10)
+
+
+def _record_media_failure(news: dict, code: str, detail: str = '') -> None:
+    """Запоминает ограниченную причину медиасбоя для /health и метрик.
+
+    Коды перечислены заранее: так Prometheus labels не разрастаются из-за URL
+    и текстов исключений. Одну и ту же причину для одного news не считаем дважды.
+    """
+    stable_code = code if code in _MEDIA_FAILURE_LABELS else 'video_download_failed'
+    seen = news.setdefault('_media_failure_codes', [])
+    if isinstance(seen, list):
+        if stable_code in seen:
+            return
+        seen.append(stable_code)
+        del seen[8:]
+    row = {
+        'ts': datetime.now(timezone.utc).isoformat(),
+        'code': stable_code,
+        'source': str(news.get('source') or '?')[:60],
+        'title': str(news.get('title') or '')[:100],
+        'detail': str(detail or '')[:160],
+    }
+    with _media_failure_lock:
+        _media_failure_counts[stable_code] = _media_failure_counts.get(stable_code, 0) + 1
+        _media_failures.append(row)
+    metrics.inc('anime_bot_media_fallback_total', labels={'reason': stable_code})
+    _event_log('media_fallback', **row)
+
+
+def media_failure_snapshot() -> dict:
+    """Потокобезопасный компактный снимок причин медиасбоев текущего процесса."""
+    with _media_failure_lock:
+        return {
+            'counts': dict(_media_failure_counts),
+            'recent': [dict(row) for row in _media_failures],
+        }
 
 
 def _refresh_runtime_metrics() -> None:
@@ -5511,7 +5561,7 @@ def _probably_has_video(news: dict) -> bool:
     return bool(_VIDEO_HINT_RE.search(text))
 
 
-def _find_video_in_html(html_text: str) -> Optional[str]:
+def _find_video_in_html(html_text: str, base_url: Optional[str] = None) -> Optional[str]:
     """Ищет ролик на странице статьи: og:video, встроенный плеер, ссылки.
 
     В RSS обычно лежит обрезанный тизер без плеера — трейлер живёт в самой
@@ -5522,33 +5572,48 @@ def _find_video_in_html(html_text: str) -> Optional[str]:
     except Exception:
         return None
 
+    def absolute(raw: Optional[str]) -> Optional[str]:
+        value = html.unescape(str(raw or '').strip())
+        if not value:
+            return None
+        if value.startswith('//'):
+            value = 'https:' + value
+        elif base_url and not value.startswith(('http://', 'https://')):
+            value = urljoin(base_url, value)
+        try:
+            parsed = urlparse(value)
+        except Exception:
+            return None
+        if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+            return None
+        return value
+
     # 1. Мета-теги: самый надёжный признак
     for prop in ('og:video:url', 'og:video:secure_url', 'og:video',
                  'twitter:player:stream'):
         meta = (soup.select_one(f'meta[property="{prop}"]')
                 or soup.select_one(f'meta[name="{prop}"]'))
-        content = (meta.get('content') or '').strip() if meta else ''
-        if content.startswith('http') and (_is_video_host(content)
-                                           or _is_direct_video(content)):
+        content = absolute(meta.get('content') if meta else None)
+        if content and (_is_video_host(content) or _is_direct_video(content)):
             return content
 
     # 2. Встроенный плеер
     for frame in soup.select('iframe[src], embed[src]'):
-        url = (frame.get('src') or '').strip()
-        if url.startswith('//'):
-            url = 'https:' + url
-        if url.startswith('http') and _is_video_host(url):
+        url = absolute(frame.get('src'))
+        if url and _is_video_host(url):
             return url
 
     # 3. Тег video
     tag = soup.select_one('video[src]') or soup.select_one('video source[src]')
-    if tag and (tag.get('src') or '').startswith('http'):
-        return tag['src'].strip()
+    if tag:
+        url = absolute(tag.get('src'))
+        if url and _is_direct_video(url):
+            return url
 
     # 4. Ссылка на видеохостинг в тексте статьи
     for link in soup.select('a[href]'):
-        url = (link.get('href') or '').strip()
-        if url.startswith('http') and _is_video_host(url):
+        url = absolute(link.get('href'))
+        if url and (_is_video_host(url) or _is_direct_video(url)):
             return url
     return None
 
@@ -5639,7 +5704,7 @@ def fetch_article(url: str) -> dict:
         logger.debug(f"статья не разобралась ({type(e).__name__}): {url[:70]}")
         text = ''
     try:
-        video = _find_video_in_html(html_text)
+        video = _find_video_in_html(html_text, url)
     except Exception:
         video = None
     result = {'text': text, 'video': video}
@@ -5656,6 +5721,22 @@ def fetch_article(url: str) -> dict:
 def fetch_article_text(url: str) -> str:
     """Только текст статьи (обёртка над fetch_article)."""
     return fetch_article(url).get('text', '')
+
+
+async def _discover_article_video(news: dict) -> None:
+    """Ищет ролик в статье независимо от доступности и настроек LLM."""
+    if (not settings.video_enabled or news.get('video')
+            or not news.get('link') or not _probably_has_video(news)):
+        return
+    article = await asyncio.to_thread(fetch_article, news['link'])
+    video = article.get('video') if isinstance(article, dict) else None
+    if video:
+        news['video'] = video
+        news['_video_note'] = 'ролик найден в статье'
+        logger.info(f"🎬 Ролик найден на странице статьи: {news.get('title', '')[:50]}")
+        return
+    news.setdefault('_video_note', 'новость про ролик, но ссылка в статье не найдена')
+    _record_media_failure(news, 'article_video_not_found')
 
 
 def fetch_og_image(url: str) -> Optional[str]:
@@ -5682,14 +5763,15 @@ def fetch_og_image(url: str) -> Optional[str]:
             return None
         soup = BeautifulSoup(html_text, 'html.parser')
         og = soup.find('meta', property='og:image')
-        if og and og.get('content'):
-            return og['content']
-        tw = soup.find('meta', attrs={'name': 'twitter:image'})
-        if tw and tw.get('content'):
-            return tw['content']
-        img = soup.find('img', src=True)
-        if img:
-            return img['src']
+        candidate = og.get('content') if og and og.get('content') else None
+        if not candidate:
+            tw = soup.find('meta', attrs={'name': 'twitter:image'})
+            candidate = tw.get('content') if tw and tw.get('content') else None
+        if not candidate:
+            img = soup.find('img', src=True)
+            candidate = img.get('src') if img else None
+        if candidate:
+            return _normalize_image_url(html.unescape(candidate), url)
     except Exception as e:
         logger.debug(f"og:image fail для {url}: {e}")
     return None
@@ -6279,18 +6361,25 @@ def extract_all_images_from_entry(entry, summary_html: Optional[str] = None,
 def _is_video_host(url: str) -> bool:
     """Проверяет, является ли URL видеохостингом, который умеет yt-dlp."""
     try:
-        host = urlparse(url).netloc.lower().lstrip('www.')
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+            return False
+        host = (parsed.hostname or '').lower()
+        if host.startswith('www.'):
+            host = host[4:]
     except Exception:
         return False
-    return any(vh in host for vh in VIDEO_HOSTS)
+    return any(host == vh or host.endswith(f'.{vh}') for vh in VIDEO_HOSTS)
 
 
 def _is_direct_video(url: str) -> bool:
     """Проверяет, что URL — прямая ссылка на видеофайл."""
     try:
         parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+            return False
         path = parsed.path.lower()
-        host = parsed.netloc.lower()
+        host = (parsed.hostname or '').lower()
     except Exception:
         return False
     # Видео из t.me/s/ живут на cdn-telegram/telesco без расширения в пути
@@ -6301,42 +6390,60 @@ def _is_direct_video(url: str) -> bool:
 
 def extract_video_url(entry, summary_html: Optional[str] = None) -> Optional[str]:
     """Ищет видео в RSS-записи: enclosures, media:content, iframe, ссылки на YouTube/Twitter/etc."""
+    base_url = str(getattr(entry, 'link', '') or '')
+
+    def absolute(value) -> Optional[str]:
+        if not value:
+            return None
+        candidate = html.unescape(str(value).strip())
+        if not candidate:
+            return None
+        if candidate.startswith('//'):
+            scheme = urlparse(base_url).scheme or 'https'
+            candidate = f'{scheme}:{candidate}'
+        else:
+            candidate = urljoin(base_url, candidate)
+        parsed = urlparse(candidate)
+        if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+            return None
+        return candidate
+
     # 1. enclosures с типом video/*
     enclosures = getattr(entry, 'enclosures', None) or []
     for enc in enclosures:
         enc_type = enc.get('type', '')
-        href = enc.get('href', '')
-        if 'video' in enc_type and href:
-            return html.unescape(href)
-        if href and _is_direct_video(href):
-            return html.unescape(href)
+        href = absolute(enc.get('href', ''))
+        if href and ('video' in enc_type or _is_direct_video(href)):
+            return href
 
     # 2. media:content с типом video
     media_content = getattr(entry, 'media_content', None) or []
     for media in media_content:
         if 'video' in media.get('type', ''):
-            url = media.get('url')
+            url = absolute(media.get('url'))
             if url:
-                return html.unescape(url)
+                return url
 
     # 3. Поиск в HTML описания
     if summary_html:
         # iframe (YouTube/Vimeo embed)
         iframe_match = re.search(r'<iframe[^>]+src=["\']([^"\']+)', summary_html, re.IGNORECASE)
         if iframe_match:
-            url = html.unescape(iframe_match.group(1))
-            if _is_video_host(url):
+            url = absolute(iframe_match.group(1))
+            if url and _is_video_host(url):
                 return url
 
         # <video src="...">
         video_tag = re.search(r'<video[^>]+src=["\']([^"\']+)', summary_html, re.IGNORECASE)
         if video_tag:
-            return html.unescape(video_tag.group(1))
+            url = absolute(video_tag.group(1))
+            if url and (_is_direct_video(url) or _is_video_host(url)):
+                return url
 
         # Прямая ссылка <a href="...youtube.../watch?v=...">
         for link_match in re.finditer(r'href=["\']([^"\']+)', summary_html):
-            url = html.unescape(link_match.group(1))
-            if _is_video_host(url) or _is_direct_video(url):
+            url = absolute(link_match.group(1))
+            if url and (_is_video_host(url) or _is_direct_video(url)):
                 return url
     return None
 
@@ -7540,7 +7647,10 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
     news_list: list[dict] = []
     seen_ids: set[str] = set()
     embed_budget = TG_EMBED_LOOKUPS_PER_RUN   # не тормозим цикл лишними запросами
-    for msg in soup.select('div.tgme_widget_message'):
+    # t.me/s/ располагает свежие посты внизу. Идём с конца, иначе ограниченный
+    # бюджет embed-запросов расходовался на старые ролики, которые затем всё
+    # равно отбрасывались срезом NEWS_PER_SOURCE.
+    for msg in reversed(soup.select('div.tgme_widget_message')):
         post_id = msg.get('data-post')          # вида 'channel/123'
         text_el = _msg_own_one(msg, 'div.tgme_widget_message_text')
         if not post_id or not text_el:
@@ -7659,8 +7769,10 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
             '_video_thumb': video_thumb,      # запасной кадр, если ролик не доедет
             '_video_note': video_note,        # что случилось с видео — видно в /logs
         })
-    # На странице свежие посты ВНИЗУ — берём последние
-    result = news_list[-NEWS_PER_SOURCE:]
+        if len(news_list) >= NEWS_PER_SOURCE:
+            break
+    # Наружу по-прежнему возвращаем обычный хронологический порядок.
+    result = list(reversed(news_list))
     logger.info(f"TG {channel}: собрано {len(result)} постов (на странице {len(news_list)})")
     return result
 
@@ -8136,15 +8248,18 @@ async def _prepare_video_file(news: dict) -> Optional[Path]:
     if not video_url:
         if _probably_has_video(news):
             news.setdefault('_video_note', 'новость про ролик, но ссылки на него нет')
+            _record_media_failure(news, 'article_video_not_found')
         return None
     # Прямой mp4/webm — Telegram скачает сам, нам качать не надо
     if _is_direct_video(video_url):
         return None
     if not _is_video_host(video_url):
         news['_video_note'] = f'хостинг не поддерживается: {urlparse(video_url).netloc}'
+        _record_media_failure(news, 'unsupported_host', urlparse(video_url).netloc)
         return None
     if not YT_DLP_AVAILABLE:
         news['_video_note'] = 'yt-dlp не установлен — ролик не скачать'
+        _record_media_failure(news, 'dependency_missing')
         return None
     note: list = []
     path = await asyncio.to_thread(download_video, video_url, note)
@@ -8163,6 +8278,8 @@ async def _prepare_video_file(news: dict) -> Optional[Path]:
             probe2 = await asyncio.to_thread(_probe_video_file, path)
             if probe2:
                 news['_video_meta'] = probe2
+    else:
+        _record_media_failure(news, 'video_download_failed', news.get('_video_note', ''))
     return path
 
 
@@ -8202,10 +8319,13 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
 
     # Что реально отправим как видео: файл | bytes | url.
     # cdn-telegram Bot API по URL не принимает — качаем сами (как и фото).
-    video_media = None
-    if settings.video_enabled and video_file is None and video_url \
+    saved_file_id = news.get('_telegram_video_file_id')
+    video_media = saved_file_id if isinstance(saved_file_id, str) and saved_file_id.strip() else None
+    if settings.video_enabled and video_file is None and video_media is None and video_url \
             and _is_direct_video(video_url):
         video_media = await _resolve_video(video_url)
+        if video_media is None:
+            _record_media_failure(news, 'direct_video_unavailable')
     has_inline_video = settings.video_enabled and (
         video_file is not None or video_media is not None
     )
@@ -8225,6 +8345,7 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
     # он всегда лучше, чем случайная og:image со страницы канала.
     if not photos and video_media is None and news.get('_video_thumb'):
         photos = [news['_video_thumb']]
+        _record_media_failure(news, 'cover_fallback')
         logger.info(f"🎬 Видео не доехало — кадр из поста: {news.get('title', '')[:50]}")
     # Картинки с хостов, которые Bot API не может скачать по URL (cdn-telegram.org
     # из t.me/s/-постов), заранее качаем байтами — иначе публикация в канал падала
@@ -8279,6 +8400,7 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
                 return True
             except TelegramError as e:
                 _raise_if_ambiguous_tg_error(e)
+                _record_media_failure(news, 'telegram_rejected', str(e))
                 if settings.require_image:
                     logger.warning(f"⊘ Видео не отправилось ({e}), require_image включено — пост пропущен")
                     return False
@@ -8381,6 +8503,8 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
             return True
         except TelegramError as e:
             _raise_if_ambiguous_tg_error(e)
+            if has_inline_video:
+                _record_media_failure(news, 'telegram_rejected', str(e))
             logger.warning(f"Альбом не отправился ({e}), пробую одиночно")
             # Fallback: пробуем по очереди — сначала видео/первая фотка с caption, остальное без
             return await _send_post_fallback(bot, news, target, video_file, video_media, photos, caption, safe_text, has_inline_video, thread_id)
@@ -8511,6 +8635,26 @@ async def _send_channel_post(bot: Bot, news: dict, video_file: Optional[Path] = 
         return await _send_post(bot, news, CHANNEL_ID, video_file)
 
 
+async def _prepare_and_send_channel_post(bot: Bot, news: dict) -> bool:
+    """Единый media-путь для ручной и отложенной публикации.
+
+    Новые moderation-записи используют Telegram file_id без повторной загрузки.
+    Старые записи без file_id проходят ту же подготовку yt-dlp, что автопубликация.
+    """
+    video_file = None
+    try:
+        file_id = news.get('_telegram_video_file_id')
+        if not (isinstance(file_id, str) and file_id.strip()):
+            video_file = await _prepare_video_file(news)
+        return await _send_channel_post(bot, news, video_file)
+    finally:
+        if video_file:
+            try:
+                video_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 async def _prepare_news_for_send(news: dict, source: str,
                                 count_stats: bool = True, *,
                                 apply_dedup: bool = True,
@@ -8525,6 +8669,7 @@ async def _prepare_news_for_send(news: dict, source: str,
     Возвращает код пропуска ('skipped_filter' / 'skipped_dup') или None, если
     пост можно отправлять."""
     await _improve_thumb(news)
+    await _discover_article_video(news)
     await _optimize_news_media(news)
     _assign_format_variant(news)
 
@@ -10991,6 +11136,24 @@ class PendingPosts:
             return False
         return True
 
+    def set_video_file_id(self, key: str, file_id: str) -> bool:
+        """Сохраняет Telegram file_id ролика с откатом при ошибке диска."""
+        item = self._items.get(key)
+        if not item or not isinstance(file_id, str) or not file_id.strip():
+            return False
+        news = item.get('news')
+        if not isinstance(news, dict):
+            return False
+        old = news.get('_telegram_video_file_id')
+        news['_telegram_video_file_id'] = file_id.strip()
+        if not self._save():
+            if old is None:
+                news.pop('_telegram_video_file_id', None)
+            else:
+                news['_telegram_video_file_id'] = old
+            return False
+        return True
+
     def set_preview(self, key: str, chat_id: int, message_id: int) -> bool:
         """Запоминает сообщение-превью; при storage-сбое откатывает память."""
         item = self._items.get(key)
@@ -11168,10 +11331,13 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     text = format_news_text_long(news)
     video_url = news.get('video')
     # Что реально отправим как видео: файл | bytes | url. cdn-telegram качаем сами.
-    video_media = None
-    if settings.video_enabled and video_file is None and video_url \
+    saved_file_id = news.get('_telegram_video_file_id')
+    video_media = saved_file_id if isinstance(saved_file_id, str) and saved_file_id.strip() else None
+    if settings.video_enabled and video_file is None and video_media is None and video_url \
             and _is_direct_video(video_url):
         video_media = await _resolve_video(video_url)
+        if video_media is None:
+            _record_media_failure(news, 'direct_video_unavailable')
     has_inline_video = settings.video_enabled and (
         video_file is not None or video_media is not None
     )
@@ -11186,6 +11352,7 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     if not photos and video_media is None and news.get('_video_thumb'):
         photos = [news['_video_thumb']]
         news['_thumb_only'] = True
+        _record_media_failure(news, 'cover_fallback')
         logger.info(f"🎬 Видео не доехало — ставлю кадр из поста: "
                     f"{news.get('title', '')[:50]}")
     media_count = len(photos) + (1 if has_inline_video else 0)
@@ -11272,13 +11439,15 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
                 msg = await bot.send_video(chat_id=target, video=video_media, supports_streaming=True,
                                            reply_markup=reply_markup, **caption_kw, **thread_kw)
             _remember_preview(pending_key, msg)
+            _remember_video_file_id(pending_key, msg, news)
             logger.info(f"🧵 {news['source']}: {news['title'][:60]} (видео+подпись)")
             return True
         except TelegramError as e:
             _raise_if_ambiguous_tg_error(e)
+            _record_media_failure(news, 'telegram_rejected', str(e))
             logger.warning(f"Видео с подписью не ушло ({e}) — откат")
             return await _send_thread_media_then_text(
-                bot, news, photos, has_inline_video, video_file, video_url,
+                bot, news, photos, has_inline_video, video_file, video_media,
                 text, reply_markup, thread_kw, target)
 
     # 3) Альбом (2+ фото и/или видео+фото): подпись на первом элементе.
@@ -11310,6 +11479,7 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
             chat_id=target, media=media, **thread_kw))
         if isinstance(msgs, (list, tuple)) and msgs:
             _remember_preview(pending_key, msgs[0])   # подпись живёт на первом элементе
+        _remember_video_file_id(pending_key, msgs, news)
         # Хвост с кнопками (media_group не поддерживает inline-кнопки)
         if reply_markup is not None:
             try:
@@ -11324,6 +11494,8 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
         return True
     except TelegramError as e:
         _raise_if_ambiguous_tg_error(e)
+        if has_inline_video:
+            _record_media_failure(news, 'telegram_rejected', str(e))
         logger.warning(f"Альбом с подписью не прошёл ({e}) — откат на раздельную отправку")
         return await _send_thread_media_then_text(
             bot, news, photos, has_inline_video, video_file, video_media,
@@ -11348,6 +11520,31 @@ def _remember_preview(pending_key, msg) -> None:
             pending_posts.set_preview(pending_key, cid, mid)
     except Exception as e:
         logger.debug(f"preview не запомнен: {e}")
+
+
+def _video_file_id_from_messages(messages) -> Optional[str]:
+    """Достаёт file_id видео из ответа send_video/send_media_group."""
+    rows = messages if isinstance(messages, (list, tuple)) else [messages]
+    for msg in rows:
+        video = getattr(msg, 'video', None)
+        file_id = getattr(video, 'file_id', None) if video is not None else None
+        if isinstance(file_id, str) and file_id.strip():
+            return file_id.strip()
+    return None
+
+
+def _remember_video_file_id(pending_key, messages, news: dict) -> None:
+    """Переиспользует уже загруженное Telegram-видео при публикации в канал."""
+    file_id = _video_file_id_from_messages(messages)
+    if not file_id:
+        return
+    news['_telegram_video_file_id'] = file_id
+    if pending_key and pending_posts is not None:
+        try:
+            if not pending_posts.set_video_file_id(str(pending_key), file_id):
+                logger.warning(f'Модерация: file_id видео не сохранён для pending {pending_key}')
+        except Exception as e:
+            logger.warning(f'Модерация: ошибка сохранения file_id для pending {pending_key}: {e}')
 
 
 async def _send_single_photo_caption(bot, target, photo, caption_kw, reply_markup,
@@ -11393,15 +11590,17 @@ async def _send_thread_media_then_text(bot, news, photos, has_inline_video, vide
             if video_file:
                 video_thumb_kw = await _video_thumbnail_kwargs_async(video_file)
                 with open(video_file, 'rb') as f:
-                    await bot.send_video(chat_id=target, video=f,
-                                         supports_streaming=True,
-                                         **video_thumb_kw, **thread_kw)
+                    msg = await bot.send_video(chat_id=target, video=f,
+                                               supports_streaming=True,
+                                               **video_thumb_kw, **thread_kw)
             else:
-                await bot.send_video(chat_id=target, video=video_url,
-                                     supports_streaming=True, **thread_kw)
+                msg = await bot.send_video(chat_id=target, video=video_url,
+                                           supports_streaming=True, **thread_kw)
+            _remember_video_file_id(news.get('_pending_key'), msg, news)
             media_sent = True
         except TelegramError as e:
             _raise_if_ambiguous_tg_error(e)
+            _record_media_failure(news, 'telegram_rejected', str(e))
             logger.warning(f"Видео в ветку не отправилось ({e})")
 
     if photos:
@@ -13440,7 +13639,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                    show_alert=True)
                 return
             try:
-                ok = await _send_channel_post(context.bot, news, None)
+                ok = await _prepare_and_send_channel_post(context.bot, news)
             except DeliveryUncertain as e:
                 pending_posts.mark_channel_uncertain(key)
                 if feature_enabled('story_registry') and story_registry is not None:
@@ -13596,7 +13795,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer('Состояние поста изменилось — обнови список.', show_alert=True)
                 return
             try:
-                ok = await _send_channel_post(context.bot, news, None)
+                ok = await _prepare_and_send_channel_post(context.bot, news)
             except DeliveryUncertain as e:
                 scheduled_posts.mark_uncertain(key)
                 await query.answer(
@@ -14604,7 +14803,7 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
                 logger.info(f'Отложенный пост сменил состояние перед отправкой: {key}')
                 continue
             try:
-                ok = await _send_channel_post(context.bot, news, None)
+                ok = await _prepare_and_send_channel_post(context.bot, news)
                 err = None
             except DeliveryUncertain as e:
                 scheduled_posts.mark_uncertain(key)
@@ -17997,6 +18196,22 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f'     до {TG_VIDEO_MAX_SECONDS // 60} мин, до {TG_VIDEO_MAX_MB} МБ')
     lines.append('  🔧 Запасная добыча видео (yt-dlp): '
                  + ('есть' if YT_DLP_AVAILABLE else '⚠️ НЕТ'))
+    media_failures = media_failure_snapshot()
+    media_counts = media_failures.get('counts') or {}
+    if media_counts:
+        compact = ', '.join(
+            f'{html.escape(_MEDIA_FAILURE_LABELS.get(code, code))}: {count}'
+            for code, count in sorted(media_counts.items(), key=lambda row: (-row[1], row[0]))
+        )
+        lines.append(f'  ⚠️ Сбои с запуска: {compact[:700]}')
+        for row in (media_failures.get('recent') or [])[-3:]:
+            stamp = str(row.get('ts') or '')[11:19]
+            reason = _MEDIA_FAILURE_LABELS.get(str(row.get('code')), str(row.get('code') or '?'))
+            title = str(row.get('title') or row.get('source') or '?')[:55]
+            lines.append(f'     {html.escape(stamp)} · {html.escape(reason)} · '
+                         f'{html.escape(title)}')
+    else:
+        lines.append('  ✅ Медиасбоев с запуска не зафиксировано')
     lines.append('  🖼 Только с картинками: '
                  + ('ВКЛ' if settings.require_image else 'ВЫКЛ'))
     ok_channel, channel_note = await _check_channel_access(context.bot)
