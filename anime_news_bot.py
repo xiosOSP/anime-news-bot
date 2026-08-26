@@ -319,7 +319,7 @@ HEALTH_STORAGE_PROBE_CACHE_SEC = max(0.5, min(60.0, _env_float('HEALTH_STORAGE_P
 HEALTH_METRICS_TOKEN = _env('HEALTH_METRICS_TOKEN', '').strip()
 HEALTH_BIND_IS_PUBLIC = HEALTH_HOST not in ('127.0.0.1', 'localhost', '::1')
 LIFECYCLE_FILE = DATA_DIR / 'runtime_lifecycle.json'
-BUILD_TAG = 'media-reliability-stage19-20260823'
+BUILD_TAG = 'stability-polish-20260826'
 TG_CAPTION_LIMIT = 1024              # жёсткое ограничение Telegram для подписи под фото
 TG_TEXT_LIMIT = 4096                 # лимит обычного текстового сообщения
 # Внутренний лимит summary для режима КАНАЛА (одно сообщение фото+подпись).
@@ -419,10 +419,6 @@ ENTITY_MEMORY_FILE = DATA_DIR / 'entity_memory.json'
 PUBLISHED_STORIES_FILE = DATA_DIR / 'published_stories.json'
 STORY_REGISTRY_FILE = DATA_DIR / 'story_registry.json'
 SOURCE_YIELD_FILE = DATA_DIR / 'source_yield.json'
-# Доля общих якорей названия, при которой без предмета от модели считаем
-# сюжет тем же. 0.6 — компромисс: ловит перефразировки, но не склеивает
-# разные новости об одной франшизе.
-STORY_ANCHOR_IDENTITY_RATIO = max(0.4, min(1.0, _env_float('STORY_ANCHOR_IDENTITY_RATIO', 0.6)))
 STORY_REGISTRY_MAX = max(200, min(10000, _env_int('STORY_REGISTRY_MAX', 2500)))
 STORY_REGISTRY_TTL_DAYS = max(1, min(90, _env_int('STORY_REGISTRY_TTL_DAYS', 14)))
 REPLAY_BUFFER_FILE = DATA_DIR / 'replay_buffer.json'
@@ -1036,8 +1032,14 @@ _MEDIA_FAILURE_LABELS = {
 _media_failure_lock = threading.Lock()
 _media_failure_counts: dict[str, int] = {}
 MEDIA_FAILURES_KEEP = 20            # столько последних сбоев храним на диске
+MEDIA_FAILURES_WINDOW_DAYS = 7      # старые исправленные сбои не засоряют /health
 MEDIA_FAILURES_FILE = DATA_DIR / 'media_failures.json'
 _media_failures: deque[dict] = deque(maxlen=MEDIA_FAILURES_KEEP)
+_media_failure_period_start = datetime.now(timezone.utc).isoformat()
+_media_failure_generation = 0
+_media_failure_save_task: Optional[asyncio.Task] = None
+_media_failure_disk_lock = threading.Lock()
+_media_failure_persisted_generation = -1
 
 
 def _record_media_failure(news: dict, code: str, detail: str = '') -> None:
@@ -1053,19 +1055,36 @@ def _record_media_failure(news: dict, code: str, detail: str = '') -> None:
             return
         seen.append(stable_code)
         del seen[8:]
+    now = datetime.now(timezone.utc)
     row = {
-        'ts': datetime.now(timezone.utc).isoformat(),
+        'ts': now.isoformat(),
         'code': stable_code,
         'source': str(news.get('source') or '?')[:60],
         'title': str(news.get('title') or '')[:100],
         'detail': str(detail or '')[:160],
     }
+    global _media_failure_generation, _media_failure_period_start
     with _media_failure_lock:
+        try:
+            period_start = datetime.fromisoformat(_media_failure_period_start)
+            if period_start.tzinfo is None:
+                period_start = period_start.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            period_start = now
+        if period_start < now - timedelta(days=MEDIA_FAILURES_WINDOW_DAYS):
+            _media_failure_counts.clear()
+            _media_failures.clear()
+            _media_failure_period_start = now.isoformat()
         _media_failure_counts[stable_code] = _media_failure_counts.get(stable_code, 0) + 1
         _media_failures.append(row)
-        snapshot = {'counts': dict(_media_failure_counts),
-                    'recent': [dict(x) for x in _media_failures]}
-    _save_media_failures(snapshot)
+        _media_failure_generation += 1
+        snapshot = {
+            '_generation': _media_failure_generation,
+            'period_start': _media_failure_period_start,
+            'counts': dict(_media_failure_counts),
+            'recent': [dict(x) for x in _media_failures],
+        }
+    _schedule_media_failure_save(snapshot)
     metrics.inc('anime_bot_media_fallback_total', labels={'reason': stable_code})
     _event_log('media_fallback', **row)
 
@@ -1078,18 +1097,68 @@ def _save_media_failures(snapshot: dict) -> None:
     «медиасбоев не зафиксировано» даже когда видео стабильно не доходило.
     Диагностика без этого бесполезна.
     """
+    global _media_failure_persisted_generation
     try:
-        _atomic_write_json(MEDIA_FAILURES_FILE,
-                           {'schema_version': 1,
-                            'counts': snapshot.get('counts') or {},
-                            'recent': (snapshot.get('recent') or [])[-MEDIA_FAILURES_KEEP:]},
-                           indent=2)
-    except OSError as e:
+        generation = int(snapshot.get('_generation', 0))
+        with _media_failure_disk_lock:
+            # Фоновый executor может завершить старую запись после новой.
+            # Не даём устаревшему snapshot затереть свежую диагностику.
+            if generation < _media_failure_persisted_generation:
+                return
+            _atomic_write_json(MEDIA_FAILURES_FILE,
+                               {'schema_version': 1,
+                                'period_start': snapshot.get('period_start'),
+                                'counts': snapshot.get('counts') or {},
+                                'recent': (snapshot.get('recent') or [])[-MEDIA_FAILURES_KEEP:]},
+                               indent=2)
+            _media_failure_persisted_generation = generation
+    except (OSError, TypeError, ValueError) as e:
         logger.debug('Медиасбои: не удалось сохранить статистику: %s', e)
+
+
+async def _flush_media_failures_async() -> None:
+    """Coalesced disk flush вне event loop; новые события не теряются."""
+    global _media_failure_save_task
+    try:
+        while True:
+            # Один короткий debounce схлопывает серию fallback одного поста.
+            await asyncio.sleep(0.1)
+            with _media_failure_lock:
+                generation = _media_failure_generation
+                snapshot = {
+                    '_generation': generation,
+                    'period_start': _media_failure_period_start,
+                    'counts': dict(_media_failure_counts),
+                    'recent': [dict(x) for x in _media_failures],
+                }
+            await asyncio.to_thread(_save_media_failures, snapshot)
+            with _media_failure_lock:
+                if generation == _media_failure_generation:
+                    _media_failure_save_task = None
+                    return
+    finally:
+        # При отмене shutdown всё равно выполнит финальный синхронный snapshot.
+        with _media_failure_lock:
+            if _media_failure_save_task is asyncio.current_task():
+                _media_failure_save_task = None
+
+
+def _schedule_media_failure_save(snapshot: dict) -> None:
+    """В async runtime пишет с debounce; в sync-тестах — сразу."""
+    global _media_failure_save_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _save_media_failures(snapshot)
+        return
+    with _media_failure_lock:
+        if _media_failure_save_task is None or _media_failure_save_task.done():
+            _media_failure_save_task = loop.create_task(_flush_media_failures_async())
 
 
 def _load_media_failures() -> None:
     """Поднимает статистику прошлых процессов при старте."""
+    global _media_failure_period_start, _media_failure_generation
     try:
         if not MEDIA_FAILURES_FILE.exists():
             return
@@ -1098,9 +1167,30 @@ def _load_media_failures() -> None:
             return
         counts = raw.get('counts')
         recent = raw.get('recent')
-    except (OSError, ValueError, TypeError):
+        period_raw = str(raw.get('period_start') or '').strip()
+        if period_raw:
+            period_start = datetime.fromisoformat(period_raw)
+            if period_start.tzinfo is None:
+                period_start = period_start.replace(tzinfo=timezone.utc)
+            period_start = period_start.astimezone(timezone.utc)
+        else:
+            period_start = datetime.fromtimestamp(
+                MEDIA_FAILURES_FILE.stat().st_mtime, tz=timezone.utc)
+    except (OSError, ValueError, TypeError, OverflowError):
+        return
+    now = datetime.now(timezone.utc)
+    if period_start < now - timedelta(days=MEDIA_FAILURES_WINDOW_DAYS):
+        with _media_failure_lock:
+            _media_failure_counts.clear()
+            _media_failures.clear()
+            _media_failure_period_start = now.isoformat()
+            _media_failure_generation += 1
         return
     with _media_failure_lock:
+        # Идемпотентность: повторная инициализация не дублирует recent rows.
+        _media_failure_counts.clear()
+        _media_failures.clear()
+        _media_failure_period_start = period_start.isoformat()
         if isinstance(counts, dict):
             for code, value in counts.items():
                 if code in _MEDIA_FAILURE_LABELS:
@@ -1110,8 +1200,16 @@ def _load_media_failures() -> None:
                         continue
         if isinstance(recent, list):
             for row in recent[-MEDIA_FAILURES_KEEP:]:
-                if isinstance(row, dict):
-                    _media_failures.append(dict(row))
+                if not isinstance(row, dict) or row.get('code') not in _MEDIA_FAILURE_LABELS:
+                    continue
+                _media_failures.append({
+                    'ts': str(row.get('ts') or '')[:40],
+                    'code': str(row.get('code')),
+                    'source': str(row.get('source') or '?')[:60],
+                    'title': str(row.get('title') or '')[:100],
+                    'detail': str(row.get('detail') or '')[:160],
+                })
+        _media_failure_generation += 1
 
 
 def media_failure_snapshot() -> dict:
@@ -1122,9 +1220,29 @@ def media_failure_snapshot() -> dict:
     """
     with _media_failure_lock:
         return {
+            '_generation': _media_failure_generation,
+            'period_start': _media_failure_period_start,
             'counts': dict(_media_failure_counts),
             'recent': [dict(row) for row in _media_failures],
         }
+
+
+async def _flush_media_failures_on_shutdown() -> None:
+    """Дожидается debounce и сохраняет самый свежий snapshot перед выходом."""
+    with _media_failure_lock:
+        pending = _media_failure_save_task
+    if pending is not None and not pending.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(pending), timeout=3.0)
+        except asyncio.TimeoutError:
+            logger.warning('Медиасбои: фоновая запись не завершилась за 3 секунды')
+        except (OSError, RuntimeError, ValueError) as e:
+            logger.debug('Медиасбои: ошибка ожидания фоновой записи: %s', e)
+    # Generation + disk lock не дадут более старому executor snapshot затереть этот.
+    try:
+        await asyncio.to_thread(_save_media_failures, media_failure_snapshot())
+    except (OSError, RuntimeError, ValueError) as e:
+        logger.debug('Медиасбои: финальная запись не удалась: %s', e)
 
 
 def _refresh_runtime_metrics() -> None:
@@ -4146,28 +4264,51 @@ def _is_generic_anchor(word: str) -> bool:
                for base in _STORY_UPDATE_GENERIC if len(base) >= 4)
 
 
+def _story_identity_anchors(value) -> set[str]:
+    """Консервативное ядро названия для delivery-дедупа."""
+    title = value.get('title', '') if isinstance(value, dict) else str(value or '')
+
+    # В скобках источники часто добавляют альтернативное название
+    # ("Голубая шкатулка (Ao no Hako)"). Однословные и событийные уточнения
+    # сохраняем: (Remake) и (Final Trailer) могут быть самостоятельной новостью.
+    def strip_alias(match: re.Match) -> str:
+        inner = match.group(0)[1:-1]
+        words = re.findall(r'[A-Za-zА-Яа-яЁё]+', inner.casefold())
+        distinguishing = {
+            'remake', 'reboot', 'spinoff', 'final',
+            'ремейк', 'ребут', 'спинофф', 'финальный', 'финальная',
+        }
+        if (len(words) >= 2 and not _story_event_markers(inner)
+                and not (set(words) & distinguishing)):
+            return ' '
+        return match.group(0)
+
+    title = re.sub(r'\([^()]{1,80}\)', strip_alias, title)
+    return {
+        anchor for anchor in _story_update_anchor({'title': title})
+        if not _is_generic_anchor(anchor)
+        and _ordinal_word_value(anchor) is None
+        and anchor not in _STORY_IDENTITY_NOISE
+    }
+
+
 def _anchor_identity_match(news: dict, old_title: str,
                            new_markers: set, old_markers: set,
                            new_numbers: set, old_numbers: set) -> bool:
-    """Один ли это сюжет, если предмет новости от модели недоступен.
-
-    Условия намеренно жёсткие: совпадающий тип события (трейлер/постер/анонс),
-    совпадающие числа сезона и большая часть общих якорей названия. Без хотя бы
-    одного маркера события не срабатываем вовсе — иначе две разные новости про
-    одну франшизу склеились бы в одну.
-    """
+    """Один ли это сюжет, если предмет новости от модели недоступен."""
     if not new_markers or new_markers != old_markers:
         return False
     if new_numbers != old_numbers:
         return False
-    new_anchor = {a for a in _story_update_anchor(news) if not _is_generic_anchor(a)}
-    old_anchor = {a for a in _story_update_anchor({'title': old_title})
-                  if not _is_generic_anchor(a)}
+    new_anchor = _story_identity_anchors(news)
+    old_anchor = _story_identity_anchors(old_title)
     if len(new_anchor) < 2 or len(old_anchor) < 2:
         return False
-    shared = new_anchor & old_anchor
-    smaller = min(len(new_anchor), len(old_anchor))
-    return len(shared) >= 2 and len(shared) / smaller >= STORY_ANCHOR_IDENTITY_RATIO
+    # Только равные смысловые ядра. Сравнение по меньшему множеству считало
+    # Solo Leveling и Solo Leveling Ragnarok одним сюжетом, а обычный и
+    # финальный трейлер — одним событием. Лишний дубль безопаснее тихой потери
+    # самостоятельной новости.
+    return new_anchor == old_anchor
 
 
 class StoryRegistry:
@@ -4224,6 +4365,14 @@ class StoryRegistry:
         new_markers = _story_event_markers(news)
         old_markers = set(str(x) for x in (row.get('delivered_markers') or []))
         if new_markers and old_markers and new_markers != old_markers:
+            return False
+        new_identity = _story_identity_anchors(news)
+        old_identity = _story_identity_anchors(old_title)
+        # Строгое расширение ядра — обычно спин-офф, ремейк или новая стадия
+        # промокампании. Даже высокая строковая схожесть и одинаковый subject
+        # не дают права молча скрывать такую новость.
+        if (new_identity and old_identity
+                and (new_identity < old_identity or old_identity < new_identity)):
             return False
         similarity = _story_similarity(news, {'title': old_title})
         if similarity >= max(0.88, STORY_CLUSTER_SIMILARITY):
@@ -12308,26 +12457,41 @@ def _story_tokens(news_or_title) -> set[str]:
 # Русские источники пишут «второй сезон», английские и часть телеграм-каналов —
 # «2 сезон». Без этой таблицы одна и та же новость выглядела для дедупа разной:
 # у одной числа пустые, у другой — {'2'}, и схожесть падала ниже порога склейки.
-_ORDINAL_WORDS = {
+_RU_ORDINAL_STEMS = {
     'перв': '1', 'втор': '2', 'трет': '3', 'четверт': '4', 'пят': '5',
     'шест': '6', 'седьм': '7', 'восьм': '8', 'девят': '9', 'десят': '10',
+}
+_EN_ORDINAL_WORDS = {
     'first': '1', 'second': '2', 'third': '3', 'fourth': '4', 'fifth': '5',
     'sixth': '6', 'seventh': '7', 'eighth': '8', 'ninth': '9', 'tenth': '10',
 }
-_ORDINAL_RE = re.compile(r'[a-zA-Zа-яёА-ЯЁ]{3,12}')
+_RU_ORDINAL_SUFFIXES = {
+    'ый', 'ий', 'ой', 'ая', 'яя', 'ое', 'ее', 'ые', 'ие',
+    'ого', 'его', 'ей', 'ому', 'ему', 'ым', 'им', 'ом', 'ем',
+    'ую', 'юю', 'ых', 'их', 'ыми', 'ими',
+    'ья', 'ье', 'ьи', 'ьего', 'ьей', 'ьему', 'ьим', 'ьем', 'ью', 'ьих', 'ьими',
+}
+_ORDINAL_RE = re.compile(r'[a-zA-Zа-яёА-ЯЁ]+')
+
+
+def _ordinal_word_value(word: str) -> Optional[str]:
+    """Порядковое числительное целым словом, без совпадений вроде «пятно»."""
+    low = str(word or '').lower().replace('ё', 'е')
+    if low in _EN_ORDINAL_WORDS:
+        return _EN_ORDINAL_WORDS[low]
+    for stem, value in _RU_ORDINAL_STEMS.items():
+        if low.startswith(stem) and low[len(stem):] in _RU_ORDINAL_SUFFIXES:
+            return value
+    return None
 
 
 def _ordinal_numbers(title: str) -> set[str]:
     """Числа, записанные словом: «второго сезона» -> {'2'}."""
     out: set[str] = set()
     for word in _ORDINAL_RE.findall(title or ''):
-        low = word.lower().replace('ё', 'е')
-        for stem, value in _ORDINAL_WORDS.items():
-            # Только для форм самого числительного: «первый», «второму»,
-            # «third». Проверка по началу слова, чтобы не ловить «шестерёнка».
-            if low.startswith(stem) and len(low) - len(stem) <= 3:
-                out.add(value)
-                break
+        value = _ordinal_word_value(word)
+        if value is not None:
+            out.add(value)
     return out
 
 
@@ -12341,6 +12505,14 @@ _STORY_UPDATE_GENERIC = {
     'release', 'released', 'релиз', 'premiere', 'премьера', 'date', 'дата', 'new', 'новый',
     'новая', 'reveals', 'revealed', 'announces', 'announced', 'анонс', 'season', 'сезон',
     'project', 'проект', 'gets', 'получил', 'получила', 'официальный', 'official',
+}
+
+# Глаголы оформления заголовка не являются частью названия франшизы. Держим
+# список локальным для fallback identity, чтобы не менять общий clustering.
+_STORY_IDENTITY_NOISE = {
+    'выдали', 'показан', 'показана', 'показали', 'представлен', 'представлена',
+    'представили', 'опубликовали', 'опубликован', 'опубликована', 'вышел', 'вышла',
+    'released', 'revealed', 'unveiled', 'published', 'out',
 }
 
 
@@ -18332,7 +18504,8 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
             f'{html.escape(_MEDIA_FAILURE_LABELS.get(code, code))}: {count}'
             for code, count in sorted(media_counts.items(), key=lambda row: (-row[1], row[0]))
         )
-        lines.append(f'  ⚠️ Сбои с запуска: {compact[:700]}')
+        period_start = str(media_failures.get('period_start') or '')[:10] or '?'
+        lines.append(f'  ⚠️ Медиасбои с {period_start} (окно до 7 дней): {compact[:700]}')
         for row in (media_failures.get('recent') or [])[-3:]:
             stamp = str(row.get('ts') or '')[11:19]
             reason = _MEDIA_FAILURE_LABELS.get(str(row.get('code')), str(row.get('code') or '?'))
@@ -20442,6 +20615,7 @@ async def _post_shutdown(app: Application) -> None:
                 saver()
     except Exception as e:
         logger.warning(f'Не удалось сбросить runtime-хранилища: {e}')
+    await _flush_media_failures_on_shutdown()
     try:
         cleanup_video_dir(max_age_hours=0)
     except Exception:
