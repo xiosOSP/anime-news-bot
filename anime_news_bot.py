@@ -419,6 +419,10 @@ ENTITY_MEMORY_FILE = DATA_DIR / 'entity_memory.json'
 PUBLISHED_STORIES_FILE = DATA_DIR / 'published_stories.json'
 STORY_REGISTRY_FILE = DATA_DIR / 'story_registry.json'
 SOURCE_YIELD_FILE = DATA_DIR / 'source_yield.json'
+# Доля общих якорей названия, при которой без предмета от модели считаем
+# сюжет тем же. 0.6 — компромисс: ловит перефразировки, но не склеивает
+# разные новости об одной франшизе.
+STORY_ANCHOR_IDENTITY_RATIO = max(0.4, min(1.0, _env_float('STORY_ANCHOR_IDENTITY_RATIO', 0.6)))
 STORY_REGISTRY_MAX = max(200, min(10000, _env_int('STORY_REGISTRY_MAX', 2500)))
 STORY_REGISTRY_TTL_DAYS = max(1, min(90, _env_int('STORY_REGISTRY_TTL_DAYS', 14)))
 REPLAY_BUFFER_FILE = DATA_DIR / 'replay_buffer.json'
@@ -1031,7 +1035,9 @@ _MEDIA_FAILURE_LABELS = {
 }
 _media_failure_lock = threading.Lock()
 _media_failure_counts: dict[str, int] = {}
-_media_failures: deque[dict] = deque(maxlen=10)
+MEDIA_FAILURES_KEEP = 20            # столько последних сбоев храним на диске
+MEDIA_FAILURES_FILE = DATA_DIR / 'media_failures.json'
+_media_failures: deque[dict] = deque(maxlen=MEDIA_FAILURES_KEEP)
 
 
 def _record_media_failure(news: dict, code: str, detail: str = '') -> None:
@@ -1057,12 +1063,63 @@ def _record_media_failure(news: dict, code: str, detail: str = '') -> None:
     with _media_failure_lock:
         _media_failure_counts[stable_code] = _media_failure_counts.get(stable_code, 0) + 1
         _media_failures.append(row)
+        snapshot = {'counts': dict(_media_failure_counts),
+                    'recent': [dict(x) for x in _media_failures]}
+    _save_media_failures(snapshot)
     metrics.inc('anime_bot_media_fallback_total', labels={'reason': stable_code})
     _event_log('media_fallback', **row)
 
 
+def _save_media_failures(snapshot: dict) -> None:
+    """Кладёт статистику на диск: в памяти она не переживает перезапуск.
+
+    Процесс перезапускается платформой каждые ~18 минут, поэтому счётчики,
+    жившие только в памяти, до /health не доживали: раздел показывал
+    «медиасбоев не зафиксировано» даже когда видео стабильно не доходило.
+    Диагностика без этого бесполезна.
+    """
+    try:
+        _atomic_write_json(MEDIA_FAILURES_FILE,
+                           {'schema_version': 1,
+                            'counts': snapshot.get('counts') or {},
+                            'recent': (snapshot.get('recent') or [])[-MEDIA_FAILURES_KEEP:]},
+                           indent=2)
+    except OSError as e:
+        logger.debug('Медиасбои: не удалось сохранить статистику: %s', e)
+
+
+def _load_media_failures() -> None:
+    """Поднимает статистику прошлых процессов при старте."""
+    try:
+        if not MEDIA_FAILURES_FILE.exists():
+            return
+        raw = json.loads(MEDIA_FAILURES_FILE.read_text(encoding='utf-8'))
+        if not isinstance(raw, dict):
+            return
+        counts = raw.get('counts')
+        recent = raw.get('recent')
+    except (OSError, ValueError, TypeError):
+        return
+    with _media_failure_lock:
+        if isinstance(counts, dict):
+            for code, value in counts.items():
+                if code in _MEDIA_FAILURE_LABELS:
+                    try:
+                        _media_failure_counts[str(code)] = max(0, int(value))
+                    except (TypeError, ValueError):
+                        continue
+        if isinstance(recent, list):
+            for row in recent[-MEDIA_FAILURES_KEEP:]:
+                if isinstance(row, dict):
+                    _media_failures.append(dict(row))
+
+
 def media_failure_snapshot() -> dict:
-    """Потокобезопасный компактный снимок причин медиасбоев текущего процесса."""
+    """Потокобезопасный компактный снимок причин медиасбоев.
+
+    Данные накапливаются между перезапусками процесса, иначе при текущем
+    режиме рестартов раздел в /health всегда пуст.
+    """
     with _media_failure_lock:
         return {
             'counts': dict(_media_failure_counts),
@@ -4075,6 +4132,44 @@ class SourceYieldStore:
         return sorted(out,key=lambda x:(-x['useful_yield'],-x['unique_stories'],x['source'].lower()))
 
 
+def _is_generic_anchor(word: str) -> bool:
+    """Служебное ли это слово вроде «сезон», «трейлер», «аниме».
+
+    Проверка по началу слова: в русском одно и то же слово приходит в разных
+    падежах — «сезон», «сезона», «сезону». Точное сравнение их не связывало, и
+    падежные формы засоряли счёт общих якорей, мешая опознать один сюжет.
+    """
+    low = str(word or '').lower().replace('ё', 'е')
+    if low in _STORY_UPDATE_GENERIC:
+        return True
+    return any(low.startswith(base) and len(low) - len(base) <= 3
+               for base in _STORY_UPDATE_GENERIC if len(base) >= 4)
+
+
+def _anchor_identity_match(news: dict, old_title: str,
+                           new_markers: set, old_markers: set,
+                           new_numbers: set, old_numbers: set) -> bool:
+    """Один ли это сюжет, если предмет новости от модели недоступен.
+
+    Условия намеренно жёсткие: совпадающий тип события (трейлер/постер/анонс),
+    совпадающие числа сезона и большая часть общих якорей названия. Без хотя бы
+    одного маркера события не срабатываем вовсе — иначе две разные новости про
+    одну франшизу склеились бы в одну.
+    """
+    if not new_markers or new_markers != old_markers:
+        return False
+    if new_numbers != old_numbers:
+        return False
+    new_anchor = {a for a in _story_update_anchor(news) if not _is_generic_anchor(a)}
+    old_anchor = {a for a in _story_update_anchor({'title': old_title})
+                  if not _is_generic_anchor(a)}
+    if len(new_anchor) < 2 or len(old_anchor) < 2:
+        return False
+    shared = new_anchor & old_anchor
+    smaller = min(len(new_anchor), len(old_anchor))
+    return len(shared) >= 2 and len(shared) / smaller >= STORY_ANCHOR_IDENTITY_RATIO
+
+
 class StoryRegistry:
     """Cross-cycle evidence memory for stories before publication."""
     def __init__(self, path: Path):
@@ -4135,11 +4230,19 @@ class StoryRegistry:
             return True
         new_subject = EntityMemory._key(news.get('_llm_subject') or '')
         old_subject = EntityMemory._key(row.get('delivered_subject') or '')
-        return bool(
-            new_subject and old_subject and new_subject == old_subject
-            and new_markers == old_markers
-            and (not new_numbers or not old_numbers or new_numbers == old_numbers)
-        )
+        if new_subject and old_subject:
+            return bool(
+                new_subject == old_subject
+                and new_markers == old_markers
+                and (not new_numbers or not old_numbers or new_numbers == old_numbers)
+            )
+        # Предмет новости проставляет модель. Когда она в лимите или выключена,
+        # он пустой — и раньше дедуп доставленного просто переставал работать:
+        # один и тот же трейлер приходил из нескольких источников и попадал в
+        # ветку по несколько раз. Опираемся на якоря названия, но строго: тот же
+        # тип события, те же числа и заметное пересечение самих якорей.
+        return _anchor_identity_match(news, old_title, new_markers, old_markers,
+                                      new_numbers, old_numbers)
 
     def observe(self, news:dict, sources:list[str], links:list[str])->dict:
         now=datetime.now(timezone.utc).isoformat(); sources=list(dict.fromkeys(str(x or 'unknown') for x in sources))
@@ -12202,9 +12305,35 @@ def _story_tokens(news_or_title) -> set[str]:
     return {t for t in tokens if len(t) >= 3 and t not in _STORY_STOPWORDS}
 
 
+# Русские источники пишут «второй сезон», английские и часть телеграм-каналов —
+# «2 сезон». Без этой таблицы одна и та же новость выглядела для дедупа разной:
+# у одной числа пустые, у другой — {'2'}, и схожесть падала ниже порога склейки.
+_ORDINAL_WORDS = {
+    'перв': '1', 'втор': '2', 'трет': '3', 'четверт': '4', 'пят': '5',
+    'шест': '6', 'седьм': '7', 'восьм': '8', 'девят': '9', 'десят': '10',
+    'first': '1', 'second': '2', 'third': '3', 'fourth': '4', 'fifth': '5',
+    'sixth': '6', 'seventh': '7', 'eighth': '8', 'ninth': '9', 'tenth': '10',
+}
+_ORDINAL_RE = re.compile(r'[a-zA-Zа-яёА-ЯЁ]{3,12}')
+
+
+def _ordinal_numbers(title: str) -> set[str]:
+    """Числа, записанные словом: «второго сезона» -> {'2'}."""
+    out: set[str] = set()
+    for word in _ORDINAL_RE.findall(title or ''):
+        low = word.lower().replace('ё', 'е')
+        for stem, value in _ORDINAL_WORDS.items():
+            # Только для форм самого числительного: «первый», «второму»,
+            # «third». Проверка по началу слова, чтобы не ловить «шестерёнка».
+            if low.startswith(stem) and len(low) - len(stem) <= 3:
+                out.add(value)
+                break
+    return out
+
+
 def _story_numbers(news_or_title) -> set[str]:
     title = news_or_title.get('title', '') if isinstance(news_or_title, dict) else str(news_or_title or '')
-    return set(re.findall(r'(?<!\w)\d{1,4}(?!\w)', title))
+    return set(re.findall(r'(?<!\w)\d{1,4}(?!\w)', title)) | _ordinal_numbers(title)
 
 
 _STORY_UPDATE_GENERIC = {
@@ -20464,6 +20593,9 @@ def _init_globals() -> None:
         error_fingerprints = ErrorFingerprintStore(ERROR_FINGERPRINT_FILE)
     if llm_budget is None:
         llm_budget = LLMBudgetStore(LLM_BUDGET_FILE)
+    # Статистика медиасбоев копится между процессами: при перезапусках раз в
+    # ~18 минут счётчики в памяти до /health просто не доживают.
+    _load_media_failures()
     if image_hashes is None:
         image_hashes = ImageHashes(IMAGE_HASHES_FILE)
         logger.info(f"Отпечатков картинок в базе: {len(image_hashes)}"
