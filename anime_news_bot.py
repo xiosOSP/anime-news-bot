@@ -190,6 +190,43 @@ def _bounded_cache_put(cache: dict, key, value, max_items: int) -> None:
     cache[key] = value
 
 
+def _cache_bytes_used(cache: dict) -> int:
+    """Суммарный объём байтовых значений кеша. Не-байтовые считаем невесомыми."""
+    total = 0
+    for value in cache.values():
+        if isinstance(value, (bytes, bytearray)):
+            total += len(value)
+    return total
+
+
+def _bounded_bytes_cache_put(cache: dict, key, value, max_items: int, max_bytes: int) -> None:
+    """Bounded-кеш с потолком и по числу записей, и по суммарному объёму.
+
+    Ограничения по одному лишь числу записей мало, когда значения — сырые
+    байты картинок. Сорок записей при потолке загрузки в 9 МБ дают до 360 МБ
+    в памяти: на маленьком контейнере это верный OOM или SIGTERM от платформы.
+    Байтовый бюджет держит кеш в предсказуемых рамках независимо от того,
+    насколько тяжёлые файлы попались в этом цикле.
+    """
+    if max_items <= 0 or max_bytes <= 0:
+        return
+    size = len(value) if isinstance(value, (bytes, bytearray)) else 0
+    if size > max_bytes:
+        # Один файл больше всего бюджета: кладём отрицательный результат, чтобы
+        # не качать его повторно, но сами байты в памяти не держим.
+        _bounded_cache_put(cache, key, None, max_items)
+        return
+    cache.pop(key, None)
+    used = _cache_bytes_used(cache)
+    # dict сохраняет порядок вставки, поэтому первый ключ — самый старый.
+    while cache and (len(cache) >= max_items or used + size > max_bytes):
+        oldest = next(iter(cache))
+        dropped = cache.pop(oldest)
+        if isinstance(dropped, (bytes, bytearray)):
+            used -= len(dropped)
+    cache[key] = value
+
+
 def _atomic_write_json(path: Path, data, *, indent: Optional[int] = None) -> None:
     """Атомарно сохраняет JSON рядом с целевым файлом.
 
@@ -11152,6 +11189,12 @@ MIN_GOOD_IMAGE_PX = 500         # ниже этой ширины кадр выг
 
 
 IMAGE_BYTES_CACHE_MAX = 40      # столько скачанных картинок держим в памяти
+# Потолок по числу записей сам по себе ничего не гарантирует: при лимите
+# загрузки в 9 МБ сорок картинок — это до 360 МБ в памяти, что на скромном
+# контейнере заканчивается убийством процесса платформой. Реальный потолок
+# кеша задаёт бюджет в мегабайтах.
+IMAGE_BYTES_CACHE_MAX_MB = max(4, min(512, _env_int('IMAGE_BYTES_CACHE_MAX_MB', 48)))
+IMAGE_BYTES_CACHE_MAX_BYTES = IMAGE_BYTES_CACHE_MAX_MB * 1024 * 1024
 _image_bytes_cache: dict = {}
 
 
@@ -11166,7 +11209,8 @@ def _cached_image_bytes(url: str) -> Optional[bytes]:
     if url in _image_bytes_cache:
         return _image_bytes_cache[url]
     data = _download_image_bytes(url)
-    _bounded_cache_put(_image_bytes_cache, url, data, IMAGE_BYTES_CACHE_MAX)
+    _bounded_bytes_cache_put(_image_bytes_cache, url, data,
+                             IMAGE_BYTES_CACHE_MAX, IMAGE_BYTES_CACHE_MAX_BYTES)
     return data
 
 

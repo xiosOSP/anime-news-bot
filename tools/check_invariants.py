@@ -330,6 +330,35 @@ def _check_dashboard_closed_without_token(bot) -> tuple[bool, str]:
     return True, 'без DASHBOARD_TOKEN доступ закрыт'
 
 
+def _check_image_cache_is_capped_in_bytes(bot) -> tuple[bool, str]:
+    """Кеш картинок должен ограничиваться объёмом, а не числом записей.
+
+    Сорок записей при потолке загрузки в 9 МБ — это до 360 МБ в памяти.
+    Именно так процесс на скромном контейнере получает SIGTERM от платформы
+    на ровном месте, хотя «утечки» в обычном смысле нет.
+    """
+    cache: dict = {}
+    budget = bot.IMAGE_BYTES_CACHE_MAX_BYTES
+    for i in range(bot.IMAGE_BYTES_CACHE_MAX * 5):
+        bot._bounded_bytes_cache_put(cache, f'https://example.com/{i}.jpg',
+                                     b'x' * bot.HTTP_IMAGE_MAX_BYTES,
+                                     bot.IMAGE_BYTES_CACHE_MAX, budget)
+    used = bot._cache_bytes_used(cache)
+    if used > budget:
+        return False, f'кеш занял {used} байт при бюджете {budget}'
+    if len(cache) > bot.IMAGE_BYTES_CACHE_MAX:
+        return False, f'записей {len(cache)} при потолке {bot.IMAGE_BYTES_CACHE_MAX}'
+    worst = bot.IMAGE_BYTES_CACHE_MAX * bot.HTTP_IMAGE_MAX_BYTES
+    if budget >= worst:
+        return False, 'бюджет не ограничивает худший случай — потолок бесполезен'
+    # Неудачная загрузка должна запоминаться, иначе битую картинку качаем снова.
+    fresh: dict = {}
+    bot._bounded_bytes_cache_put(fresh, 'fail', None, bot.IMAGE_BYTES_CACHE_MAX, budget)
+    if 'fail' not in fresh:
+        return False, 'отрицательный результат не кешируется'
+    return True, f'кеш ограничен {budget // (1024 * 1024)} МБ вместо {worst // (1024 * 1024)} МБ'
+
+
 def _check_manifest_describes_reality() -> tuple[bool, str]:
     """Опись не должна числить файлы, которых в репозитории нет.
 
@@ -395,6 +424,7 @@ def checks(bot, tree) -> list[tuple[str, bool, str]]:
     add('метки метрик обрезаны по длине', _check_metric_labels_are_capped(bot))
     add('дашборд закрыт без токена', _check_dashboard_closed_without_token(bot))
     add('claim в ledger эксклюзивен', _check_ledger_claim_is_exclusive(bot))
+    add('кеш картинок ограничен по объёму', _check_image_cache_is_capped_in_bytes(bot))
     add('манифест описывает существующие файлы', _check_manifest_describes_reality())
     return rows
 
