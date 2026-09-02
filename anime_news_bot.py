@@ -282,10 +282,16 @@ except OSError as e:
         raise SystemExit(f"DATA_DIR недоступен: {DATA_DIR}: {e}") from e
     DATA_DIR = Path('.')
 
-CHECK_INTERVAL_SEC = 1800
+# Ёмкостные потолки вынесены в env специально: раньше их приходилось править
+# в коде, поэтому переезд на другой тариф каждый раз означал патч на 21 тысячу
+# строк. Значения по умолчанию — прежние, так что без переменных поведение
+# не меняется; тариф пошире поднимается одними переменными окружения.
+CHECK_INTERVAL_SEC = max(300, _env_int('CHECK_INTERVAL_SEC', 1800))
 SENT_LINKS_FILE = DATA_DIR / 'sent_links.json'
-SENT_LINKS_MAX = 5000
-SENT_LINKS_TRIM_TO = 3000
+SENT_LINKS_MAX = max(500, _env_int('SENT_LINKS_MAX', 5000))
+# Подрезаем всегда ниже потолка, иначе обрезка не освобождает место.
+SENT_LINKS_TRIM_TO = max(200, min(SENT_LINKS_MAX - 100,
+    _env_int('SENT_LINKS_TRIM_TO', SENT_LINKS_MAX * 3 // 5)))
 HTTP_TIMEOUT = 15
 HTTP_MAX_REDIRECTS = 5
 HTTP_IMAGE_MAX_BYTES = 9 * 1024 * 1024
@@ -332,9 +338,12 @@ SUMMARY_MAX_CHARS_THREAD = 3500
 # Для канала хватает 1500, но для ветки нужен длинный текст — берём максимум.
 TRANSLATION_INPUT_LIMIT = 1500
 TRANSLATION_INPUT_LIMIT_THREAD = 4000
-NEWS_PER_SOURCE = 5
+NEWS_PER_SOURCE = max(1, min(50, _env_int('NEWS_PER_SOURCE', 5)))
 PAUSE_BETWEEN_SENDS = 2.0
-SOURCE_FETCH_CONCURRENCY = 5          # столько источников качаем одновременно
+# Сбор упирается в сеть, а не в ядра: потоки почти всё время ждут ответа и
+# держат GIL отпущенным. Потолок в 32 — защита от того, чтобы десятки
+# одновременных ответов по 5 МБ не встретились в памяти разом.
+SOURCE_FETCH_CONCURRENCY = max(1, min(32, _env_int('SOURCE_FETCH_CONCURRENCY', 5)))
 SOURCE_FETCH_WALL_TIMEOUT = max(10, _env_int('SOURCE_FETCH_WALL_TIMEOUT', 60))
 
 # --- Quality / Observability feature flags ---
@@ -745,8 +754,8 @@ ANILIST_NEGATIVE_TTL_DAYS = 7        # отрицательные («не най
 
 # --- Логирование ---
 LOG_FILE = DATA_DIR / 'bot.log'
-LOG_MAX_BYTES = 5 * 1024 * 1024      # 5 МБ на файл
-LOG_BACKUP_COUNT = 3                 # храним 3 ротированных файла (~20 МБ всего)
+LOG_MAX_BYTES = max(1, _env_int('LOG_MAX_MB', 5)) * 1024 * 1024
+LOG_BACKUP_COUNT = max(1, min(20, _env_int('LOG_BACKUP_COUNT', 3)))
 LOG_TAIL_LINES = 50                  # сколько последних строк показывает /logs
 
 # --- HTTP retry ---
@@ -781,11 +790,24 @@ def _video_format() -> str:
 
 
 VIDEO_FORMAT = _video_format()
-VIDEO_DOWNLOAD_DIR = Path(tempfile.gettempdir()) / 'anime_news_bot_videos'
-VIDEO_DOWNLOAD_DIR.mkdir(exist_ok=True)
+# По умолчанию — системный temp, но на части хостингов /tmp это tmpfs, то есть
+# та же оперативная память: ролик на 48 МБ там съедает RAM, а не диск. Если у
+# тарифа диск заметно щедрее памяти, VIDEO_DIR стоит указать на том же томе,
+# что и DATA_DIR.
+_video_dir_env = (os.getenv('VIDEO_DIR') or '').strip()
+VIDEO_DOWNLOAD_DIR = Path(_video_dir_env or (Path(tempfile.gettempdir()) / 'anime_news_bot_videos'))
+try:
+    VIDEO_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+except OSError as _e:
+    if _video_dir_env:
+        raise SystemExit(f"VIDEO_DIR недоступен: {VIDEO_DOWNLOAD_DIR}: {_e}") from _e
+    VIDEO_DOWNLOAD_DIR = Path(tempfile.gettempdir()) / 'anime_news_bot_videos'
+    VIDEO_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Медиа ---
-MAX_PHOTOS_PER_POST = 6               # сколько фото максимум собирать в media group
+# Потолок 10 — это лимит Telegram на media group, а не сервера: выше не
+# поднимется даже на самом мощном тарифе.
+MAX_PHOTOS_PER_POST = max(1, min(10, _env_int('MAX_PHOTOS_PER_POST', 6)))
 TG_VIDEO_MAX_SECONDS = 300            # видео из TG-каналов: до 5 минут
 TG_VIDEO_MAX_MB = 48                  # Bot API не принимает файлы больше ~50 МБ
 TG_FLOOD_MAX_RETRIES = 3              # сколько RetryAfter подряд терпим за один вызов
@@ -2053,15 +2075,19 @@ translator: Optional[GoogleTranslator] = None
 
 # ============== ОЧЕРЕДЬ ПОСТОВ ==============
 QUEUE_FILE = DATA_DIR / 'post_queue.json'
-QUEUE_MAX_SIZE = 30                  # больше — старые вытесняются
+QUEUE_MAX_SIZE = max(5, min(500, _env_int('QUEUE_MAX_SIZE', 30)))   # больше — старые вытесняются
 QUEUE_POST_TTL_HOURS = 24            # пост старше — выбрасывается без отправки
 QUEUE_MAX_SEND_RETRIES = 4           # после N технических ошибок пост не блокирует очередь вечно
 # Stage 4 backpressure: когда канал физически не успевает разгребать очередь,
 # не надо каждый тик churn-ить десятки слабых кандидатов через bounded queue.
+# Пороги задаются долей от очереди, а не абсолютным числом. Иначе поднятый
+# QUEUE_MAX_SIZE не давал бы ничего: backpressure продолжал бы срабатывать на
+# прежних 20, и вся добавленная ёмкость просто не использовалась бы.
+# При QUEUE_MAX_SIZE = 30 доли дают ровно прежние 20 и 27.
 BACKPRESSURE_SOFT_QUEUE = max(1, min(QUEUE_MAX_SIZE - 2,
-    _env_int('BACKPRESSURE_SOFT_QUEUE', 20)))
+    _env_int('BACKPRESSURE_SOFT_QUEUE', QUEUE_MAX_SIZE * 2 // 3)))
 BACKPRESSURE_HARD_QUEUE = max(BACKPRESSURE_SOFT_QUEUE + 1, min(QUEUE_MAX_SIZE,
-    _env_int('BACKPRESSURE_HARD_QUEUE', 27)))
+    _env_int('BACKPRESSURE_HARD_QUEUE', QUEUE_MAX_SIZE * 9 // 10)))
 BACKPRESSURE_SOFT_NEW = max(1, min(QUEUE_MAX_SIZE, _env_int('BACKPRESSURE_SOFT_NEW', 6)))
 BACKPRESSURE_HARD_NEW = max(1, min(BACKPRESSURE_SOFT_NEW,
     _env_int('BACKPRESSURE_HARD_NEW', 2)))
