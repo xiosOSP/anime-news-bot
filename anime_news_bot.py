@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - Windows fallback: polling сам ко�
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
@@ -1403,8 +1404,14 @@ def normalize_url(url: str) -> str:
         return raw
 
 
+@lru_cache(maxsize=8192)
 def normalize_title(title: str) -> str:
-    """Нормализует заголовок для сравнения: убираем регистр, пробелы, пунктуацию."""
+    """Нормализует заголовок для сравнения: убираем регистр, пробелы, пунктуацию.
+
+    Кеш здесь не украшение: один и тот же заголовок нормализуется десятки раз за
+    цикл (дедуп ledger, clustering, story registry), а regex по строке — самая
+    заметная часть этой работы. Заголовки короткие, потолок кеша ограничен.
+    """
     if not title:
         return ''
     return re.sub(r'[^\w]+', '', title, flags=re.UNICODE).lower()
@@ -1605,10 +1612,11 @@ def _read_limited_response(response, max_bytes: int) -> Optional[bytes]:
                 if total > max_bytes:
                     return None
                 chunks.append(chunk)
-            if chunks:
-                return b''.join(chunks)
-            data = getattr(response, 'content', b'') or b''
-            return data if len(data) <= max_bytes else None
+            # Пустое тело — это b'', а не сбой. Раньше здесь читался
+            # ``response.content``, но у requests он после iter_content уже
+            # помечен consumed и бросает RuntimeError: корректный 204/пустой
+            # ответ превращался в None, то есть в «не смог прочитать».
+            return b''.join(chunks)
         except Exception as e:
             logger.debug(f"Потоковое чтение HTTP-ответа прервано: {type(e).__name__}: {e}")
             return None
@@ -1661,6 +1669,7 @@ def http_post_with_retry(
             last_exc = e
             logger.debug(f"Сетевая ошибка ({type(e).__name__}) для POST {url}, попытка {attempt + 1}")
         except requests.RequestException as e:
+            logger.debug(f"Не-ретрайная ошибка для POST {url}: {e}")
             return None
 
         if attempt < HTTP_RETRY_ATTEMPTS - 1:
@@ -1841,6 +1850,13 @@ class SentLinksStore:
         norm = normalize_title(title)
         tokens = _title_tokens(title)
         now = time.time()
+        # Один matcher на весь проход: SequenceMatcher строит обратный индекс по
+        # второй строке и переиспользует его, пока меняется только первая. Раньше
+        # на каждую из 500 запомненных строк создавался новый объект и индекс для
+        # `norm` собирался заново — ровно та же работа 500 раз.
+        matcher = difflib.SequenceMatcher(None)
+        matcher.set_seq2(norm)
+        norm_len = len(norm)
         for ts, old_norm, old_tokens in self._recent_titles:
             if now - ts > window_hours * 3600:
                 continue
@@ -1848,9 +1864,11 @@ class SentLinksStore:
                 union = len(tokens | old_tokens)
                 if union and len(tokens & old_tokens) / union >= 0.6:
                     return True
-            if len(norm) >= 16 and len(old_norm) >= 16:
-                m = difflib.SequenceMatcher(None, norm, old_norm).find_longest_match(
-                    0, len(norm), 0, len(old_norm))
+            if norm_len >= 16 and len(old_norm) >= 16:
+                # Длина общей подстроки симметрична, поэтому порядок аргументов
+                # можно поменять местами без изменения результата.
+                matcher.set_seq1(old_norm)
+                m = matcher.find_longest_match(0, len(old_norm), 0, norm_len)
                 if m.size >= 16:
                     return True
         return False
@@ -4867,9 +4885,16 @@ def clean_html(text: str) -> str:
 
 
 def smart_truncate(text: str, limit: int) -> str:
+    """Обрезает текст по границе слова, укладываясь РОВНО в limit символов.
+
+    Многоточие — тоже символ: раньше ``text[:limit] + '…'`` давало limit + 1 и
+    подпись, посчитанная впритык под лимит Telegram, отвергалась Bot API.
+    """
     if not text or len(text) <= limit:
         return text
-    cut = text[:limit].rsplit(' ', 1)[0]
+    if limit <= 1:
+        return '…'[:max(0, limit)]
+    cut = text[:limit - 1].rsplit(' ', 1)[0]
     # Не оставляем "хвост" в виде запятой/тире
     cut = cut.rstrip(',—-:;')
     return cut + '…'
@@ -8779,7 +8804,6 @@ async def _send_post_fallback(
     try:
         sent_first = False
         if has_inline_video:
-            video_url = news.get('video')
             if video_file:
                 video_thumb_kw = await _video_thumbnail_kwargs_async(video_file)
                 with open(video_file, 'rb') as f:
@@ -12448,10 +12472,23 @@ def source_reputation_snapshot() -> list[dict]:
     return sorted(rows, key=lambda row: (-row['score'], row['source'].lower()))
 
 
-def _story_tokens(news_or_title) -> set[str]:
-    title = news_or_title.get('title', '') if isinstance(news_or_title, dict) else str(news_or_title or '')
+def _story_title_of(news_or_title) -> str:
+    """Заголовок из news-словаря либо готовая строка — единая точка входа."""
+    if isinstance(news_or_title, dict):
+        return str(news_or_title.get('title', '') or '')
+    return str(news_or_title or '')
+
+
+@lru_cache(maxsize=4096)
+def _story_tokens_cached(title: str) -> frozenset:
     tokens = re.findall(r'[A-Za-zА-Яа-яЁё0-9]+', title.lower())
-    return {t for t in tokens if len(t) >= 3 and t not in _STORY_STOPWORDS}
+    return frozenset(t for t in tokens if len(t) >= 3 and t not in _STORY_STOPWORDS)
+
+
+def _story_tokens(news_or_title) -> set[str]:
+    # Clustering сравнивает каждого кандидата с сотней представителей кластеров,
+    # и без кеша токены одного и того же заголовка пересчитывались сотни раз.
+    return set(_story_tokens_cached(_story_title_of(news_or_title)))
 
 
 # Русские источники пишут «второй сезон», английские и часть телеграм-каналов —
@@ -12495,9 +12532,13 @@ def _ordinal_numbers(title: str) -> set[str]:
     return out
 
 
+@lru_cache(maxsize=4096)
+def _story_numbers_cached(title: str) -> frozenset:
+    return frozenset(re.findall(r'(?<!\w)\d{1,4}(?!\w)', title)) | frozenset(_ordinal_numbers(title))
+
+
 def _story_numbers(news_or_title) -> set[str]:
-    title = news_or_title.get('title', '') if isinstance(news_or_title, dict) else str(news_or_title or '')
-    return set(re.findall(r'(?<!\w)\d{1,4}(?!\w)', title)) | _ordinal_numbers(title)
+    return set(_story_numbers_cached(_story_title_of(news_or_title)))
 
 
 _STORY_UPDATE_GENERIC = {
@@ -12523,10 +12564,11 @@ def _story_update_anchor(news_or_title) -> set[str]:
 
 def _story_similarity(a: dict, b: dict) -> float:
     """Консервативная близость двух заголовков для cross-source clustering."""
-    ta, tb = _story_tokens(a), _story_tokens(b)
+    title_a, title_b = _story_title_of(a), _story_title_of(b)
+    ta, tb = _story_tokens_cached(title_a), _story_tokens_cached(title_b)
     if not ta or not tb:
         return 0.0
-    nums_a, nums_b = _story_numbers(a), _story_numbers(b)
+    nums_a, nums_b = _story_numbers_cached(title_a), _story_numbers_cached(title_b)
     # Season 2 и Season 3 нельзя сливать даже при почти одинаковом шаблоне заголовка.
     if nums_a and nums_b and nums_a != nums_b:
         return 0.0
@@ -12536,8 +12578,14 @@ def _story_similarity(a: dict, b: dict) -> float:
     union = ta | tb
     jaccard = len(common) / max(1, len(union))
     containment = len(common) / max(1, min(len(ta), len(tb)))
-    seq = difflib.SequenceMatcher(None, normalize_title(a.get('title', '')),
-                                  normalize_title(b.get('title', ''))).ratio()
+    # SequenceMatcher — самая дорогая часть цикла сборки (квадратичен по длине
+    # заголовка и вызывается для каждой пары кандидат/кластер). Считаем его
+    # только когда он ещё способен изменить ответ: даже при seq == 1.0 итог не
+    # превысит jaccard, если 0.55 * containment + 0.45 <= jaccard.
+    if 0.55 * containment + 0.45 <= jaccard:
+        return jaccard
+    seq = difflib.SequenceMatcher(None, normalize_title(title_a),
+                                  normalize_title(title_b)).ratio()
     return max(jaccard, 0.55 * containment + 0.45 * seq)
 
 
@@ -13053,7 +13101,17 @@ _source_worker_names: set[str] = set()
 _source_worker_since: dict[str, float] = {}   # имя -> момент захвата слота
 
 
-class SourceWorkerBusy(RuntimeError):
+class SourceWorkerUnavailable(RuntimeError):
+    """Слот под сбор не выдан по нашей вине, а не из-за источника.
+
+    Зависший поток прошлого цикла и переполненный пул — это наши внутренние
+    проблемы. Источник за них отвечать не должен: hard-ошибка открыла бы ему
+    circuit breaker, а накопленные ``fails`` + незакрытый ``silent_since``
+    рано или поздно выключили бы совершенно здоровый сайт совсем.
+    """
+
+
+class SourceWorkerBusy(SourceWorkerUnavailable):
     """Предыдущий сбор этого же источника ещё не завершился."""
 
 
@@ -13123,10 +13181,10 @@ async def _run_source_collector_bounded(name: str, collector, timeout: float):
             # начисляем, чтобы breaker не наказал сайт за наше же зависание.
             metrics.inc('anime_bot_source_worker_busy_total', labels={'source': str(name)})
             logger.warning('Источник %s пропущен: предыдущий сбор ещё не завершился', name)
-            raise TimeoutError(f'previous collector for {name} still running') from None
+            raise SourceWorkerBusy(f'previous collector for {name} still running') from None
         left = deadline - time.monotonic()
         if left <= 0:
-            raise TimeoutError('source worker pool saturated by unfinished collectors')
+            raise SourceWorkerUnavailable('source worker pool saturated by unfinished collectors')
         await asyncio.sleep(min(0.05, left))
 
     fut = loop.create_future()
@@ -13230,7 +13288,8 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
                 if settings.require_image and not item.get('images'):
                     no_image_skipped += 1
                     continue
-                seen_urls.add(norm_url)
+                if norm_url:
+                    seen_urls.add(norm_url)
                 if norm_title:
                     seen_titles.setdefault(norm_title, name)
                 unique_items.append(item)
@@ -13264,6 +13323,16 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
             if feature_enabled('source_yield') and source_yield is not None:
                 await asyncio.to_thread(source_yield.record_fetch, name, raw=len(items), fresh=len(unique_items),
                                         duplicates=duplicate_skipped, no_image=no_image_skipped, duration_sec=fetch_seconds)
+        except SourceWorkerUnavailable as e:
+            # Слот не выдан из-за нашего же зависшего потока/переполненного пула.
+            # Источник тут ни при чём: ни hard-ошибку, ни счётчик тишины ему не
+            # начисляем, иначе breaker и auto-disable выключат здоровый сайт.
+            stats_lines.append(f"{name}: ⏭")
+            metrics.inc('anime_bot_source_fetch_total', labels={'source': name, 'status': 'skipped'})
+            _event_log('source_fetch_skipped', source=name, reason='worker_unavailable',
+                       detail=str(e)[:200])
+            logger.warning('%s пропущен без штрафа: %s', name, e)
+            continue
         except Exception as e:
             message = f'{type(e).__name__}: {e}'
             fingerprint = (await asyncio.to_thread(error_fingerprints.record, f'source:{name}', message)
@@ -13832,7 +13901,6 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ветке. Всё остальное (настройки, /scheduled-кнопки) — только админам."""
     query = update.callback_query
     data = query.data or ""
-    user = getattr(update, 'effective_user', None)
     if is_admin(update):
         _audit_update(update, 'callback', callback=data[:160])
 
@@ -15596,7 +15664,8 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                     f"🧵 Новых отправлено этой проверкой: {sent_count}\n"
                 )
                 if backpressure_deferred:
-                    message += f"⏳ Отложено backpressure-ом: {backpressure_deferred}\n"
+                    message += (f"⏳ Отложено backpressure-ом: {backpressure_deferred} "
+                                f"({backpressure_level})\n")
                 if skipped_count:
                     dup_n = skipped_reasons.get('skipped_dup', 0)
                     filter_n = skipped_reasons.get('skipped_filter', 0)
@@ -15652,7 +15721,8 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                 f"📦 Осталось в очереди: {queue_size}"
             )
             if backpressure_deferred:
-                message += f"\n⏳ Отложено backpressure-ом: {backpressure_deferred}"
+                message += (f"\n⏳ Отложено backpressure-ом: {backpressure_deferred} "
+                            f"({backpressure_level})")
             if confidence_reviewed:
                 message += f"\n🧠 На ручную проверку по confidence: {confidence_reviewed}"
             if errors:
@@ -16330,7 +16400,7 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: s
     """Вызов модели с соблюдением лимитов: по одному запросу за раз,
     с паузой между ними и дневным потолком."""
     global _llm_last_call, _llm_disabled_runtime, _llm_disabled_reason, _llm_circuit_until, _llm_circuit_level
-    global _llm_last_usage_tokens, _llm_budget_exhausted_alert_day, _llm_fail_streak
+    global _llm_last_usage_tokens, _llm_budget_exhausted_alert_day
     if not _llm_active():
         return None
     if _llm_quota_left() <= 0:
@@ -16996,7 +17066,6 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
                        'Studio Pierrot returns for the last part.',
             'source': 'проверка', 'lang': 'en',
         }
-    before_disabled = _llm_disabled_runtime
     result = await _llm_enrich(probe)
     if result == 'off':
         # Раньше здесь всегда предлагалось «проверь LLM_API_KEY», даже когда
@@ -17569,7 +17638,6 @@ class UserDirectory:
         }
         if self._by_id.get(uid) == entry:
             return                       # ничего не изменилось — не пишем на диск
-        old = self._by_id.get(uid)
         self._by_id[uid] = entry
         if len(self._by_id) > USER_DIRECTORY_MAX:
             oldest = sorted(self._by_id, key=lambda k: self._by_id[k].get('seen', ''))
@@ -18050,7 +18118,7 @@ async def send_startup_report(app, brief: bool = False) -> None:
     lines.append(f'📡 Источников: {len(enabled)} вкл' + (f', {len(paused)} на паузе' if paused else ''))
     if paused:
         lines.append(f'   ⏸ {html.escape(", ".join(paused[:8]))}')
-    lines.append(f'🧵 Режим: ' + ('ветка обсуждения' if settings.thread_mode else 'сразу в канал'))
+    lines.append('🧵 Режим: ' + ('ветка обсуждения' if settings.thread_mode else 'сразу в канал'))
     lines.append('🎬 Видео: ' + ('ВКЛ' if settings.video_enabled else 'ВЫКЛ')
                  + f' (до {TG_VIDEO_MAX_SECONDS // 60} мин)')
     lines.append('🖼 Дедуп по картинке: ' + ('ВКЛ' if settings.image_dedup else 'ВЫКЛ'))
@@ -19026,11 +19094,11 @@ async def stats_command(update, context: ContextTypes.DEFAULT_TYPE):
             bot_age = f'{hours} ч.'
 
     # Общая сводка
-    lines = [f'📊 <b>Метрики бота</b>']
+    lines = ['📊 <b>Метрики бота</b>']
     if bot_age:
         lines.append(f'⏱ Работает: {bot_age}')
     lines.append('')
-    lines.append(f'<b>За всё время:</b>')
+    lines.append('<b>За всё время:</b>')
     lines.append(f'  📥 Собрано: {totals.get("collected", 0)}')
     lines.append(f'  📤 Опубликовано: {totals.get("published", 0)}')
     skipped_total = (
@@ -19047,7 +19115,7 @@ async def stats_command(update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f'  💥 Ошибок источников: {totals.get("source_errors", 0)}')
 
     lines.append('')
-    lines.append(f'<b>За последние:</b>')
+    lines.append('<b>За последние:</b>')
     lines.append(f'  24 часа: 📤 {published_24h} опубликовано, ⚠️ {failed_24h} ошибок')
     lines.append(f'  7 дней:  📤 {published_7d} опубликовано')
 
@@ -19058,7 +19126,7 @@ async def stats_command(update, context: ContextTypes.DEFAULT_TYPE):
             key=lambda kv: -kv[1].get('published', 0),
         )
         lines.append('')
-        lines.append(f'<b>📡 По источникам:</b>')
+        lines.append('<b>📡 По источникам:</b>')
         for name, data in ranked:
             collected = data.get('collected', 0)
             published = data.get('published', 0)
@@ -20253,6 +20321,25 @@ code{{color:#b9d2ff}}a{{color:#91b8ff}}@media(max-width:700px){{th:nth-child(n+4
 _health_probe_seen: dict[str, int] = {}
 
 
+# Health-порт может быть открыт наружу, а путь запроса выбирает клиент. Метки
+# Prometheus поэтому берём только из этого списка: иначе любой сканер, дёргающий
+# случайные URL, навсегда добавлял бы по счётчику на каждый путь, и registry рос
+# бы без границы (реестр живёт всю жизнь процесса и ничего не вытесняет).
+_HEALTH_PROBE_KNOWN_PATHS = frozenset({
+    '/', '/health', '/healthz', '/healthcheck', '/health-check',
+    '/live', '/livez', '/liveness', '/ping', '/ready', '/readyz', '/readiness',
+    '/status', '/up', '/_health', '/api/health',
+})
+
+
+def _health_probe_label(path: str) -> str:
+    """Ограниченная метка пути для метрик: всё незнакомое схлопываем в 'other'."""
+    normalized = str(path or '/').split('?', 1)[0].lower()
+    if len(normalized) > 1:
+        normalized = normalized.rstrip('/') or '/'
+    return normalized if normalized in _HEALTH_PROBE_KNOWN_PATHS else 'other'
+
+
 def _note_health_probe(method: str, path: str) -> None:
     """Запоминает последнюю liveness/readiness-пробу без обращения к диску."""
     _runtime_health['last_http_probe_at'] = datetime.now(timezone.utc).isoformat()
@@ -20264,7 +20351,7 @@ def _note_health_probe(method: str, path: str) -> None:
         _health_probe_seen[key] = seen
     if seen <= 3:
         logger.info('Health-проба от платформы: %s (отвечаю 200)', key)
-    metrics.inc('anime_bot_health_probe_total', labels={'path': path[:60]})
+    metrics.inc('anime_bot_health_probe_total', labels={'path': _health_probe_label(path)})
 
 
 class _HealthHandler(BaseHTTPRequestHandler):

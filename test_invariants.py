@@ -13,33 +13,44 @@ import pytest
 
 import anime_news_bot as bot
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent
 CHECKER = ROOT / 'tools' / 'check_invariants.py'
 
+# Минимум, ниже которого список не имеет права опуститься: каждая строка — это
+# отдельная найденная и закрытая проблема, и удаление проверки вместе с
+# регрессией должно ронять сборку, а не проходить незамеченным.
+MIN_INVARIANTS = 14
 
-def _checker():
+
+def _load_rows():
+    if not CHECKER.exists():
+        return None
     spec = importlib.util.spec_from_file_location('check_invariants', CHECKER)
     module = importlib.util.module_from_spec(spec)
     sys.modules['check_invariants'] = module
     spec.loader.exec_module(module)
-    return module
-
-
-@pytest.fixture(scope='module')
-def rows():
-    if not CHECKER.exists():
-        pytest.fail('tools/check_invariants.py пропал вместе с проверками ревью')
-    module = _checker()
     tree = ast.parse((ROOT / 'anime_news_bot.py').read_text(encoding='utf-8'))
     return module.checks(bot, tree)
 
 
+# Собираем на импорте: параметризация должна знать реальную длину списка,
+# иначе новые инварианты молча остаются без отдельного теста.
+_ROWS = _load_rows()
+
+
+@pytest.fixture(scope='module')
+def rows():
+    if _ROWS is None:
+        pytest.fail('tools/check_invariants.py пропал вместе с проверками ревью')
+    return _ROWS
+
+
 def test_checker_covers_every_review_finding(rows):
     """Список не должен худеть: каждая строка — отдельная найденная проблема."""
-    assert len(rows) >= 14
+    assert len(rows) >= MIN_INVARIANTS
 
 
-@pytest.mark.parametrize("index", range(14))
+@pytest.mark.parametrize("index", range(len(_ROWS) if _ROWS else MIN_INVARIANTS))
 def test_invariant_holds(rows, index):
     name, ok, why = rows[index]
     assert ok, f'{name} — {why}'

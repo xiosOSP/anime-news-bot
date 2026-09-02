@@ -30,14 +30,25 @@ Telegram-бот для автопостинга аниме-новостей в �
 
 ```
 pip install -r requirements.txt
+cp .env.example .env      # локально: впишите свои значения
 python anime_news_bot.py
 ```
+
+На хостинге `.env` не нужен — переменные задаются в панели.
 
 ## Тесты
 
 ```
 pip install -r requirements-dev.txt
 pytest
+```
+
+`tools/check_invariants.py` — тот же список инвариантов, но с читаемым выводом:
+каждая строка соответствует найденной и закрытой проблеме, поэтому список может
+только расти.
+
+```
+python tools/check_invariants.py
 ```
 
 ## Команды бота
