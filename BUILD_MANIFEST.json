@@ -3,78 +3,53 @@
   "foundation": "Foundation 1 — Reproducible & Measurable",
   "base_archive": "anime news bot autosend repaired.zip",
   "base_archive_sha256": "961b270d3325cddfae4b276a6d35c8e85d223fa0bfb5db2f8c5ec49be4d00108",
-  "python_target": "3.13.5",
-  "git_commit": null,
-  "source_date_epoch": null,
-  "generated_at_utc": "2026-08-10T22:34:14.486042+00:00",
+  "python_target": "3.11",
+  "git_commit": "5a6a5187fa6dd3b683642fffc729c6382a38a981",
+  "generated_at_utc": "2026-09-02T14:18:12.228015+00:00",
   "files": {
+    ".env.example": {
+      "sha256": "6d40293f82082c815765df542fb0f1c6bf30b98e492b03ba02fca9de1b9e4a35",
+      "bytes": 3581
+    },
+    ".gitignore": {
+      "sha256": "e10083d18e2845dee47c814957f79cfc6b0e8d41b0c24e4550040bcc68e0234a",
+      "bytes": 744
+    },
+    "Procfile": {
+      "sha256": "481c207aa2641be552955d59bb56bcd230232ec85d02fbb6ca5056ca4716caaf",
+      "bytes": 33
+    },
+    "README.md": {
+      "sha256": "3930c6947795e9d1e757d4f14713e0793d5675aee8175b8c4f921ca51fb4ee28",
+      "bytes": 2989
+    },
     "anime_news_bot.py": {
-      "sha256": "2458fe745d44681bb256ea37a25fc7c60cb65978d7343efff4a33653802b236d",
-      "bytes": 936557
-    },
-    "requirements.in": {
-      "sha256": "1bc011126ed2a69f2b24689352aa7a4347fb764ca4687ac02a48c36edc0ed268",
-      "bytes": 233
-    },
-    "requirements.txt": {
-      "sha256": "93f453e80223ff4acbb963349be92e49af71b840948a5ea9b12c32fe4bdbcc29",
-      "bytes": 509
-    },
-    "requirements.lock": {
-      "sha256": "93f453e80223ff4acbb963349be92e49af71b840948a5ea9b12c32fe4bdbcc29",
-      "bytes": 509
-    },
-    "requirements-dev.in": {
-      "sha256": "a74064fb168d53a5c3f2664523e811c84ee315bc1ce25c001616a152c31d7585",
-      "bytes": 106
+      "sha256": "bf46455bbde9f7aa436d18091627282336716b21d37e653fc64ccafc397ba458",
+      "bytes": 1068476
     },
     "requirements-dev.txt": {
-      "sha256": "cc2d915f3530f2b16ab605d633b94e6c8784ee70f799daf639dd30deef2361de",
-      "bytes": 25
+      "sha256": "47513016713737d50c5d0ac216c51f4de34c9148181b158532aff49d81a06257",
+      "bytes": 46
     },
-    "requirements-dev.lock": {
-      "sha256": "f6fe42af4f05e171649867f5158b027a57d76e3a9b3614455bbbb63995f13f60",
-      "bytes": 213
+    "requirements.txt": {
+      "sha256": "8ee04d13c070d8adf46c3f93921573c9fe9f7a172ecca62581e7d5fd06a216d0",
+      "bytes": 141
     },
-    ".python-version": {
-      "sha256": "e72b03ed5b70312f2782f2b05055c55b24670e126d50e24c4f2c559bf288f810",
-      "bytes": 7
+    "runtime.txt": {
+      "sha256": "22fa90cd1f8121c0165c6df911d1ea71452a179460fbe371834bb792ba42f6c9",
+      "bytes": 12
     },
-    ".github/workflows/ci.yml": {
-      "sha256": "c6e09063fcc0f72e2958b0128a5794e043383f672131fc794a5fccce3944ac60",
-      "bytes": 1282
+    "test_invariants.py": {
+      "sha256": "95cd31dec11c7478c2b51d11ef17d49eb3853e2965160e61b0f6efccad9b92f7",
+      "bytes": 2319
     },
-    "KPI.md": {
-      "sha256": "ffe69be5a947c34f505408fe3dc413391bc4ddde5281c4b08eacab48916deab1",
-      "bytes": 1629
-    },
-    "FOUNDATION1.md": {
-      "sha256": "4bc469245d15ae22bd3ce40da3fda8dbd938371e5defecb2a1d572b1da9abaee",
-      "bytes": 1880
-    },
-    "DEVELOPMENT.md": {
-      "sha256": "25224b8b60823ae1a1a6f7e6861ac78971eab904e8f064e6f7a2a4b8f3f64680",
-      "bytes": 2481
+    "tools/build_manifest.py": {
+      "sha256": "cc919a734905cbccfb831c788f67db28a726f978a049aa251ad2867031359f0c",
+      "bytes": 4744
     },
     "tools/check_invariants.py": {
-      "sha256": "5bc4236341ce61ffa3ea48d3d5cda4e4411b7fd771651c01e21fcb58d86add5c",
-      "bytes": 9003
-    },
-    "tools/verify_foundation.py": {
-      "sha256": "2a54e3fd08d1083e4be30771052868dbc48ea2f26c9227d370a2c53ed59adbc9",
-      "bytes": 3866
-    },
-    "tests/e2e/test_publish_contract.py": {
-      "sha256": "90b2ad59f70978fd985a556fb05028a88dd16785b6a2368c431ee12fd12be39a",
-      "bytes": 3719
-    },
-    "tests/e2e/test_build_contract.py": {
-      "sha256": "3e2192abea73115e01629e90309dde6abfb9f095fdd7c363136db543899bbd11",
-      "bytes": 934
-    },
-    "tests/e2e/test_cli_contract.py": {
-      "sha256": "8a8e84a04e2f8f2342da5973d5d0266cebc8c728cb91ca8d1ac39f5910ed7730",
-      "bytes": 819
+      "sha256": "9c138c2cb7d5f1e9c2a8946e99036e411ec7fac5d3ac57177e5ca080ba546ace",
+      "bytes": 22534
     }
   }
 }

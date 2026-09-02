@@ -34,6 +34,10 @@ anime_news_bot_videos/
 .coverage
 htmlcov/
 
+# Остальные runtime-хранилища (появляются рядом со скриптом без DATA_DIR)
+*.json
+!BUILD_MANIFEST.json
+
 # OS
 .DS_Store
 Thumbs.db
