@@ -51,6 +51,14 @@ pytest
 python tools/check_invariants.py
 ```
 
+`BUILD_MANIFEST.json` — опись отслеживаемых файлов с хешами. Она генерируется,
+а не правится руками, иначе снова разъедется с репозиторием:
+
+```
+python tools/build_manifest.py           # пересобрать после изменений
+python tools/build_manifest.py --check   # сверить, ничего не записывая
+```
+
 ## Команды бота
 
 - `/start` — меню

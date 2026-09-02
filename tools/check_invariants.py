@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -329,6 +330,26 @@ def _check_dashboard_closed_without_token(bot) -> tuple[bool, str]:
     return True, 'без DASHBOARD_TOKEN доступ закрыт'
 
 
+def _check_manifest_describes_reality() -> tuple[bool, str]:
+    """Опись не должна числить файлы, которых в репозитории нет.
+
+    Манифест, перечисляющий несуществующее, хуже отсутствующего: он выглядит
+    как проверяемая опись, но проверить по нему нельзя ничего. Пересобрать —
+    ``python tools/build_manifest.py``.
+    """
+    manifest_path = ROOT / 'BUILD_MANIFEST.json'
+    if not manifest_path.exists():
+        return True, 'манифеста нет — вводить в заблуждение нечему'
+    try:
+        listed = json.loads(manifest_path.read_text(encoding='utf-8')).get('files') or {}
+    except (json.JSONDecodeError, OSError) as exc:
+        return False, f'манифест не читается: {exc}'
+    phantom = sorted(name for name in listed if not (ROOT / name).is_file())
+    if phantom:
+        return False, f'в манифесте числятся отсутствующие файлы: {phantom[:5]}'
+    return True, f'все {len(listed)} записей манифеста существуют'
+
+
 def _check_ledger_claim_is_exclusive(bot) -> tuple[bool, str]:
     """Двойной claim одного URL — это дубль в канале."""
     async def run() -> tuple[bool, str]:
@@ -374,6 +395,7 @@ def checks(bot, tree) -> list[tuple[str, bool, str]]:
     add('метки метрик обрезаны по длине', _check_metric_labels_are_capped(bot))
     add('дашборд закрыт без токена', _check_dashboard_closed_without_token(bot))
     add('claim в ledger эксклюзивен', _check_ledger_claim_is_exclusive(bot))
+    add('манифест описывает существующие файлы', _check_manifest_describes_reality())
     return rows
 
 
