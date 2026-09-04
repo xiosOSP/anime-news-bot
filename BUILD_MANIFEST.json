@@ -4,12 +4,16 @@
   "base_archive": "anime news bot autosend repaired.zip",
   "base_archive_sha256": "961b270d3325cddfae4b276a6d35c8e85d223fa0bfb5db2f8c5ec49be4d00108",
   "python_target": "3.11",
-  "git_commit": "5a6a5187fa6dd3b683642fffc729c6382a38a981",
-  "generated_at_utc": "2026-09-02T14:18:12.228015+00:00",
+  "git_commit": "d91431fcc443d017af210458d2273041f30a5e06",
+  "generated_at_utc": "2026-09-02T16:59:08.403807+00:00",
   "files": {
     ".env.example": {
-      "sha256": "6d40293f82082c815765df542fb0f1c6bf30b98e492b03ba02fca9de1b9e4a35",
-      "bytes": 3581
+      "sha256": "37f58a24fc93f6953757757d60926f7d58f6fb2749579e8a1d0b8beee90a94fb",
+      "bytes": 4482
+    },
+    ".github/workflows/ci.yml": {
+      "sha256": "88b4b715cf815e2ae3c80e422f04b21efb93ac873d712e6b4507f229ce0d62f9",
+      "bytes": 2159
     },
     ".gitignore": {
       "sha256": "e10083d18e2845dee47c814957f79cfc6b0e8d41b0c24e4550040bcc68e0234a",
@@ -24,8 +28,8 @@
       "bytes": 2989
     },
     "anime_news_bot.py": {
-      "sha256": "bf46455bbde9f7aa436d18091627282336716b21d37e653fc64ccafc397ba458",
-      "bytes": 1068476
+      "sha256": "b640c1d887d092f7ebe5669112c0a6117afce52b3da5d413a1ab1deba00cd9a4",
+      "bytes": 1079764
     },
     "requirements-dev.txt": {
       "sha256": "47513016713737d50c5d0ac216c51f4de34c9148181b158532aff49d81a06257",
@@ -43,13 +47,17 @@
       "sha256": "95cd31dec11c7478c2b51d11ef17d49eb3853e2965160e61b0f6efccad9b92f7",
       "bytes": 2319
     },
+    "tests/test_pipeline.py": {
+      "sha256": "d86a3f8751af3223b7b832790fd90ac990b16cb156df546343f6fe7eed581052",
+      "bytes": 8335
+    },
     "tools/build_manifest.py": {
       "sha256": "cc919a734905cbccfb831c788f67db28a726f978a049aa251ad2867031359f0c",
       "bytes": 4744
     },
     "tools/check_invariants.py": {
-      "sha256": "9c138c2cb7d5f1e9c2a8946e99036e411ec7fac5d3ac57177e5ca080ba546ace",
-      "bytes": 22534
+      "sha256": "ddbafb72e6f157a1feeb60345374609f3351a0cd4c69573791d7f526eef73541",
+      "bytes": 24564
     }
   }
 }

@@ -190,6 +190,43 @@ def _bounded_cache_put(cache: dict, key, value, max_items: int) -> None:
     cache[key] = value
 
 
+def _cache_bytes_used(cache: dict) -> int:
+    """Суммарный объём байтовых значений кеша. Не-байтовые считаем невесомыми."""
+    total = 0
+    for value in cache.values():
+        if isinstance(value, (bytes, bytearray)):
+            total += len(value)
+    return total
+
+
+def _bounded_bytes_cache_put(cache: dict, key, value, max_items: int, max_bytes: int) -> None:
+    """Bounded-кеш с потолком и по числу записей, и по суммарному объёму.
+
+    Ограничения по одному лишь числу записей мало, когда значения — сырые
+    байты картинок. Сорок записей при потолке загрузки в 9 МБ дают до 360 МБ
+    в памяти: на маленьком контейнере это верный OOM или SIGTERM от платформы.
+    Байтовый бюджет держит кеш в предсказуемых рамках независимо от того,
+    насколько тяжёлые файлы попались в этом цикле.
+    """
+    if max_items <= 0 or max_bytes <= 0:
+        return
+    size = len(value) if isinstance(value, (bytes, bytearray)) else 0
+    if size > max_bytes:
+        # Один файл больше всего бюджета: кладём отрицательный результат, чтобы
+        # не качать его повторно, но сами байты в памяти не держим.
+        _bounded_cache_put(cache, key, None, max_items)
+        return
+    cache.pop(key, None)
+    used = _cache_bytes_used(cache)
+    # dict сохраняет порядок вставки, поэтому первый ключ — самый старый.
+    while cache and (len(cache) >= max_items or used + size > max_bytes):
+        oldest = next(iter(cache))
+        dropped = cache.pop(oldest)
+        if isinstance(dropped, (bytes, bytearray)):
+            used -= len(dropped)
+    cache[key] = value
+
+
 def _atomic_write_json(path: Path, data, *, indent: Optional[int] = None) -> None:
     """Атомарно сохраняет JSON рядом с целевым файлом.
 
@@ -570,6 +607,16 @@ STARTUP_REPORT_WINDOW_SEC = max(60, min(24 * 3600, _env_int('STARTUP_REPORT_WIND
 _process_started_at = time.time()
 RESTART_STORM_WINDOW_SEC = max(60, min(24 * 3600, _env_int('RESTART_STORM_WINDOW_SEC', 900)))
 RESTART_STORM_THRESHOLD = max(3, min(20, _env_int('RESTART_STORM_THRESHOLD', 4)))
+# Петля перезапусков определяется средним интервалом между стартами, а не
+# «стартов в минуту». Прежний порог требовал строго чаще раза в минуту, и
+# реальный цикл с интервалом 77 с в него не попадал: 10 стартов за 11.6 мин —
+# это 0.87 в минуту, диагноз не срабатывал и админ не получал ничего.
+RESTART_LOOP_INTERVAL_SEC = max(30, min(3600, _env_int('RESTART_LOOP_INTERVAL_SEC', 300)))
+# Весь конвейер живёт в одном event loop, поэтому любая синхронная работа в нём
+# делает бота глухим: команды не отвечают, health-запросы ждут. Замеряем это
+# прямо, а не по косвенным признакам вроде «кажется, тормозит».
+EVENT_LOOP_LAG_INTERVAL_SEC = max(0.2, min(60.0, _env_float('EVENT_LOOP_LAG_INTERVAL_SEC', 1.0)))
+EVENT_LOOP_LAG_WARN_MS = max(50, min(60000, _env_int('EVENT_LOOP_LAG_WARN_MS', 1000)))
 
 # Adaptive Publishing — Stage 9
 ADAPTIVE_PUBLISHING_FILE = DATA_DIR / 'adaptive_publishing.json'
@@ -4898,10 +4945,20 @@ def clean_shortcodes(text: str) -> str:
     return text
 
 
+# Содержимое этих тегов — код и стили, а не текст новости. Снятие одних лишь
+# угловых скобок оставляло тело скрипта в посте: RSS-описания с виджетами
+# соцсетей приносили в канал куски JavaScript вперемешку с анонсом.
+_NON_TEXT_HTML_BLOCKS = re.compile(
+    r'<(script|style|noscript|template|svg)\b[^>]*>.*?</\1\s*>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
 def clean_html(text: str) -> str:
     """Полная очистка: теги, шорткоды, HTML-сущности, неразрывные пробелы."""
     if not text:
         return ''
+    text = _NON_TEXT_HTML_BLOCKS.sub(' ', text)
     text = re.sub(r'<[^>]+>', '', text)
     text = clean_shortcodes(text)
     text = html.unescape(text)
@@ -11152,6 +11209,12 @@ MIN_GOOD_IMAGE_PX = 500         # ниже этой ширины кадр выг
 
 
 IMAGE_BYTES_CACHE_MAX = 40      # столько скачанных картинок держим в памяти
+# Потолок по числу записей сам по себе ничего не гарантирует: при лимите
+# загрузки в 9 МБ сорок картинок — это до 360 МБ в памяти, что на скромном
+# контейнере заканчивается убийством процесса платформой. Реальный потолок
+# кеша задаёт бюджет в мегабайтах.
+IMAGE_BYTES_CACHE_MAX_MB = max(4, min(512, _env_int('IMAGE_BYTES_CACHE_MAX_MB', 48)))
+IMAGE_BYTES_CACHE_MAX_BYTES = IMAGE_BYTES_CACHE_MAX_MB * 1024 * 1024
 _image_bytes_cache: dict = {}
 
 
@@ -11166,7 +11229,8 @@ def _cached_image_bytes(url: str) -> Optional[bytes]:
     if url in _image_bytes_cache:
         return _image_bytes_cache[url]
     data = _download_image_bytes(url)
-    _bounded_cache_put(_image_bytes_cache, url, data, IMAGE_BYTES_CACHE_MAX)
+    _bounded_bytes_cache_put(_image_bytes_cache, url, data,
+                             IMAGE_BYTES_CACHE_MAX, IMAGE_BYTES_CACHE_MAX_BYTES)
     return data
 
 
@@ -18029,9 +18093,14 @@ def _restart_loop_note() -> str:
     except (ValueError, TypeError):
         return ''
     span = (parsed[-1] - parsed[0]).total_seconds()
-    if span <= 0 or span > 15 * 60:
+    if span <= 0:
         return ''
-    if len(parsed) / (span / 60.0) < 1.0:
+    # Средний интервал между стартами — прямая мера того, что видит человек.
+    # Прежняя формула («стартов в минуту» плюс потолок разброса в 15 минут)
+    # молчала на цикле с интервалом 77 с: он и в минутную частоту не попадал,
+    # и в 15 минут разброса влезал лишь частично.
+    average_interval = span / max(1, len(parsed) - 1)
+    if average_interval > RESTART_LOOP_INTERVAL_SEC:
         return ''
 
     kind = str(data.get('last_exit_kind') or '')
@@ -18043,8 +18112,17 @@ def _restart_loop_note() -> str:
         'polling_returned': ('polling завершился сам, без ошибки. Обычно это тот же '
                              'конфликт токена либо остановка снаружи'),
         'system_exit': 'бот сам отказался стартовать, причина в строке ниже',
+        # Самый частый и самый непонятный случай: бот отработал штатно, а его
+        # всё равно остановили. Подсказка называет то, что стоит смотреть, —
+        # иначе админ видит «внешняя остановка» и не знает, что с этим делать.
+        'external_signal': ('контейнер остановила платформа, а не бот. Смотри логи '
+                            'хостинга за этот момент и строку про HTTP-пробы ниже: '
+                            'если проб не было вовсе, платформа убила процесс, '
+                            'ни разу не проверив его — обычно это несовпадение '
+                            'типа процесса (web/worker) с ожиданиями хостинга'),
     }
-    lines = [f'⚠️ <b>Частые перезапуски: {len(parsed)} за {int(span)} с</b>']
+    lines = [f'⚠️ <b>Частые перезапуски: {len(parsed)} за {int(span)} с</b>',
+             f'   В среднем каждые {int(average_interval)} с']
     if kind:
         lines.append(f'   Прошлый выход: <code>{html.escape(kind)}</code>')
         if kind in hints:
@@ -19698,6 +19776,18 @@ async def lifecycle_command(update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f'🚨 Restart storm: {RESTART_STORM_THRESHOLD} запусков за {int(span)} сек')
         except (ValueError, TypeError):
             pass
+    lag_peak = float(_runtime_health.get('event_loop_lag_peak_sec') or 0.0)
+    if lag_peak:
+        stalls = int(_runtime_health.get('event_loop_lag_stalls', 0) or 0)
+        lines.append(f'Задержка event loop: пик <b>{lag_peak * 1000:.0f} мс</b>'
+                     + (f', залипаний дольше {EVENT_LOOP_LAG_WARN_MS} мс: {stalls}'
+                        if stalls else ''))
+    # Отсутствие проб — сильный сигнал, а не пустое место: платформа убивает
+    # контейнер, ни разу с ним не поговорив. Раньше строки просто не было.
+    if _runtime_health.get('health_server_ok') and not _runtime_health.get('last_http_probe_at'):
+        uptime_now = int(time.time() - _process_started_at)
+        lines.append(f'⚠️ HTTP-проб не приходило ни одной за {uptime_now} с работы — '
+                     'платформа не проверяет этот порт')
     probe_at = str(life.get('last_health_probe_at') or '')
     probe_method = str(life.get('last_health_probe_method') or '')
     probe_path = str(life.get('last_health_probe_path') or '')
@@ -20686,6 +20776,68 @@ async def health_probe_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning(f'Health probe Telegram не прошёл: {e}')
 
 
+_event_loop_lag_task: Optional[asyncio.Task] = None
+
+
+async def _event_loop_lag_monitor() -> None:
+    """Меряет, насколько event loop отстаёт от собственного расписания.
+
+    Задача засыпает на известный интервал и смотрит, сколько времени прошло на
+    самом деле. Разница — это ровно то время, которое loop не мог обработать
+    ничего: ни команду админа, ни ответ Telegram. Косвенных признаков тут
+    недостаточно, потому что «бот тормозит» одинаково выглядит и при медленной
+    сети, и при синхронной обработке в loop, а лечится это по-разному.
+    """
+    interval = EVENT_LOOP_LAG_INTERVAL_SEC
+    threshold = EVENT_LOOP_LAG_WARN_MS / 1000.0
+    while True:
+        started = time.monotonic()
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+        lag = time.monotonic() - started - interval
+        if lag <= 0:
+            continue
+        metrics.observe('anime_bot_event_loop_lag_seconds', lag)
+        peak = float(_runtime_health.get('event_loop_lag_peak_sec') or 0.0)
+        if lag > peak:
+            _runtime_health['event_loop_lag_peak_sec'] = round(lag, 3)
+            _runtime_health['event_loop_lag_peak_at'] = datetime.now(timezone.utc).isoformat()
+        if lag < threshold:
+            continue
+        _runtime_health['event_loop_lag_stalls'] = int(
+            _runtime_health.get('event_loop_lag_stalls', 0) or 0) + 1
+        metrics.inc('anime_bot_event_loop_stall_total')
+        logger.warning('🐌 Event loop заблокирован на %.0f мс — в это время бот '
+                       'не отвечал ни на команды, ни на Telegram', lag * 1000)
+        _event_log('event_loop_stalled', lag_ms=round(lag * 1000, 1),
+                   threshold_ms=EVENT_LOOP_LAG_WARN_MS)
+
+
+def _start_event_loop_lag_monitor() -> None:
+    global _event_loop_lag_task
+    if _event_loop_lag_task is not None and not _event_loop_lag_task.done():
+        return
+    try:
+        _event_loop_lag_task = asyncio.get_running_loop().create_task(
+            _event_loop_lag_monitor(), name='event-loop-lag')
+    except RuntimeError:
+        _event_loop_lag_task = None      # loop ещё не запущен — не критично
+
+
+async def _stop_event_loop_lag_monitor() -> None:
+    global _event_loop_lag_task
+    task, _event_loop_lag_task = _event_loop_lag_task, None
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
 async def _post_shutdown(app: Application) -> None:
     """Best-effort сброс runtime-состояния перед остановкой процесса.
 
@@ -20713,6 +20865,15 @@ async def _post_shutdown(app: Application) -> None:
                           f'{_runtime_health.get("last_http_probe_path", "")}')
         except (ValueError, TypeError):
             pass
+    elif _runtime_health.get('health_server_ok'):
+        # Отсутствие проб — это диагноз, а не пустое место. Health-сервер слушал
+        # весь uptime, но платформа ни разу не постучалась: значит она убила
+        # контейнер не потому, что признала бота нездоровым, а вообще не
+        # разговаривая с ним. Раньше это состояние отличалось от «пробы шли»
+        # только отсутствием подстроки, и прочитать его можно было лишь зная,
+        # что подстрока вообще бывает.
+        probe_note = (f'; HTTP-проб не было ни одной за {uptime} с '
+                      f'(слушали {HEALTH_HOST}:{HEALTH_PORT})')
     logger.info('Получен сигнал остановки: PTB выключается штатно. '
                 'Если это не ручная остановка, значит контейнер остановила платформа.')
     try:
@@ -20728,6 +20889,7 @@ async def _post_shutdown(app: Application) -> None:
                 saver()
     except Exception as e:
         logger.warning(f'Не удалось сбросить runtime-хранилища: {e}')
+    await _stop_event_loop_lag_monitor()
     await _flush_media_failures_on_shutdown()
     try:
         cleanup_video_dir(max_age_hours=0)
@@ -20789,6 +20951,9 @@ async def setup_bot_commands(app: Application) -> None:
         health_probe_job, interval=300, first=300, name='health_probe',
         job_kwargs=JOB_KWARGS,
     )
+    # Отдельная задача, а не job: job_queue сам стоит в очереди того же loop и
+    # при блокировке опоздал бы вместе с ним, то есть измерял бы себя.
+    _start_event_loop_lag_monitor()
 
     # APScheduler jobs живут только в памяти процесса. Восстанавливаем
     # пользовательское состояние авторассылки после restart/redeploy.
