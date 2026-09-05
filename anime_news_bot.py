@@ -366,15 +366,14 @@ LIFECYCLE_FILE = DATA_DIR / 'runtime_lifecycle.json'
 BUILD_TAG = 'stability-polish-20260826'
 TG_CAPTION_LIMIT = 1024              # жёсткое ограничение Telegram для подписи под фото
 TG_TEXT_LIMIT = 4096                 # лимит обычного текстового сообщения
-# Внутренний лимит summary для режима КАНАЛА (одно сообщение фото+подпись).
-SUMMARY_MAX_CHARS = 950
-# Внутренний лимит summary для режима ВЕТКИ (текст отдельным сообщением до 4096).
-# Оставляем запас под заголовок и html.escape.
-SUMMARY_MAX_CHARS_THREAD = 3500
 # Сколько отдаём в Google Translate за раз.
-# Для канала хватает 1500, но для ветки нужен длинный текст — берём максимум.
+# SUMMARY_MAX_CHARS / SUMMARY_MAX_CHARS_THREAD / TRANSLATION_INPUT_LIMIT_THREAD
+# отсюда убраны: они ни разу не использовались. Формат поста один и тот же для
+# канала и для ветки (format_news_short), а длину ограничивает лимит Telegram
+# на подпись. Оставленные «на будущее» константы создавали ложное впечатление,
+# что режимы отличаются длиной текста, — при переезде в канал это ровно та
+# деталь, из-за которой правят не тот параметр.
 TRANSLATION_INPUT_LIMIT = 1500
-TRANSLATION_INPUT_LIMIT_THREAD = 4000
 NEWS_PER_SOURCE = max(1, min(50, _env_int('NEWS_PER_SOURCE', 5)))
 PAUSE_BETWEEN_SENDS = 2.0
 # Сбор упирается в сеть, а не в ядра: потоки почти всё время ждут ответа и
@@ -2154,6 +2153,12 @@ class PostQueue:
     def __init__(self, path: Path):
         self.path = path
         self._items: list[dict] = []   # каждая запись = {'news': dict, 'queued_at': iso-str}
+        # Переполнение очереди — это молча потерянные новости. В режиме канала
+        # публикуется один пост за интервал, поэтому при живых источниках
+        # выбрасывание становится нормой, а не исключением, и админ должен
+        # видеть его в отчёте, а не только в логе, куда никто не смотрит.
+        self.dropped_last_push = 0
+        self.dropped_total = 0
         self._inflight: Optional[dict] = None
         self._inflight_owner = None
         self._lock = asyncio.Lock()
@@ -2285,7 +2290,10 @@ class PostQueue:
                     existing_story_ids.add(story_registry_id)
                 added += 1
             dropped = self._trim_overflow_unlocked()
+            self.dropped_last_push = dropped
             if dropped:
+                self.dropped_total += dropped
+                metrics.inc('anime_bot_queue_dropped_total', dropped)
                 logger.info(f"📦 Очередь переполнена, выброшено {dropped} низкоприоритетных постов")
             if not self._save():
                 # Очередь — durable handoff. Если новое состояние не записалось,
@@ -10690,6 +10698,13 @@ class SourceHealth:
         self.path = path
         self._data: dict[str, dict] = {}
         self._dirty = False
+        # Запись идёт из asyncio.to_thread, а правки прилетают из event loop
+        # (сбор цикла, ручное переключение источника в /settings). Без блокировки
+        # json.dump ловил «dictionary changed size during iteration», а _save
+        # ловит только OSError — то есть исключение улетало наверх и обрывало
+        # весь цикл сбора. Соседние хранилища блокировку имеют, эти две — нет.
+        # RLock, а не Lock: record_fail внутри себя зовёт breaker_remaining.
+        self._lock = threading.RLock()
         self._load()
 
     def _load(self) -> None:
@@ -10702,11 +10717,17 @@ class SourceHealth:
             logger.warning(f"source_health не загружен: {e}")
 
     def _save(self) -> bool:
-        try:
-            _atomic_write_json(self.path, self._data)
+        # Снимок под блокировкой, запись на диск — уже без неё: держать lock на
+        # время I/O значило бы подвешивать event loop на каждой правке.
+        with self._lock:
+            snapshot = {k: dict(v) for k, v in self._data.items()}
             self._dirty = False
+        try:
+            _atomic_write_json(self.path, snapshot)
             return True
         except OSError as e:
+            with self._lock:
+                self._dirty = True      # не записали — состояние всё ещё грязное
             logger.error(f"source_health не сохранён: {e}")
             return False
 
@@ -10731,6 +10752,12 @@ class SourceHealth:
         return datetime.now(timezone.utc)
 
     def record_ok(self, name: str, count: int, *, save: bool = True) -> None:
+        with self._lock:
+            self._record_ok_locked(name, count)
+        if save:
+            self._save()
+
+    def _record_ok_locked(self, name: str, count: int) -> None:
         entry = self._entry(name)
         entry['fails'] = 0
         entry['hard_fails'] = 0
@@ -10741,8 +10768,6 @@ class SourceHealth:
         entry['last_count'] = int(count)
         entry['last_error'] = ''
         self._dirty = True
-        if save:
-            self._save()
 
     def _open_breaker_unlocked(self, entry: dict) -> int:
         level = max(0, _safe_nonnegative_int(entry.get('breaker_level')))
@@ -10759,6 +10784,15 @@ class SourceHealth:
         circuit breaker. Обычный "0 постов" сохраняет прежний silent-source
         счётчик, но breaker не открывает.
         """
+        with self._lock:
+            fails = self._record_fail_locked(name, reason, hard=hard)
+        # Запись на диск — уже вне блокировки: держать её на время I/O значило бы
+        # подвешивать event loop, который ждёт этот же lock ради быстрой правки.
+        if save:
+            self._save()
+        return fails
+
+    def _record_fail_locked(self, name: str, reason: str, *, hard: bool) -> int:
         entry = self._entry(name)
         entry['fails'] = _safe_nonnegative_int(entry.get('fails')) + 1
         entry['last_error'] = str(reason)[:200]
@@ -10785,15 +10819,14 @@ class SourceHealth:
                 except NameError:
                     pass
         self._dirty = True
-        if save:
-            self._save()
         return entry['fails']
 
     def breaker_remaining(self, name: str) -> float:
         """Сколько секунд источник ещё должен отдыхать; 0 если breaker закрыт."""
         if not feature_enabled('circuit_breakers'):
             return 0.0
-        entry = self._data.get(name)
+        with self._lock:
+            entry = dict(self._data.get(name) or {})
         if not entry or not entry.get('breaker_until'):
             return 0.0
         try:
@@ -10816,7 +10849,8 @@ class SourceHealth:
 
     def silent_hours(self, name: str) -> Optional[float]:
         """Сколько часов источник не отдаёт новостей. None — если всё хорошо."""
-        entry = self._data.get(name)
+        with self._lock:
+            entry = dict(self._data.get(name) or {})
         if not entry:
             return None
         started = entry.get('silent_since') or entry.get('last_ok')
@@ -10832,6 +10866,10 @@ class SourceHealth:
 
     def reset(self, name: str) -> None:
         """Сброс — например, когда источник включили вручную."""
+        with self._lock:
+            self._reset_locked(name)
+
+    def _reset_locked(self, name: str) -> None:
         if name in self._data:
             row = self._entry(name)
             row['fails'] = 0
@@ -10843,10 +10881,12 @@ class SourceHealth:
             self._save()
 
     def info(self, name: str) -> dict:
-        return dict(self._data.get(name, {}))
+        with self._lock:
+            return dict(self._data.get(name, {}))
 
     def all(self) -> dict:
-        return {k: dict(v) for k, v in self._data.items()}
+        with self._lock:
+            return {k: dict(v) for k, v in self._data.items()}
 
 
 source_health: Optional['SourceHealth'] = None
@@ -12247,6 +12287,9 @@ class SourceIntelligenceStore:
     def __init__(self, path: Path):
         self.path = path
         self._data = {'schema_version': 1, 'sources': {}, 'stories': {}}
+        # Та же причина, что и у SourceHealth: flush уходит в asyncio.to_thread,
+        # а observe_story правит те же словари из event loop.
+        self._lock = threading.RLock()
         self._load()
 
     @staticmethod
@@ -12287,8 +12330,10 @@ class SourceIntelligenceStore:
             logger.warning(f'Не удалось прочитать source intelligence {self.path}: {e}')
 
     def _save(self) -> None:
+        with self._lock:
+            snapshot = copy.deepcopy(self._data)
         try:
-            _atomic_write_json(self.path, self._data, indent=2)
+            _atomic_write_json(self.path, snapshot, indent=2)
         except OSError as e:
             logger.error(f'Не удалось сохранить source intelligence: {e}')
 
@@ -12326,6 +12371,10 @@ class SourceIntelligenceStore:
             self._save()
 
     def observe_story(self, story_id: str, cluster: list[dict]) -> dict:
+        with self._lock:
+            return self._observe_story_locked(story_id, cluster)
+
+    def _observe_story_locked(self, story_id: str, cluster: list[dict]) -> dict:
         now = datetime.now(timezone.utc)
         story_id = str(story_id or '')[:64]
         if not story_id or not cluster:
@@ -12415,7 +12464,8 @@ class SourceIntelligenceStore:
         }
 
     def flush(self) -> None:
-        self._prune(save=False)
+        with self._lock:
+            self._prune(save=False)
         self._save()
 
     def _historical_sample(self, source: str) -> tuple[int, int]:
@@ -15838,6 +15888,14 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
             if backpressure_deferred:
                 message += (f"\n⏳ Отложено backpressure-ом: {backpressure_deferred} "
                             f"({backpressure_level})")
+            if post_queue.dropped_last_push:
+                # Это не «отложено», а именно потеряно: пост уже не вернётся.
+                message += (f"\n🗑 Выброшено из переполненной очереди: "
+                            f"{post_queue.dropped_last_push}"
+                            f" (всего за сессию {post_queue.dropped_total})"
+                            f"\n   Канал успевает {86400 // max(1, settings.check_interval_sec)} "
+                            f"постов в сутки. Если выбрасывание повторяется — "
+                            f"уменьшите интервал или число источников.")
             if confidence_reviewed:
                 message += f"\n🧠 На ручную проверку по confidence: {confidence_reviewed}"
             if errors:
@@ -16131,9 +16189,51 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
         f"Канал: {CHANNEL_ID}\n"
         f"Скачивание видео: {video_state}\n"
         f"yt-dlp: {yt_status}\n"
-        f"ffmpeg: {ffmpeg_status}\n\n"
+        f"ffmpeg: {ffmpeg_status}\n"
+        # Показываем только пока сидим в ветке: после переключения этот блок
+        # уже ничего не готовит, а цифры темпа видны в отчётах цикла.
+        + (f"{_channel_mode_readiness()}\n" if settings.thread_mode else "")
+        + "\n"
         f"📡 Источники:\n{sources_list}"
     )
+
+
+def _channel_mode_readiness() -> str:
+    """Что изменится при переходе «в ветку» → «сразу в канал».
+
+    Переключатель — одна кнопка, но последствия несимметричны: пропадает
+    ручное одобрение, а темп публикации становится жёстким. Считаем это по
+    фактическим цифрам заранее, чтобы решение принималось до переключения,
+    а не по потерянным новостям после.
+    """
+    per_day = 86400 // max(1, settings.check_interval_sec)
+    lines = ['', '<b>Готовность к режиму «сразу в канал»</b>']
+    lines.append(f'  Темп: {per_day} постов в сутки '
+                 f'(1 за {settings.check_interval_sec // 60} мин), очередь {QUEUE_MAX_SIZE}')
+
+    # Сколько бот реально находит — из собственной статистики за сутки.
+    try:
+        collected = stats.count_events_since(datetime.now() - timedelta(hours=24), 'collected')
+    except Exception:
+        collected = 0
+    if collected:
+        lines.append(f'  Найдено за сутки: {collected}')
+        if collected > per_day:
+            lines.append('  ⚠️ Канал не успеет за источниками: лишнее будет '
+                         'выброшено из очереди. Уменьшите интервал либо '
+                         'отключите часть источников.')
+        else:
+            lines.append('  ✅ Темпа хватает на текущий поток новостей')
+
+    if DISCUSSION_CHAT_FROM_ENV and DISCUSSION_THREAD_FROM_ENV:
+        lines.append('  ✅ Ветка настроена: посты с низкой уверенностью всё равно '
+                     'поедут на ручную проверку')
+    else:
+        lines.append('  ⚠️ Ветка не настроена: в канал будет уходить ВСЁ без '
+                     'ручной проверки, включая спорное')
+    if post_queue is not None and post_queue.dropped_total:
+        lines.append(f'  🗑 Уже выброшено из очереди за сессию: {post_queue.dropped_total}')
+    return '\n'.join(lines)
 
 
 def _scheduled_status_block(context) -> str:

@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -359,6 +360,58 @@ def _check_image_cache_is_capped_in_bytes(bot) -> tuple[bool, str]:
     return True, f'кеш ограничен {budget // (1024 * 1024)} МБ вместо {worst // (1024 * 1024)} МБ'
 
 
+def _check_threaded_stores_are_locked(tree) -> tuple[bool, str]:
+    """Хранилище, которое пишут из потока, обязано иметь блокировку.
+
+    Запись уходит в ``asyncio.to_thread``, а правки прилетают из event loop.
+    Без блокировки ``json.dump`` ловит «dictionary changed size during
+    iteration», а ``_save`` ловит только OSError — то есть исключение улетает
+    наверх и обрывает цикл сбора. Воспроизводится за секунды на 400 записях.
+    """
+    threaded = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        try:
+            target = ast.unparse(node.func)
+        except Exception:
+            continue
+        if target != 'asyncio.to_thread' or not node.args:
+            continue
+        try:
+            first = ast.unparse(node.args[0])
+        except Exception:
+            continue
+        # asyncio.to_thread(store.method) -> имя глобального хранилища
+        if '.' in first:
+            threaded.add(first.split('.')[0])
+
+    globals_to_class = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            try:
+                hint = ast.unparse(node.annotation)
+            except Exception:
+                continue
+            match = re.search(r"'([A-Za-z_]+)'", hint)
+            if match:
+                globals_to_class[node.target.id] = match.group(1)
+
+    unlocked = []
+    for name in sorted(threaded):
+        cls_name = globals_to_class.get(name)
+        if not cls_name:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == cls_name:
+                body = ast.unparse(node)
+                if 'threading.Lock' not in body and 'threading.RLock' not in body:
+                    unlocked.append(f'{name} ({cls_name})')
+    if unlocked:
+        return False, f'пишутся из потока без блокировки: {unlocked}'
+    return True, f'проверено хранилищ: {len(threaded)}'
+
+
 def _check_manifest_describes_reality() -> tuple[bool, str]:
     """Опись не должна числить файлы, которых в репозитории нет.
 
@@ -425,6 +478,7 @@ def checks(bot, tree) -> list[tuple[str, bool, str]]:
     add('дашборд закрыт без токена', _check_dashboard_closed_without_token(bot))
     add('claim в ledger эксклюзивен', _check_ledger_claim_is_exclusive(bot))
     add('кеш картинок ограничен по объёму', _check_image_cache_is_capped_in_bytes(bot))
+    add('потоковые хранилища под блокировкой', _check_threaded_stores_are_locked(tree))
     add('манифест описывает существующие файлы', _check_manifest_describes_reality())
     return rows
 
