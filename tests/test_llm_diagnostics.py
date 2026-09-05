@@ -9,6 +9,7 @@ import re
 import time
 
 import pytest
+import telegram.error as bot_error
 
 import anime_news_bot as bot
 
@@ -159,3 +160,58 @@ def test_permanent_failure_never_returns_on_its_own(alerts, monkeypatch):
     bot._llm_try_failover('model', 'подсказка')          # кулдаун не задан
     assert bot._llm_primary_retry_at == 0.0
     assert bot._llm_current()[2] == 'mistral-small-latest'
+
+
+# ---------- доставка админам ----------
+
+class _FakeBot:
+    """Ведёт себя как Telegram: отвергает HTML, который не разбирается."""
+
+    def __init__(self, strict: bool = True):
+        self.strict = strict
+        self.sent: list[dict] = []
+
+    async def send_message(self, chat_id, text, parse_mode=None):
+        if parse_mode == 'HTML' and self.strict and '<Response' in text:
+            raise bot_error.BadRequest("Can't parse entities: unsupported start tag")
+        self.sent.append({'chat_id': chat_id, 'text': text, 'parse_mode': parse_mode})
+
+
+@pytest.mark.asyncio
+async def test_admin_alert_is_sent_as_html():
+    """Разметка обязана доезжать разметкой: иначе <code> виден как текст,
+    а html.escape превращает кавычки в &quot; — то есть делает только хуже."""
+    fake = _FakeBot()
+    await bot._send_admin_text(fake, 1, 'Модель <code>x</code> отказала')
+    assert fake.sent[0]['parse_mode'] == 'HTML'
+
+
+@pytest.mark.asyncio
+async def test_broken_markup_still_reaches_admin():
+    """Текст исключения с `<` ломает разбор HTML. Предупреждение важнее вида:
+    оно должно дойти без разметки, а не пропасть целиком."""
+    fake = _FakeBot()
+    await bot._send_admin_text(fake, 1, 'Ошибка: <Response [500]>')
+    assert len(fake.sent) == 1
+    assert fake.sent[0]['parse_mode'] is None
+    assert '<Response [500]>' in fake.sent[0]['text']
+
+
+@pytest.mark.asyncio
+async def test_unrelated_bad_request_is_not_swallowed():
+    """Блокировка ботом или неверный chat_id — не проблема разметки.
+    Глушить их повторной отправкой значило бы врать о доставке."""
+    class _Blocked(_FakeBot):
+        async def send_message(self, chat_id, text, parse_mode=None):
+            raise bot_error.BadRequest('chat not found')
+
+    with pytest.raises(bot_error.BadRequest):
+        await bot._send_admin_text(_Blocked(), 1, 'текст')
+
+
+def test_provider_answer_is_not_cut_mid_word(alerts, monkeypatch):
+    """Обрезка по голому срезу давала хвост вроде «? Mod» — теперь многоточие."""
+    long_error = 'HTTP 404: ' + 'x' * 500
+    monkeypatch.setattr(bot, '_llm_last_provider_error', long_error)
+    bot._llm_try_failover('model', 'подсказка')
+    assert '…' in alerts[0]
