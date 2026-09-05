@@ -57,7 +57,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import Conflict, RetryAfter, TelegramError
+from telegram.error import BadRequest, Conflict, RetryAfter, TelegramError
 try:
     from telegram.error import NetworkError as _TelegramNetworkError, TimedOut as _TelegramTimedOut
     _TG_AMBIGUOUS_ERROR_TYPES = (_TelegramNetworkError, _TelegramTimedOut)
@@ -12105,12 +12105,37 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
 _unreachable_admins: set[int] = set()
 
 
+async def _send_admin_text(bot: Bot, uid: int, text: str) -> None:
+    """Шлёт админу сообщение с HTML-разметкой, не теряя его при кривой разметке.
+
+    Сообщения админам собираются с ``<code>`` и ``html.escape``, но уходили без
+    ``parse_mode``: админ видел сырые теги и ``&quot;`` вместо кавычек, то есть
+    экранирование делало текст не безопаснее, а только хуже читаемым.
+
+    Просто включить HTML нельзя: часть сообщений содержит неэкранированный текст
+    исключений, где встречается ``<`` — например ``<Response [500]>``. Telegram
+    отвергает такую разметку целиком, и алерт пропал бы вовсе. Поэтому при
+    ошибке разбора повторяем тем же текстом без разметки: показать теги хуже,
+    чем красиво, но несравнимо лучше, чем не доставить предупреждение.
+    """
+    try:
+        await bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML)
+        return
+    except BadRequest as e:
+        reason = str(e).lower()
+        if 'pars' not in reason and 'entit' not in reason and 'tag' not in reason:
+            raise
+        logger.debug('Админ-сообщение не разобралось как HTML (%s) — шлю без разметки', e)
+        metrics.inc('anime_bot_admin_alert_plain_fallback_total')
+    await bot.send_message(chat_id=uid, text=text)
+
+
 async def notify_admin(bot: Bot, text: str) -> int:
     """Шлёт сообщение всем админам и возвращает число успешных доставок."""
     delivered = 0
     for uid in _all_admin_ids():
         try:
-            await bot.send_message(chat_id=uid, text=text)
+            await _send_admin_text(bot, uid, text)
             delivered += 1
             _unreachable_admins.discard(uid)   # снова доступен — сняли метку
         except TelegramError as e:
@@ -16313,7 +16338,8 @@ def _llm_try_failover(reason: str, hint: str = '', retry_after_sec: float = 0.0)
         lines.append('')
         lines.append(f'Причина: {hint}')
     if _llm_last_provider_error:
-        lines.append(f'Ответ провайдера: <code>{html.escape(_llm_last_provider_error[:200])}</code>')
+        lines.append(f'Ответ провайдера: '
+                     f'<code>{_escape_to_limit(_llm_last_provider_error, 300)}</code>')
     lines.append('')
     if retry_after_sec:
         # Временный отказ: чинить нечего, надо просто подождать. Обещать правку
@@ -16597,7 +16623,7 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: s
                 ]
                 if _llm_last_provider_error:
                     pause_lines.append(f'Последний ответ: '
-                                       f'<code>{html.escape(_llm_last_provider_error[:200])}</code>')
+                                       f'<code>{_escape_to_limit(_llm_last_provider_error, 300)}</code>')
                 pause_lines.append('Fallback DeepL/Google продолжает работать. Подробности — /llm.')
                 _queue_admin_alert('\n'.join(pause_lines))
             else:
