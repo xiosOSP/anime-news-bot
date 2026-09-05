@@ -16172,10 +16172,23 @@ LLM_FAST_API_KEY = _env('LLM_FAST_API_KEY', '').strip()
 LLM_FAST_BASE_URL = (_env('LLM_FAST_BASE_URL', '').strip() or _route_preset[0]).rstrip('/')
 LLM_FAST_MODEL = _env('LLM_FAST_MODEL', '').strip() or _route_preset[1]
 LLM_FAST_TASKS = {x.strip().lower() for x in _env('LLM_FAST_TASKS', 'judge').split(',') if x.strip()}
+# Временный отказ основного провайдера не должен стоить его до перезапуска:
+# бот уходит на запасного, но через этот срок пробует основного снова.
+LLM_PRIMARY_RETRY_SEC = max(60, min(24 * 3600, _env_int('LLM_PRIMARY_RETRY_SEC', 1800)))
 LLM_TIMEOUT = max(5, min(120, _env_int('LLM_TIMEOUT', 30)))
 LLM_MIN_INTERVAL = max(0.0, min(60.0, _env_float('LLM_MIN_INTERVAL', 1.2)))
 LLM_DAILY_LIMIT = max(1, min(10000, _env_int('LLM_DAILY_LIMIT', 900)))
 LLM_MAX_TOKENS = max(64, min(4000, _env_int('LLM_MAX_TOKENS', 700)))
+
+
+# Формулировки, которыми провайдеры сообщают о временной нехватке мощности.
+# Отличать их от «такой модели нет» приходится по тексту: код ответа у части
+# роутеров одинаковый (404 model_not_found) в обоих случаях.
+_LLM_TEMPORARY_MARKERS = (
+    'no available capacity', 'try again later', 'temporarily unavailable',
+    'currently unavailable', 'overloaded', 'capacity constraints',
+    'no instances available', 'try again in a', 'server is busy',
+)
 
 
 def _llm_fatal_reason(status: int, body: str) -> Optional[dict]:
@@ -16189,6 +16202,23 @@ def _llm_fatal_reason(status: int, body: str) -> Optional[dict]:
     Возвращает None для временных ошибок: их повторять как раз нужно.
     """
     text = (body or '').lower()
+    # Роутеры отдают 404 с кодом model_not_found и тогда, когда модель есть, но
+    # у неё сейчас нет свободной мощности: «No available capacity ... Please try
+    # again later». Это временный отказ, а не ошибка конфигурации. Раньше он
+    # засчитывался как неустранимый, и часовая просадка бесплатного тира
+    # выбрасывала основного провайдера до конца жизни процесса.
+    looks_like_model_refusal = (status == 404 or 'model_not_found' in text
+                                or 'model not found' in text)
+    # Только для отказов по модели: обычные 5xx и таймауты — забота HTTP-ретрая,
+    # и переключать из-за них провайдера значило бы терять основного на пустом
+    # месте, ради ошибки, которая проходит сама через секунду.
+    if looks_like_model_refusal and any(marker in text for marker in _LLM_TEMPORARY_MARKERS):
+        return {'reason': 'capacity',
+                'log': f'у модели {LLM_MODEL!r} сейчас нет свободной мощности',
+                'admin': f'у модели <code>{html.escape(LLM_MODEL or "?")}</code> сейчас нет '
+                         'свободной мощности — провайдер просит зайти позже. '
+                         'Переменные менять не нужно.',
+                'retry_after_sec': LLM_PRIMARY_RETRY_SEC}
     if status == 402 or 'insufficient_balance' in text or 'insufficient balance' in text:
         return {'reason': 'billing',
                 'log': 'у провайдера кончился баланс/лимит',
@@ -16235,13 +16265,27 @@ def _llm_fallback_configured() -> bool:
 
 
 def _llm_current() -> tuple[str, str, str]:
-    """Адрес, ключ и модель провайдера, который используется прямо сейчас."""
+    """Адрес, ключ и модель провайдера, который используется прямо сейчас.
+
+    После временного отказа (нет свободной мощности) основной провайдер не
+    списывается до перезапуска: по истечении кулдауна пробуем его снова. Иначе
+    часовая просадка бесплатного тира означала бы работу на запасном сутками —
+    ровно до тех пор, пока кто-нибудь не перезапустит бота вручную.
+    """
+    global _llm_using_fallback, _llm_primary_retry_at
+    if _llm_using_fallback and _llm_primary_retry_at:
+        if time.monotonic() >= _llm_primary_retry_at:
+            _llm_using_fallback = False
+            _llm_primary_retry_at = 0.0
+            logger.info('LLM: кулдаун истёк — пробую основного провайдера снова')
+            metrics.inc('anime_bot_llm_primary_retry_total')
+            return LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
     if _llm_using_fallback:
         return LLM_FALLBACK_BASE_URL, LLM_FALLBACK_API_KEY, LLM_FALLBACK_MODEL
     return LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
 
 
-def _llm_try_failover(reason: str, hint: str = '') -> bool:
+def _llm_try_failover(reason: str, hint: str = '', retry_after_sec: float = 0.0) -> bool:
     """Переключает на запасного провайдера. True, если переключились.
 
     Только на неустранимых ошибках основного: временные проходят сами, и
@@ -16254,11 +16298,12 @@ def _llm_try_failover(reason: str, hint: str = '') -> bool:
     переключении в личку уходил один голый код причины вроде «(model)», по
     которому непонятно ни какая модель не найдена, ни где её править.
     """
-    global _llm_using_fallback, _llm_failover_at
+    global _llm_using_fallback, _llm_failover_at, _llm_primary_retry_at
     if _llm_using_fallback or not _llm_fallback_configured():
         return False
     _llm_using_fallback = True
     _llm_failover_at = datetime.now(timezone.utc).isoformat()
+    _llm_primary_retry_at = (time.monotonic() + retry_after_sec) if retry_after_sec else 0.0
     metrics.inc('anime_bot_llm_failover_total', labels={'reason': reason})
     logger.warning('LLM: основной провайдер отказал (%s) — перехожу на запасного %s',
                    reason, LLM_FALLBACK_MODEL)
@@ -16270,11 +16315,17 @@ def _llm_try_failover(reason: str, hint: str = '') -> bool:
     if _llm_last_provider_error:
         lines.append(f'Ответ провайдера: <code>{html.escape(_llm_last_provider_error[:200])}</code>')
     lines.append('')
-    # Ошибки вроде неверного имени модели сами не проходят. Без этой строки
-    # «попробует основного» читается как «оно ещё наладится», и переменные
-    # никто не правит — а бот каждый перезапуск тратит вызов на тот же отказ.
-    lines.append('Сам по себе основной не починится: пока переменные не исправлены, '
-                 'каждый перезапуск будет начинаться с того же отказа. Проверить — /llm.')
+    if retry_after_sec:
+        # Временный отказ: чинить нечего, надо просто подождать. Обещать правку
+        # переменных здесь было бы прямой дезинформацией.
+        lines.append(f'Это временно. Через {int(retry_after_sec // 60)} мин бот сам '
+                     'вернётся к основному провайдеру — вмешательство не нужно.')
+    else:
+        # Ошибки вроде неверного имени модели сами не проходят. Без этой строки
+        # «попробует основного» читается как «оно ещё наладится», и переменные
+        # никто не правит — а бот каждый перезапуск тратит вызов на тот же отказ.
+        lines.append('Сам по себе основной не починится: пока переменные не исправлены, '
+                     'каждый перезапуск будет начинаться с того же отказа. Проверить — /llm.')
     _queue_admin_alert('\n'.join(lines))
     return True
 
@@ -16292,6 +16343,7 @@ def _remember_provider_error(status: int, body: str) -> None:
     text = ' '.join(str(body or '').split())[:300]
     _llm_last_provider_error = _redact_secrets(f'HTTP {status}: {text}' if text
                                               else f'HTTP {status}')
+_llm_primary_retry_at = 0.0          # monotonic; 0 = к основному не возвращаемся
 _llm_circuit_until = 0.0             # monotonic timestamp
 _llm_circuit_level = 0
 _llm_json_mode = True               # просить строгий JSON (снимаем, если провайдер против)
@@ -16457,7 +16509,8 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
     fatal = _llm_fatal_reason(r.status_code, r.text)
     if fatal:
         _remember_provider_error(r.status_code, r.text)
-        if _llm_try_failover(fatal['reason'], fatal['admin']):
+        if _llm_try_failover(fatal['reason'], fatal['admin'],
+                             float(fatal.get('retry_after_sec') or 0.0)):
             return None          # следующий вызов пойдёт к запасному провайдеру
         _llm_disabled_runtime = True
         _llm_disabled_reason = fatal['reason']
