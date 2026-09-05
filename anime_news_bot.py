@@ -366,15 +366,14 @@ LIFECYCLE_FILE = DATA_DIR / 'runtime_lifecycle.json'
 BUILD_TAG = 'stability-polish-20260826'
 TG_CAPTION_LIMIT = 1024              # жёсткое ограничение Telegram для подписи под фото
 TG_TEXT_LIMIT = 4096                 # лимит обычного текстового сообщения
-# Внутренний лимит summary для режима КАНАЛА (одно сообщение фото+подпись).
-SUMMARY_MAX_CHARS = 950
-# Внутренний лимит summary для режима ВЕТКИ (текст отдельным сообщением до 4096).
-# Оставляем запас под заголовок и html.escape.
-SUMMARY_MAX_CHARS_THREAD = 3500
 # Сколько отдаём в Google Translate за раз.
-# Для канала хватает 1500, но для ветки нужен длинный текст — берём максимум.
+# SUMMARY_MAX_CHARS / SUMMARY_MAX_CHARS_THREAD / TRANSLATION_INPUT_LIMIT_THREAD
+# отсюда убраны: они ни разу не использовались. Формат поста один и тот же для
+# канала и для ветки (format_news_short), а длину ограничивает лимит Telegram
+# на подпись. Оставленные «на будущее» константы создавали ложное впечатление,
+# что режимы отличаются длиной текста, — при переезде в канал это ровно та
+# деталь, из-за которой правят не тот параметр.
 TRANSLATION_INPUT_LIMIT = 1500
-TRANSLATION_INPUT_LIMIT_THREAD = 4000
 NEWS_PER_SOURCE = max(1, min(50, _env_int('NEWS_PER_SOURCE', 5)))
 PAUSE_BETWEEN_SENDS = 2.0
 # Сбор упирается в сеть, а не в ядра: потоки почти всё время ждут ответа и
@@ -2154,6 +2153,12 @@ class PostQueue:
     def __init__(self, path: Path):
         self.path = path
         self._items: list[dict] = []   # каждая запись = {'news': dict, 'queued_at': iso-str}
+        # Переполнение очереди — это молча потерянные новости. В режиме канала
+        # публикуется один пост за интервал, поэтому при живых источниках
+        # выбрасывание становится нормой, а не исключением, и админ должен
+        # видеть его в отчёте, а не только в логе, куда никто не смотрит.
+        self.dropped_last_push = 0
+        self.dropped_total = 0
         self._inflight: Optional[dict] = None
         self._inflight_owner = None
         self._lock = asyncio.Lock()
@@ -2285,7 +2290,10 @@ class PostQueue:
                     existing_story_ids.add(story_registry_id)
                 added += 1
             dropped = self._trim_overflow_unlocked()
+            self.dropped_last_push = dropped
             if dropped:
+                self.dropped_total += dropped
+                metrics.inc('anime_bot_queue_dropped_total', dropped)
                 logger.info(f"📦 Очередь переполнена, выброшено {dropped} низкоприоритетных постов")
             if not self._save():
                 # Очередь — durable handoff. Если новое состояние не записалось,
@@ -15880,6 +15888,14 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
             if backpressure_deferred:
                 message += (f"\n⏳ Отложено backpressure-ом: {backpressure_deferred} "
                             f"({backpressure_level})")
+            if post_queue.dropped_last_push:
+                # Это не «отложено», а именно потеряно: пост уже не вернётся.
+                message += (f"\n🗑 Выброшено из переполненной очереди: "
+                            f"{post_queue.dropped_last_push}"
+                            f" (всего за сессию {post_queue.dropped_total})"
+                            f"\n   Канал успевает {86400 // max(1, settings.check_interval_sec)} "
+                            f"постов в сутки. Если выбрасывание повторяется — "
+                            f"уменьшите интервал или число источников.")
             if confidence_reviewed:
                 message += f"\n🧠 На ручную проверку по confidence: {confidence_reviewed}"
             if errors:
@@ -16173,9 +16189,51 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
         f"Канал: {CHANNEL_ID}\n"
         f"Скачивание видео: {video_state}\n"
         f"yt-dlp: {yt_status}\n"
-        f"ffmpeg: {ffmpeg_status}\n\n"
+        f"ffmpeg: {ffmpeg_status}\n"
+        # Показываем только пока сидим в ветке: после переключения этот блок
+        # уже ничего не готовит, а цифры темпа видны в отчётах цикла.
+        + (f"{_channel_mode_readiness()}\n" if settings.thread_mode else "")
+        + "\n"
         f"📡 Источники:\n{sources_list}"
     )
+
+
+def _channel_mode_readiness() -> str:
+    """Что изменится при переходе «в ветку» → «сразу в канал».
+
+    Переключатель — одна кнопка, но последствия несимметричны: пропадает
+    ручное одобрение, а темп публикации становится жёстким. Считаем это по
+    фактическим цифрам заранее, чтобы решение принималось до переключения,
+    а не по потерянным новостям после.
+    """
+    per_day = 86400 // max(1, settings.check_interval_sec)
+    lines = ['', '<b>Готовность к режиму «сразу в канал»</b>']
+    lines.append(f'  Темп: {per_day} постов в сутки '
+                 f'(1 за {settings.check_interval_sec // 60} мин), очередь {QUEUE_MAX_SIZE}')
+
+    # Сколько бот реально находит — из собственной статистики за сутки.
+    try:
+        collected = stats.count_events_since(datetime.now() - timedelta(hours=24), 'collected')
+    except Exception:
+        collected = 0
+    if collected:
+        lines.append(f'  Найдено за сутки: {collected}')
+        if collected > per_day:
+            lines.append('  ⚠️ Канал не успеет за источниками: лишнее будет '
+                         'выброшено из очереди. Уменьшите интервал либо '
+                         'отключите часть источников.')
+        else:
+            lines.append('  ✅ Темпа хватает на текущий поток новостей')
+
+    if DISCUSSION_CHAT_FROM_ENV and DISCUSSION_THREAD_FROM_ENV:
+        lines.append('  ✅ Ветка настроена: посты с низкой уверенностью всё равно '
+                     'поедут на ручную проверку')
+    else:
+        lines.append('  ⚠️ Ветка не настроена: в канал будет уходить ВСЁ без '
+                     'ручной проверки, включая спорное')
+    if post_queue is not None and post_queue.dropped_total:
+        lines.append(f'  🗑 Уже выброшено из очереди за сессию: {post_queue.dropped_total}')
+    return '\n'.join(lines)
 
 
 def _scheduled_status_block(context) -> str:
