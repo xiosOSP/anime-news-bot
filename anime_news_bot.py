@@ -7990,6 +7990,54 @@ def _fetch_video_from_embed(post_id: str):
     return None, None, best_thumb or thumb
 
 
+# Строка, в которой нет ни одной буквы и ни одной цифры, — это украшение:
+# эмодзи-разделитель, ряд точек, стрелка. Заголовком она быть не может.
+_TG_MEANINGFUL_RE = re.compile(r'[A-Za-zА-Яа-яЁё0-9]')
+# Подпись канала под постом: «@channel», ссылка на t.me, либо короткая строка
+# с названием самого источника.
+_TG_SIGNATURE_RE = re.compile(r'(?:^|\s)@[A-Za-z0-9_]{4,}\s*$|t\.me/', re.IGNORECASE)
+
+
+def _tg_strip_decoration(value: str) -> str:
+    """Строка без эмодзи и пунктуации — для сравнения с названием канала."""
+    return re.sub(r'[^A-Za-zА-Яа-яЁё0-9]+', ' ', str(value or '')).strip().lower()
+
+
+def _tg_is_signature(line: str, channel: str, label: str) -> bool:
+    """Похожа ли строка на подпись канала, а не на текст новости."""
+    if len(line) > 60:
+        return False                     # длинная строка — это уже содержание
+    if _TG_SIGNATURE_RE.search(line):
+        return True
+    clean = _tg_strip_decoration(line)
+    if not clean:
+        return False
+    for name in (channel, label):
+        other = _tg_strip_decoration(name)
+        # Название канала целиком внутри короткой строки — это подпись.
+        if other and len(other) >= 4 and (clean == other or other in clean or clean in other):
+            return True
+    return False
+
+
+def _tg_title_and_summary(full_text: str, channel: str, label: str) -> tuple[str, str]:
+    """Делит текст телеграм-поста на заголовок и тело.
+
+    Первая строка не всегда заголовок. Каналы начинают пост декоративным
+    эмодзи на отдельной строке, а заканчивают подписью с собственным именем.
+    Раньше эмодзи становился заголовком — в канал уходило «🔍.», — а подпись
+    источника уезжала в тело поста, хотя своё имя канал у себя не публикует.
+    """
+    lines = [ln.strip() for ln in str(full_text or '').split('\n') if ln.strip()]
+    kept = [ln for ln in lines
+            if _TG_MEANINGFUL_RE.search(ln) and not _tg_is_signature(ln, channel, label)]
+    if not kept:
+        return '', ''
+    title = kept[0][:200]
+    summary = ' '.join(kept[1:])[:1000] if len(kept) > 1 else ''
+    return title, summary
+
+
 def get_telegram_channel(channel: str, label: str) -> list[dict]:
     """Парсит публичный Telegram-канал через t.me/s/. Возвращает список news-словарей."""
     url = f'https://t.me/s/{channel}'
@@ -8029,9 +8077,9 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
         full_text = text_el.get_text('\n', strip=True)
         if len(full_text) < 15:
             continue
-        lines = [ln.strip() for ln in full_text.split('\n') if ln.strip()]
-        title = lines[0][:200]
-        summary = ' '.join(lines[1:])[:1000] if len(lines) > 1 else ''
+        title, summary = _tg_title_and_summary(full_text, channel, label)
+        if not title:
+            continue                     # остались одни украшения и подпись
         # Дата поста
         published_parsed = None
         t = _msg_own_one(msg, 'time[datetime]')
@@ -16300,6 +16348,11 @@ LLM_FAST_TASKS = {x.strip().lower() for x in _env('LLM_FAST_TASKS', 'judge').spl
 # Временный отказ основного провайдера не должен стоить его до перезапуска:
 # бот уходит на запасного, но через этот срок пробует основного снова.
 LLM_PRIMARY_RETRY_SEC = max(60, min(24 * 3600, _env_int('LLM_PRIMARY_RETRY_SEC', 1800)))
+# Если основной лежит не полчаса, а сутки, проверять его каждые 30 минут — это
+# 48 холостых вызовов и 48 одинаковых сообщений админу за день. Пауза растёт
+# удвоением и сбрасывается, как только основной ответил.
+LLM_PRIMARY_RETRY_MAX_SEC = max(LLM_PRIMARY_RETRY_SEC,
+                                min(24 * 3600, _env_int('LLM_PRIMARY_RETRY_MAX_SEC', 6 * 3600)))
 LLM_TIMEOUT = max(5, min(120, _env_int('LLM_TIMEOUT', 30)))
 LLM_MIN_INTERVAL = max(0.0, min(60.0, _env_float('LLM_MIN_INTERVAL', 1.2)))
 LLM_DAILY_LIMIT = max(1, min(10000, _env_int('LLM_DAILY_LIMIT', 900)))
@@ -16424,14 +16477,32 @@ def _llm_try_failover(reason: str, hint: str = '', retry_after_sec: float = 0.0)
     которому непонятно ни какая модель не найдена, ни где её править.
     """
     global _llm_using_fallback, _llm_failover_at, _llm_primary_retry_at
+    global _llm_failover_level, _llm_failover_alert_key
     if _llm_using_fallback or not _llm_fallback_configured():
         return False
     _llm_using_fallback = True
     _llm_failover_at = datetime.now(timezone.utc).isoformat()
-    _llm_primary_retry_at = (time.monotonic() + retry_after_sec) if retry_after_sec else 0.0
+    if retry_after_sec:
+        # Пауза удваивается с каждым повтором: провайдер, лежащий сутки, не
+        # должен стоить 48 холостых вызовов и 48 одинаковых сообщений.
+        cooldown = min(LLM_PRIMARY_RETRY_MAX_SEC,
+                       retry_after_sec * (2 ** min(_llm_failover_level, 6)))
+        _llm_primary_retry_at = time.monotonic() + cooldown
+        _llm_failover_level = min(_llm_failover_level + 1, 7)
+    else:
+        cooldown = 0.0
+        _llm_primary_retry_at = 0.0
     metrics.inc('anime_bot_llm_failover_total', labels={'reason': reason})
     logger.warning('LLM: основной провайдер отказал (%s) — перехожу на запасного %s',
                    reason, LLM_FALLBACK_MODEL)
+    # Повторный отказ по той же причине — не новость. Сообщаем один раз, а о
+    # возвращении основного скажем отдельно, когда он реально ответит.
+    alert_key = f'{reason}|{LLM_MODEL}'
+    if alert_key == _llm_failover_alert_key:
+        metrics.inc('anime_bot_llm_failover_alert_suppressed_total')
+        return True
+    _llm_failover_alert_key = alert_key
+    retry_after_sec = cooldown
     lines = [f'🤖 Основной провайдер модели отказал ({reason}). '
              f'Перешёл на запасного: <code>{html.escape(LLM_FALLBACK_MODEL)}</code>.']
     if hint:
@@ -16456,6 +16527,31 @@ def _llm_try_failover(reason: str, hint: str = '', retry_after_sec: float = 0.0)
     return True
 
 
+def _llm_note_primary_recovered() -> None:
+    """Основной провайдер снова отвечает — снимаем эскалацию и говорим об этом.
+
+    Без этого админ узнавал только об отказе: сообщение «перешёл на запасного»
+    висело последним, и понять, вернулся основной или нет, можно было лишь
+    командой /llm. А пауза перед следующей проверкой так и осталась бы
+    удвоенной, хотя причина уже ушла.
+    """
+    global _llm_failover_level, _llm_failover_alert_key
+    if _llm_using_fallback:
+        return                           # отвечает запасной, это не возвращение
+    if not _llm_failover_alert_key and not _llm_failover_level:
+        return
+    had_key = _llm_failover_alert_key
+    _llm_failover_level = 0
+    _llm_failover_alert_key = ''
+    if had_key:
+        metrics.inc('anime_bot_llm_primary_recovered_total')
+        logger.info('LLM: основной провайдер снова отвечает')
+        _queue_admin_alert(
+            f'✅ Основной провайдер модели снова отвечает: '
+            f'<code>{html.escape(LLM_MODEL or "?")}</code>.\n'
+            'Бот вернулся на него, запасной больше не используется.')
+
+
 def _remember_provider_error(status: int, body: str) -> None:
     """Запоминает, что именно ответил провайдер.
 
@@ -16470,6 +16566,8 @@ def _remember_provider_error(status: int, body: str) -> None:
     _llm_last_provider_error = _redact_secrets(f'HTTP {status}: {text}' if text
                                               else f'HTTP {status}')
 _llm_primary_retry_at = 0.0          # monotonic; 0 = к основному не возвращаемся
+_llm_failover_level = 0              # сколько раз подряд основной отказал
+_llm_failover_alert_key = ''         # о чём уже сообщили: не повторяемся
 _llm_circuit_until = 0.0             # monotonic timestamp
 _llm_circuit_level = 0
 _llm_json_mode = True               # просить строгий JSON (снимаем, если провайдер против)
@@ -16778,6 +16876,7 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: s
             result = await asyncio.to_thread(_llm_request, messages, max_tokens)
         _llm_last_call = time.time()
         if result is not None:
+            _llm_note_primary_recovered()
             _llm_circuit_level = 0
             _llm_circuit_until = 0.0
             if _llm_disabled_reason == 'circuit':
