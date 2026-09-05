@@ -16241,13 +16241,18 @@ def _llm_current() -> tuple[str, str, str]:
     return LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
 
 
-def _llm_try_failover(reason: str) -> bool:
+def _llm_try_failover(reason: str, hint: str = '') -> bool:
     """Переключает на запасного провайдера. True, если переключились.
 
     Только на неустранимых ошибках основного: временные проходят сами, и
     менять из-за них провайдера значило бы терять основной на пустом месте.
     Переключение одноразовое: если запасной тоже отказал, модель выключается,
     как раньше. При следующем запуске бот снова начнёт с основного.
+
+    ``hint`` — готовое объяснение, что чинить. Раньше оно вычислялось, но
+    доходило до админа только когда запасного провайдера не было: при удачном
+    переключении в личку уходил один голый код причины вроде «(model)», по
+    которому непонятно ни какая модель не найдена, ни где её править.
     """
     global _llm_using_fallback, _llm_failover_at
     if _llm_using_fallback or not _llm_fallback_configured():
@@ -16257,9 +16262,20 @@ def _llm_try_failover(reason: str) -> bool:
     metrics.inc('anime_bot_llm_failover_total', labels={'reason': reason})
     logger.warning('LLM: основной провайдер отказал (%s) — перехожу на запасного %s',
                    reason, LLM_FALLBACK_MODEL)
-    _queue_admin_alert(f'🤖 Основной провайдер модели отказал ({reason}). '
-                       f'Перешёл на запасного: <code>{html.escape(LLM_FALLBACK_MODEL)}</code>.\n'
-                       'При следующем перезапуске бот снова попробует основного.')
+    lines = [f'🤖 Основной провайдер модели отказал ({reason}). '
+             f'Перешёл на запасного: <code>{html.escape(LLM_FALLBACK_MODEL)}</code>.']
+    if hint:
+        lines.append('')
+        lines.append(f'Причина: {hint}')
+    if _llm_last_provider_error:
+        lines.append(f'Ответ провайдера: <code>{html.escape(_llm_last_provider_error[:200])}</code>')
+    lines.append('')
+    # Ошибки вроде неверного имени модели сами не проходят. Без этой строки
+    # «попробует основного» читается как «оно ещё наладится», и переменные
+    # никто не правит — а бот каждый перезапуск тратит вызов на тот же отказ.
+    lines.append('Сам по себе основной не починится: пока переменные не исправлены, '
+                 'каждый перезапуск будет начинаться с того же отказа. Проверить — /llm.')
+    _queue_admin_alert('\n'.join(lines))
     return True
 
 
@@ -16422,7 +16438,10 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
         return None
     if r.status_code in (401, 403):
         _remember_provider_error(r.status_code, r.text)
-        if _llm_try_failover('auth'):
+        if _llm_try_failover('auth', 'провайдер отклонил ключ основного аккаунта. '
+                                     'Проверь LLM_API_KEY: у бесплатных роутеров тот же '
+                                     '401 приходит и при исчерпанной квоте, и при '
+                                     'приостановленном аккаунте.'):
             return None          # следующий вызов пойдёт к запасному провайдеру
         _llm_disabled_runtime = True
         _llm_disabled_reason = 'auth'
@@ -16438,7 +16457,7 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
     fatal = _llm_fatal_reason(r.status_code, r.text)
     if fatal:
         _remember_provider_error(r.status_code, r.text)
-        if _llm_try_failover(fatal['reason']):
+        if _llm_try_failover(fatal['reason'], fatal['admin']):
             return None          # следующий вызов пойдёт к запасному провайдеру
         _llm_disabled_runtime = True
         _llm_disabled_reason = fatal['reason']
@@ -16511,10 +16530,23 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: s
                 _event_log('llm_circuit_open', cooldown_sec=cooldown,
                            failures=_llm_fail_streak)
                 logger.error(f"LLM: {_llm_fail_streak} ошибок подряд — пауза {cooldown}с")
-                _queue_admin_alert(
+                # «После повторных ошибок» — это не диагноз: непонятно, кто
+                # ошибался и что именно ответил. Всё нужное уже лежит в
+                # состоянии, поэтому кладём его в само сообщение.
+                _, _, active_model = _llm_current()
+                where = 'запасной' if _llm_using_fallback else 'основной'
+                pause_lines = [
                     f'🤖 Языковая модель временно поставлена на паузу на '
-                    f'{max(1, (cooldown + 59) // 60)} мин после повторных ошибок. '
-                    'Fallback DeepL/Google продолжает работать.')
+                    f'{max(1, (cooldown + 59) // 60)} мин после '
+                    f'{_llm_fail_streak} ошибок подряд.',
+                    f'Отвечал {where} провайдер, модель '
+                    f'<code>{html.escape(active_model or "?")}</code>.',
+                ]
+                if _llm_last_provider_error:
+                    pause_lines.append(f'Последний ответ: '
+                                       f'<code>{html.escape(_llm_last_provider_error[:200])}</code>')
+                pause_lines.append('Fallback DeepL/Google продолжает работать. Подробности — /llm.')
+                _queue_admin_alert('\n'.join(pause_lines))
             else:
                 _llm_disabled_runtime = True
                 _llm_disabled_reason = 'circuit'
