@@ -173,3 +173,23 @@ def test_openrouter_preset_points_at_a_live_model():
     _, model = bot.LLM_PRESETS['openrouter']
     assert model != 'google/gemma-3-27b-it:free', 'снятая модель вернулась в пресет'
     assert model
+
+
+def test_presets_do_not_mix_up_catalogs():
+    """У каждого роутера свой каталог: имя от соседа даёт 400 invalid_model.
+
+    Ошибка из практики: модель, взятая из каталога openrouter.ai, была
+    подставлена провайдеру orcarouter.ai — внешне похожие сервисы, но списки
+    моделей у них разные и не пересекаются по именам.
+    """
+    base_orca, model_orca = bot.LLM_PRESETS['orcarouter']
+    base_or, model_or = bot.LLM_PRESETS['openrouter']
+    assert 'orcarouter' in base_orca and 'openrouter' in base_or
+    assert model_orca != model_or, 'один и тот же id для разных каталогов'
+
+
+def test_every_preset_has_a_base_url_and_a_model():
+    """Пресет без модели — это отказ провайдера при первом же запросе."""
+    for name, (base_url, model) in bot.LLM_PRESETS.items():
+        assert base_url.startswith('https://'), name
+        assert model, f'{name}: пресет без модели'

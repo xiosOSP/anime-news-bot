@@ -17213,6 +17213,9 @@ LLM_PRESETS = {
     'openrouter': ('https://openrouter.ai/api/v1', 'google/gemma-4-31b-it:free'),
     'nvidia':     ('https://integrate.api.nvidia.com/v1', 'meta/llama-3.3-70b-instruct'),
     'cerebras':   ('https://api.cerebras.ai/v1', 'llama-3.3-70b'),
+    # Каталог у роутеров свой: имя, живущее у одного, у другого даёт
+    # 400 invalid_model. Пресет избавляет от подбора вручную.
+    'orcarouter': ('https://api.orcarouter.ai/v1', 'deepseek/deepseek-v4-flash-free'),
 }
 
 LLM_PROVIDER = _env('LLM_PROVIDER', '').strip().lower()
