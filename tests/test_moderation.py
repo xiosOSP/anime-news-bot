@@ -297,3 +297,121 @@ def test_stats_survive_restart(tmp_path):
     first = bot.ChatModerationStore(path)
     first.record_decision('flood', 'mute')
     assert bot.ChatModerationStore(path).stats()['by_action']['mute'] == 1
+
+
+# ---------- режим наблюдения ----------
+
+def test_observe_is_the_default(tmp_path):
+    """Новая функция не должна начинать с наказаний.
+
+    Ступень «сначала только сигналит» была в плане, но реализована была
+    всё-или-ничего: включил модерацию — бот сразу наказывает.
+    """
+    assert bot.ChatModerationStore(tmp_path / 'm.json').mode == 'observe'
+
+
+def test_mode_switches_and_survives_restart(tmp_path):
+    path = tmp_path / 'm.json'
+    store = bot.ChatModerationStore(path)
+    store.set_mode('active')
+    assert bot.ChatModerationStore(path).mode == 'active'
+
+
+def test_unknown_mode_is_rejected(tmp_path):
+    """Опечатка в режиме не должна молча дать боту права."""
+    store = bot.ChatModerationStore(tmp_path / 'm.json')
+    with pytest.raises(ValueError):
+        store.set_mode('actve')
+
+
+# ---------- кулдаун наказаний ----------
+
+def test_second_action_in_a_row_is_blocked():
+    """Серия наказаний за минуту хуже одной ошибки: человек уйдёт раньше,
+    чем админ успеет разобраться."""
+    bot._MOD_LAST_ACTION.clear()
+    assert bot._mod_cooldown_active(500, 5000) is False
+    assert bot._mod_cooldown_active(500, 5000) is True
+
+
+def test_cooldown_is_per_user():
+    """Один нарушитель не должен прикрывать другого."""
+    bot._MOD_LAST_ACTION.clear()
+    bot._mod_cooldown_active(500, 5001)
+    assert bot._mod_cooldown_active(500, 5002) is False
+
+
+# ---------- промпт покрывает случаи, где модель ошибается чаще всего ----------
+
+@pytest.mark.parametrize('marker', [
+    'персонаж',        # оскорбление персонажа не равно оскорблению человека
+    'цитир',           # пересказ чужих слов
+    'самоирония',      # «я тупой»
+    'перепалка',       # взаимный обмен колкостями
+    'сомневаешься',    # при неуверенности — не нарушение
+])
+def test_prompt_covers_high_risk_cases(marker):
+    """Описание правил эти случаи не покрывает: границу между рофлом и
+    травлей задают примеры, а не формулировки."""
+    assert marker in bot.MODERATION_SYSTEM_PROMPT.lower()
+
+
+def test_prompt_states_asymmetric_cost():
+    """Модель должна знать, что цена ошибок разная, и склоняться к «не нарушение»."""
+    text = bot.MODERATION_SYSTEM_PROMPT.lower()
+    assert 'violation:false' in text
+    assert 'прогонит человека' in text or 'цена этих ошибок разная' in text
+
+
+# ---------- оскорбление группы людей ----------
+
+def test_group_slur_has_its_own_category():
+    """Брошенное в пустоту «пидорасы» прошло мимо на реальном тесте.
+
+    Причина была не в списках, а в промпте: правило «смотри на адресность»
+    само велело модели пропускать оскорбление, ни к кому не обращённое.
+    Оскорбление группы вредит и без адресата, поэтому у него своя категория.
+    """
+    assert 'hate' in bot.MODERATION_RULES
+    assert bot.MODERATION_RULES['hate']['action'] == 'mute'
+
+
+@pytest.mark.parametrize('text', [
+    'Пидорасы',
+    'ну ты и даун',
+    'понаехали хачи',
+])
+def test_slurs_reach_the_model(text):
+    assert bot._mod_local_check(1, 60, text) is not None
+
+
+@pytest.mark.parametrize('text', [
+    'я гей, и мне зашёл этот тайтл',
+    'обсуждаем новый сезон',
+])
+def test_neutral_speech_is_not_routed(text):
+    """Нейтральное слово о себе не должно даже доходить до модели."""
+    assert bot._mod_local_check(1, 61, text) is None
+
+
+def test_prompt_exempts_slurs_from_the_addressee_rule():
+    """Без явного исключения правило про адресность перекрывает правило про
+    оскорбление группы — именно так и случилось на проде."""
+    text = bot.MODERATION_SYSTEM_PROMPT
+    assert 'НАРУШЕНИЕ ВСЕГДА' in text
+    assert 'hate,' in text                      # категория объявлена модели
+    assert 'человек о себе' in text             # самоописание не наказывается
+    assert 'цитата в жалобе' in text            # пересказ не наказывается
+
+
+def test_slur_leads_to_mute_not_warning():
+    """Оскорбление группы серьёзнее обычной грубости: сразу мут, без ступени
+    предупреждения."""
+    assert bot._mod_decide('hate', severity=2, warns=0)['action'] == 'mute'
+
+
+def test_slur_still_never_leads_to_ban():
+    """Даже самая тяжёлая категория не даёт боту права на бан."""
+    for severity in (1, 2, 3):
+        for warns in range(6):
+            assert bot._mod_decide('hate', severity, warns)['action'] != 'ban'
