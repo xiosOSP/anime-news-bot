@@ -2690,14 +2690,63 @@ class BotSettings:
         self._data['post_max_age_hours'] = max(1, int(value))
         self.save()
 
+    # Режимов три, но исторически хранился один флаг thread_mode. Новый ключ
+    # publish_mode главный, а thread_mode остаётся вычисляемым: на него смотрят
+    # два десятка мест, и переписывать их все ради нового варианта значило бы
+    # трогать весь цикл публикации ради одной настройки.
+    PUBLISH_MODES = ('thread', 'channel', 'both')
+
+    @property
+    def publish_mode(self) -> str:
+        raw = str(self._data.get('publish_mode') or '').strip().lower()
+        if raw in self.PUBLISH_MODES:
+            return raw
+        # Старые файлы настроек знают только про thread_mode.
+        return 'thread' if self._data.get('thread_mode', False) else 'channel'
+
+    @publish_mode.setter
+    def publish_mode(self, value: str) -> None:
+        mode = str(value or '').strip().lower()
+        if mode not in self.PUBLISH_MODES:
+            raise ValueError(f'неизвестный режим публикации: {value!r}')
+        self._data['publish_mode'] = mode
+        # thread_mode держим в актуальном состоянии: если код когда-нибудь
+        # прочитает файл настроек напрямую, он не должен увидеть противоречие.
+        self._data['thread_mode'] = mode in ('thread', 'both')
+        self.save()
+
     @property
     def thread_mode(self) -> bool:
-        return self._data.get('thread_mode', False)
+        """Идёт ли пачка в ветку. True и для режима «и в ветку, и в канал»."""
+        return self.publish_mode in ('thread', 'both')
 
     @thread_mode.setter
     def thread_mode(self, value: bool) -> None:
-        self._data['thread_mode'] = bool(value)
+        self.publish_mode = 'thread' if value else 'channel'
+
+    @property
+    def channel_autopost(self) -> bool:
+        """Публикует ли бот в канал сам, без нажатия кнопки в ветке."""
+        return self.publish_mode in ('channel', 'both')
+
+    @property
+    def channel_interval_min(self) -> int:
+        """Интервал автопубликации в канал для режима «и в ветку, и в канал».
+
+        Отдельный от интервала сбора: собирать источники и выкладывать в канал
+        имеет смысл с разной частотой. Ноль означает «как интервал сбора».
+        """
+        raw = _safe_nonnegative_int(self._data.get('channel_interval_min'), 0)
+        return raw if raw > 0 else self.check_interval_min
+
+    @channel_interval_min.setter
+    def channel_interval_min(self, value: int) -> None:
+        self._data['channel_interval_min'] = max(0, int(value))
         self.save()
+
+    @property
+    def channel_interval_sec(self) -> int:
+        return max(60, self.channel_interval_min * 60)
 
     @property
     def translator_engine(self) -> str:
@@ -11564,6 +11613,31 @@ class PendingPosts:
             logger.critical(f'Moderation channel_state uncertain не записан: {key}')
         return saved
 
+    def next_for_autopost(self) -> Optional[tuple[str, dict]]:
+        """Самый старый пост из ветки, ещё не ушедший в канал.
+
+        Порядок по времени попадания в ветку: канал должен повторять ленту, а
+        не выдавать её вперемешку. Состояния sending и uncertain пропускаются —
+        такой пост уже кто-то публикует или его результат неизвестен, и
+        повторная отправка дала бы дубль в канале.
+        """
+        best_key: Optional[str] = None
+        best_ts: Optional[float] = None
+        for key, item in self._items.items():
+            if str(item.get('channel_state') or 'pending') != 'pending':
+                continue
+            if not isinstance(item.get('news'), dict):
+                continue
+            try:
+                ts = float(item.get('ts') or 0.0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            if best_ts is None or ts < best_ts:
+                best_key, best_ts = key, ts
+        if best_key is None:
+            return None
+        return best_key, dict(self._items[best_key]['news'])
+
     def uncertain_count(self) -> int:
         return sum(1 for item in self._items.values()
                    if str(item.get('channel_state') or 'pending') == 'uncertain')
@@ -13642,6 +13716,17 @@ async def deny_access(update: Update) -> None:
 
 
 # ============== INLINE-МЕНЮ "НАСТРОЙКИ" ==============
+_PUBLISH_MODE_LABELS = {
+    'thread': 'в ветку',
+    'channel': 'сразу в канал',
+    'both': 'в ветку + в канал по интервалу',
+}
+# Порядок перебора кнопкой: ветка -> ветка+канал -> только канал -> ветка.
+# «Только канал» стоит последним намеренно: это единственный режим без ручной
+# проверки, и попасть в него одним случайным нажатием не должно быть легко.
+_PUBLISH_MODE_ORDER = ('thread', 'both', 'channel')
+
+
 def _sw(value: bool) -> str:
     """Компактный индикатор состояния для кнопки."""
     return '🟢' if value else '⚪️'
@@ -13677,8 +13762,7 @@ def build_settings_menu() -> InlineKeyboardMarkup:
 
 def _menu_posts() -> InlineKeyboardMarkup:
     """Что и как публикуется."""
-    thread = ('🧵 Куда слать: в ветку' if settings.thread_mode
-              else '📢 Куда слать: сразу в канал')
+    thread = f'📤 Куда слать: {_PUBLISH_MODE_LABELS[settings.publish_mode]}'
     quiet = f'{_sw(settings.quiet_mode)} Тихий режим'
     open_mod = ('👥 Кнопки в ветке: всем' if settings.open_moderation
                 else '👤 Кнопки в ветке: админам')
@@ -13686,15 +13770,34 @@ def _menu_posts() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(thread, callback_data='settings:toggle_thread')],
         [InlineKeyboardButton(f'⏰ Свежесть: {settings.post_max_age_hours} ч',
                               callback_data='settings:age'),
-         InlineKeyboardButton('🔁 Интервал', callback_data='settings:interval')],
+         InlineKeyboardButton('🔁 Интервал сбора', callback_data='settings:interval')],
         [InlineKeyboardButton(open_mod, callback_data='settings:toggle_open')],
         [InlineKeyboardButton(quiet, callback_data='settings:toggle_quiet')],
         [InlineKeyboardButton(f'{_sw(settings.dedup_final_text)} Ловить повтор новостей',
                               callback_data='settings:toggle_finaldedup')],
         [InlineKeyboardButton('📦 Очередь', callback_data='settings:queue'),
          InlineKeyboardButton('🧹 История', callback_data='settings:history')],
-        [InlineKeyboardButton('⬅️ Назад', callback_data='settings:back')],
     ]
+    # Интервал канала показываем только когда бот публикует туда сам: в двух
+    # других режимах кнопка ничего не меняла бы и только путала.
+    if settings.publish_mode == 'both':
+        rows.insert(2, [InlineKeyboardButton(
+            f'📢 Интервал канала: {settings.channel_interval_min} мин',
+            callback_data='settings:chinterval')])
+    rows.append([InlineKeyboardButton('⬅️ Назад', callback_data='settings:back')])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_channel_interval_menu() -> InlineKeyboardMarkup:
+    """Как часто пост из ветки уходит в канал сам."""
+    options = [10, 15, 30, 60, 120, 240]
+    current = settings.channel_interval_min
+    rows = []
+    for opt in options:
+        marker = '✅ ' if opt == current else ''
+        label = f'{marker}{opt} мин' if opt < 60 else f'{marker}{opt // 60} ч'
+        rows.append([InlineKeyboardButton(label, callback_data=f'chint:{opt}')])
+    rows.append([InlineKeyboardButton('⬅️ Назад', callback_data='settings:back')])
     return InlineKeyboardMarkup(rows)
 
 
@@ -13787,7 +13890,7 @@ _SECTION_BUILDERS = {
 _TOGGLE_SECTION = {
     'toggle_thread': 'posts', 'toggle_quiet': 'posts', 'toggle_open': 'posts',
     'toggle_finaldedup': 'posts',
-    'age': 'posts', 'interval': 'posts',
+    'age': 'posts', 'interval': 'posts', 'chinterval': 'posts',
     'video': 'media', 'toggle_require_image': 'media', 'toggle_dedup': 'media',
     'toggle_llm': 'llm', 'toggle_llm_rewrite': 'llm', 'toggle_llm_filter': 'llm',
     'toggle_llm_tags': 'llm', 'toggle_llm_article': 'llm', 'toggle_llm_filler': 'llm',
@@ -13804,7 +13907,10 @@ def _menu_for(data: str) -> InlineKeyboardMarkup:
     После переключения тумблера надо остаться на месте: выбрасывать в корень
     каждый раз — значит заставлять заново нырять в раздел ради второй галочки."""
     key = data.split(':', 1)[-1]
-    section = _TOGGLE_SECTION.get(key)
+    # chint:30 / int:30 / age:24 несут в хвосте число, а не имя настройки.
+    section = _TOGGLE_SECTION.get(key) or _TOGGLE_SECTION.get(data.split(':', 1)[0])
+    if section is None and data.split(':', 1)[0] in ('chint', 'int', 'age'):
+        section = 'posts'
     builder = _SECTION_BUILDERS.get(section) if section else None
     return builder() if builder else build_settings_menu()
 
@@ -14504,23 +14610,55 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "settings:toggle_thread":
-        settings.thread_mode = not settings.thread_mode
-        if settings.thread_mode:
-            await query.answer("Режим ветки включён 🟢")
-            text = (
-                "⚙️ Настройки\n\n"
-                "🧵 Режим ветки ВКЛЮЧЁН.\n"
-                "Все найденные новости будут отправляться пачкой "
-                "в ветку обсуждения, а не по одной в канал."
-            )
-        else:
-            await query.answer("Режим ветки выключен 🔴")
-            text = (
-                "⚙️ Настройки\n\n"
-                "🧵 Режим ветки ВЫКЛЮЧЕН.\n"
-                "Бот снова публикует по одному посту в канал за интервал."
-            )
-        await query.edit_message_text(text, reply_markup=_menu_for(data))
+        order = _PUBLISH_MODE_ORDER
+        try:
+            nxt = order[(order.index(settings.publish_mode) + 1) % len(order)]
+        except ValueError:
+            nxt = order[0]
+        settings.publish_mode = nxt
+        await query.answer(f'Режим: {_PUBLISH_MODE_LABELS[nxt]}')
+        explain = {
+            'thread': ("🧵 Только в ветку.\n"
+                       "Все найденные новости уходят пачкой в ветку обсуждения. "
+                       "В канал попадает лишь то, что вы отправите кнопкой 📢."),
+            'both': (f"🧵📢 В ветку и в канал.\n"
+                     f"Ветка получает всё, как раньше, а в канал бот сам "
+                     f"выкладывает по одному посту раз в "
+                     f"{settings.channel_interval_min} мин — в том же порядке.\n\n"
+                     f"Кнопка 📢 продолжает работать: нажатие публикует пост "
+                     f"вне очереди, и повторно бот его уже не отправит. "
+                     f"Скрытый кнопкой ✖ пост в канал не попадёт.\n\n"
+                     f"Интервал канала настраивается отдельной кнопкой."),
+            'channel': ("📢 Только в канал.\n"
+                        "Ветка больше не получает пачку, посты идут по одному "
+                        "в канал за интервал сбора.\n\n"
+                        "⚠️ Ручной проверки в этом режиме нет: всё, что бот "
+                        "счёл годным, публикуется само."),
+        }[nxt]
+        await query.edit_message_text(f"⚙️ Настройки\n\n{explain}",
+                                      reply_markup=_menu_for(data))
+        return
+
+    if data == "settings:chinterval":
+        await query.edit_message_text(
+            f"📢 Как часто пост из ветки уходит в канал\n\n"
+            f"Текущий: {settings.channel_interval_min} мин\n"
+            f"Интервал сбора источников настраивается отдельно.",
+            reply_markup=build_channel_interval_menu(),
+        )
+        return
+
+    if data.startswith("chint:"):
+        try:
+            new_min = int(data[6:])
+        except ValueError:
+            return
+        settings.channel_interval_min = new_min
+        await query.answer(f'Интервал канала: {new_min} мин')
+        await query.edit_message_text(
+            f"📢 Пост из ветки уходит в канал раз в {new_min} мин.",
+            reply_markup=_menu_for(data),
+        )
         return
 
     if data.startswith("settings:toggle_llm"):
@@ -16025,6 +16163,86 @@ async def _publish_one_from_queue(bot_api) -> tuple[Optional[str], Optional[dict
 _publisher_lock = asyncio.Lock()
 
 
+async def _channel_autopost_due(now: Optional[datetime] = None) -> bool:
+    """Пора ли выкладывать очередной пост из ветки в канал."""
+    now = now or datetime.now(timezone.utc)
+    raw = str(getattr(settings, 'last_publish_at', '') or '')
+    if not raw:
+        return True
+    try:
+        last = datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return (now - last).total_seconds() >= settings.channel_interval_sec
+
+
+async def _autopost_one_from_thread(bot_api) -> Optional[str]:
+    """Публикует в канал один пост из ветки — режим «и в ветку, и в канал».
+
+    Ledger трогать нельзя: ссылка списана ещё при отправке в ветку. Защита от
+    дубля здесь другая и уже существует — channel_state у pending-поста.
+    ``mark_channel_sending`` переводит его из pending в sending и возвращает
+    False, если состояние уже не pending. Поэтому ручное нажатие «📢 В канал»
+    и этот автопубликатор не могут отправить один пост дважды: кто первым
+    занял состояние, тот и публикует.
+    """
+    if pending_posts is None or not await _channel_autopost_due():
+        return None
+    row = pending_posts.next_for_autopost()
+    if row is None:
+        return None
+    key, news = row
+    with _PublishGuard(f'pending:{key}') as guard:
+        if not guard.acquired:
+            return None                  # этот пост прямо сейчас публикует человек
+        if not pending_posts.mark_channel_sending(key):
+            return None                  # состояние занято: уже ушёл или в процессе
+        try:
+            ok = await _prepare_and_send_channel_post(bot_api, news)
+        except DeliveryUncertain as e:
+            pending_posts.mark_channel_uncertain(key)
+            logger.warning('Автопостинг в канал: неоднозначная доставка (%s)', e)
+            metrics.inc('anime_bot_publish_attempts_total',
+                        labels={'mode': 'autopost', 'result': 'uncertain'})
+            return 'uncertain'
+        except asyncio.CancelledError:
+            pending_posts.mark_channel_uncertain(key)
+            raise
+        except Exception:
+            pending_posts.mark_channel_pending(key)
+            logger.exception('Автопостинг в канал упал')
+            metrics.inc('anime_bot_publish_attempts_total',
+                        labels={'mode': 'autopost', 'result': 'failed'})
+            return 'failed'
+    if not ok:
+        pending_posts.mark_channel_pending(key)
+        metrics.inc('anime_bot_publish_attempts_total',
+                    labels={'mode': 'autopost', 'result': 'failed'})
+        return 'failed'
+
+    # Пост ушёл. Дальше — тот же учёт, что и при ручной публикации кнопкой.
+    pending_posts.pop(key)
+    _mark_published_now()
+    _mark_published()
+    source = str(news.get('source') or 'unknown')
+    if stats is not None:
+        await stats.record_published(source)
+    if feature_enabled('source_yield') and source_yield is not None:
+        await asyncio.to_thread(source_yield.record_published, source)
+    if feature_enabled('story_registry') and story_registry is not None:
+        await asyncio.to_thread(story_registry.mark_delivery, news, published=True)
+    if story_history is not None:
+        await asyncio.to_thread(story_history.record, news, format_news_short(news))
+    metrics.inc('anime_bot_publish_attempts_total',
+                labels={'mode': 'autopost', 'result': 'sent'})
+    _event_log('publish_result', story_id=news.get('_story_id'), mode='autopost',
+               result='sent', source=source)
+    logger.info('📢 Автопостинг в канал: %s', str(news.get('title', ''))[:70])
+    return 'sent'
+
+
 async def publisher_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Разгружает очередь независимо от сбора новостей.
 
@@ -16036,8 +16254,16 @@ async def publisher_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     прошлой публикации прошёл настроенный интервал. Решение о времени берётся
     из того же ``settings.last_publish_at``, что и раньше.
     """
-    if (settings is None or post_queue is None or settings.thread_mode
+    if (settings is None or post_queue is None
             or not settings.auto_enabled or not feature_enabled('independent_publisher')):
+        return
+    if settings.publish_mode == 'both':
+        # Ветка уже получила пачку и списала ссылки в историю, поэтому очередь
+        # здесь пуста по определению: источником для канала служат сами
+        # pending-посты из ветки.
+        await _autopost_one_from_thread(context.bot)
+        return
+    if settings.thread_mode:
         return
     if _publisher_lock.locked():
         return          # предыдущий тик ещё идёт
@@ -16221,13 +16447,20 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
     interval_note = (f'в ветку до {BACKPRESSURE_THREAD_MAX_PER_CYCLE} постов за цикл'
                      if settings.thread_mode
                      else 'до 1 публикации в канал за интервал')
+    if settings.publish_mode == 'both':
+        interval_note += f'; в канал 1 раз в {settings.channel_interval_min} мин'
+    mode_line = f'📤 Режим: {_PUBLISH_MODE_LABELS[settings.publish_mode]}'
+    if settings.publish_mode == 'both':
+        mode_line += f' (в канал раз в {settings.channel_interval_min} мин)'
+    readiness = (f'{_channel_mode_readiness()}\n'
+                 if settings.publish_mode == 'thread' else '')
     await update.message.reply_text(
         f"Авторассылка: {'🟢 включена' if is_running else '🔴 выключена'}"
         f"{' ⚠️ (должна быть включена)' if auto_saved and not is_running else ''}\n"
         f"Автовосстановление: {'ВКЛ' if auto_saved else 'ВЫКЛ'}\n"
         f"Последняя автопроверка: {last_check_text}\n"
         f"Интервал: {settings.check_interval_min} мин ({interval_note})\n"
-        f"🧵 Режим ветки: {'ВКЛ (всё в ветку)' if settings.thread_mode else 'ВЫКЛ (по 1 в канал)'}\n"
+        f"{mode_line}\n"
         f"🌐 Переводчик: {translator_name}\n"
         f"⏰ Свежесть постов: {settings.post_max_age_hours} ч\n"
         f"🖼 Только с картинками: {'ВКЛ' if settings.require_image else 'ВЫКЛ'}\n"
@@ -16238,10 +16471,9 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
         f"Скачивание видео: {video_state}\n"
         f"yt-dlp: {yt_status}\n"
         f"ffmpeg: {ffmpeg_status}\n"
-        # Показываем только пока сидим в ветке: после переключения этот блок
-        # уже ничего не готовит, а цифры темпа видны в отчётах цикла.
-        + (f"{_channel_mode_readiness()}\n" if settings.thread_mode else "")
-        + "\n"
+        # Блок готовности нужен, только пока автопубликации в канал ещё нет.
+        f"{readiness}"
+        "\n"
         f"📡 Источники:\n{sources_list}"
     )
 
@@ -18532,7 +18764,7 @@ async def send_startup_report(app, brief: bool = False) -> None:
     lines.append(f'📡 Источников: {len(enabled)} вкл' + (f', {len(paused)} на паузе' if paused else ''))
     if paused:
         lines.append(f'   ⏸ {html.escape(", ".join(paused[:8]))}')
-    lines.append('🧵 Режим: ' + ('ветка обсуждения' if settings.thread_mode else 'сразу в канал'))
+    lines.append('📤 Режим: ' + _PUBLISH_MODE_LABELS[settings.publish_mode])
     lines.append('🎬 Видео: ' + ('ВКЛ' if settings.video_enabled else 'ВЫКЛ')
                  + f' (до {TG_VIDEO_MAX_SECONDS // 60} мин)')
     lines.append('🖼 Дедуп по картинке: ' + ('ВКЛ' if settings.image_dedup else 'ВЫКЛ'))
