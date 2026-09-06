@@ -4,7 +4,10 @@
 несправедливое наказание — это ушедший из сообщества человек. Поэтому тесты
 проверяют в первую очередь то, чего бот делать НЕ должен.
 """
+from types import SimpleNamespace
+
 import pytest
+import telegram.error as bot_error
 
 import anime_news_bot as bot
 
@@ -415,3 +418,113 @@ def test_slur_still_never_leads_to_ban():
     for severity in (1, 2, 3):
         for warns in range(6):
             assert bot._mod_decide('hate', severity, warns)['action'] != 'ban'
+
+
+# ---------- находки автономных раундов ----------
+
+@pytest.mark.asyncio
+async def test_unverifiable_status_makes_user_immune():
+    """Раунд 1. Сбой Telegram делал участника наказуемым.
+
+    _mod_is_immune возвращал False, а False означает «не иммунен». Комментарий
+    обещал обратное: при недоступности Telegram админ чата мог получить мут
+    из-за таймаута.
+    """
+    class _Broken:
+        async def get_chat_member(self, *a, **k):
+            raise bot_error.TelegramError('timeout')
+
+    assert await bot._mod_is_immune(_Broken(), -100, 777) is True
+
+
+def test_escalation_uses_every_rung():
+    """Раунд 2. Первая ступень лестницы не использовалась вовсе.
+
+    Получалось предупреждение, предупреждение, а потом сразу сутки — и
+    несоразмерно, и не так, как описано.
+    """
+    actions = [bot._mod_decide('toxic', 1, w) for w in range(4)]
+    assert actions[0]['action'] == 'warn'
+    assert actions[1]['action'] == 'mute'
+    assert actions[1]['minutes'] == bot.MODERATION_MUTE_LADDER[0]
+    assert actions[2]['minutes'] == bot.MODERATION_MUTE_LADDER[1]
+
+
+def test_escalation_stops_growing():
+    """Бот не эскалирует бесконечно: дальше решает человек."""
+    assert bot._mod_decide('toxic', 1, 99)['minutes'] == bot.MODERATION_MUTE_LADDER[-1]
+
+
+def test_context_windows_are_bounded():
+    """Раунд 3. Окон контекста заводилось по одному на чат без потолка."""
+    bot._moderation_windows.clear()
+    for chat in range(400):
+        bot._mod_note_message(chat, 1, 'x', 'сообщение')
+    assert len(bot._moderation_windows) <= 200
+
+
+def test_decision_log_records_reasoning(tmp_path):
+    """Раунд 4. Счётчики говорят «сколько», журнал — «почему».
+
+    Разобрать спорное наказание через час иначе нечем: сообщение удалено,
+    отчёт утонул в личке админа.
+    """
+    store = bot.ChatModerationStore(tmp_path / 'm.json')
+    store.log_decision(-100, 5, 'Тестер', 'toxic', 'warn', 'модель',
+                       'адресное оскорбление', 'ты дебил')
+    row = store.recent_log(1)[0]
+    assert row['category'] == 'toxic' and row['reason'] and row['text']
+
+
+def test_decision_log_is_bounded_and_persistent(tmp_path):
+    """Тексты чужих сообщений на диске — вещь чувствительная: список короткий."""
+    path = tmp_path / 'm.json'
+    store = bot.ChatModerationStore(path)
+    for i in range(bot.MODERATION_LOG_MAX + 20):
+        store.log_decision(-1, i, 'x', 'spam', 'warn', 'локальные правила', '', f'текст {i}')
+    assert len(store.recent_log(1000)) <= bot.MODERATION_LOG_MAX
+    assert bot.ChatModerationStore(path).recent_log(1000)      # переживает перезапуск
+
+
+@pytest.mark.asyncio
+async def test_channel_posts_are_not_moderated(tmp_path, monkeypatch):
+    """Раунд 1. За sender_chat нет участника, которого можно наказать.
+
+    Отдельно это закрывает автопересылку постов канала в связанную группу:
+    без проверки бот модерировал бы собственные новости.
+    """
+    store = bot.ChatModerationStore(tmp_path / 'm.json')
+    store.set_chat(-100, True)
+    monkeypatch.setattr(bot, 'chat_moderation', store)
+    monkeypatch.setattr(bot, 'feature_enabled', lambda name: True)
+
+    def _boom(_message):
+        raise AssertionError('до разбора сообщения дойти не должно')
+
+    monkeypatch.setattr(bot, '_mod_message_text', _boom)
+    update = SimpleNamespace(
+        effective_message=SimpleNamespace(sender_chat=SimpleNamespace(id=-100)),
+        effective_user=SimpleNamespace(is_bot=False, id=1, full_name='x'),
+        effective_chat=SimpleNamespace(id=-100),
+    )
+    await bot.moderation_message_handler(update, SimpleNamespace(bot=None))
+
+
+@pytest.mark.asyncio
+async def test_failed_model_call_does_not_spend_budget(monkeypatch):
+    """Раунд 1. Молчание провайдера съедало дневной лимит вызовов.
+
+    Бюджет существует, чтобы модерация не оставила без модели новостной цикл.
+    Считать неотвеченные попытки — значит выключать модерацию тем быстрее, чем
+    хуже работает провайдер.
+    """
+    spent = []
+    monkeypatch.setattr(bot, '_moderation_llm_count', lambda: spent.append(1))
+    monkeypatch.setattr(bot, '_moderation_llm_budget_left', lambda: 100)
+
+    async def _silent(*a, **k):
+        return None
+
+    monkeypatch.setattr(bot, '_llm_call', _silent)
+    assert await bot._moderation_classify(-1, 'ты дебил') is None
+    assert spent == []
