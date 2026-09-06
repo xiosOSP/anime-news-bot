@@ -2971,6 +2971,10 @@ class BotSettings:
         'last_backup_date': '',  # дата последнего бэкапа (YYYY-MM-DD)
         'startup_report': True,  # отчёт админам при запуске бота
         'last_publish_at': '',   # когда последний раз что-то опубликовали
+        # Своя отметка у канала. Общая с веткой означала, что пост в ветку
+        # сдвигает расписание канала: при ветке чаще канала последний не
+        # получал ничего вообще.
+        'last_channel_post_at': '',  # когда последний раз ушло в канал
         'deepl_month': '',       # месяц, за который считаем символы DeepL
         'deepl_chars': 0,        # израсходовано символов DeepL за месяц
         'llm_enabled': True,     # использовать языковую модель (если задан ключ)
@@ -3423,6 +3427,21 @@ class BotSettings:
     @last_publish_at.setter
     def last_publish_at(self, value: str) -> None:
         self._data['last_publish_at'] = str(value)
+
+    @property
+    def last_channel_post_at(self) -> str:
+        """Когда бот сам выложил пост в канал.
+
+        Отдельно от last_publish_at: та отметка кормит сторожа тишины и
+        обновляется любой публикацией, в том числе в ветку. Расписание канала
+        обязано зависеть только от публикаций в канал.
+        """
+        return str(self._data.get('last_channel_post_at', ''))
+
+    @last_channel_post_at.setter
+    def last_channel_post_at(self, value: str) -> None:
+        self._data['last_channel_post_at'] = str(value)
+        self.save()
         self.save()
 
     @property
@@ -9585,7 +9604,14 @@ async def _prepare_and_send_channel_post(bot: Bot, news: dict) -> bool:
         file_id = news.get('_telegram_video_file_id')
         if not (isinstance(file_id, str) and file_id.strip()):
             video_file = await _prepare_video_file(news)
-        return await _send_channel_post(bot, news, video_file)
+        sent = await _send_channel_post(bot, news, video_file)
+        if sent:
+            # Отметка одна на все пути в канал: автопостинг, кнопка «📢 В канал»
+            # и отложка. Иначе ручная публикация не сдвигала бы расписание, и
+            # автопостинг мог добавить второй пост через минуту после неё —
+            # хотя интервал канала обещает обратное.
+            _mark_channel_post_now()
+        return sent
     finally:
         if video_file:
             try:
@@ -14207,6 +14233,52 @@ def _sw(value: bool) -> str:
     return '🟢' if value else '⚪️'
 
 
+def _fmt_minutes(minutes: int) -> str:
+    """Интервал по-человечески: 30 мин, 2 ч, 1 ч 30 мин.
+
+    В меню одни и те же числа показывались по-разному: кнопка раздела писала
+    «120 мин», а экран выбора — «2 ч». Одна настройка не должна выглядеть
+    двумя разными.
+    """
+    minutes = max(0, int(minutes))
+    if minutes < 60:
+        return f'{minutes} мин'
+    hours, rest = divmod(minutes, 60)
+    if rest == 0:
+        return f'{hours} ч'
+    return f'{hours} ч {rest} мин'
+
+
+def _settings_overview() -> str:
+    """Что бот делает прямо сейчас — одним экраном.
+
+    «Выбери раздел» не отвечало ни на один вопрос, с которым сюда заходят:
+    куда идут посты, как часто и включена ли модель. Чтобы это узнать,
+    приходилось нырять в три раздела подряд.
+    """
+    mode = settings.publish_mode
+    lines = ['⚙️ <b>Настройки</b>', '']
+    lines.append(f'📤 Публикация: <b>{_PUBLISH_MODE_LABELS[mode]}</b>')
+    if mode == 'both':
+        lines.append(f'   🧵 в ветку раз в {_fmt_minutes(settings.check_interval_min)}')
+        lines.append(f'   📢 в канал раз в {_fmt_minutes(settings.channel_interval_min)}')
+    elif mode == 'thread':
+        lines.append(f'   🧵 в ветку раз в {_fmt_minutes(settings.check_interval_min)}')
+    else:
+        lines.append(f'   📢 в канал раз в {_fmt_minutes(settings.check_interval_min)}')
+    lines.append(f'⏰ Берём новости не старше {settings.post_max_age_hours} ч')
+    state = '🟢 включён' if settings.auto_enabled else '⚪️ выключен'
+    lines.append(f'🔄 Автопостинг: {state}')
+    if _llm_configured():
+        model = '🟢 ' + _llm_current()[2] if settings.llm_enabled else '⚪️ выключена'
+        lines.append(f'🤖 Модель: {model}')
+    else:
+        lines.append('🤖 Модель: не настроена')
+    lines.append('')
+    lines.append('Выбери раздел ↓')
+    return '\n'.join(lines)
+
+
 SETTINGS_SECTIONS = {
     'posts': '📝 Посты',
     'media': '🎬 Медиа',
@@ -14241,11 +14313,28 @@ def _menu_posts() -> InlineKeyboardMarkup:
     quiet = f'{_sw(settings.quiet_mode)} Тихий режим'
     open_mod = ('👥 Кнопки в ветке: всем' if settings.open_moderation
                 else '👤 Кнопки в ветке: админам')
+    # Кнопка интервала называет площадку, а не механику: «интервал сбора»
+    # ничего не говорило о том, куда именно посты пойдут с этой частотой.
+    own = _fmt_minutes(settings.check_interval_min)
+    if settings.publish_mode == 'channel':
+        interval_rows = [[InlineKeyboardButton(f'📢 В канал: раз в {own}',
+                                               callback_data='settings:interval')]]
+    elif settings.publish_mode == 'thread':
+        interval_rows = [[InlineKeyboardButton(f'🧵 В ветку: раз в {own}',
+                                               callback_data='settings:interval')]]
+    else:
+        # Оба интервала рядом: смысл режима «и в ветку, и в канал» именно в
+        # том, что у площадок разный темп, и сравнивать их надо на одном экране.
+        interval_rows = [[
+            InlineKeyboardButton(f'🧵 Ветка: {own}', callback_data='settings:interval'),
+            InlineKeyboardButton(f'📢 Канал: {_fmt_minutes(settings.channel_interval_min)}',
+                                 callback_data='settings:chinterval'),
+        ]]
     rows = [
         [InlineKeyboardButton(thread, callback_data='settings:toggle_thread')],
+        *interval_rows,
         [InlineKeyboardButton(f'⏰ Свежесть: {settings.post_max_age_hours} ч',
-                              callback_data='settings:age'),
-         InlineKeyboardButton('🔁 Интервал сбора', callback_data='settings:interval')],
+                              callback_data='settings:age')],
         [InlineKeyboardButton(open_mod, callback_data='settings:toggle_open')],
         [InlineKeyboardButton(quiet, callback_data='settings:toggle_quiet')],
         [InlineKeyboardButton(f'{_sw(settings.dedup_final_text)} Ловить повтор новостей',
@@ -14253,26 +14342,28 @@ def _menu_posts() -> InlineKeyboardMarkup:
         [InlineKeyboardButton('📦 Очередь', callback_data='settings:queue'),
          InlineKeyboardButton('🧹 История', callback_data='settings:history')],
     ]
-    # Интервал канала показываем только когда бот публикует туда сам: в двух
-    # других режимах кнопка ничего не меняла бы и только путала.
-    if settings.publish_mode == 'both':
-        rows.insert(2, [InlineKeyboardButton(
-            f'📢 Интервал канала: {settings.channel_interval_min} мин',
-            callback_data='settings:chinterval')])
     rows.append([InlineKeyboardButton('⬅️ Назад', callback_data='settings:back')])
     return InlineKeyboardMarkup(rows)
 
 
 def build_channel_interval_menu() -> InlineKeyboardMarkup:
-    """Как часто пост из ветки уходит в канал сам."""
-    options = [10, 15, 30, 60, 120, 240]
+    """Как часто пост из ветки уходит в канал сам.
+
+    Вариантов больше, чем у сбора, и они реже: канал читают подписчики, а не
+    модераторы, и для него нормально отставать от ветки в разы.
+    """
+    options = [15, 30, 60, 90, 120, 180, 240, 360]
     current = settings.channel_interval_min
     rows = []
-    for opt in options:
-        marker = '✅ ' if opt == current else ''
-        label = f'{marker}{opt} мин' if opt < 60 else f'{marker}{opt // 60} ч'
-        rows.append([InlineKeyboardButton(label, callback_data=f'chint:{opt}')])
-    rows.append([InlineKeyboardButton('⬅️ Назад', callback_data='settings:back')])
+    # По две кнопки в ряд: восемь вариантов в столбик — это экран прокрутки.
+    for i in range(0, len(options), 2):
+        row = []
+        for opt in options[i:i + 2]:
+            marker = '✅ ' if opt == current else ''
+            row.append(InlineKeyboardButton(f'{marker}{_fmt_minutes(opt)}',
+                                            callback_data=f'chint:{opt}'))
+        rows.append(row)
+    rows.append([InlineKeyboardButton('⬅️ Назад', callback_data='settings:sec:posts')])
     return InlineKeyboardMarkup(rows)
 
 
@@ -14393,10 +14484,15 @@ def _menu_for(data: str) -> InlineKeyboardMarkup:
 
 
 def _section_view(name: str) -> tuple[str, InlineKeyboardMarkup]:
-    """Заголовок и клавиатура раздела."""
+    """Заголовок и клавиатура раздела.
+
+    К подписи раздела добавлена живая строка состояния: подпись объясняет, что
+    здесь лежит, но не отвечает на вопрос, ради которого сюда и заходят —
+    «а как сейчас?».
+    """
     builder = _SECTION_BUILDERS.get(name)
     if builder is None:
-        return '⚙️ Настройки', build_settings_menu()
+        return _settings_overview(), build_settings_menu()
     hints = {
         'posts': 'Куда и как часто уходят посты.',
         'media': 'Картинки и видео в постах.',
@@ -14404,7 +14500,37 @@ def _section_view(name: str) -> tuple[str, InlineKeyboardMarkup]:
         'sources': 'Откуда бот берёт новости.',
         'system': 'Бэкапы и уведомления.',
     }
-    return f'{SETTINGS_SECTIONS[name]}\n\n{hints[name]}', builder()
+    lines = [f'<b>{SETTINGS_SECTIONS[name]}</b>', '', hints[name]]
+    state = _section_state(name)
+    if state:
+        lines += ['', state]
+    return '\n'.join(lines), builder()
+
+
+def _section_state(name: str) -> str:
+    """Одна строка живого состояния раздела — или пусто, если сказать нечего."""
+    if name == 'posts':
+        if settings.publish_mode == 'both':
+            return (f'Сейчас: 🧵 ветка раз в {_fmt_minutes(settings.check_interval_min)}, '
+                    f'📢 канал раз в {_fmt_minutes(settings.channel_interval_min)}.')
+        where = 'канал' if settings.publish_mode == 'channel' else 'ветка'
+        return f'Сейчас: {where} раз в {_fmt_minutes(settings.check_interval_min)}.'
+    if name == 'sources':
+        on = sum(1 for n, _ in SOURCES if settings.is_source_enabled(n))
+        return f'Сейчас: включено {on} из {len(SOURCES)}.'
+    if name == 'llm':
+        if not _llm_configured():
+            return 'Модель не настроена — /llm'
+        if not settings.llm_enabled:
+            return 'Модель выключена: перевод идёт через DeepL/Google.'
+        return f'Сейчас: <code>{html.escape(_llm_current()[2])}</code>.'
+    if name == 'media':
+        parts = []
+        parts.append('видео ' + ('вкл' if settings.video_enabled else 'выкл'))
+        if settings.require_image:
+            parts.append('только с картинкой')
+        return 'Сейчас: ' + ', '.join(parts) + '.'
+    return ''
 
 
 
@@ -14481,14 +14607,17 @@ def build_sources_menu(page: int = 0) -> InlineKeyboardMarkup:
 
 def build_interval_menu() -> InlineKeyboardMarkup:
     """Меню выбора интервала автопроверки."""
-    options = [15, 30, 60, 120, 240]
+    options = [15, 30, 45, 60, 120, 240]
     current = settings.check_interval_min
     rows = []
-    for opt in options:
-        marker = "✅ " if opt == current else ""
-        label = f"{marker}{opt} мин" if opt < 60 else f"{marker}{opt // 60} ч"
-        rows.append([InlineKeyboardButton(label, callback_data=f"int:{opt}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings:back")])
+    for i in range(0, len(options), 2):
+        row = []
+        for opt in options[i:i + 2]:
+            marker = '✅ ' if opt == current else ''
+            row.append(InlineKeyboardButton(f'{marker}{_fmt_minutes(opt)}',
+                                            callback_data=f'int:{opt}'))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings:sec:posts")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -15012,8 +15141,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # === Главное меню и разделы ===
     if data == "settings:back":
-        await _safe_edit(query, '⚙️ <b>Настройки</b>\n\nВыбери раздел.',
-                         build_settings_menu())
+        await _safe_edit(query, _settings_overview(), build_settings_menu())
         return
     if data.startswith("settings:sec:"):
         text, markup = _section_view(data.split(':', 2)[2])
@@ -15044,9 +15172,12 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if data == "settings:interval":
+        where = ('в канал' if settings.publish_mode == 'channel' else 'в ветку')
         await query.edit_message_text(
-            f"🔁 Интервал автопроверки\n\nТекущий: {settings.check_interval_min} мин",
-            reply_markup=build_interval_menu(),
+            f'🔁 <b>Как часто бот проверяет источники</b>\n\n'
+            f'С этой же частотой найденное уходит {where}.\n'
+            f'Сейчас: <b>раз в {_fmt_minutes(settings.check_interval_min)}</b>',
+            reply_markup=build_interval_menu(), parse_mode=ParseMode.HTML,
         )
         return
     if data == "settings:age":
@@ -15127,10 +15258,11 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "settings:chinterval":
         await query.edit_message_text(
-            f"📢 Как часто пост из ветки уходит в канал\n\n"
-            f"Текущий: {settings.channel_interval_min} мин\n"
-            f"Интервал сбора источников настраивается отдельно.",
-            reply_markup=build_channel_interval_menu(),
+            f'📢 <b>Как часто пост из ветки уходит в канал</b>\n\n'
+            f'Сейчас: <b>раз в {_fmt_minutes(settings.channel_interval_min)}</b>\n'
+            f'В ветку — раз в {_fmt_minutes(settings.check_interval_min)}, '
+            f'это отдельная настройка.',
+            reply_markup=build_channel_interval_menu(), parse_mode=ParseMode.HTML,
         )
         return
 
@@ -15140,10 +15272,11 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             return
         settings.channel_interval_min = new_min
-        await query.answer(f'Интервал канала: {new_min} мин')
+        await query.answer(f'Интервал канала: {_fmt_minutes(new_min)}')
         await query.edit_message_text(
-            f"📢 Пост из ветки уходит в канал раз в {new_min} мин.",
-            reply_markup=_menu_for(data),
+            f'📢 <b>В канал раз в {_fmt_minutes(new_min)}</b>\n'
+            f'🧵 В ветку раз в {_fmt_minutes(settings.check_interval_min)}',
+            reply_markup=_menu_for(data), parse_mode=ParseMode.HTML,
         )
         return
 
@@ -15323,11 +15456,19 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             extra = " (автопроверка восстановлена)"
         else:
             extra = ""
-        await query.answer(f"Интервал: {new_min} мин{extra}")
-        await query.edit_message_text(
-            f"🔁 Интервал автопроверки\n\nТекущий: {settings.check_interval_min} мин",
-            reply_markup=build_interval_menu(),
-        )
+        await query.answer(f'Интервал: {_fmt_minutes(new_min)}{extra}')
+        where = ('в канал' if settings.publish_mode == 'channel' else 'в ветку')
+        lines = [f'🔁 <b>Проверяем источники раз в '
+                 f'{_fmt_minutes(settings.check_interval_min)}</b>',
+                 f'С этой же частотой найденное уходит {where}.']
+        if settings.publish_mode == 'both':
+            lines.append(f'📢 В канал — раз в '
+                         f'{_fmt_minutes(settings.channel_interval_min)}.')
+        if extra:
+            lines.append(extra.strip(' ()').capitalize() + '.')
+        await query.edit_message_text('\n'.join(lines),
+                                      reply_markup=build_interval_menu(),
+                                      parse_mode=ParseMode.HTML)
         return
 
     # === Переключение видео ===
@@ -16114,7 +16255,7 @@ async def start(update, context: ContextTypes.DEFAULT_TYPE):
 async def settings_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /settings — открыть inline-меню настроек."""
     await update.message.reply_text(
-        '⚙️ <b>Настройки</b>\n\nВыбери раздел.',
+        _settings_overview(),
         reply_markup=build_settings_menu(),
         parse_mode=ParseMode.HTML,
     )
@@ -16650,9 +16791,16 @@ _publisher_lock = asyncio.Lock()
 
 
 async def _channel_autopost_due(now: Optional[datetime] = None) -> bool:
-    """Пора ли выкладывать очередной пост из ветки в канал."""
+    """Пора ли выкладывать очередной пост из ветки в канал.
+
+    Считаем от последней публикации В КАНАЛ, а не от последней публикации
+    вообще. Раньше отметка была общей с веткой, и пост в ветку отодвигал
+    канал: при ветке раз в 30 мин и канале раз в 2 часа срок канала не
+    наступал никогда — то есть настройка разных интервалов не работала ровно
+    в том направлении, ради которого её заводили.
+    """
     now = now or datetime.now(timezone.utc)
-    raw = str(getattr(settings, 'last_publish_at', '') or '')
+    raw = str(getattr(settings, 'last_channel_post_at', '') or '')
     if not raw:
         return True
     try:
@@ -16796,6 +16944,18 @@ def _mark_published_now() -> None:
         settings.save()
     except Exception:
         logger.exception('Publisher: не удалось сохранить время публикации')
+
+
+def _mark_channel_post_now() -> None:
+    """Отмечает публикацию в канал — от неё считается интервал канала."""
+    if settings is None:
+        return
+    try:
+        settings.last_channel_post_at = datetime.now(timezone.utc).isoformat()
+    except Exception:
+        # Не сохранили — следующий тик решит, что пора, и канал получит пост
+        # раньше срока. Это заметно, но безобидно; молчащий канал хуже.
+        logger.exception('Автопостинг: не удалось сохранить время публикации в канал')
 
 
 def _ensure_publisher_job(job_queue) -> bool:
