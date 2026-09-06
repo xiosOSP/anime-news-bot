@@ -140,3 +140,36 @@ def test_returning_to_primary_starts_a_new_round(three):
     bot._llm_using_fallback = False        # кулдаун вернул нас к основному
     assert bot._llm_try_failover('capacity', '', 60.0) is True
     assert bot._llm_current()[2] == 'mistral-small-latest'
+
+
+def test_suggested_name_means_waiting_will_not_help(three):
+    """«Did you mean X?» — это «такой модели у меня нет», чем бы ни объяснялось.
+
+    Реальный случай: роутер писал «No available capacity ... try again later»
+    про модель, которой в его каталоге уже не было вовсе. Совет «подождать»
+    отправлял ждать того, что не наступит.
+    """
+    reason = bot._llm_fatal_reason(404, REAL_404)
+    assert 'ожидание не поможет' in reason['admin']
+    assert 'Переменные менять не нужно' not in reason['admin']
+
+
+def test_plain_capacity_refusal_still_says_to_wait(three):
+    """Без подсказки имени отказ по мощности остаётся тем, чем был."""
+    body = ('{"error":{"code":"model_not_found","message":"No available capacity '
+            'for model x right now. Please try again later."}}')
+    reason = bot._llm_fatal_reason(404, body)
+    assert reason['reason'] == 'capacity'
+    assert 'Переменные менять не нужно' in reason['admin']
+
+
+def test_openrouter_preset_points_at_a_live_model():
+    """Пресет вёл на снятую модель, то есть был готовой поломкой из коробки.
+
+    Имена бесплатных моделей у роутеров живут недолго. Проверить существование
+    по сети здесь нельзя, поэтому сторожим хотя бы то, что пресет не остался на
+    той, про которую точно известно, что её сняли.
+    """
+    _, model = bot.LLM_PRESETS['openrouter']
+    assert model != 'google/gemma-3-27b-it:free', 'снятая модель вернулась в пресет'
+    assert model
