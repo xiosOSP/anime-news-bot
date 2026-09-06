@@ -361,3 +361,57 @@ def test_prompt_states_asymmetric_cost():
     text = bot.MODERATION_SYSTEM_PROMPT.lower()
     assert 'violation:false' in text
     assert 'прогонит человека' in text or 'цена этих ошибок разная' in text
+
+
+# ---------- оскорбление группы людей ----------
+
+def test_group_slur_has_its_own_category():
+    """Брошенное в пустоту «пидорасы» прошло мимо на реальном тесте.
+
+    Причина была не в списках, а в промпте: правило «смотри на адресность»
+    само велело модели пропускать оскорбление, ни к кому не обращённое.
+    Оскорбление группы вредит и без адресата, поэтому у него своя категория.
+    """
+    assert 'hate' in bot.MODERATION_RULES
+    assert bot.MODERATION_RULES['hate']['action'] == 'mute'
+
+
+@pytest.mark.parametrize('text', [
+    'Пидорасы',
+    'ну ты и даун',
+    'понаехали хачи',
+])
+def test_slurs_reach_the_model(text):
+    assert bot._mod_local_check(1, 60, text) is not None
+
+
+@pytest.mark.parametrize('text', [
+    'я гей, и мне зашёл этот тайтл',
+    'обсуждаем новый сезон',
+])
+def test_neutral_speech_is_not_routed(text):
+    """Нейтральное слово о себе не должно даже доходить до модели."""
+    assert bot._mod_local_check(1, 61, text) is None
+
+
+def test_prompt_exempts_slurs_from_the_addressee_rule():
+    """Без явного исключения правило про адресность перекрывает правило про
+    оскорбление группы — именно так и случилось на проде."""
+    text = bot.MODERATION_SYSTEM_PROMPT
+    assert 'НАРУШЕНИЕ ВСЕГДА' in text
+    assert 'hate,' in text                      # категория объявлена модели
+    assert 'человек о себе' in text             # самоописание не наказывается
+    assert 'цитата в жалобе' in text            # пересказ не наказывается
+
+
+def test_slur_leads_to_mute_not_warning():
+    """Оскорбление группы серьёзнее обычной грубости: сразу мут, без ступени
+    предупреждения."""
+    assert bot._mod_decide('hate', severity=2, warns=0)['action'] == 'mute'
+
+
+def test_slur_still_never_leads_to_ban():
+    """Даже самая тяжёлая категория не даёт боту права на бан."""
+    for severity in (1, 2, 3):
+        for warns in range(6):
+            assert bot._mod_decide('hate', severity, warns)['action'] != 'ban'
