@@ -450,6 +450,53 @@ def _check_ledger_claim_is_exclusive(bot) -> tuple[bool, str]:
     return asyncio.run(run())
 
 
+def _check_bot_never_bans_on_its_own(tree) -> tuple[bool, str]:
+    """Бан выполняет только человек нажатием кнопки, но не сам бот.
+
+    Это прямое требование владельца чата: муты и предупреждения бот выдаёт
+    сам, бан — крайняя мера с человеком в контуре. Требование живёт в двух
+    местах кода (решающая функция и обработчик кнопок), поэтому его легко
+    потерять при следующей правке — пусть его стережёт проверка.
+    """
+    ban_calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        try:
+            target = ast.unparse(node.func)
+        except Exception:
+            continue
+        if target.endswith('.ban_chat_member'):
+            ban_calls.append(node)
+    if not ban_calls:
+        return True, 'бан не вызывается нигде'
+    if len(ban_calls) > 1:
+        return False, f'вызовов ban_chat_member стало {len(ban_calls)}, ожидался один'
+
+    # Единственный вызов обязан жить в обработчике нажатий, а не в автоматике.
+    holder = None
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if any(call is ban_calls[0] for call in ast.walk(node)):
+            # Берём самую вложенную функцию: ast.walk обойдёт и внешнюю.
+            if holder is None or len(list(ast.walk(node))) < len(list(ast.walk(holder))):
+                holder = node
+    name = getattr(holder, 'name', '')
+    if 'callback' not in name:
+        return False, f'ban_chat_member вызывается из {name!r}, а не из обработчика кнопок'
+
+    # И решающая функция не должна уметь возвращать бан.
+    decide = next((n for n in ast.walk(tree)
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and n.name == '_mod_decide'), None)
+    if decide is not None:
+        for node in ast.walk(decide):
+            if isinstance(node, ast.Constant) and node.value == 'ban':
+                return False, "_mod_decide упоминает 'ban': автоматический бан вернулся"
+    return True, f'единственный бан — по кнопке в {name}'
+
+
 def checks(bot, tree) -> list[tuple[str, bool, str]]:
     """Полный список инвариантов. Порядок стабилен: на него смотрит pytest."""
     rows: list[tuple[str, bool, str]] = []
@@ -479,6 +526,7 @@ def checks(bot, tree) -> list[tuple[str, bool, str]]:
     add('claim в ledger эксклюзивен', _check_ledger_claim_is_exclusive(bot))
     add('кеш картинок ограничен по объёму', _check_image_cache_is_capped_in_bytes(bot))
     add('потоковые хранилища под блокировкой', _check_threaded_stores_are_locked(tree))
+    add('бан только по кнопке человека', _check_bot_never_bans_on_its_own(tree))
     add('манифест описывает существующие файлы', _check_manifest_describes_reality())
     return rows
 

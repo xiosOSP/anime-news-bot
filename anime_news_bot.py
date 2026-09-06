@@ -1465,6 +1465,9 @@ MODERATION_DEFAULT_MODE = (
 # Не больше одного наказания на человека за это время. Если модель начнёт
 # ошибаться подряд, серия наказаний за минуту хуже одной ошибки.
 MODERATION_ACTION_COOLDOWN_SEC = max(0, min(3600, _env_int('MODERATION_ACTION_COOLDOWN_SEC', 60)))
+# Сколько последних решений храним для разбора. Тексты чужих сообщений на
+# диске — вещь чувствительная, поэтому список короткий и обрезанный.
+MODERATION_LOG_MAX = max(0, min(500, _env_int('MODERATION_LOG_MAX', 50)))
 
 # Правила сообщества в машиночитаемом виде. Модель без них судила бы по своим
 # представлениям, а не по нормам этого чата.
@@ -1576,6 +1579,12 @@ def _mod_note_message(chat_id: int, user_id: int, name: str, text: str,
     Telegram присылает их отдельными обновлениями, и счётчик рос как от новых
     сообщений.
     """
+    if int(chat_id) not in _moderation_windows and len(_moderation_windows) >= 200:
+        # Окно на чат ограничено по числу сообщений, но самих чатов было
+        # неограниченно много. Практического риска мало (окна заводятся только
+        # для включённых чатов), но безграничная в принципе структура в
+        # долгоживущем процессе — это то, что однажды выстреливает.
+        _moderation_windows.pop(next(iter(_moderation_windows)), None)
     window = _moderation_windows.setdefault(int(chat_id), deque(maxlen=MODERATION_CONTEXT_SIZE))
     row = {'user_id': int(user_id), 'name': str(name)[:64],
            'text': str(text or '')[:MODERATION_MAX_MESSAGE_CHARS],
@@ -1678,6 +1687,7 @@ class ChatModerationStore:
                 # смысл только накопительно.
                 'stats': stats_row if isinstance(stats_row, dict) else {},
                 'mode': str(raw.get('mode') or ''),
+                'log': raw.get('log') if isinstance(raw.get('log'), list) else [],
             }
         except (OSError, ValueError, TypeError) as e:
             logger.warning(f'Модерация: состояние не загружено: {e}')
@@ -1775,7 +1785,12 @@ class ChatModerationStore:
             self._prune_locked()
             total = len(((self._data.get('users') or {}).get(
                 self._key(chat_id, user_id)) or {}).get('warns') or [])
-        self._save()
+        if not self._save():
+            # Предупреждение осталось только в памяти: после перезапуска счётчик
+            # обнулится. Направление ошибки безопасное (человека простят, а не
+            # накажут лишний раз), но знать об этом админ должен.
+            logger.error('Модерация: предупреждение не записано на диск, '
+                         'после перезапуска счётчик сбросится')
         return total
 
     def clear_warns(self, chat_id, user_id) -> bool:
@@ -1818,6 +1833,32 @@ class ChatModerationStore:
                     category[:40], {'total': 0, 'overturned': 0})
                 by_cat['overturned'] = int(by_cat.get('overturned', 0)) + 1
         self._save()
+
+    def log_decision(self, chat_id, user_id, name: str, category: str,
+                     action: str, source: str, reason: str, text: str) -> None:
+        """Последние решения целиком — чтобы их можно было разобрать потом.
+
+        Счётчики в /modstats говорят «сколько», но не «почему». Когда админ
+        видит спорное наказание через час, восстановить контекст сейчас нечем:
+        сообщение удалено, отчёт потерялся в личке.
+        """
+        with self._lock:
+            log = self._data.setdefault('log', [])
+            log.append({
+                'at': time.time(),
+                'chat_id': int(chat_id), 'user_id': int(user_id),
+                'name': str(name)[:64], 'category': str(category)[:40],
+                'action': str(action)[:24], 'source': str(source)[:24],
+                'reason': str(reason)[:200],
+                'text': str(text)[:400],
+            })
+            if len(log) > MODERATION_LOG_MAX:
+                self._data['log'] = log[-MODERATION_LOG_MAX:]
+        self._save()
+
+    def recent_log(self, limit: int = 10) -> list[dict]:
+        with self._lock:
+            return [dict(row) for row in (self._data.get('log') or [])[-limit:]]
 
     def stats(self) -> dict:
         with self._lock:
@@ -17648,10 +17689,10 @@ async def _moderation_classify(chat_id: int, text: str) -> Optional[dict]:
         {'role': 'system', 'content': MODERATION_SYSTEM_PROMPT},
         {'role': 'user', 'content': _moderation_render_context(chat_id, text)},
     ]
-    _moderation_llm_count()
     raw = await _llm_call(messages, max_tokens=200, task='moderation')
     if not raw:
-        return None
+        return None                      # провайдер не ответил — бюджет не тратим
+    _moderation_llm_count()
     parsed = _llm_parse_json(raw)
     if not isinstance(parsed, dict):
         return None
@@ -20945,8 +20986,14 @@ async def _mod_is_immune(bot: Bot, chat_id: int, user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat_id, user_id)
         is_admin_here = getattr(member, 'status', '') in ('creator', 'administrator')
-    except TelegramError:
-        return False                     # не смогли проверить — не наказываем вслепую
+    except TelegramError as e:
+        # False здесь означало «не иммунен», то есть наказуемый. Комментарий
+        # обещал обратное, а код при сбое Telegram открывал дорогу к наказанию
+        # админа чата. Не смогли проверить — считаем иммунным: пропустить
+        # нарушение дешевле, чем замутить модератора из-за таймаута.
+        logger.info('Модерация: статус участника не проверен (%s) — считаю иммунным', e)
+        metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'status_unknown'})
+        return True
     if len(_MOD_ADMIN_CACHE) > 2000:
         _MOD_ADMIN_CACHE.clear()
     _MOD_ADMIN_CACHE[key] = (now, is_admin_here)
@@ -20966,15 +21013,21 @@ def _mod_decide(category: str, severity: int, warns: int) -> dict:
         return {'action': 'escalate', 'delete': True, 'human': rule['human']}
     if base == 'delete':
         return {'action': 'delete', 'delete': True, 'human': rule['human']}
+    last = len(MODERATION_MUTE_LADDER) - 1
     if base == 'mute':
-        minutes = MODERATION_MUTE_LADDER[min(warns, len(MODERATION_MUTE_LADDER) - 1)]
+        # Категория сразу мутится, лестница считается по числу прошлых наказаний.
+        minutes = MODERATION_MUTE_LADDER[min(warns, last)]
         return {'action': 'mute', 'delete': True, 'minutes': minutes, 'human': rule['human']}
-    # warn: третье предупреждение переводит в мут, дальше зовём человека.
-    if warns >= len(MODERATION_MUTE_LADDER) or severity >= 3:
-        minutes = MODERATION_MUTE_LADDER[min(warns, len(MODERATION_MUTE_LADDER) - 1)]
-        return {'action': 'mute', 'delete': severity >= 2, 'minutes': minutes,
-                'human': rule['human']}
-    return {'action': 'warn', 'delete': severity >= 2, 'human': rule['human']}
+    # warn: первое нарушение — предупреждение, дальше лестница мутов.
+    # Раньше индекс брался прямо из числа предупреждений, поэтому первая
+    # ступень (час) не использовалась вовсе: получалось предупреждение,
+    # предупреждение, а потом сразу сутки. Для третьего мелкого нарушения
+    # это несоразмерно, да и описанию не соответствовало.
+    if warns == 0 and severity < 3:
+        return {'action': 'warn', 'delete': severity >= 2, 'human': rule['human']}
+    minutes = MODERATION_MUTE_LADDER[min(max(0, warns - 1), last)]
+    return {'action': 'mute', 'delete': severity >= 2, 'minutes': minutes,
+            'human': rule['human']}
 
 
 _MOD_LAST_ACTION: dict[str, float] = {}
@@ -21150,6 +21203,13 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
         return
     if getattr(user, 'is_bot', False) or not chat_moderation.is_enabled(chat.id):
         return
+    # Сообщение от имени канала или анонимного админа: from_user там служебный
+    # (GroupAnonymousBot), реального участника за ним нет, и наказывать некого.
+    # Отдельно это закрывает автопересылку постов канала в связанную группу:
+    # без проверки бот модерировал бы собственные новости.
+    if getattr(message, 'sender_chat', None) is not None:
+        metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'sender_chat'})
+        return
     text = _mod_message_text(message)
     if not text:
         return                           # служебное событие: считать нечего
@@ -21196,6 +21256,9 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
         metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'cooldown'})
         return
     applied = await _mod_apply(context.bot, message, decision, category, reason)
+    chat_moderation.log_decision(
+        chat.id, user_id, getattr(user, 'full_name', ''), category,
+        decision['action'], source, reason, text)
     await _mod_report(context.bot, message, category, decision, reason, applied, source)
 
 
@@ -21256,9 +21319,19 @@ async def modtest_command(update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML)
         return
 
-    lines = [f'🧪 <b>Проверка</b>\n<blockquote>{_escape_to_limit(text, 300)}</blockquote>']
     # Отдельный чат для теста, чтобы не засорять окно контекста живого чата.
     probe_chat = -1
+    # Реплики через « | » разыгрывают переписку: часть решений зависит от
+    # контекста, и без него проверить дружескую перепалку было невозможно.
+    history: list[str] = []
+    if ' | ' in text:
+        *history, text = [part.strip() for part in text.split(' | ') if part.strip()]
+        _moderation_windows.pop(probe_chat, None)
+        for index, replica in enumerate(history):
+            _mod_note_message(probe_chat, index + 1, f'Участник {index + 1}', replica)
+    lines = [f'🧪 <b>Проверка</b>\n<blockquote>{_escape_to_limit(text, 300)}</blockquote>']
+    if history:
+        lines.append(f'\n<i>Контекст: {len(history)} реплик(и) перед оцениваемой</i>')
     local = _mod_local_check(probe_chat, 0, text)
     if local is None:
         lines.append('\n1️⃣ Локальные правила: чисто, модель <b>не вызывается</b>.')
@@ -21305,6 +21378,42 @@ async def modtest_command(update, context: ContextTypes.DEFAULT_TYPE):
     if chat_moderation is not None and chat_moderation.mode == 'observe':
         lines.append('\n⚠️ Сейчас режим наблюдения — в бою бот только доложил бы.')
     await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def modlog_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Последние решения бота с причинами: /modlog [сколько].
+
+    Счётчики отвечают «сколько», журнал — «почему». Разобрать спорное
+    наказание через час иначе нечем: сообщение удалено, отчёт утонул в личке.
+    """
+    if chat_moderation is None:
+        await update.message.reply_text('Хранилище модерации не готово.')
+        return
+    try:
+        limit = max(1, min(20, int(context.args[0]))) if context.args else 8
+    except (ValueError, IndexError):
+        limit = 8
+    rows = chat_moderation.recent_log(limit)
+    if not rows:
+        await update.message.reply_text('Решений пока не было.')
+        return
+    lines = [f'🧾 <b>Последние решения ({len(rows)})</b>']
+    for row in reversed(rows):
+        when = _fmt_local(datetime.fromtimestamp(float(row.get('at') or 0), timezone.utc))
+        human = MODERATION_RULES.get(str(row.get('category') or ''), {}).get(
+            'human', row.get('category'))
+        lines.append('')
+        lines.append(f'<b>{html.escape(when)}</b> · {html.escape(str(human))} · '
+                     f'{html.escape(str(row.get("action")))} · {html.escape(str(row.get("source")))}')
+        lines.append(f'{html.escape(str(row.get("name") or row.get("user_id")))} '
+                     f'(<code>{int(row.get("user_id") or 0)}</code>)')
+        if row.get('reason'):
+            lines.append(f'<i>{html.escape(str(row["reason"]))}</i>')
+        lines.append(f'<blockquote>{_escape_to_limit(str(row.get("text") or ""), 200)}</blockquote>')
+    lines.append('')
+    lines.append('Снять предупреждения: /unwarn ответом на сообщение участника.')
+    await update.message.reply_text('\n'.join(lines)[:4000], parse_mode=ParseMode.HTML)
 
 
 @admin_only
@@ -22908,6 +23017,7 @@ def main():
     app.add_handler(CommandHandler("modoff", modoff_command))
     app.add_handler(CommandHandler("modstats", modstats_command))
     app.add_handler(CommandHandler("modtest", modtest_command))
+    app.add_handler(CommandHandler("modlog", modlog_command))
     app.add_handler(CommandHandler("modmode", modmode_command))
     app.add_handler(CommandHandler("warns", warns_command))
     app.add_handler(CommandHandler("unwarn", unwarn_command))
