@@ -17238,6 +17238,12 @@ LLM_FAST_API_KEY = _env('LLM_FAST_API_KEY', '').strip()
 LLM_FAST_BASE_URL = (_env('LLM_FAST_BASE_URL', '').strip() or _route_preset[0]).rstrip('/')
 LLM_FAST_MODEL = _env('LLM_FAST_MODEL', '').strip() or _route_preset[1]
 LLM_FAST_TASKS = {x.strip().lower() for x in _env('LLM_FAST_TASKS', 'judge').split(',') if x.strip()}
+# Запасные модели у ТОГО ЖЕ провайдера, через запятую. Бесплатные модели у
+# роутеров исчезают и теряют мощность поодиночке, а ключ при этом остаётся
+# рабочим. Заводить ради этого второй аккаунт незачем: сосед по каталогу
+# доступен тем же ключом, и переключение на него ничего не стоит.
+LLM_MODEL_ALTERNATES = tuple(
+    x.strip() for x in _env('LLM_MODEL_ALTERNATES', '').replace(';', ',').split(',') if x.strip())
 # Временный отказ основного провайдера не должен стоить его до перезапуска:
 # бот уходит на запасного, но через этот срок пробует основного снова.
 LLM_PRIMARY_RETRY_SEC = max(60, min(24 * 3600, _env_int('LLM_PRIMARY_RETRY_SEC', 1800)))
@@ -17330,6 +17336,30 @@ def _llm_slot_config(slot: str) -> tuple[str, str, str]:
         if override:
             model = override
     return base_url, api_key, model
+
+
+def _llm_candidates() -> list[tuple[str, str]]:
+    """Все варианты по порядку: сначала модели своего провайдера, потом чужие.
+
+    Порядок неслучаен. Соседняя модель на том же ключе — самая дешёвая замена:
+    ни нового аккаунта, ни чужих лимитов. И только когда у своего провайдера
+    варианты кончились, идём к другому.
+    """
+    chosen = _llm_primary_slot()
+    out: list[tuple[str, str]] = []
+    model = _llm_slot_config(chosen)[2]
+    if model:
+        out.append((chosen, model))
+    for alternate in LLM_MODEL_ALTERNATES:
+        if (chosen, alternate) not in out:
+            out.append((chosen, alternate))
+    for slot in LLM_SLOTS:
+        if slot == chosen or not _llm_slot_ready(slot):
+            continue
+        pair = (slot, _llm_slot_config(slot)[2])
+        if pair not in out:
+            out.append(pair)
+    return out
 
 
 def _llm_primary_config() -> tuple[str, str, str]:
@@ -17448,8 +17478,8 @@ _llm_disabled_runtime = False       # permanent auth disable или времен
 _llm_disabled_reason = ''            # '', 'auth', 'circuit'
 _llm_last_provider_error = ''        # последний ответ провайдера, для /llm
 _llm_using_fallback = False          # переключились ли на запасного провайдера
-_llm_slot_override = ''              # слот, на котором работаем сейчас ('' — основной)
-_llm_tried_slots: set = set()        # кого уже пробовали в этом круге
+_llm_candidate: tuple = ()           # (слот, модель) сейчас; () — штатный основной
+_llm_tried_candidates: set = set()   # что уже пробовали в этом круге
 _llm_failover_at = ''                # когда переключились, для /llm
 
 
@@ -17465,18 +17495,21 @@ def _llm_current() -> tuple[str, str, str]:
     часовая просадка бесплатного тира означала бы работу на запасном сутками —
     ровно до тех пор, пока кто-нибудь не перезапустит бота вручную.
     """
-    global _llm_using_fallback, _llm_primary_retry_at, _llm_slot_override, _llm_tried_slots
+    global _llm_using_fallback, _llm_primary_retry_at, _llm_candidate, _llm_tried_candidates
     if _llm_using_fallback and _llm_primary_retry_at:
         if time.monotonic() >= _llm_primary_retry_at:
             _llm_using_fallback = False
-            _llm_slot_override = ''
-            _llm_tried_slots = set()
+            _llm_candidate = ()
+            _llm_tried_candidates = set()
             _llm_primary_retry_at = 0.0
             logger.info('LLM: кулдаун истёк — пробую основного провайдера снова')
             metrics.inc('anime_bot_llm_primary_retry_total')
             return _llm_primary_config()
-    if _llm_slot_override and _llm_slot_ready(_llm_slot_override):
-        return _llm_slot_config(_llm_slot_override)
+    if _llm_candidate:
+        slot, model = _llm_candidate
+        if _llm_slot_ready(slot):
+            base_url, api_key, _ = _llm_slot_env(slot)
+            return base_url, api_key, model
     if _llm_using_fallback:
         return _llm_backup_config()
     return _llm_primary_config()
@@ -17497,26 +17530,33 @@ def _llm_try_failover(reason: str, hint: str = '', retry_after_sec: float = 0.0)
     """
     global _llm_using_fallback, _llm_failover_at, _llm_primary_retry_at
     global _llm_failover_level, _llm_failover_alert_key
-    global _llm_slot_override, _llm_tried_slots
+    global _llm_candidate, _llm_tried_candidates
     # Раньше переключение было одноразовым: сходили на запасного и всё. Третий
     # настроенный провайдер не использовался никогда, а когда два первых легли
     # по разным временным причинам — а это норма для бесплатных тарифов, —
     # бот оставался вообще без модели при живом ключе в окружении.
+    candidates = _llm_candidates()
+    # Отталкиваемся от того, чем пользовались сейчас, а не от первого в списке:
+    # у основного слота модели может не быть вовсе, и тогда первым в списке
+    # окажется чужой провайдер — то есть мы объявили бы его опробованным, ещё
+    # не спросив.
+    chosen = _llm_primary_slot()
+    current = _llm_candidate if _llm_using_fallback else (chosen, _llm_slot_config(chosen)[2])
     if _llm_using_fallback:
-        tried = set(_llm_tried_slots) | {_llm_slot_override or _llm_primary_slot()}
+        tried = set(_llm_tried_candidates) | {current}
     else:
         # Мы снова на основном — значит начинается новый круг, и прошлые
         # попытки не в счёт. Признак берём из самого состояния, а не из набора
         # опробованных: вернуть нас к основному может и кулдаун, и ручное
         # переключение, и тогда набор остался бы от прошлого круга, а перебор
         # застрял бы, не дойдя ни до кого.
-        tried = {_llm_primary_slot()}
-    nxt = next((slot for slot in LLM_SLOTS
-                if slot not in tried and _llm_slot_ready(slot)), None)
-    if nxt is None:
+        tried = {current}
+    nxt_pair = next((pair for pair in candidates if pair not in tried), None)
+    if nxt_pair is None:
         return False
-    _llm_tried_slots = tried
-    _llm_slot_override = nxt
+    _llm_tried_candidates = tried
+    _llm_candidate = nxt_pair
+    nxt = nxt_pair[0]
     _llm_using_fallback = True
     _llm_failover_at = datetime.now(timezone.utc).isoformat()
     if retry_after_sec:
@@ -17530,8 +17570,8 @@ def _llm_try_failover(reason: str, hint: str = '', retry_after_sec: float = 0.0)
         cooldown = 0.0
         _llm_primary_retry_at = 0.0
     metrics.inc('anime_bot_llm_failover_total', labels={'reason': reason})
-    logger.warning('LLM: провайдер отказал (%s) — перехожу на %s (%s)',
-                   reason, LLM_SLOT_HUMAN[nxt], _llm_slot_config(nxt)[2])
+    logger.warning('LLM: отказ (%s) — перехожу на %s (%s)',
+                   reason, LLM_SLOT_HUMAN[nxt], nxt_pair[1])
     # Повторный отказ по той же причине — не новость. Сообщаем один раз, а о
     # возвращении основного скажем отдельно, когда он реально ответит.
     alert_key = f'{reason}|{_llm_primary_model()}'
@@ -17542,7 +17582,7 @@ def _llm_try_failover(reason: str, hint: str = '', retry_after_sec: float = 0.0)
     retry_after_sec = cooldown
     lines = [f'🤖 Основной провайдер модели отказал ({reason}). '
              f'Перешёл на {html.escape(LLM_SLOT_HUMAN[nxt].split(" (")[0])}: '
-             f'<code>{html.escape(_llm_slot_config(nxt)[2])}</code>.']
+             f'<code>{html.escape(nxt_pair[1])}</code>.']
     if hint:
         lines.append('')
         lines.append(f'Причина: {hint}')
@@ -17578,9 +17618,9 @@ def _llm_reset_provider_state(why: str) -> None:
     global _llm_failover_level, _llm_failover_alert_key
     global _llm_disabled_runtime, _llm_disabled_reason, _llm_circuit_until
     global _llm_fail_streak, _llm_json_mode, _llm_last_provider_error
-    global _llm_slot_override, _llm_tried_slots
-    _llm_slot_override = ''
-    _llm_tried_slots = set()
+    global _llm_candidate, _llm_tried_candidates
+    _llm_candidate = ()
+    _llm_tried_candidates = set()
     _llm_using_fallback = False
     _llm_failover_at = ''
     _llm_primary_retry_at = 0.0
@@ -17606,9 +17646,9 @@ def _llm_note_primary_recovered() -> None:
     командой /llm. А пауза перед следующей проверкой так и осталась бы
     удвоенной, хотя причина уже ушла.
     """
-    global _llm_failover_level, _llm_failover_alert_key, _llm_tried_slots
+    global _llm_failover_level, _llm_failover_alert_key, _llm_tried_candidates
     if _llm_using_fallback:
-        _llm_tried_slots = set()         # провайдер ответил — круг перебора закрыт
+        _llm_tried_candidates = set()    # провайдер ответил — круг перебора закрыт
         return                           # отвечает запасной, это не возвращение
     if not _llm_failover_alert_key and not _llm_failover_level:
         return
@@ -18831,7 +18871,7 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('\n'.join(out), parse_mode=ParseMode.HTML)
 
 
-def _llm_probe_slot(slot: str, timeout: float = 12.0) -> dict:
+def _llm_probe_slot(slot: str, timeout: float = 12.0, model: str = '') -> dict:
     """Стучится в провайдера напрямую и возвращает, что он ответил.
 
     Обычный путь вызова слишком много решает за нас: молчит по кулдауну,
@@ -18839,7 +18879,8 @@ def _llm_probe_slot(slot: str, timeout: float = 12.0) -> dict:
     нужен именно сырой ответ каждого — код, задержка, тело. Проба ничего не
     меняет: ни счётчиков, ни failover, ни состояния circuit.
     """
-    base_url, api_key, model = _llm_slot_config(slot)
+    base_url, api_key, slot_model = _llm_slot_config(slot)
+    model = model or slot_model
     started = time.monotonic()
     try:
         r = requests.post(
@@ -18876,15 +18917,19 @@ async def llmping_command(update, context: ContextTypes.DEFAULT_TYPE):
     сказать только «провайдер не ответил»: она смотрела на общее состояние
     бота, а не спрашивала самих провайдеров.
     """
-    ready = _llm_ready_slots()
-    if not ready:
+    # Проверяем все варианты, а не только слоты: запасные модели на том же
+    # ключе — первое, чем бот воспользуется при отказе, и знать, живы ли они,
+    # нужно заранее, а не в момент поломки.
+    candidates = _llm_candidates()
+    if not candidates:
         await update.message.reply_text(
             'Ни один провайдер не настроен. Нужны <code>LLM_PROVIDER</code> и '
             '<code>LLM_API_KEY</code> — подробности в /llm',
             parse_mode=ParseMode.HTML)
         return
-    msg = await update.message.reply_text(f'📡 Стучусь к провайдерам ({len(ready)})…')
-    results = [await asyncio.to_thread(_llm_probe_slot, slot) for slot in ready]
+    msg = await update.message.reply_text(f'📡 Проверяю варианты ({len(candidates)})…')
+    results = [await asyncio.to_thread(_llm_probe_slot, slot, 12.0, model)
+               for slot, model in candidates]
 
     lines = ['📡 <b>Проверка провайдеров</b>', '']
     for row in results:
