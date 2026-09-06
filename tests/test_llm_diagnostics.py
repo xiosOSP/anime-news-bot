@@ -30,6 +30,10 @@ def alerts(monkeypatch):
     monkeypatch.setattr(bot, '_queue_admin_alert', collected.append)
     monkeypatch.setattr(bot, '_llm_using_fallback', False)
     monkeypatch.setattr(bot, '_llm_last_provider_error', '')
+    # Состояние дедупа сообщений — тоже глобальное: без сброса второй тест
+    # получал бы «об этом уже сообщали» и не видел ни одного сообщения.
+    monkeypatch.setattr(bot, '_llm_failover_alert_key', '')
+    monkeypatch.setattr(bot, '_llm_failover_level', 0)
     monkeypatch.setattr(bot, 'LLM_FALLBACK_API_KEY', 'key')
     monkeypatch.setattr(bot, 'LLM_FALLBACK_BASE_URL', 'https://api.mistral.ai/v1')
     monkeypatch.setattr(bot, 'LLM_FALLBACK_MODEL', 'mistral-small-latest')
@@ -215,3 +219,72 @@ def test_provider_answer_is_not_cut_mid_word(alerts, monkeypatch):
     monkeypatch.setattr(bot, '_llm_last_provider_error', long_error)
     bot._llm_try_failover('model', 'подсказка')
     assert '…' in alerts[0]
+
+
+# ---------- длительная недоступность основного провайдера ----------
+
+@pytest.fixture
+def failover_state(monkeypatch):
+    monkeypatch.setattr(bot, '_llm_failover_level', 0)
+    monkeypatch.setattr(bot, '_llm_failover_alert_key', '')
+    monkeypatch.setattr(bot, '_llm_primary_retry_at', 0.0)
+    monkeypatch.setattr(bot, '_llm_using_fallback', False)
+    monkeypatch.setattr(bot, 'LLM_FALLBACK_API_KEY', 'key')
+    monkeypatch.setattr(bot, 'LLM_FALLBACK_BASE_URL', 'https://api.mistral.ai/v1')
+    monkeypatch.setattr(bot, 'LLM_FALLBACK_MODEL', 'mistral-small-latest')
+    collected: list[str] = []
+    monkeypatch.setattr(bot, '_queue_admin_alert', collected.append)
+    return collected
+
+
+def _fail_once(base=1800.0):
+    bot._llm_using_fallback = False       # кулдаун истёк — пробуем основного
+    bot._llm_try_failover('capacity', 'подсказка', retry_after_sec=base)
+    return bot._llm_primary_retry_at - time.monotonic()
+
+
+def test_cooldown_grows_while_primary_stays_down(failover_state):
+    """Провайдер, лежащий сутки, не должен стоить 48 холостых проверок."""
+    waits = [round(_fail_once() / 60) for _ in range(5)]
+    assert waits == sorted(waits)                 # пауза только растёт
+    assert waits[0] == 30 and waits[-1] > waits[0]
+
+
+def test_cooldown_is_capped(failover_state):
+    for _ in range(12):
+        _fail_once()
+    assert (bot._llm_primary_retry_at - time.monotonic()) <= bot.LLM_PRIMARY_RETRY_MAX_SEC + 1
+
+
+def test_repeated_failure_alerts_once(failover_state):
+    """Одна и та же причина — не новость. Иначе за сутки это 48 сообщений."""
+    for _ in range(10):
+        _fail_once()
+    assert len(failover_state) == 1
+
+
+def test_new_reason_alerts_again(failover_state):
+    """Смена причины — уже другая проблема, о ней сказать надо."""
+    _fail_once()
+    bot._llm_using_fallback = False
+    bot._llm_try_failover('billing', 'кончился баланс')
+    assert len(failover_state) == 2
+
+
+def test_recovery_is_announced_and_resets_escalation(failover_state):
+    """Без этого админ не узнает, что основной вернулся."""
+    for _ in range(4):
+        _fail_once()
+    bot._llm_using_fallback = False
+    bot._llm_note_primary_recovered()
+    assert bot._llm_failover_level == 0
+    assert 'снова отвечает' in failover_state[-1]
+
+
+def test_no_recovery_notice_while_fallback_answers(failover_state):
+    """Ответил запасной — это не возвращение основного."""
+    _fail_once()
+    before = len(failover_state)
+    bot._llm_using_fallback = True
+    bot._llm_note_primary_recovered()
+    assert len(failover_state) == before

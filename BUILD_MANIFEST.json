@@ -4,8 +4,8 @@
   "base_archive": "anime news bot autosend repaired.zip",
   "base_archive_sha256": "961b270d3325cddfae4b276a6d35c8e85d223fa0bfb5db2f8c5ec49be4d00108",
   "python_target": "3.11",
-  "git_commit": "a426ea87f49f12c94d881a2cce04280bcd069bf9",
-  "generated_at_utc": "2026-09-05T19:52:06.733298+00:00",
+  "git_commit": "337a9a838680b55be212c365b3f86ac572737847",
+  "generated_at_utc": "2026-09-05T20:20:40.110109+00:00",
   "files": {
     ".env.example": {
       "sha256": "669bb942ce577a1f8432c785a77b340a8a1ac01c3072c3015f33eab62f439eda",
@@ -28,8 +28,8 @@
       "bytes": 2989
     },
     "anime_news_bot.py": {
-      "sha256": "cdb292c941eeb7c254095348c53b179d629d8d416fe5748a66910e9fa9362ed8",
-      "bytes": 1095982
+      "sha256": "a92e3bcb4f047292c722b883b63cecafc5826e109013a7c12833df77ac0804c1",
+      "bytes": 1102095
     },
     "pytest.ini": {
       "sha256": "e28a989e765f6f1fc37e02fb00a351f56391f749cafcd3f93057abbfb17ba26b",
@@ -56,12 +56,16 @@
       "bytes": 6248
     },
     "tests/test_llm_diagnostics.py": {
-      "sha256": "f294b9ae9d6c400bfe108050af4f428cfa89e9fa38373061f62713cdc3716a67",
-      "bytes": 11122
+      "sha256": "2f4b97ee35880d163ad5b8fe2da654aa4391a87041e77d2995a1f823e9f6cbfc",
+      "bytes": 14405
     },
     "tests/test_pipeline.py": {
       "sha256": "d86a3f8751af3223b7b832790fd90ac990b16cb156df546343f6fe7eed581052",
       "bytes": 8335
+    },
+    "tests/test_post_text.py": {
+      "sha256": "3670e109204aa34db33d82d04d6589645e01df5db100e3bd61d748539de2701e",
+      "bytes": 3759
     },
     "tools/build_manifest.py": {
       "sha256": "cc919a734905cbccfb831c788f67db28a726f978a049aa251ad2867031359f0c",
