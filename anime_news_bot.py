@@ -14279,6 +14279,10 @@ def _settings_overview() -> str:
     lines.append(f'⏰ Берём новости не старше {settings.post_max_age_hours} ч')
     state = '🟢 включён' if settings.auto_enabled else '⚪️ выключен'
     lines.append(f'🔄 Автопостинг: {state}')
+    if chat_moderation is not None and feature_enabled('chat_moderation'):
+        lines.append('🛡 Модерация: ' + ('🟢 наказывает'
+                                         if chat_moderation.mode == 'active'
+                                         else '👀 только смотрит'))
     if _llm_configured():
         model = '🟢 ' + _llm_current()[2] if settings.llm_enabled else '⚪️ выключена'
         lines.append(f'🤖 Модель: {model}')
@@ -14294,6 +14298,7 @@ SETTINGS_SECTIONS = {
     'media': '🎬 Медиа',
     'llm': '🤖 Модель',
     'sources': '📡 Источники',
+    'moderation': '🛡 Модерация',
     'system': '🔧 Система',
 }
 
@@ -14311,7 +14316,9 @@ def build_settings_menu() -> InlineKeyboardMarkup:
                                   callback_data='settings:sec:llm'),
              InlineKeyboardButton(SETTINGS_SECTIONS['sources'],
                                   callback_data='settings:sec:sources')],
-            [InlineKeyboardButton(SETTINGS_SECTIONS['system'],
+            [InlineKeyboardButton(SETTINGS_SECTIONS['moderation'],
+                                  callback_data='settings:sec:moderation'),
+             InlineKeyboardButton(SETTINGS_SECTIONS['system'],
                                   callback_data='settings:sec:system')],
             [InlineKeyboardButton('✖ Закрыть', callback_data='settings:close')]]
     return InlineKeyboardMarkup(rows)
@@ -14456,11 +14463,47 @@ def _menu_system() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _menu_moderation() -> InlineKeyboardMarkup:
+    """Модерация чата: режим и разбор решений."""
+    if chat_moderation is None or not feature_enabled('chat_moderation'):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('🛡 Модерация выключена — /modhere',
+                                  callback_data='mods:help')],
+            [InlineKeyboardButton('⬅️ Назад', callback_data='settings:back')],
+        ])
+    active = chat_moderation.mode == 'active'
+    # Подпись называет, что бот делает СЕЙЧАС, а не куда ведёт нажатие:
+    # кнопка-состояние, у которой написано будущее, читается наоборот и
+    # однажды окажется нажатой ради того, что и так включено.
+    label = ('🛡 Сейчас наказывает' if active else '👀 Сейчас только смотрит')
+    rows = [
+        [InlineKeyboardButton(label, callback_data='mods:mode')],
+        [InlineKeyboardButton('📊 Статистика', callback_data='mods:stats'),
+         InlineKeyboardButton('🧾 Решения', callback_data='mods:log')],
+        [InlineKeyboardButton('⬅️ Назад', callback_data='settings:back')],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _menu_moderation_confirm() -> InlineKeyboardMarkup:
+    """Подтверждение включения наказаний.
+
+    Обратный переход подтверждения не требует: выключить наказания — всегда
+    безопасно, а включить — значит начать молча ограничивать живых людей.
+    Асимметрия намеренная.
+    """
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('🛡 Да, включить наказания', callback_data='mods:mode_yes')],
+        [InlineKeyboardButton('⬅️ Отмена', callback_data='settings:sec:moderation')],
+    ])
+
+
 _SECTION_BUILDERS = {
     'posts': _menu_posts,
     'media': _menu_media,
     'llm': _menu_llm,
     'sources': _menu_sources,
+    'moderation': _menu_moderation,
     'system': _menu_system,
 }
 
@@ -14475,6 +14518,7 @@ _TOGGLE_SECTION = {
     'toggle_llm_dedup': 'llm', 'toggle_llm_repeats': 'llm',
     'toggle_translator': 'llm', 'llmslot': 'llm',
     'toggle_autodis': 'sources', 'sources': 'sources',
+    'mods': 'moderation',
     'toggle_backup': 'system', 'toggle_startup': 'system',
 }
 
@@ -14508,6 +14552,7 @@ def _section_view(name: str) -> tuple[str, InlineKeyboardMarkup]:
         'media': 'Картинки и видео в постах.',
         'llm': 'Перевод, текст постов, теги и фильтры.',
         'sources': 'Откуда бот берёт новости.',
+        'moderation': 'Как бот следит за порядком в чате.',
         'system': 'Бэкапы и уведомления.',
     }
     lines = [f'<b>{SETTINGS_SECTIONS[name]}</b>', '', hints[name]]
@@ -14534,6 +14579,14 @@ def _section_state(name: str) -> str:
         if not settings.llm_enabled:
             return 'Модель выключена: перевод идёт через DeepL/Google.'
         return f'Сейчас: <code>{html.escape(_llm_current()[2])}</code>.'
+    if name == 'moderation':
+        if chat_moderation is None or not feature_enabled('chat_moderation'):
+            return 'Функция выключена: FEATURE_CHAT_MODERATION=true и /modhere в чате.'
+        chats = len(chat_moderation.enabled_chats())
+        where = f'чатов под наблюдением: {chats}' if chats else 'ни одного чата не подключено'
+        if chat_moderation.mode == 'active':
+            return f'Сейчас: 🛡 наказывает (удаляет, предупреждает, мутит), {where}.'
+        return f'Сейчас: 👀 только смотрит и докладывает, {where}.'
     if name == 'media':
         parts = []
         parts.append('видео ' + ('вкл' if settings.video_enabled else 'выкл'))
@@ -14844,6 +14897,9 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Выбор основного провайдера: свой экран, права проверяются внутри.
     if data.startswith('llmslot:'):
         await llm_slot_callback(update, context)
+        return
+    if data.startswith('mods:'):
+        await moderation_settings_callback(update, context)
         return
     if is_admin(update):
         _audit_update(update, 'callback', callback=data[:160])
@@ -19075,6 +19131,101 @@ async def llmmodel_command(update, context: ContextTypes.DEFAULT_TYPE):
                                     parse_mode=ParseMode.HTML)
 
 
+async def moderation_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопки раздела «Модерация» в настройках."""
+    query = update.callback_query
+    if not is_admin(update):
+        await query.answer('Только для админа', show_alert=True)
+        return
+    action = (query.data or '').split(':', 1)[-1]
+
+    if action == 'help':
+        await query.answer(
+            'Модерация включается переменной FEATURE_CHAT_MODERATION=true, '
+            'а в самом чате — командой /modhere', show_alert=True)
+        return
+
+    if chat_moderation is None:
+        await query.answer('Хранилище модерации не готово', show_alert=True)
+        return
+
+    if action == 'stats':
+        await query.answer()
+        await _safe_edit(query, _moderation_stats_text(), _menu_moderation())
+        return
+
+    if action == 'log':
+        await query.answer()
+        rows = chat_moderation.recent_log(8)
+        if not rows:
+            text = '🧾 <b>Решения</b>\n\nПока ни одного.'
+        else:
+            text = _moderation_log_text(rows)
+        await _safe_edit(query, text, _menu_moderation())
+        return
+
+    if action == 'mode':
+        if chat_moderation.mode == 'active':
+            # Выключение наказаний — безопасная сторона: делаем сразу.
+            if not chat_moderation.set_mode('observe'):
+                await query.answer('Не удалось записать настройку', show_alert=True)
+                return
+            _audit_update(update, 'moderation_mode', mode='observe')
+            await query.answer('Теперь только наблюдает')
+            await _safe_edit(query, _moderation_mode_text(), _menu_moderation())
+            return
+        # Включение — через подтверждение: дальше бот начнёт ограничивать людей.
+        await query.answer()
+        await _safe_edit(query, _moderation_arm_text(), _menu_moderation_confirm())
+        return
+
+    if action == 'mode_yes':
+        if not chat_moderation.set_mode('active'):
+            await query.answer('Не удалось записать настройку', show_alert=True)
+            return
+        _audit_update(update, 'moderation_mode', mode='active')
+        await query.answer('Модерация наказывает')
+        await _safe_edit(query, _moderation_mode_text(), _menu_moderation())
+        return
+    await query.answer()
+
+
+def _moderation_mode_text() -> str:
+    """Что бот делает в текущем режиме — словами, а не названием режима."""
+    if chat_moderation is not None and chat_moderation.mode == 'active':
+        return ('🛡 <b>Модерация наказывает</b>\n\n'
+                'Бот удаляет нарушения, выдаёт предупреждения и муты — '
+                'предупреждение, затем час, затем сутки.\n'
+                'Банить он не может ни в каком режиме: тяжёлые случаи приходят '
+                'вам в личку с кнопкой, и решение остаётся за человеком.\n\n'
+                'Если пойдут ошибки — одно нажатие, и он снова только смотрит.')
+    return ('👀 <b>Модерация только смотрит</b>\n\n'
+            'Бот оценивает сообщения и докладывает, но чат не трогает. '
+            'На этой ступени копится статистика, по которой видно, '
+            'можно ли доверить ему наказания.')
+
+
+def _moderation_arm_text() -> str:
+    """Экран подтверждения: что именно изменится."""
+    stats = chat_moderation.stats() if chat_moderation is not None else {}
+    total = int(stats.get('total') or 0)
+    overturned = int(stats.get('overturned') or 0)
+    lines = ['🛡 <b>Включить наказания?</b>', '',
+             'Бот начнёт сам удалять сообщения, выдавать предупреждения и муты.',
+             'Банить он не будет — это по-прежнему только через вашу кнопку.', '']
+    if total:
+        lines.append(f'По прошлым решениям: всего {total}, из них вы отменили {overturned}.')
+        if overturned and total and overturned / total > 0.2:
+            lines.append('⚠️ Отменённых больше пятой части — модель ошибается часто. '
+                         'Возможно, стоит ещё понаблюдать.')
+    else:
+        lines.append('⚠️ Статистики решений пока нет — бот ещё не на чем себя показал. '
+                     'Надёжнее сначала дать ему поработать в наблюдении.')
+    lines.append('')
+    lines.append('Вернуть наблюдение можно одним нажатием в любой момент.')
+    return '\n'.join(lines)
+
+
 async def llm_slot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Кнопки экрана /llmmodel."""
     query = update.callback_query
@@ -22201,22 +22352,7 @@ async def modlog_command(update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text('Решений пока не было.')
         return
-    lines = [f'🧾 <b>Последние решения ({len(rows)})</b>']
-    for row in reversed(rows):
-        when = _fmt_local(datetime.fromtimestamp(float(row.get('at') or 0), timezone.utc))
-        human = MODERATION_RULES.get(str(row.get('category') or ''), {}).get(
-            'human', row.get('category'))
-        lines.append('')
-        lines.append(f'<b>{html.escape(when)}</b> · {html.escape(str(human))} · '
-                     f'{html.escape(str(row.get("action")))} · {html.escape(str(row.get("source")))}')
-        lines.append(f'{html.escape(str(row.get("name") or row.get("user_id")))} '
-                     f'(<code>{int(row.get("user_id") or 0)}</code>)')
-        if row.get('reason'):
-            lines.append(f'<i>{html.escape(str(row["reason"]))}</i>')
-        lines.append(f'<blockquote>{_escape_to_limit(str(row.get("text") or ""), 200)}</blockquote>')
-    lines.append('')
-    lines.append('Снять предупреждения: /unwarn ответом на сообщение участника.')
-    await update.message.reply_text('\n'.join(lines)[:4000], parse_mode=ParseMode.HTML)
+    await update.message.reply_text(_moderation_log_text(rows), parse_mode=ParseMode.HTML)
 
 
 @admin_only
@@ -22254,28 +22390,27 @@ async def modmode_command(update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML)
 
 
-@admin_only
-async def modstats_command(update, context: ContextTypes.DEFAULT_TYPE):
+def _moderation_stats_text() -> str:
     """Сколько решений принял бот и сколько из них отменили люди.
 
     Это единственная цифра, по которой можно решать, давать ли боту больше
     прав. Пока доля отмен высокая, расширять полномочия нельзя.
+
+    Живёт отдельно от команды: тот же текст показывает раздел настроек, а два
+    разных отчёта об одном и том же рано или поздно разойдутся.
     """
     if chat_moderation is None:
-        await update.message.reply_text('Хранилище модерации не готово.')
-        return
+        return 'Хранилище модерации не готово.'
     data = chat_moderation.stats()
     by_action = data.get('by_action') or {}
     by_category = data.get('by_category') or {}
     total = sum(int(v) for v in by_action.values())
     overturned = int(data.get('overturned_total', 0))
     if not total:
-        await update.message.reply_text(
-            '🛡 Решений пока не было.\n'
-            f'Модерируемых чатов: {len(chat_moderation.enabled_chats())}\n'
-            f'Бюджет модели: {_moderation_llm_budget_left()} из '
-            f'{MODERATION_LLM_DAILY_LIMIT} на сегодня')
-        return
+        return ('🛡 Решений пока не было.\n'
+                f'Модерируемых чатов: {len(chat_moderation.enabled_chats())}\n'
+                f'Бюджет модели: {_moderation_llm_budget_left()} из '
+                f'{MODERATION_LLM_DAILY_LIMIT} на сегодня')
 
     accuracy = 100.0 * (total - overturned) / max(1, total)
     lines = [
@@ -22305,7 +22440,33 @@ async def modstats_command(update, context: ContextTypes.DEFAULT_TYPE):
     if overturned and accuracy < 80:
         lines += ['', '⚠️ Отмен много. Расширять полномочия бота рано — '
                       'сначала стоит поправить правила или пороги.']
-    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
+    return '\n'.join(lines)
+
+
+def _moderation_log_text(rows: list) -> str:
+    """Последние решения с причинами — общий текст для /modlog и настроек."""
+    lines = [f'🧾 <b>Последние решения ({len(rows)})</b>']
+    for row in reversed(rows):
+        when = _fmt_local(datetime.fromtimestamp(float(row.get('at') or 0), timezone.utc))
+        human = MODERATION_RULES.get(str(row.get('category') or ''), {}).get(
+            'human', row.get('category'))
+        lines.append('')
+        lines.append(f'<b>{html.escape(when)}</b> · {html.escape(str(human))} · '
+                     f'{html.escape(str(row.get("action")))} · {html.escape(str(row.get("source")))}')
+        lines.append(f'{html.escape(str(row.get("name") or row.get("user_id")))} '
+                     f'(<code>{int(row.get("user_id") or 0)}</code>)')
+        if row.get('reason'):
+            lines.append(f'<i>{html.escape(str(row["reason"]))}</i>')
+        lines.append(f'<blockquote>{_escape_to_limit(str(row.get("text") or ""), 200)}</blockquote>')
+    lines.append('')
+    lines.append('Снять предупреждения: /unwarn ответом на сообщение участника.')
+    return '\n'.join(lines)[:4000]
+
+
+@admin_only
+async def modstats_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика решений модерации: /modstats."""
+    await update.message.reply_text(_moderation_stats_text(), parse_mode=ParseMode.HTML)
 
 
 @admin_only
