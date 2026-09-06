@@ -98,15 +98,36 @@ class TestFailoverIsConservative:
         bot._llm_request([{'role': 'user', 'content': 'hi'}], 100)
         assert bot._llm_using_fallback is False
 
-    def test_rate_limit_does_not_switch(self, providers):
+    def _rate_limited(self, providers):
         response = MagicMock()
         response.status_code = 429
         response.text = 'rate limited'
         response.headers = {'Retry-After': '10'}
         response.json.return_value = {}
         providers.setattr(bot.requests, 'post', lambda *a, **k: response)
+        return response
+
+    def test_rate_limit_switches_when_there_is_somewhere_to_go(self, providers):
+        """Лимит одного провайдера ничего не говорит об остальных.
+
+        Раньше при 429 бот всегда пережидал на месте. Это верно, когда
+        провайдер один, но при живом соседе означало молчать вместо того,
+        чтобы спросить его. Возврат при этом не теряется: пауза из
+        Retry-After становится кулдауном, по которому мы сами вернёмся.
+        """
+        self._rate_limited(providers)
         bot._llm_request([{'role': 'user', 'content': 'hi'}], 100)
-        assert bot._llm_using_fallback is False, 'лимит запросов не повод менять провайдера'
+        assert bot._llm_using_fallback is True
+        assert bot._llm_primary_retry_at > 0, 'без кулдауна к основному не вернуться'
+
+    def test_rate_limit_waits_when_there_is_nowhere_to_go(self, providers):
+        """Единственного провайдера из-за лимита не бросаем: его надо переждать."""
+        providers.setattr(bot, 'LLM_FALLBACK_API_KEY', '')
+        providers.setattr(bot, 'LLM_FAST_API_KEY', '')
+        self._rate_limited(providers)
+        bot._llm_request([{'role': 'user', 'content': 'hi'}], 100)
+        assert bot._llm_using_fallback is False, 'уходить некуда — надо ждать'
+        assert bot._llm_circuit_until > 0, 'пауза из Retry-After не выставлена'
 
     def test_without_fallback_behaviour_is_unchanged(self, providers):
         providers.setattr(bot, 'LLM_FALLBACK_API_KEY', '')
