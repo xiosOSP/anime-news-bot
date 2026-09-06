@@ -37,6 +37,8 @@ htmlcov/
 # Остальные runtime-хранилища (появляются рядом со скриптом без DATA_DIR)
 *.json
 !BUILD_MANIFEST.json
+# Журнал действий админа: пишется построчно, под правило *.json не попадал
+*.jsonl
 
 # OS
 .DS_Store

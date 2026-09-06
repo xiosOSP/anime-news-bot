@@ -14228,6 +14228,16 @@ _PUBLISH_MODE_LABELS = {
 _PUBLISH_MODE_ORDER = ('thread', 'both', 'channel')
 
 
+def _publish_mode_label(mode) -> str:
+    """Подпись режима публикации. Незнакомое значение не роняет экран.
+
+    Раньше подпись бралась индексом по словарю, и любое значение вне трёх
+    известных обрывало сборку меню целиком — вместо того чтобы показать
+    настройки и дать их починить.
+    """
+    return _PUBLISH_MODE_LABELS.get(str(mode), f'неизвестный режим ({mode})')
+
+
 def _sw(value: bool) -> str:
     """Компактный индикатор состояния для кнопки."""
     return '🟢' if value else '⚪️'
@@ -14258,7 +14268,7 @@ def _settings_overview() -> str:
     """
     mode = settings.publish_mode
     lines = ['⚙️ <b>Настройки</b>', '']
-    lines.append(f'📤 Публикация: <b>{_PUBLISH_MODE_LABELS[mode]}</b>')
+    lines.append(f'📤 Публикация: <b>{_publish_mode_label(mode)}</b>')
     if mode == 'both':
         lines.append(f'   🧵 в ветку раз в {_fmt_minutes(settings.check_interval_min)}')
         lines.append(f'   📢 в канал раз в {_fmt_minutes(settings.channel_interval_min)}')
@@ -14309,7 +14319,7 @@ def build_settings_menu() -> InlineKeyboardMarkup:
 
 def _menu_posts() -> InlineKeyboardMarkup:
     """Что и как публикуется."""
-    thread = f'📤 Куда слать: {_PUBLISH_MODE_LABELS[settings.publish_mode]}'
+    thread = f'📤 Куда слать: {_publish_mode_label(settings.publish_mode)}'
     quiet = f'{_sw(settings.quiet_mode)} Тихий режим'
     open_mod = ('👥 Кнопки в ветке: всем' if settings.open_moderation
                 else '👤 Кнопки в ветке: админам')
@@ -14463,7 +14473,7 @@ _TOGGLE_SECTION = {
     'toggle_llm': 'llm', 'toggle_llm_rewrite': 'llm', 'toggle_llm_filter': 'llm',
     'toggle_llm_tags': 'llm', 'toggle_llm_article': 'llm', 'toggle_llm_filler': 'llm',
     'toggle_llm_dedup': 'llm', 'toggle_llm_repeats': 'llm',
-    'toggle_translator': 'llm',
+    'toggle_translator': 'llm', 'llmslot': 'llm',
     'toggle_autodis': 'sources', 'sources': 'sources',
     'toggle_backup': 'system', 'toggle_startup': 'system',
 }
@@ -15233,7 +15243,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             nxt = order[0]
         settings.publish_mode = nxt
-        await query.answer(f'Режим: {_PUBLISH_MODE_LABELS[nxt]}')
+        await query.answer(f'Режим: {_publish_mode_label(nxt)}')
         explain = {
             'thread': ("🧵 Только в ветку.\n"
                        "Все найденные новости уходят пачкой в ветку обсуждения. "
@@ -17095,7 +17105,7 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
                      else 'до 1 публикации в канал за интервал')
     if settings.publish_mode == 'both':
         interval_note += f'; в канал 1 раз в {settings.channel_interval_min} мин'
-    mode_line = f'📤 Режим: {_PUBLISH_MODE_LABELS[settings.publish_mode]}'
+    mode_line = f'📤 Режим: {_publish_mode_label(settings.publish_mode)}'
     if settings.publish_mode == 'both':
         mode_line += f' (в канал раз в {settings.channel_interval_min} мин)'
     readiness = (f'{_channel_mode_readiness()}\n'
@@ -17306,8 +17316,12 @@ def _llm_slot_config(slot: str) -> tuple[str, str, str]:
     чужую модель по чужому ключу.
     """
     base_url, api_key, model = _llm_slot_env(slot)
-    if slot == _llm_primary_slot() and settings is not None:
-        override = settings.llm_model_override
+    if slot == _llm_primary_slot():
+        # getattr, а не прямое обращение: соседний _llm_primary_slot читает
+        # настройки именно так. Исключение отсюда всплывает через _llm_active
+        # в вызывающий код и роняет обработчик — то есть неполный объект
+        # настроек выключал бы модель падением, а не отказом.
+        override = str(getattr(settings, 'llm_model_override', '') or '')
         if override:
             model = override
     return base_url, api_key, model
@@ -18666,6 +18680,11 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
         lines.append('  ℹ️ запасной не задан: при отказе провайдера обогащение '
                      'выключится до перезапуска')
     lines.append(f'Prompt version: <code>{html.escape(LLM_PROMPT_VERSION)}</code>')
+    # Команд нет в синем меню — значит про них надо сказать там, где их ищут.
+    lines.append('')
+    lines.append('🔀 Сменить провайдера — /llmmodel')
+    lines.append('📡 Спросить каждого напрямую — /llmping')
+    lines.append('')
     lines.append('LLM judge: ' + ('ВКЛ' if feature_enabled('llm_judge') else 'выкл'))
     if feature_enabled('llm_quality_routing') and _llm_fast_configured():
         lines.append(f'Fast route: <code>{html.escape(LLM_FAST_MODEL)}</code> для '
@@ -18845,6 +18864,9 @@ def _llm_model_menu() -> InlineKeyboardMarkup:
     if chosen != 'primary' or (settings is not None and settings.llm_model_override):
         rows.append([InlineKeyboardButton('↩️ Как в переменных окружения',
                                           callback_data='llmslot:reset')])
+    # Экран открывается из раздела «Модель», значит должен уметь вернуть туда.
+    # Без этой кнопки он был тупиком: выйти можно было только новой командой.
+    rows.append([InlineKeyboardButton('⬅️ Назад', callback_data='settings:sec:llm')])
     return InlineKeyboardMarkup(rows)
 
 
@@ -19969,7 +19991,7 @@ async def send_startup_report(app, brief: bool = False) -> None:
     lines.append(f'📡 Источников: {len(enabled)} вкл' + (f', {len(paused)} на паузе' if paused else ''))
     if paused:
         lines.append(f'   ⏸ {html.escape(", ".join(paused[:8]))}')
-    lines.append('📤 Режим: ' + _PUBLISH_MODE_LABELS[settings.publish_mode])
+    lines.append('📤 Режим: ' + _publish_mode_label(settings.publish_mode))
     lines.append('🎬 Видео: ' + ('ВКЛ' if settings.video_enabled else 'ВЫКЛ')
                  + f' (до {TG_VIDEO_MAX_SECONDS // 60} мин)')
     lines.append('🖼 Дедуп по картинке: ' + ('ВКЛ' if settings.image_dedup else 'ВЫКЛ'))
@@ -23398,9 +23420,11 @@ async def setup_bot_commands(app: Application) -> None:
         BotCommand("doctor", "🧰 Самодиагностика"),
         BotCommand("stats", "📈 Статистика"),
         BotCommand("sources", "📡 Источники"),
+        # /llmmodel и /llmping работают, но в списке их нет: это диагностика
+        # на случай поломки, а не ежедневная кнопка. Синее меню — то, чем
+        # пользуются постоянно; когда в нём четырнадцать строк, не находится
+        # уже ничего. Обе команды подсказывает /llm, когда они нужны.
         BotCommand("llm", "🤖 Модель: статус и проверка"),
-        BotCommand("llmmodel", "🔀 Какая модель основная"),
-        BotCommand("llmping", "📡 Проверить провайдеров"),
         BotCommand("reliability", "🛡 Надёжность и лимиты"),
         BotCommand("admins", "👥 Администраторы"),
         BotCommand("logs", "📝 Логи"),
