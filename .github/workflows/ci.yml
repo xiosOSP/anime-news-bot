@@ -35,7 +35,12 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: Синтаксис и мёртвый код
-        run: python -m pyflakes anime_news_bot.py tools/*.py test_invariants.py tests/*.py
+        run: python -m pyflakes anime_news_bot.py tools/*.py test_invariants.py tests/*.py tests/e2e/*.py
+
+      # F821 — обращение к несуществующему имени. Именно этот класс ошибок уже
+      # ронял бота в проде, и тест на него есть; без инструмента он не работал.
+      - name: Несуществующие имена
+        run: python -m ruff check --select F821 anime_news_bot.py tools/*.py
 
       - name: Тесты
         # BOT_TOKEN нужен только чтобы модуль импортировался; сеть не трогаем.
