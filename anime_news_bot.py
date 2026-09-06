@@ -17208,9 +17208,14 @@ LLM_PRESETS = {
     'groq':       ('https://api.groq.com/openai/v1', 'llama-3.3-70b-versatile'),
     'gemini':     ('https://generativelanguage.googleapis.com/v1beta/openai',
                    'gemini-2.0-flash'),
-    'openrouter': ('https://openrouter.ai/api/v1', 'google/gemma-3-27b-it:free'),
+    # Бесплатные модели у роутеров снимают без предупреждения: прежний
+    # gemma-3-27b-it:free из каталога уже пропал, и пресет вёл в никуда.
+    'openrouter': ('https://openrouter.ai/api/v1', 'google/gemma-4-31b-it:free'),
     'nvidia':     ('https://integrate.api.nvidia.com/v1', 'meta/llama-3.3-70b-instruct'),
     'cerebras':   ('https://api.cerebras.ai/v1', 'llama-3.3-70b'),
+    # Каталог у роутеров свой: имя, живущее у одного, у другого даёт
+    # 400 invalid_model. Пресет избавляет от подбора вручную.
+    'orcarouter': ('https://api.orcarouter.ai/v1', 'deepseek/deepseek-v4-flash-free'),
 }
 
 LLM_PROVIDER = _env('LLM_PROVIDER', '').strip().lower()
@@ -17396,8 +17401,11 @@ def _llm_fatal_reason(status: int, body: str) -> Optional[dict]:
         return {'reason': 'capacity',
                 'log': f'у модели {_llm_primary_model()!r} сейчас нет свободной мощности',
                 'admin': f'у модели <code>{html.escape(_llm_primary_model() or "?")}</code> сейчас нет '
-                         'свободной мощности — провайдер просит зайти позже. '
-                         'Переменные менять не нужно.' + hint_line,
+                         'свободной мощности — провайдер просит зайти позже.'
+                         + (' Но он же предлагает другое имя модели, а это '
+                            'значит, что нынешнего он не находит: ожидание '
+                            'не поможет.' if suggestion else
+                            ' Переменные менять не нужно.') + hint_line,
                 'retry_after_sec': LLM_PRIMARY_RETRY_SEC,
                 'suggested_model': suggestion}
     if status == 402 or 'insufficient_balance' in text or 'insufficient balance' in text:
@@ -18919,14 +18927,25 @@ async def llmping_command(update, context: ContextTypes.DEFAULT_TYPE):
         # Отказы бывают разные, и «подождать» с «поправить настройки» стоит
         # различать: при временном ждать действительно надо, при 404 по имени
         # модели ожидание не поможет никогда.
-        if all(row.get('temporary') for row in results):
+        # Провайдер, предлагающий другое имя модели, на самом деле говорит
+        # «такой модели у меня нет». Формулировка при этом может быть про
+        # мощность — «no available capacity ... did you mean X?». Считать это
+        # временным значило бы советовать ждать того, что не наступит: снятую
+        # модель ожидание не вернёт.
+        renamed = [row for row in results if row.get('suggested')]
+        if renamed:
+            lines.append('')
+            lines.append('⚠️ Провайдер предлагает другое имя модели — значит '
+                         'нынешнего он не находит, как бы ни была написана '
+                         'причина. Ожидание тут не поможет: у бесплатных '
+                         'моделей имена меняются, а старые снимают. Смени '
+                         'модель командой выше.')
+        elif all(row.get('temporary') for row in results):
             lines.append('')
             lines.append('Все отказы временные: нет свободной мощности или '
                          'превышен темп запросов. Настройки править не нужно — '
                          'но пока это так, бот работает без модели. '
-                         'Третий провайдер снял бы такие совпадения: ключи '
-                         'Groq и Cerebras бесплатные, задаются переменными '
-                         'LLM_FAST_PROVIDER и LLM_FAST_API_KEY.')
+                         'Третий провайдер снял бы такие совпадения.')
     else:
         alive = ', '.join(LLM_SLOT_HUMAN[r['slot']].split(' (')[0] for r in working)
         current = _llm_primary_slot()
