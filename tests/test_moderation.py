@@ -170,3 +170,66 @@ def test_store_survives_restart(tmp_path):
     second = bot.ChatModerationStore(path)
     assert second.is_enabled(-999) is True
     assert second.warn_count(-999, 42) == 1
+
+
+# ---------- случаи с реального теста в чате ----------
+
+def test_obscene_insult_reaches_the_model():
+    """Настоящее оскорбление с прода прошло мимо: в списке был «дурак», но не мат.
+
+    Получалось наоборот задуманного — мягкие оскорбления показывались модели,
+    а грубые проходили насквозь.
+    """
+    verdict = bot._mod_local_check(1, 10, 'Хм фанаты магички хуесосы')
+    assert verdict is not None and verdict['confident'] is False
+
+
+@pytest.mark.parametrize('text', [
+    'дебилы какие-то',          # множественное число
+    'ты тупая',                 # женский род
+    'вы придурки',              # множественное
+    'какой же он мудак',        # падеж
+])
+def test_inflected_forms_are_caught(text):
+    """Русский склоняет и множит: сравнение по словам целиком пропускало
+    ровно те формы, в которых оскорбления и пишут."""
+    assert bot._mod_local_check(1, 11, text) is not None
+
+
+@pytest.mark.parametrize('text', [
+    'нормальный спор про сезон',
+    'не согласен, рисовка слабая',
+    'этот опенинг лучше прошлого',
+])
+def test_normal_speech_still_passes(text):
+    """Расширение списка не должно превратиться в ловлю обычной речи."""
+    assert bot._mod_local_check(1, 12, text) is None
+
+
+def test_sticker_and_photo_flood_is_caught():
+    """Тестер флудил стикерами и фото и мута не получил.
+
+    Обработчик был подписан на TEXT|CAPTION, поэтому медиа до него не доходило,
+    а внутри проверка выходила на пустом тексте. Флуд — это частота сообщений,
+    а не наличие текста.
+    """
+    поток = ['Я', 'П', 'Пола', 'Ататаи', 'Татата', '[фото]', '[фото]', '[стикер 🐸]']
+    verdicts = []
+    for text in поток:
+        bot._mod_note_message(3, 30, 'Tester', text)
+        verdicts.append(bot._mod_local_check(3, 30, text))
+    assert any(v and v['category'] == 'flood' for v in verdicts)
+
+
+def test_media_without_text_is_counted_but_not_judged():
+    """Медиа считается для частоты, но судить его по тексту не по чему."""
+    bot._mod_note_message(4, 40, 'Tester', '[фото]')
+    assert bot._mod_local_check(4, 40, '[фото]') is None
+
+
+def test_repeated_sticker_is_spam():
+    """Один и тот же стикер подряд — повтор, даже без текста."""
+    for _ in range(bot.MODERATION_REPEAT_LIMIT):
+        bot._mod_note_message(5, 50, 'Tester', '[стикер 🐸]')
+    verdict = bot._mod_local_check(5, 50, '[стикер 🐸]')
+    assert verdict is not None and verdict['category'] in ('spam', 'flood')

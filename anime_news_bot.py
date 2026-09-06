@@ -1491,21 +1491,60 @@ _moderation_llm_calls: dict[str, int] = {}     # дата -> сколько вы
 # первого уровня не судить, а отобрать кандидатов для второго.
 _MOD_LINK_RE = re.compile(r'(https?://|t\.me/|@[A-Za-z0-9_]{5,})', re.IGNORECASE)
 _MOD_INVITE_RE = re.compile(r'(t\.me/joinchat|t\.me/\+|discord\.gg/|joinchat)', re.IGNORECASE)
-# Слова, после которых имеет смысл спросить модель. Это НЕ список для
+# Корни, после которых имеет смысл спросить модель. Это НЕ список для
 # наказания: по нему только выбираются сообщения на разбор, решение принимает
-# модель с учётом контекста — иначе шуточное «дурак» ловилось бы как оскорбление.
-_MOD_SUSPECT_WORDS = frozenset({
-    'идиот', 'дебил', 'тупой', 'урод', 'мразь', 'тварь', 'заткнись', 'ненавижу',
-    'дурак', 'придурок', 'клоун', 'лох', 'нищий', 'сдохни', 'убей',
-    'мать', 'мамка', 'мамаша', 'батя', 'отец',
-    'путин', 'зеленский', 'война', 'сво', 'украина', 'политик', 'выборы',
-    'скам', 'кинул', 'развод', 'бесплатно раздаю', 'пиши в лс',
-    'idiot', 'stupid', 'kill yourself', 'kys', 'scam',
-})
+# модель с учётом контекста — иначе шуточное «дурак» между своими ловилось бы
+# как оскорбление, а правила чата разрешают рофл.
+#
+# Ищем именно КОРНИ и подстрокой, а не слова целиком: русский язык склоняет и
+# множит, и проверка по точному совпадению пропускала «хуесосы», «дебилы»,
+# «тупые» — то есть ровно те формы, в которых оскорбления и пишут.
+_MOD_SUSPECT_STEMS = (
+    # Обсценная лексика. Сама по себе не наказывается — правила чата разрешают
+    # мат между своими, — но это самый сильный повод показать текст модели.
+    'хуе', 'хуй', 'хуё', 'хуя', 'пизд', 'бляд', 'блят', 'ебан', 'ёбан', 'ебал',
+    'ебат', 'ебуч', 'заеб', 'долбоёб', 'долбоеб', 'мудак', 'мудил', 'гандон',
+    'сука', 'суки', 'чмо', 'гнид', 'ублюд', 'падл', 'шлюх', 'пидор', 'пидар',
+    # Обычные оскорбления.
+    'идиот', 'дебил', 'тупой', 'тупая', 'тупые', 'тупиц', 'урод', 'мраз',
+    'тварь', 'придур', 'клоун', 'дурак', 'дура', 'ничтож', 'лошар',
+    'заткнись', 'ненавиж', 'сдохни', 'убей себя',
+    # Семья — отдельная категория правил чата.
+    'мамк', 'мамаш', 'мать твою', 'батя твой', 'отец твой',
+    # Политика.
+    'путин', 'зеленск', 'война', 'украин', 'выбор', 'политик',
+    # Скам и реклама.
+    'скам', 'кинул на деньг', 'бесплатно раздаю', 'пиши в лс', 'заработок',
+    # Английский.
+    'idiot', 'stupid', 'kill yourself', ' kys', 'scam', 'faggot', 'retard',
+)
 
 
 def _mod_normalize(text: str) -> str:
     return re.sub(r'\s+', ' ', str(text or '')).strip().lower()
+
+
+def _mod_message_text(message) -> str:
+    """Текст сообщения либо подстановка для медиа.
+
+    Флуд — это частота сообщений, а не наличие текста: стикерами и картинками
+    засыпают чат ровно так же. Раньше обработчик до них даже не доходил, а
+    внутри выходил на пустом тексте, и такой флуд был для бота невидим.
+    Подстановка заодно даёт работать проверке повторов: пять одинаковых
+    стикеров — это пять одинаковых строк.
+    """
+    text = message.text or message.caption or ''
+    if text.strip():
+        return text
+    sticker = getattr(message, 'sticker', None)
+    if sticker is not None:
+        return f'[стикер {getattr(sticker, "emoji", "") or getattr(sticker, "file_unique_id", "")}]'
+    for attr, label in (('photo', 'фото'), ('animation', 'гиф'), ('video', 'видео'),
+                        ('video_note', 'кружок'), ('voice', 'голосовое'),
+                        ('audio', 'аудио'), ('document', 'файл')):
+        if getattr(message, attr, None):
+            return f'[{label}]'
+    return ''
 
 
 def _mod_note_message(chat_id: int, user_id: int, name: str, text: str) -> None:
@@ -1528,10 +1567,12 @@ def _mod_local_check(chat_id: int, user_id: int, text: str) -> Optional[dict]:
     Возвращает ``{'category', 'confident'}``. ``confident=True`` означает
     «нарушение очевидно, модель не нужна»; ``False`` — «похоже на проблему,
     пусть посмотрит модель с контекстом».
+
+    Частотные проверки идут ПЕРВЫМИ и не зависят от текста: флуд стикерами и
+    картинками — такой же флуд, а раньше проверка выходила на пустом тексте и
+    пропускала его целиком.
     """
     normalized = _mod_normalize(text)
-    if not normalized:
-        return None
 
     # Флуд — считается, а не оценивается: тут модель не нужна.
     key = f'{chat_id}:{user_id}'
@@ -1540,12 +1581,16 @@ def _mod_local_check(chat_id: int, user_id: int, text: str) -> Optional[dict]:
     if sum(1 for ts in recent if ts > edge) >= MODERATION_FLOOD_MESSAGES:
         return {'category': 'flood', 'confident': True}
 
-    # Одно и то же сообщение подряд — тоже арифметика.
+    # Одно и то же сообщение подряд — тоже арифметика. Для медиа сравниваются
+    # подстановки вроде «[стикер]», поэтому повтор одного стикера тоже виден.
     window = _moderation_windows.get(int(chat_id)) or deque()
-    same = [m for m in window if m['user_id'] == user_id
-            and _mod_normalize(m['text']) == normalized]
-    if len(same) >= MODERATION_REPEAT_LIMIT:
-        return {'category': 'spam', 'confident': True}
+    if normalized:
+        same = [m for m in window if m['user_id'] == user_id
+                and _mod_normalize(m['text']) == normalized]
+        if len(same) >= MODERATION_REPEAT_LIMIT:
+            return {'category': 'spam', 'confident': True}
+    if not normalized:
+        return None                      # медиа без текста: дальше судить не по чему
 
     if _MOD_INVITE_RE.search(text or ''):
         return {'category': 'spam', 'confident': True}
@@ -1555,11 +1600,10 @@ def _mod_local_check(chat_id: int, user_id: int, text: str) -> Optional[dict]:
         # но ссылкой делятся и по делу, поэтому решает модель.
         return {'category': 'spam', 'confident': False}
 
-    words = set(re.findall(r'[a-zA-Zа-яёА-ЯЁ]+', normalized))
-    if words & _MOD_SUSPECT_WORDS:
+    # Подстрокой, а не по словам: русский язык склоняет, и «хуесосы» не совпало
+    # бы ни с одним словом из списка при точном сравнении.
+    if any(stem in normalized for stem in _MOD_SUSPECT_STEMS):
         return {'category': '', 'confident': False}
-    if any(phrase in normalized for phrase in ('пиши в лс', 'бесплатно раздаю')):
-        return {'category': 'spam', 'confident': False}
     return None
 
 
@@ -20854,7 +20898,7 @@ async def _mod_report(bot: Bot, message, category: str, decision: dict,
         text += f'Пояснение модели: {html.escape(reason)}\n'
     if category in MODERATION_HUMAN_ONLY:
         text += '\n⚠️ Бот сам не банит. Решение за вами.\n'
-    text += f'\n<blockquote>{_escape_to_limit(message.text or "", 400)}</blockquote>'
+    text += f'\n<blockquote>{_escape_to_limit(_mod_message_text(message), 400)}</blockquote>'
     for admin_id in _all_admin_ids():
         try:
             await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML,
@@ -20879,9 +20923,9 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
         return
     if getattr(user, 'is_bot', False) or not chat_moderation.is_enabled(chat.id):
         return
-    text = message.text or message.caption or ''
-    if not text.strip():
-        return
+    text = _mod_message_text(message)
+    if not text:
+        return                           # служебное событие: считать нечего
 
     user_id = int(user.id)
     _mod_note_message(chat.id, user_id, getattr(user, 'full_name', ''), text)
@@ -22484,9 +22528,11 @@ def main():
     app.add_handler(MessageHandler(reply_filter, reply_button_handler))
     # Модерация чата: группа 1 — после всех служебных обработчиков, чтобы
     # команды и кнопки бота обрабатывались раньше и не попадали под проверку.
+    # Пропускаем ВСЕ сообщения группы, а не только текстовые: флуд стикерами и
+    # картинками — такой же флуд, а фильтр по TEXT|CAPTION делал его невидимым.
     app.add_handler(
         MessageHandler(
-            (filters.TEXT | filters.CAPTION) & ~filters.COMMAND & filters.ChatType.GROUPS,
+            ~filters.COMMAND & filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL,
             moderation_message_handler,
         ),
         group=1,
