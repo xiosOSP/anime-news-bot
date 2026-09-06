@@ -23,8 +23,8 @@ def three(monkeypatch):
         ('LLM_FALLBACK_MODEL', 'mistral-small-latest'),
         ('LLM_FAST_BASE_URL', 'https://three.test/v1'),
         ('LLM_FAST_API_KEY', 'key-three-cccc'), ('LLM_FAST_MODEL', 'llama-3.3-70b'),
-        ('_llm_using_fallback', False), ('_llm_slot_override', ''),
-        ('_llm_tried_slots', set()), ('_llm_primary_retry_at', 0.0),
+        ('_llm_using_fallback', False), ('_llm_candidate', ()),
+        ('_llm_tried_candidates', set()), ('_llm_primary_retry_at', 0.0),
         ('_llm_disabled_runtime', False), ('_llm_disabled_reason', ''),
         ('_llm_fail_streak', 0), ('_llm_circuit_until', 0.0),
         ('_llm_failover_level', 0), ('_llm_failover_alert_key', ''),
@@ -65,14 +65,14 @@ def test_answer_closes_the_round(three):
     bot._llm_try_failover('capacity', '', 60.0)
     bot._llm_try_failover('rate_limit', '', 60.0)
     bot._llm_note_primary_recovered()
-    assert bot._llm_tried_slots == set()
+    assert bot._llm_tried_candidates == set()
 
 
 def test_manual_switch_clears_the_round(three):
     """Ручное переключение — новая конфигурация, старые попытки не в счёт."""
     bot._llm_try_failover('capacity', '', 60.0)
     bot._llm_reset_provider_state('тест')
-    assert bot._llm_tried_slots == set()
+    assert bot._llm_tried_candidates == set()
     assert bot._llm_current()[2] == 'deepseek/deepseek-v4-pro-free'
 
 
@@ -193,3 +193,59 @@ def test_every_preset_has_a_base_url_and_a_model():
     for name, (base_url, model) in bot.LLM_PRESETS.items():
         assert base_url.startswith('https://'), name
         assert model, f'{name}: пресет без модели'
+
+
+# ---------- запасные модели на том же ключе ----------
+
+@pytest.fixture
+def alternates(three, monkeypatch):
+    """Три бесплатные модели одного провайдера — типичный расклад free-тарифа."""
+    monkeypatch.setattr(bot, 'LLM_MODEL_ALTERNATES',
+                        ('qwen/qwen3.8-27b-free', 'tencent/hy3-free'))
+    return monkeypatch
+
+
+def test_own_models_are_tried_before_other_providers(alternates):
+    """Сосед по каталогу — самая дешёвая замена: тот же ключ, свои лимиты.
+
+    Идти к другому провайдеру, когда у своего есть живая бесплатная модель,
+    значит тратить чужую квоту на пустом месте.
+    """
+    order = bot._llm_candidates()
+    assert order[0] == ('primary', 'deepseek/deepseek-v4-pro-free')
+    assert order[1] == ('primary', 'qwen/qwen3.8-27b-free')
+    assert order[2] == ('primary', 'tencent/hy3-free')
+    assert order[3][0] == 'fallback'
+
+
+def test_rotation_walks_models_then_providers(alternates):
+    """Перебор доходит до конца списка, а не до конца слотов."""
+    seen = []
+    while bot._llm_try_failover('capacity', '', 60.0):
+        seen.append(bot._llm_current()[2])
+    assert seen[:2] == ['qwen/qwen3.8-27b-free', 'tencent/hy3-free']
+    assert 'mistral-small-latest' in seen
+    assert 'llama-3.3-70b' in seen
+
+
+def test_alternate_keeps_the_key_of_its_own_provider(alternates):
+    """Модель соседа по каталогу берётся тем же ключом, а не чужим."""
+    bot._llm_try_failover('capacity', '', 60.0)
+    base_url, api_key, model = bot._llm_current()
+    assert model == 'qwen/qwen3.8-27b-free'
+    assert (base_url, api_key) == ('https://one.test/v1', 'key-one-aaaa')
+
+
+def test_no_alternates_configured_behaves_as_before(three):
+    """Без списка запасных ничего не меняется: сразу к другому провайдеру."""
+    order = bot._llm_candidates()
+    assert order[0][0] == 'primary'
+    assert order[1][0] == 'fallback'
+
+
+def test_duplicate_alternate_is_not_tried_twice(three, monkeypatch):
+    """Модель, уже стоящая основной, в списке запасных ничего не добавляет."""
+    monkeypatch.setattr(bot, 'LLM_MODEL_ALTERNATES',
+                        ('deepseek/deepseek-v4-pro-free', 'qwen/qwen3.8-27b-free'))
+    order = bot._llm_candidates()
+    assert order.count(('primary', 'deepseek/deepseek-v4-pro-free')) == 1
