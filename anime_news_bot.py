@@ -17553,6 +17553,53 @@ def _llm_note_primary_recovered() -> None:
             'Бот вернулся на него, запасной больше не используется.')
 
 
+_llm_last_failure: dict = {}       # что именно не сработало в последний раз
+
+
+def _llm_note_failure(kind: str, detail: str, *, model: str = '') -> None:
+    """Запоминает причину последнего молчания модели.
+
+    Записывалась только часть отказов — те, где провайдер прислал внятный код.
+    Сетевая ошибка, 5xx, 429 и нечитаемый ответ не оставляли ничего, и
+    диагностика честно, но бесполезно отвечала «провайдер не ответил на
+    запрос». Под этой фразой пряталось пять разных поломок, которые чинятся
+    по-разному: таймаут — это сеть хостинга, 502 — это сторона провайдера,
+    429 — это темп запросов.
+    """
+    global _llm_last_failure
+    _llm_last_failure = {
+        'kind': str(kind)[:32],
+        'detail': _redact_secrets(' '.join(str(detail or '').split()))[:300],
+        'model': str(model or '')[:120],
+        'at': time.time(),
+    }
+    metrics.inc('anime_bot_llm_failure_total', labels={'kind': str(kind)[:32]})
+
+
+_LLM_FAILURE_HUMAN = {
+    'network': 'запрос не дошёл до провайдера (сеть, таймаут или DNS хостинга)',
+    'http': 'провайдер ответил ошибкой',
+    'rate_limit': 'провайдер ограничил темп запросов (429)',
+    'bad_body': 'провайдер ответил, но тело ответа не разобрать',
+    'token_budget': 'исчерпан дневной бюджет токенов (LLM_DAILY_TOKEN_BUDGET)',
+    'quota': 'исчерпан дневной лимит вызовов (LLM_DAILY_LIMIT)',
+}
+
+
+def _llm_last_failure_text() -> str:
+    """Последняя причина молчания человеческим языком. Пусто — если её нет."""
+    row = _llm_last_failure
+    if not row:
+        return ''
+    human = _LLM_FAILURE_HUMAN.get(str(row.get('kind')), str(row.get('kind')))
+    parts = [human]
+    if row.get('model'):
+        parts.append(f'модель {row["model"]}')
+    if row.get('detail'):
+        parts.append(str(row['detail']))
+    return ' — '.join(parts)
+
+
 def _remember_provider_error(status: int, body: str) -> None:
     """Запоминает, что именно ответил провайдер.
 
@@ -17631,6 +17678,9 @@ def _llm_unavailable_reason() -> Optional[str]:
         return f'модель отключена: {_llm_disabled_reason or "ошибки подряд"}'
     if _llm_quota_left() <= 0:
         return f'дневной лимит вызовов исчерпан ({LLM_DAILY_LIMIT})'
+    if (feature_enabled('llm_budget') and LLM_DAILY_TOKEN_BUDGET > 0
+            and llm_budget is not None and not llm_budget.can_charge(0)):
+        return f'исчерпан дневной бюджет токенов ({LLM_DAILY_TOKEN_BUDGET})'
     return None
 
 
@@ -17707,6 +17757,7 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
     except Exception as e:
         if not routed_task:
             _llm_fail_streak += 1
+        _llm_note_failure('network', f'{type(e).__name__}: {e}', model=model)
         logger.warning(f"LLM: запрос не удался ({type(e).__name__}: {e})")
         return None
 
@@ -17714,6 +17765,7 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
     # the global circuit, trigger provider failover, or disable the quality route.
     if routed_task and r.status_code != 200:
         metrics.inc('anime_bot_llm_route_error_total', labels={'status': str(r.status_code)})
+        _llm_note_failure('http', f'быстрый маршрут: HTTP {r.status_code}', model=model)
         logger.warning('LLM fast route: HTTP %s — fallback to quality route', r.status_code)
         return None
 
@@ -17734,16 +17786,19 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
             # просьба сбавить темп. Мы её выполняем, значит следующий запрос
             # должен пройти — наказывать модель длинной паузой не за что.
             metrics.inc('anime_bot_llm_rate_limited_total', labels={'source': 'retry_after'})
+            _llm_note_failure('rate_limit', f'просит подождать {pause:.0f} с', model=model)
             logger.warning('LLM: провайдер просит подождать %.0f с (429) — жду ровно столько', pause)
         else:
             # Без заголовка мы не знаем, сколько ждать, поэтому обычная защита
             # по счётчику провалов остаётся: она не даст долбить провайдера.
             _llm_fail_streak += 1
             metrics.inc('anime_bot_llm_rate_limited_total', labels={'source': 'no_header'})
+            _llm_note_failure('rate_limit', 'без заголовка Retry-After', model=model)
             logger.warning('LLM: провайдер вернул 429 (лимит запросов) — притормаживаю')
         return None
     if r.status_code in (401, 403):
         _remember_provider_error(r.status_code, r.text)
+        _llm_note_failure('http', f'HTTP {r.status_code}: ключ отклонён', model=model)
         if _llm_try_failover('auth', 'провайдер отклонил ключ основного аккаунта. '
                                      'Проверь LLM_API_KEY: у бесплатных роутеров тот же '
                                      '401 приходит и при исчерпанной квоте, и при '
@@ -17763,6 +17818,7 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
     fatal = _llm_fatal_reason(r.status_code, r.text)
     if fatal:
         _remember_provider_error(r.status_code, r.text)
+        _llm_note_failure('http', f'HTTP {r.status_code}: {fatal["log"]}', model=model)
         if _llm_try_failover(fatal['reason'], fatal['admin'],
                              float(fatal.get('retry_after_sec') or 0.0)):
             return None          # следующий вызов пойдёт к запасному провайдеру
@@ -17779,6 +17835,8 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
         return _llm_request(messages, max_tokens, route_config=route_config)
     if r.status_code != 200:
         _llm_fail_streak += 1
+        _remember_provider_error(r.status_code, r.text)
+        _llm_note_failure('http', f'HTTP {r.status_code}: {r.text[:200]}', model=model)
         logger.warning(f"LLM: HTTP {r.status_code} — {r.text[:150]}")
         return None
 
@@ -17793,11 +17851,15 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
     except (ValueError, KeyError, IndexError, TypeError) as e:
         if not routed_task:
             _llm_fail_streak += 1
+        _llm_note_failure('bad_body', f'{type(e).__name__}: {e} | {r.text[:150]}', model=model)
         logger.warning(f"LLM: непонятный ответ ({e})")
         return None
 
     if not routed_task:
         _llm_fail_streak = 0
+        # Ответ пришёл: прошлая причина больше не актуальна. Иначе /llm будет
+        # неделю показывать давно ушедший таймаут как текущую проблему.
+        _llm_last_failure.clear()
     return (content or '').strip()
 
 
@@ -17823,6 +17885,7 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: s
         if not _llm_disabled_runtime:
             logger.info(f"LLM: дневной лимит {LLM_DAILY_LIMIT} исчерпан — "
                         f"до завтра работаю без модели")
+        _llm_note_failure('quota', f'лимит {LLM_DAILY_LIMIT} вызовов в сутки')
         return None
     if _llm_fail_streak >= LLM_FAIL_PAUSE_AFTER:
         if not _llm_disabled_runtime:
@@ -17880,6 +17943,7 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: s
                     _queue_admin_alert(
                         f'💰 Дневной LLM token budget ({LLM_DAILY_TOKEN_BUDGET}) исчерпан. '
                         'До следующего дня бот продолжит работу через fallback без LLM.')
+                _llm_note_failure('token_budget', f'лимит {LLM_DAILY_TOKEN_BUDGET} токенов')
                 return None
             reserved_tokens = llm_budget.charge(estimated_tokens)
             metrics.set('anime_bot_llm_budget_tokens', llm_budget.snapshot()['tokens'])
@@ -18540,6 +18604,9 @@ def _llm_off_reason() -> str:
         parts.append('Провайдер не ответил. Возможно, сеть или временный сбой.')
     if _llm_quota_left() <= 0:
         parts.append('📉 Дневной лимит запросов исчерпан (LLM_DAILY_LIMIT).')
+    fresh = _llm_last_failure_text()
+    if fresh:
+        parts.append(f'\nЧто именно не сработало: {html.escape(fresh)}')
     if _llm_last_provider_error:
         parts.append(f'\nОтвет провайдера: <code>'
                      f'{html.escape(_llm_last_provider_error[:200])}</code>')
@@ -18673,6 +18740,96 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
         out.append('')
         out.append('Проверить на своём тексте: <code>/llm заголовок новости</code>')
     await update.message.reply_text('\n'.join(out), parse_mode=ParseMode.HTML)
+
+
+def _llm_probe_slot(slot: str, timeout: float = 12.0) -> dict:
+    """Стучится в провайдера напрямую и возвращает, что он ответил.
+
+    Обычный путь вызова слишком много решает за нас: молчит по кулдауну,
+    уходит на запасного, выключается по счётчику ошибок. Когда молчат все,
+    нужен именно сырой ответ каждого — код, задержка, тело. Проба ничего не
+    меняет: ни счётчиков, ни failover, ни состояния circuit.
+    """
+    base_url, api_key, model = _llm_slot_config(slot)
+    started = time.monotonic()
+    try:
+        r = requests.post(
+            f'{base_url}/chat/completions',
+            headers={'Authorization': f'Bearer {api_key}',
+                     'Content-Type': 'application/json'},
+            json={'model': model, 'max_tokens': 5,
+                  'messages': [{'role': 'user', 'content': 'ping'}]},
+            timeout=timeout,
+        )
+    except Exception as e:
+        return {'slot': slot, 'model': model, 'ok': False, 'status': 0,
+                'took': time.monotonic() - started,
+                'detail': _redact_secrets(f'{type(e).__name__}: {e}')[:200]}
+    took = time.monotonic() - started
+    if r.status_code == 200:
+        return {'slot': slot, 'model': model, 'ok': True, 'status': 200,
+                'took': took, 'detail': ''}
+    return {'slot': slot, 'model': model, 'ok': False, 'status': r.status_code,
+            'took': took,
+            'detail': _redact_secrets(' '.join((r.text or '').split()))[:200]}
+
+
+@admin_only
+async def llmping_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Живая проверка каждого провайдера по отдельности: /llmping.
+
+    Появилась, когда молчали и основной, и запасной, а диагностика могла
+    сказать только «провайдер не ответил»: она смотрела на общее состояние
+    бота, а не спрашивала самих провайдеров.
+    """
+    ready = _llm_ready_slots()
+    if not ready:
+        await update.message.reply_text(
+            'Ни один провайдер не настроен. Нужны <code>LLM_PROVIDER</code> и '
+            '<code>LLM_API_KEY</code> — подробности в /llm',
+            parse_mode=ParseMode.HTML)
+        return
+    msg = await update.message.reply_text(f'📡 Стучусь к провайдерам ({len(ready)})…')
+    results = [await asyncio.to_thread(_llm_probe_slot, slot) for slot in ready]
+
+    lines = ['📡 <b>Проверка провайдеров</b>', '']
+    for row in results:
+        head = LLM_SLOT_HUMAN[row['slot']].split(' (')[0]
+        mark = '✅' if row['ok'] else '❌'
+        lines.append(f'{mark} <b>{html.escape(head)}</b> · '
+                     f'<code>{html.escape(row["model"])}</code>')
+        if row['ok']:
+            lines.append(f'   ответил за {row["took"]:.1f} с')
+        elif row['status'] == 0:
+            lines.append(f'   не дозвонился за {row["took"]:.1f} с')
+            lines.append(f'   <code>{html.escape(row["detail"])}</code>')
+        else:
+            lines.append(f'   HTTP {row["status"]} за {row["took"]:.1f} с')
+            if row['detail']:
+                lines.append(f'   <code>{html.escape(row["detail"])}</code>')
+        lines.append('')
+
+    working = [r for r in results if r['ok']]
+    if not working:
+        lines.append('<b>Не отвечает никто.</b>')
+        # Одинаковая сетевая ошибка у всех — это почти наверняка не совпадение
+        # трёх провайдеров, а закрытый наружу хостинг.
+        if all(r['status'] == 0 for r in results):
+            lines.append('У всех обрыв связи, а не отказ — так выглядит проблема '
+                         'на стороне хостинга: нет исхода в интернет, DNS или '
+                         'блокировка. Провайдеры тут ни при чём.')
+        else:
+            lines.append('Смотри код ответа выше: 401/403 — ключ или квота, '
+                         '402 — деньги, 404 — имя модели, 429 — темп запросов, '
+                         '5xx — сторона провайдера.')
+    else:
+        alive = ', '.join(LLM_SLOT_HUMAN[r['slot']].split(' (')[0] for r in working)
+        current = _llm_primary_slot()
+        lines.append(f'Отвечают: <b>{html.escape(alive)}</b>.')
+        if not any(r['slot'] == current for r in working):
+            lines.append('Основной сейчас не в их числе — переключиться можно '
+                         'кнопкой в /llmmodel.')
+    await msg.edit_text('\n'.join(lines)[:4000], parse_mode=ParseMode.HTML)
 
 
 def _llm_model_menu() -> InlineKeyboardMarkup:
@@ -21815,11 +21972,14 @@ async def modtest_command(update, context: ContextTypes.DEFAULT_TYPE):
         verdict = await _moderation_classify(probe_chat, text)
         if verdict is None:
             lines.append('\n2️⃣ Модель: <b>недоступна</b> — в бою бот бы промолчал.')
-            lines.append(f'   Причина: {html.escape(why or "провайдер не ответил на запрос")}')
+            # Причину, записанную самим вызовом, показываем первой: она свежее
+            # и конкретнее, чем состояние, снятое до запроса.
+            fresh = _llm_last_failure_text()
+            lines.append(f'   Причина: {html.escape(fresh or why or "провайдер не ответил")}')
             if _llm_last_provider_error:
                 lines.append('   Ответ провайдера: '
                              f'<code>{_escape_to_limit(_llm_last_provider_error, 200)}</code>')
-            lines.append('   Состояние и смена провайдера — /llm и /llmmodel')
+            lines.append('   Проверить каждого провайдера отдельно — /llmping')
             await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
             return
         if not verdict.get('violation'):
@@ -23240,6 +23400,7 @@ async def setup_bot_commands(app: Application) -> None:
         BotCommand("sources", "📡 Источники"),
         BotCommand("llm", "🤖 Модель: статус и проверка"),
         BotCommand("llmmodel", "🔀 Какая модель основная"),
+        BotCommand("llmping", "📡 Проверить провайдеров"),
         BotCommand("reliability", "🛡 Надёжность и лимиты"),
         BotCommand("admins", "👥 Администраторы"),
         BotCommand("logs", "📝 Логи"),
@@ -23455,6 +23616,7 @@ def main():
     app.add_handler(CommandHandler("media", media_command))
     app.add_handler(CommandHandler("llm", llm_command))
     app.add_handler(CommandHandler("llmmodel", llmmodel_command))
+    app.add_handler(CommandHandler("llmping", llmping_command))
     app.add_handler(CommandHandler("reliability", reliability_command))
     app.add_handler(CommandHandler("experiments", experiments_command))
     app.add_handler(CommandHandler("adaptive", adaptive_command))
