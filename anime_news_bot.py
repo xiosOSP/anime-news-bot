@@ -2983,6 +2983,11 @@ class BotSettings:
         'llm_limit_repeats': True, # не больше 3 постов про один тайтл в сутки
         'llm_day': '',           # сутки, за которые считаем вызовы
         'llm_calls_today': 0,    # сколько вызовов модели сделано сегодня
+        # Какой из настроенных провайдеров сейчас основной. '' — как в
+        # переменных окружения. Когда основной проваливается на весь день,
+        # переключение не должно требовать правки переменных и перезапуска.
+        'llm_primary_slot': '',  # '' | 'primary' | 'fallback' | 'fast'
+        'llm_model_override': '',  # имя модели вместо штатной у основного слота
     }
 
     def __init__(self, path: Path):
@@ -3283,6 +3288,28 @@ class BotSettings:
     @llm_enabled.setter
     def llm_enabled(self, value: bool) -> None:
         self._data['llm_enabled'] = bool(value)
+        self.save()
+
+    @property
+    def llm_primary_slot(self) -> str:
+        raw = str(self._data.get('llm_primary_slot') or '').strip().lower()
+        return raw if raw in ('primary', 'fallback', 'fast') else ''
+
+    @llm_primary_slot.setter
+    def llm_primary_slot(self, value: str) -> None:
+        raw = str(value or '').strip().lower()
+        self._data['llm_primary_slot'] = raw if raw in ('primary', 'fallback', 'fast') else ''
+        self.save()
+
+    @property
+    def llm_model_override(self) -> str:
+        return str(self._data.get('llm_model_override') or '').strip()
+
+    @llm_model_override.setter
+    def llm_model_override(self, value: str) -> None:
+        # Имя модели уходит в тело HTTP-запроса, поэтому режем длину и
+        # переводы строк: провайдеры на такое отвечают невнятной 400.
+        self._data['llm_model_override'] = ' '.join(str(value or '').split())[:120]
         self.save()
 
     @property
@@ -14293,6 +14320,8 @@ def _menu_llm() -> InlineKeyboardMarkup:
                 [InlineKeyboardButton(f'{_sw(settings.llm_limit_repeats)} Лимит на тайтл',
                                       callback_data='settings:toggle_llm_repeats')],
             ]
+        rows.append([InlineKeyboardButton('🔀 Какая модель основная',
+                                          callback_data='llmslot:show')])
     else:
         rows.append([InlineKeyboardButton('🤖 Модель не настроена — /llm',
                                           callback_data='settings:llm_help')])
@@ -14672,6 +14701,10 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # сообщений админам, а не из меню настроек.
     if data.startswith('mod:'):
         await moderation_callback(update, context)
+        return
+    # Выбор основного провайдера: свой экран, права проверяются внутри.
+    if data.startswith('llmslot:'):
+        await llm_slot_callback(update, context)
         return
     if is_admin(update):
         _audit_update(update, 'callback', callback=data[:160])
@@ -17044,6 +17077,99 @@ LLM_DAILY_LIMIT = max(1, min(10000, _env_int('LLM_DAILY_LIMIT', 900)))
 LLM_MAX_TOKENS = max(64, min(4000, _env_int('LLM_MAX_TOKENS', 700)))
 
 
+# --- какой провайдер сейчас основной ---
+# Переменные окружения задают до трёх настроенных провайдеров. Раньше роль была
+# жёстко привязана к переменной: основной — только LLM_PROVIDER. Когда основной
+# ложится на весь день, а запасной работает, единственным способом поменять их
+# местами была правка переменных на хостинге и перезапуск. Теперь роль
+# выбирается в настройках, а переменные остаются описанием доступных ключей.
+LLM_SLOTS = ('primary', 'fallback', 'fast')
+LLM_SLOT_HUMAN = {
+    'primary':  'основной (LLM_PROVIDER)',
+    'fallback': 'запасной (LLM_FALLBACK_PROVIDER)',
+    'fast':     'быстрый (LLM_FAST_PROVIDER)',
+}
+
+
+def _llm_slot_env(slot: str) -> tuple[str, str, str]:
+    """Адрес, ключ и модель слота ровно так, как их задали переменные."""
+    if slot == 'fallback':
+        return LLM_FALLBACK_BASE_URL, LLM_FALLBACK_API_KEY, LLM_FALLBACK_MODEL
+    if slot == 'fast':
+        return LLM_FAST_BASE_URL, LLM_FAST_API_KEY, LLM_FAST_MODEL
+    return LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
+
+
+def _llm_slot_ready(slot: str) -> bool:
+    base_url, api_key, model = _llm_slot_env(slot)
+    return bool(base_url and api_key and model)
+
+
+def _llm_ready_slots() -> list[str]:
+    return [slot for slot in LLM_SLOTS if _llm_slot_ready(slot)]
+
+
+def _llm_primary_slot() -> str:
+    """Слот, назначенный основным.
+
+    Если выбранный слот перестал быть настроенным (ключ убрали из окружения),
+    молча возвращаемся к штатному основному: настройка, оставшаяся от прошлой
+    конфигурации, не должна выключать модель целиком.
+    """
+    chosen = getattr(settings, 'llm_primary_slot', '') if settings is not None else ''
+    if chosen in LLM_SLOTS and _llm_slot_ready(chosen):
+        return chosen
+    return 'primary'
+
+
+def _llm_backup_slot() -> Optional[str]:
+    """Слот, на который уходим при отказе основного.
+
+    Порядок фиксированный, а не «всегда LLM_FALLBACK»: если основным назначен
+    запасной провайдер, страховкой становится штатный основной. Быстрый слот
+    берётся последним — раньше он не участвовал в подстраховке вовсе, и при
+    незаданном LLM_FALLBACK отказ основного выключал модель, хотя рабочий ключ
+    в окружении был.
+    """
+    chosen = _llm_primary_slot()
+    for slot in LLM_SLOTS:
+        if slot != chosen and _llm_slot_ready(slot):
+            return slot
+    return None
+
+
+def _llm_slot_config(slot: str) -> tuple[str, str, str]:
+    """Настройки слота с учётом переопределения имени модели.
+
+    Переопределение действует только на основной слот и только на модель:
+    адрес и ключ остаются от провайдера, иначе получилась бы попытка спросить
+    чужую модель по чужому ключу.
+    """
+    base_url, api_key, model = _llm_slot_env(slot)
+    if slot == _llm_primary_slot() and settings is not None:
+        override = settings.llm_model_override
+        if override:
+            model = override
+    return base_url, api_key, model
+
+
+def _llm_primary_config() -> tuple[str, str, str]:
+    return _llm_slot_config(_llm_primary_slot())
+
+
+def _llm_backup_config() -> tuple[str, str, str]:
+    slot = _llm_backup_slot()
+    return _llm_slot_config(slot) if slot else ('', '', '')
+
+
+def _llm_primary_model() -> str:
+    return _llm_primary_config()[2]
+
+
+def _llm_backup_model() -> str:
+    return _llm_backup_config()[2]
+
+
 # Формулировки, которыми провайдеры сообщают о временной нехватке мощности.
 # Отличать их от «такой модели нет» приходится по тексту: код ответа у части
 # роутеров одинаковый (404 model_not_found) в обоих случаях.
@@ -17077,8 +17203,8 @@ def _llm_fatal_reason(status: int, body: str) -> Optional[dict]:
     # месте, ради ошибки, которая проходит сама через секунду.
     if looks_like_model_refusal and any(marker in text for marker in _LLM_TEMPORARY_MARKERS):
         return {'reason': 'capacity',
-                'log': f'у модели {LLM_MODEL!r} сейчас нет свободной мощности',
-                'admin': f'у модели <code>{html.escape(LLM_MODEL or "?")}</code> сейчас нет '
+                'log': f'у модели {_llm_primary_model()!r} сейчас нет свободной мощности',
+                'admin': f'у модели <code>{html.escape(_llm_primary_model() or "?")}</code> сейчас нет '
                          'свободной мощности — провайдер просит зайти позже. '
                          'Переменные менять не нужно.',
                 'retry_after_sec': LLM_PRIMARY_RETRY_SEC}
@@ -17090,8 +17216,8 @@ def _llm_fatal_reason(status: int, body: str) -> Optional[dict]:
                          'провайдера через LLM_BASE_URL.'}
     if status == 404 or 'model_not_found' in text or 'model not found' in text:
         return {'reason': 'model',
-                'log': f'провайдер не знает модель {LLM_MODEL!r} или адрес',
-                'admin': f'провайдер не нашёл модель <code>{html.escape(LLM_MODEL or "?")}</code>. '
+                'log': f'провайдер не знает модель {_llm_primary_model()!r} или адрес',
+                'admin': f'провайдер не нашёл модель <code>{html.escape(_llm_primary_model() or "?")}</code>. '
                          'Проверь LLM_MODEL и LLM_BASE_URL: у роутеров имена '
                          'отличаются, например с префиксом или суффиксом -free.'}
     return None
@@ -17124,7 +17250,7 @@ _llm_failover_at = ''                # когда переключились, д
 
 
 def _llm_fallback_configured() -> bool:
-    return bool(LLM_FALLBACK_API_KEY and LLM_FALLBACK_BASE_URL and LLM_FALLBACK_MODEL)
+    return _llm_backup_slot() is not None
 
 
 def _llm_current() -> tuple[str, str, str]:
@@ -17142,10 +17268,10 @@ def _llm_current() -> tuple[str, str, str]:
             _llm_primary_retry_at = 0.0
             logger.info('LLM: кулдаун истёк — пробую основного провайдера снова')
             metrics.inc('anime_bot_llm_primary_retry_total')
-            return LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
+            return _llm_primary_config()
     if _llm_using_fallback:
-        return LLM_FALLBACK_BASE_URL, LLM_FALLBACK_API_KEY, LLM_FALLBACK_MODEL
-    return LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
+        return _llm_backup_config()
+    return _llm_primary_config()
 
 
 def _llm_try_failover(reason: str, hint: str = '', retry_after_sec: float = 0.0) -> bool:
@@ -17179,17 +17305,17 @@ def _llm_try_failover(reason: str, hint: str = '', retry_after_sec: float = 0.0)
         _llm_primary_retry_at = 0.0
     metrics.inc('anime_bot_llm_failover_total', labels={'reason': reason})
     logger.warning('LLM: основной провайдер отказал (%s) — перехожу на запасного %s',
-                   reason, LLM_FALLBACK_MODEL)
+                   reason, _llm_backup_model())
     # Повторный отказ по той же причине — не новость. Сообщаем один раз, а о
     # возвращении основного скажем отдельно, когда он реально ответит.
-    alert_key = f'{reason}|{LLM_MODEL}'
+    alert_key = f'{reason}|{_llm_primary_model()}'
     if alert_key == _llm_failover_alert_key:
         metrics.inc('anime_bot_llm_failover_alert_suppressed_total')
         return True
     _llm_failover_alert_key = alert_key
     retry_after_sec = cooldown
     lines = [f'🤖 Основной провайдер модели отказал ({reason}). '
-             f'Перешёл на запасного: <code>{html.escape(LLM_FALLBACK_MODEL)}</code>.']
+             f'Перешёл на запасного: <code>{html.escape(_llm_backup_model())}</code>.']
     if hint:
         lines.append('')
         lines.append(f'Причина: {hint}')
@@ -17210,6 +17336,36 @@ def _llm_try_failover(reason: str, hint: str = '', retry_after_sec: float = 0.0)
                      'каждый перезапуск будет начинаться с того же отказа. Проверить — /llm.')
     _queue_admin_alert('\n'.join(lines))
     return True
+
+
+def _llm_reset_provider_state(why: str) -> None:
+    """Забывает всё, что бот успел решить о прошлом провайдере.
+
+    Без этого смена провайдера в настройках выглядела бы как «ничего не
+    произошло»: отключение по auth держится до перезапуска, открытый circuit —
+    до конца кулдауна, а флаг _llm_using_fallback продолжал бы уводить запросы
+    на старого запасного. Все эти решения относились к прежней конфигурации и
+    после переключения не значат ничего.
+    """
+    global _llm_using_fallback, _llm_failover_at, _llm_primary_retry_at
+    global _llm_failover_level, _llm_failover_alert_key
+    global _llm_disabled_runtime, _llm_disabled_reason, _llm_circuit_until
+    global _llm_fail_streak, _llm_json_mode, _llm_last_provider_error
+    _llm_using_fallback = False
+    _llm_failover_at = ''
+    _llm_primary_retry_at = 0.0
+    _llm_failover_level = 0
+    _llm_failover_alert_key = ''
+    _llm_disabled_runtime = False
+    _llm_disabled_reason = ''
+    _llm_circuit_until = 0.0
+    _llm_fail_streak = 0
+    # Строгий JSON снимался под конкретного провайдера: у нового он может
+    # поддерживаться, и начинать с ослабленного режима незачем.
+    _llm_json_mode = True
+    _llm_last_provider_error = ''
+    logger.info('LLM: состояние провайдера сброшено (%s)', why)
+    metrics.inc('anime_bot_llm_provider_reset_total')
 
 
 def _llm_note_primary_recovered() -> None:
@@ -17233,7 +17389,7 @@ def _llm_note_primary_recovered() -> None:
         logger.info('LLM: основной провайдер снова отвечает')
         _queue_admin_alert(
             f'✅ Основной провайдер модели снова отвечает: '
-            f'<code>{html.escape(LLM_MODEL or "?")}</code>.\n'
+            f'<code>{html.escape(_llm_primary_model() or "?")}</code>.\n'
             'Бот вернулся на него, запасной больше не используется.')
 
 
@@ -17287,6 +17443,35 @@ def _llm_active() -> bool:
         else:
             return False
     return bool(settings is not None and settings.llm_enabled)
+
+
+def _llm_unavailable_reason() -> Optional[str]:
+    """Почему модель не будет отвечать прямо сейчас. None — будет.
+
+    До этого любой отказ выглядел одинаково: «модель недоступна». Под этой
+    строкой пряталось шесть разных состояний — от выключенного тумблера до
+    исчерпанного дневного лимита, — и починить по ней было нечего.
+    """
+    if settings is None:
+        return 'бот ещё не инициализирован'
+    if not _llm_configured():
+        base_url, api_key, model = _llm_current()
+        missing = [name for name, value in (('адрес', base_url), ('ключ', api_key),
+                                            ('модель', model)) if not value]
+        return f'провайдер не настроен — не задано: {", ".join(missing)}'
+    if not settings.llm_enabled:
+        return 'модель выключена в настройках (/settings → Модель)'
+    if _llm_disabled_runtime and _llm_disabled_reason == 'auth':
+        return ('провайдер не принял ключ и модель отключена до перезапуска '
+                'или смены провайдера (/llmmodel)')
+    if _llm_disabled_runtime and _llm_disabled_reason == 'circuit':
+        left = max(0, int(_llm_circuit_until - time.monotonic()))
+        return f'провайдер попросил подождать, осталось ~{left} с'
+    if _llm_disabled_runtime:
+        return f'модель отключена: {_llm_disabled_reason or "ошибки подряд"}'
+    if _llm_quota_left() <= 0:
+        return f'дневной лимит вызовов исчерпан ({LLM_DAILY_LIMIT})'
+    return None
 
 
 def _llm_quota_left() -> int:
@@ -18200,7 +18385,7 @@ def _llm_off_reason() -> str:
                      f'{html.escape(_llm_last_provider_error[:200])}</code>')
     if _llm_using_fallback:
         parts.append(f'\nСейчас работает запасной: <code>'
-                     f'{html.escape(LLM_FALLBACK_MODEL)}</code>')
+                     f'{html.escape(_llm_backup_model())}</code>')
     parts.append('\nПодробности: /logs LLM')
     return '\n'.join(parts)
 
@@ -18225,18 +18410,31 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     used = settings.llm_calls_today if settings.llm_day == _local_now().strftime('%Y-%m-%d') else 0
+    slot = _llm_primary_slot()
     lines.append(f'Провайдер: {html.escape(LLM_PROVIDER or "свой адрес")}')
     _, _, current_model = _llm_current()
     lines.append(f'Модель: <code>{html.escape(current_model)}</code>')
+    # Роль провайдера теперь выбирается в настройках, а не только переменными.
+    # Без этой строки непонятно, почему работает не тот, кто задан в LLM_PROVIDER.
+    if slot != 'primary' or settings.llm_model_override:
+        lines.append(f'  ⚙️ выбрано вручную: {html.escape(LLM_SLOT_HUMAN[slot])}'
+                     + (f', модель <code>{html.escape(settings.llm_model_override)}</code>'
+                        if settings.llm_model_override else ''))
+        lines.append('     сбросить к переменным окружения — /llmmodel сброс')
     # Видно сразу, кто отвечает: иначе при молчаливом переходе на запасного
     # непонятно, чьи ответы приходят и почему они другого качества.
     if _llm_using_fallback:
         lines.append('  ⚠️ работает ЗАПАСНОЙ провайдер'
                      + (f' (с {html.escape(_llm_failover_at[:16])})' if _llm_failover_at else ''))
-        lines.append('     основной вернётся при следующем перезапуске')
+        if _llm_primary_retry_at:
+            left = max(0, int(_llm_primary_retry_at - time.monotonic()))
+            lines.append(f'     к основному вернёмся сам через ~{left // 60} мин')
+        else:
+            lines.append('     основной вернётся при следующем перезапуске '
+                         'или по команде /llmmodel')
     elif _llm_fallback_configured():
         lines.append(f'  🅱️ запасной наготове: <code>'
-                     f'{html.escape(LLM_FALLBACK_MODEL)}</code>')
+                     f'{html.escape(_llm_backup_model())}</code>')
     else:
         lines.append('  ℹ️ запасной не задан: при отказе провайдера обогащение '
                      'выключится до перезапуска')
@@ -18247,7 +18445,7 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
                      f'<code>{html.escape(",".join(sorted(LLM_FAST_TASKS)) or "judge")}</code>')
     else:
         lines.append('Fast route: не настроен (основная модель выполняет все задачи)')
-    lines.append(f'Адрес: <code>{html.escape(LLM_BASE_URL)}</code>')
+    lines.append(f'Адрес: <code>{html.escape(_llm_current()[0])}</code>')
     lines.append('')
     lines.append('Включено: ' + ('ДА' if settings.llm_enabled else 'НЕТ'))
     lines.append('  📝 Перевод и текст: ' + ('ВКЛ' if settings.llm_rewrite else 'ВЫКЛ'))
@@ -18315,6 +18513,108 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
         out.append('')
         out.append('Проверить на своём тексте: <code>/llm заголовок новости</code>')
     await update.message.reply_text('\n'.join(out), parse_mode=ParseMode.HTML)
+
+
+def _llm_model_menu() -> InlineKeyboardMarkup:
+    """Кнопки выбора основного провайдера — по одной на настроенный слот."""
+    chosen = _llm_primary_slot()
+    rows = []
+    for slot in _llm_ready_slots():
+        _, _, model = _llm_slot_env(slot)
+        mark = '✅ ' if slot == chosen else ''
+        rows.append([InlineKeyboardButton(
+            f'{mark}{LLM_SLOT_HUMAN[slot].split(" (")[0]}: {model[:28]}',
+            callback_data=f'llmslot:{slot}')])
+    if chosen != 'primary' or (settings is not None and settings.llm_model_override):
+        rows.append([InlineKeyboardButton('↩️ Как в переменных окружения',
+                                          callback_data='llmslot:reset')])
+    return InlineKeyboardMarkup(rows)
+
+
+def _llm_model_view() -> str:
+    """Текст экрана выбора модели."""
+    ready = _llm_ready_slots()
+    if not ready:
+        return ('🤖 <b>Выбор модели</b>\n\nНи один провайдер не настроен. '
+                'Задай <code>LLM_PROVIDER</code> и <code>LLM_API_KEY</code> — /llm')
+    chosen = _llm_primary_slot()
+    backup = _llm_backup_slot()
+    lines = ['🤖 <b>Выбор модели</b>', '']
+    lines.append(f'Сейчас основной: <b>{html.escape(LLM_SLOT_HUMAN[chosen])}</b>')
+    lines.append(f'Модель: <code>{html.escape(_llm_primary_model())}</code>')
+    if backup:
+        lines.append(f'Запасной: {html.escape(LLM_SLOT_HUMAN[backup])} — '
+                     f'<code>{html.escape(_llm_backup_model())}</code>')
+    else:
+        lines.append('Запасного нет: при отказе основного обогащение остановится.')
+    if settings is not None and settings.llm_model_override:
+        lines.append('')
+        lines.append(f'Имя модели переопределено вручную: '
+                     f'<code>{html.escape(settings.llm_model_override)}</code>')
+    lines.append('')
+    lines.append('Кнопка меняет, кто из настроенных провайдеров основной, '
+                 'а кто страхует. Ключи и адреса берутся из переменных окружения — '
+                 'выбрать можно только уже настроенного.')
+    lines.append('')
+    lines.append('Другая модель у того же провайдера: '
+                 '<code>/llmmodel mistral-small-latest</code>')
+    lines.append('Вернуть всё как в переменных: <code>/llmmodel сброс</code>')
+    return '\n'.join(lines)
+
+
+@admin_only
+async def llmmodel_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор основного провайдера и модели без правки переменных: /llmmodel.
+
+    Появилось после суток, которые бот провёл на отказавшем основном
+    провайдере: запасной работал, но поменять их местами можно было только
+    через переменные окружения и перезапуск.
+    """
+    arg = ' '.join(context.args or []).strip()
+    if arg:
+        if arg.lower() in ('сброс', 'reset', 'default', 'по умолчанию'):
+            settings.llm_primary_slot = ''
+            settings.llm_model_override = ''
+            _llm_reset_provider_state('сброс выбора модели')
+            _audit_update(update, 'llm_model_reset')
+        else:
+            settings.llm_model_override = arg
+            _llm_reset_provider_state(f'модель вручную: {arg}')
+            _audit_update(update, 'llm_model_override', detail=arg[:120])
+    await update.message.reply_text(_llm_model_view(),
+                                    reply_markup=_llm_model_menu(),
+                                    parse_mode=ParseMode.HTML)
+
+
+async def llm_slot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопки экрана /llmmodel."""
+    query = update.callback_query
+    if not is_admin(update):
+        await query.answer('Только для админа', show_alert=True)
+        return
+    slot = (query.data or '').split(':', 1)[-1]
+    if slot == 'show':
+        await query.answer()
+    elif slot == 'reset':
+        settings.llm_primary_slot = ''
+        settings.llm_model_override = ''
+        _llm_reset_provider_state('сброс выбора модели')
+        _audit_update(update, 'llm_model_reset')
+        await query.answer('Вернул как в переменных окружения')
+    elif slot in LLM_SLOTS and _llm_slot_ready(slot):
+        # Переопределение имени снимаем: оно относилось к прежнему провайдеру,
+        # и у нового такой модели, скорее всего, просто нет.
+        settings.llm_model_override = ''
+        settings.llm_primary_slot = slot
+        _llm_reset_provider_state(f'основным выбран слот {slot}')
+        _audit_update(update, 'llm_model_switch', detail=slot)
+        await query.answer(f'Основной: {_llm_primary_model()}')
+    else:
+        await query.answer('Этот провайдер не настроен', show_alert=True)
+        return
+    await query.edit_message_text(_llm_model_view(),
+                                  reply_markup=_llm_model_menu(),
+                                  parse_mode=ParseMode.HTML)
 
 
 @admin_only
@@ -19357,7 +19657,7 @@ async def send_startup_report(app, brief: bool = False) -> None:
                  + f' (до {TG_VIDEO_MAX_SECONDS // 60} мин)')
     lines.append('🖼 Дедуп по картинке: ' + ('ВКЛ' if settings.image_dedup else 'ВЫКЛ'))
     if _llm_configured():
-        lines.append(f'🤖 Модель: {html.escape(LLM_MODEL)} '
+        lines.append(f'🤖 Модель: {html.escape(_llm_current()[2])} '
                      + ('(вкл)' if settings.llm_enabled else '(выкл)'))
     else:
         lines.append('🤖 Модель: не настроена — перевод через DeepL/Google')
@@ -19875,7 +20175,7 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
         elif _llm_disabled_runtime:
             lines.append('  🤖 Модель: ⚠️ отключена из-за ошибок (см. /llm)')
         else:
-            lines.append(f'  🤖 Модель {html.escape(LLM_MODEL)}: '
+            lines.append(f'  🤖 Модель {html.escape(_llm_current()[2])}: '
                          f'{llm_used} из {LLM_DAILY_LIMIT} вызовов сегодня')
     if DEEPL_API_KEY:
         share = used / DEEPL_MONTHLY_LIMIT * 100 if DEEPL_MONTHLY_LIMIT else 0
@@ -21346,9 +21646,20 @@ async def modtest_command(update, context: ContextTypes.DEFAULT_TYPE):
     else:
         hint = local.get('category') or 'подозрительно'
         lines.append(f'\n1️⃣ Локальные правила: <i>{html.escape(str(hint))}</i> → спрашиваем модель')
+        # Причину спрашиваем ДО вызова: после него часть состояний уже изменится,
+        # а «недоступна» без объяснения — это тупик, из которого нечего чинить.
+        why = _llm_unavailable_reason()
+        if why is None and _moderation_llm_budget_left() <= 0:
+            why = ('дневной лимит вызовов на модерацию исчерпан '
+                   f'({MODERATION_LLM_DAILY_LIMIT})')
         verdict = await _moderation_classify(probe_chat, text)
         if verdict is None:
             lines.append('\n2️⃣ Модель: <b>недоступна</b> — в бою бот бы промолчал.')
+            lines.append(f'   Причина: {html.escape(why or "провайдер не ответил на запрос")}')
+            if _llm_last_provider_error:
+                lines.append('   Ответ провайдера: '
+                             f'<code>{_escape_to_limit(_llm_last_provider_error, 200)}</code>')
+            lines.append('   Состояние и смена провайдера — /llm и /llmmodel')
             await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
             return
         if not verdict.get('violation'):
@@ -21761,8 +22072,8 @@ def _redact_secrets(text: str) -> str:
         return ''
     out = str(text)
     # Сначала точные значения из окружения: они могут не подходить под шаблон.
-    for secret in (TOKEN, LLM_API_KEY, DEEPL_API_KEY,
-                   DASHBOARD_TOKEN, HEALTH_METRICS_TOKEN):
+    for secret in (TOKEN, LLM_API_KEY, LLM_FALLBACK_API_KEY, LLM_FAST_API_KEY,
+                   DEEPL_API_KEY, DASHBOARD_TOKEN, HEALTH_METRICS_TOKEN):
         if secret and len(str(secret)) >= 8:
             out = out.replace(str(secret), '<скрыто>')
     # Затем всё, что выглядит как токен бота, включая чужие и старые.
@@ -22768,6 +23079,7 @@ async def setup_bot_commands(app: Application) -> None:
         BotCommand("stats", "📈 Статистика"),
         BotCommand("sources", "📡 Источники"),
         BotCommand("llm", "🤖 Модель: статус и проверка"),
+        BotCommand("llmmodel", "🔀 Какая модель основная"),
         BotCommand("reliability", "🛡 Надёжность и лимиты"),
         BotCommand("admins", "👥 Администраторы"),
         BotCommand("logs", "📝 Логи"),
@@ -22982,6 +23294,7 @@ def main():
     app.add_handler(CommandHandler("videocheck", videocheck_command))
     app.add_handler(CommandHandler("media", media_command))
     app.add_handler(CommandHandler("llm", llm_command))
+    app.add_handler(CommandHandler("llmmodel", llmmodel_command))
     app.add_handler(CommandHandler("reliability", reliability_command))
     app.add_handler(CommandHandler("experiments", experiments_command))
     app.add_handler(CommandHandler("adaptive", adaptive_command))
