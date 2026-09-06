@@ -4,8 +4,8 @@
   "base_archive": "anime news bot autosend repaired.zip",
   "base_archive_sha256": "961b270d3325cddfae4b276a6d35c8e85d223fa0bfb5db2f8c5ec49be4d00108",
   "python_target": "3.11",
-  "git_commit": "c1702f5429e734649d2c51648c9233220444990e",
-  "generated_at_utc": "2026-09-06T20:40:59.925397+00:00",
+  "git_commit": "f1fe120c2dd143c2c77d21c4c237e367a57435a6",
+  "generated_at_utc": "2026-09-06T21:18:07.657311+00:00",
   "files": {
     ".env.example": {
       "sha256": "e1f067b8a676a7d6c3b701b3b88981b925b63314aa8f817b4a7c4accbd5f3b8b",
@@ -28,8 +28,8 @@
       "bytes": 2989
     },
     "anime_news_bot.py": {
-      "sha256": "15066671151769492b470485d79c09f26fbce6b10825874681550bc0f06c20d6",
-      "bytes": 1240738
+      "sha256": "199657653104cb69198f7d58bdbd52705d2f4b0edbfcb6518edd9de985f569b5",
+      "bytes": 1250274
     },
     "pytest.ini": {
       "sha256": "e28a989e765f6f1fc37e02fb00a351f56391f749cafcd3f93057abbfb17ba26b",
