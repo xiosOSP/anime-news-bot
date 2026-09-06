@@ -297,3 +297,67 @@ def test_stats_survive_restart(tmp_path):
     first = bot.ChatModerationStore(path)
     first.record_decision('flood', 'mute')
     assert bot.ChatModerationStore(path).stats()['by_action']['mute'] == 1
+
+
+# ---------- режим наблюдения ----------
+
+def test_observe_is_the_default(tmp_path):
+    """Новая функция не должна начинать с наказаний.
+
+    Ступень «сначала только сигналит» была в плане, но реализована была
+    всё-или-ничего: включил модерацию — бот сразу наказывает.
+    """
+    assert bot.ChatModerationStore(tmp_path / 'm.json').mode == 'observe'
+
+
+def test_mode_switches_and_survives_restart(tmp_path):
+    path = tmp_path / 'm.json'
+    store = bot.ChatModerationStore(path)
+    store.set_mode('active')
+    assert bot.ChatModerationStore(path).mode == 'active'
+
+
+def test_unknown_mode_is_rejected(tmp_path):
+    """Опечатка в режиме не должна молча дать боту права."""
+    store = bot.ChatModerationStore(tmp_path / 'm.json')
+    with pytest.raises(ValueError):
+        store.set_mode('actve')
+
+
+# ---------- кулдаун наказаний ----------
+
+def test_second_action_in_a_row_is_blocked():
+    """Серия наказаний за минуту хуже одной ошибки: человек уйдёт раньше,
+    чем админ успеет разобраться."""
+    bot._MOD_LAST_ACTION.clear()
+    assert bot._mod_cooldown_active(500, 5000) is False
+    assert bot._mod_cooldown_active(500, 5000) is True
+
+
+def test_cooldown_is_per_user():
+    """Один нарушитель не должен прикрывать другого."""
+    bot._MOD_LAST_ACTION.clear()
+    bot._mod_cooldown_active(500, 5001)
+    assert bot._mod_cooldown_active(500, 5002) is False
+
+
+# ---------- промпт покрывает случаи, где модель ошибается чаще всего ----------
+
+@pytest.mark.parametrize('marker', [
+    'персонаж',        # оскорбление персонажа не равно оскорблению человека
+    'цитир',           # пересказ чужих слов
+    'самоирония',      # «я тупой»
+    'перепалка',       # взаимный обмен колкостями
+    'сомневаешься',    # при неуверенности — не нарушение
+])
+def test_prompt_covers_high_risk_cases(marker):
+    """Описание правил эти случаи не покрывает: границу между рофлом и
+    травлей задают примеры, а не формулировки."""
+    assert marker in bot.MODERATION_SYSTEM_PROMPT.lower()
+
+
+def test_prompt_states_asymmetric_cost():
+    """Модель должна знать, что цена ошибок разная, и склоняться к «не нарушение»."""
+    text = bot.MODERATION_SYSTEM_PROMPT.lower()
+    assert 'violation:false' in text
+    assert 'прогонит человека' in text or 'цена этих ошибок разная' in text
