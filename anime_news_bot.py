@@ -1547,12 +1547,30 @@ def _mod_message_text(message) -> str:
     return ''
 
 
-def _mod_note_message(chat_id: int, user_id: int, name: str, text: str) -> None:
-    """Кладёт сообщение в окно контекста и в счётчик частоты."""
+def _mod_note_message(chat_id: int, user_id: int, name: str, text: str,
+                      *, counts_as_new: bool = True) -> None:
+    """Кладёт сообщение в окно контекста и в счётчик частоты.
+
+    ``counts_as_new=False`` — для правок уже отправленного сообщения. Правка
+    не засоряет чат, а раньше шесть исправлений одной опечатки давали «флуд»:
+    Telegram присылает их отдельными обновлениями, и счётчик рос как от новых
+    сообщений.
+    """
     window = _moderation_windows.setdefault(int(chat_id), deque(maxlen=MODERATION_CONTEXT_SIZE))
-    window.append({'user_id': int(user_id), 'name': str(name)[:64],
-                   'text': str(text or '')[:MODERATION_MAX_MESSAGE_CHARS],
-                   'at': time.time()})
+    row = {'user_id': int(user_id), 'name': str(name)[:64],
+           'text': str(text or '')[:MODERATION_MAX_MESSAGE_CHARS],
+           'at': time.time()}
+    if not counts_as_new:
+        # Правка заменяет прошлую версию того же сообщения, а не добавляется
+        # рядом: иначе восемь исправлений одной опечатки выглядели бы как
+        # восемь одинаковых реплик, то есть как спам.
+        for index in range(len(window) - 1, -1, -1):
+            if window[index].get('user_id') == int(user_id):
+                window[index] = row
+                return
+        window.append(row)
+        return
+    window.append(row)
     key = f'{chat_id}:{user_id}'
     recent = _moderation_recent.setdefault(key, deque(maxlen=MODERATION_FLOOD_MESSAGES * 3))
     recent.append(time.time())
@@ -1630,10 +1648,15 @@ class ChatModerationStore:
                 return
             chats = [int(x) for x in (raw.get('chats') or []) if str(x).lstrip('-').isdigit()]
             users = raw.get('users')
+            stats_row = raw.get('stats')
             self._data = {
                 'schema_version': 1,
                 'chats': chats,
                 'users': users if isinstance(users, dict) else {},
+                # Статистика решений обязана переживать перезапуск: по ней
+                # оценивается, ошибается бот или нет, а такая оценка имеет
+                # смысл только накопительно.
+                'stats': stats_row if isinstance(stats_row, dict) else {},
             }
         except (OSError, ValueError, TypeError) as e:
             logger.warning(f'Модерация: состояние не загружено: {e}')
@@ -1726,6 +1749,43 @@ class ChatModerationStore:
         if existed:
             self._save()
         return existed
+
+    # --- статистика решений ---
+    #
+    # Без неё нельзя ответить на главный вопрос: ошибается бот или нет. А это
+    # ровно то, от чего зависит, можно ли когда-нибудь дать ему больше прав.
+    # Кнопка «Снять» — единственный честный сигнал «бот ошибся»: её нажимает
+    # человек, который видел контекст.
+
+    def record_decision(self, category: str, action: str) -> None:
+        with self._lock:
+            stats_row = self._data.setdefault('stats', {})
+            by_cat = stats_row.setdefault('by_category', {})
+            row = by_cat.setdefault(str(category)[:40], {'total': 0, 'overturned': 0})
+            row['total'] = int(row.get('total', 0)) + 1
+            by_action = stats_row.setdefault('by_action', {})
+            by_action[str(action)[:20]] = int(by_action.get(str(action)[:20], 0)) + 1
+        self._save()
+
+    def record_overturned(self, chat_id, user_id) -> None:
+        """Человек отменил решение бота — значит бот ошибся."""
+        with self._lock:
+            stats_row = self._data.setdefault('stats', {})
+            stats_row['overturned_total'] = int(stats_row.get('overturned_total', 0)) + 1
+            # Категорию берём из последнего предупреждения этого участника:
+            # именно оно и было отменено.
+            row = (self._data.get('users') or {}).get(self._key(chat_id, user_id)) or {}
+            warns = row.get('warns') or []
+            if warns:
+                category = str(warns[-1].get('category') or '')
+                by_cat = stats_row.setdefault('by_category', {}).setdefault(
+                    category[:40], {'total': 0, 'overturned': 0})
+                by_cat['overturned'] = int(by_cat.get('overturned', 0)) + 1
+        self._save()
+
+    def stats(self) -> dict:
+        with self._lock:
+            return copy.deepcopy(self._data.get('stats') or {})
 
     def history(self, chat_id, user_id) -> list[dict]:
         with self._lock:
@@ -20792,15 +20852,32 @@ async def blacklist_command(update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============== МОДЕРАЦИЯ ЧАТА: РЕШЕНИЕ И ДЕЙСТВИЕ ==============
 
+_MOD_ADMIN_CACHE: dict[str, tuple[float, bool]] = {}
+MODERATION_ADMIN_CACHE_SEC = max(30, min(3600, _env_int('MODERATION_ADMIN_CACHE_SEC', 300)))
+
+
 async def _mod_is_immune(bot: Bot, chat_id: int, user_id: int) -> bool:
-    """Админов чата и админов бота не трогаем."""
+    """Админов чата и админов бота не трогаем.
+
+    Ответ кешируется: состав админов меняется редко, а без кеша каждое
+    подозрительное сообщение стоило бы отдельного обращения к Telegram.
+    """
     if user_id in _all_admin_ids():
         return True
+    key = f'{chat_id}:{user_id}'
+    cached = _MOD_ADMIN_CACHE.get(key)
+    now = time.monotonic()
+    if cached and now - cached[0] < MODERATION_ADMIN_CACHE_SEC:
+        return cached[1]
     try:
         member = await bot.get_chat_member(chat_id, user_id)
-        return getattr(member, 'status', '') in ('creator', 'administrator')
+        is_admin_here = getattr(member, 'status', '') in ('creator', 'administrator')
     except TelegramError:
-        return False
+        return False                     # не смогли проверить — не наказываем вслепую
+    if len(_MOD_ADMIN_CACHE) > 2000:
+        _MOD_ADMIN_CACHE.clear()
+    _MOD_ADMIN_CACHE[key] = (now, is_admin_here)
+    return is_admin_here
 
 
 def _mod_decide(category: str, severity: int, warns: int) -> dict:
@@ -20859,14 +20936,53 @@ async def _mod_apply(bot: Bot, message, decision: dict, category: str,
     elif action == 'warn':
         done.append('предупреждение')
 
+    warns_total = 0
     if action in ('warn', 'mute') and chat_moderation is not None:
-        chat_moderation.add_warn(chat_id, user_id, category, reason)
+        warns_total = chat_moderation.add_warn(chat_id, user_id, category, reason)
+    if chat_moderation is not None:
+        chat_moderation.record_decision(category, action)
+
+    # Молчаливое предупреждение бесполезно: человек не узнает ни что нарушил,
+    # ни что следующий раз будет мутом. Пишем коротко и в чат, чтобы правило
+    # видели и остальные — это и есть смысл предупреждения.
+    if action in ('warn', 'mute'):
+        await _mod_tell_user(bot, message, decision, category, warns_total)
 
     metrics.inc('anime_bot_moderation_actions_total',
                 labels={'action': action, 'category': category})
     _event_log('moderation_action', chat_id=chat_id, action=action,
                category=category, severity=int(decision.get('severity') or 0))
     return ', '.join(done) if done else 'без действий'
+
+
+async def _mod_tell_user(bot: Bot, message, decision: dict, category: str,
+                         warns_total: int) -> None:
+    """Короткое объяснение участнику прямо в чате.
+
+    Без него предупреждение существует только в базе: человек видит, что его
+    сообщение исчезло, но не знает ни причины, ни того, что будет дальше.
+    """
+    user = message.from_user
+    mention = f'<a href="tg://user?id={int(user.id)}">{html.escape(str(user.full_name or "участник")[:48])}</a>'
+    human = html.escape(str(decision.get('human') or category))
+    if str(decision.get('action')) == 'mute':
+        minutes = int(decision.get('minutes') or 0)
+        срок = f'{minutes // 60} ч' if minutes >= 60 else f'{minutes} мин'
+        tail = f'Мут на {срок}.'
+    else:
+        осталось = max(0, len(MODERATION_MUTE_LADDER) - warns_total)
+        tail = (f'Предупреждение {warns_total}. '
+                + ('Следующее — мут.' if осталось <= 0 else 'Дальше будет мут.'))
+    try:
+        await bot.send_message(
+            message.chat_id,
+            f'⚠️ {mention}, нарушение: <b>{human}</b>. {tail}\n'
+            f'<i>Если это ошибка — напишите админам, решение снимут.</i>',
+            parse_mode=ParseMode.HTML,
+            disable_notification=True,
+        )
+    except TelegramError as e:
+        logger.info('Модерация: предупреждение в чат не отправлено: %s', e)
 
 
 def _mod_report_markup(chat_id: int, user_id: int) -> InlineKeyboardMarkup:
@@ -20928,7 +21044,10 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
         return                           # служебное событие: считать нечего
 
     user_id = int(user.id)
-    _mod_note_message(chat.id, user_id, getattr(user, 'full_name', ''), text)
+    # Правка — это то же сообщение, а не новое: считать её флудом нельзя.
+    is_edit = getattr(update, 'edited_message', None) is not None
+    _mod_note_message(chat.id, user_id, getattr(user, 'full_name', ''), text,
+                      counts_as_new=not is_edit)
 
     local = _mod_local_check(chat.id, user_id, text)
     if local is None:
@@ -20997,6 +21116,58 @@ async def modoff_command(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def modstats_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Сколько решений принял бот и сколько из них отменили люди.
+
+    Это единственная цифра, по которой можно решать, давать ли боту больше
+    прав. Пока доля отмен высокая, расширять полномочия нельзя.
+    """
+    if chat_moderation is None:
+        await update.message.reply_text('Хранилище модерации не готово.')
+        return
+    data = chat_moderation.stats()
+    by_action = data.get('by_action') or {}
+    by_category = data.get('by_category') or {}
+    total = sum(int(v) for v in by_action.values())
+    overturned = int(data.get('overturned_total', 0))
+    if not total:
+        await update.message.reply_text(
+            '🛡 Решений пока не было.\n'
+            f'Модерируемых чатов: {len(chat_moderation.enabled_chats())}\n'
+            f'Бюджет модели: {_moderation_llm_budget_left()} из '
+            f'{MODERATION_LLM_DAILY_LIMIT} на сегодня')
+        return
+
+    accuracy = 100.0 * (total - overturned) / max(1, total)
+    lines = [
+        '🛡 <b>Модерация: статистика</b>', '',
+        f'Решений всего: <b>{total}</b>',
+        f'Отменено людьми: <b>{overturned}</b> ({100 - accuracy:.0f}%)',
+        f'Похоже на верные: <b>{accuracy:.0f}%</b>',
+        '',
+        '<b>По действиям:</b>',
+    ]
+    for action, count in sorted(by_action.items(), key=lambda kv: -int(kv[1])):
+        lines.append(f'  {html.escape(action)}: {int(count)}')
+    rows = [(name, row) for name, row in by_category.items() if int(row.get('total', 0))]
+    if rows:
+        lines.append('')
+        lines.append('<b>По категориям:</b>')
+        for name, row in sorted(rows, key=lambda kv: -int(kv[1].get('total', 0))):
+            human = MODERATION_RULES.get(name, {}).get('human', name)
+            bad = int(row.get('overturned', 0))
+            tail = f' · отменено {bad}' if bad else ''
+            lines.append(f'  {html.escape(str(human))}: {int(row.get("total", 0))}{tail}')
+    lines += ['', f'Бюджет модели: {_moderation_llm_budget_left()} из '
+                  f'{MODERATION_LLM_DAILY_LIMIT} на сегодня',
+              f'Чатов под модерацией: {len(chat_moderation.enabled_chats())}']
+    if overturned and accuracy < 80:
+        lines += ['', '⚠️ Отмен много. Расширять полномочия бота рано — '
+                      'сначала стоит поправить правила или пороги.']
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
+
+
+@admin_only
 async def warns_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает предупреждения участника: /warns <id> (ответом на сообщение)."""
     chat = update.effective_chat
@@ -21060,6 +21231,9 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return True
     if verb == 'undo':
         if chat_moderation is not None:
+            # Порядок важен: категорию отменённого решения берём из последнего
+            # предупреждения, поэтому фиксируем ошибку ДО очистки.
+            chat_moderation.record_overturned(chat_id, user_id)
             chat_moderation.clear_warns(chat_id, user_id)
         try:
             await context.bot.restrict_chat_member(
@@ -22503,6 +22677,7 @@ def main():
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("modhere", modhere_command))
     app.add_handler(CommandHandler("modoff", modoff_command))
+    app.add_handler(CommandHandler("modstats", modstats_command))
     app.add_handler(CommandHandler("warns", warns_command))
     app.add_handler(CommandHandler("unwarn", unwarn_command))
 
