@@ -233,3 +233,67 @@ def test_repeated_sticker_is_spam():
         bot._mod_note_message(5, 50, 'Tester', '[стикер 🐸]')
     verdict = bot._mod_local_check(5, 50, '[стикер 🐸]')
     assert verdict is not None and verdict['category'] in ('spam', 'flood')
+
+
+# ---------- правки не должны выглядеть нарушением ----------
+
+def test_editing_own_message_is_not_flood():
+    """Шесть исправлений опечатки — не флуд.
+
+    Telegram присылает каждую правку отдельным обновлением, и счётчик рос как
+    от новых сообщений.
+    """
+    for _ in range(8):
+        bot._mod_note_message(90, 900, 'Кто-то', 'исправляю опечатку',
+                              counts_as_new=False)
+    assert bot._mod_local_check(90, 900, 'исправляю опечатку') is None
+
+
+def test_edit_replaces_previous_version_in_window():
+    """Правка заменяет прошлую версию, иначе восемь исправлений выглядят
+    как восемь одинаковых реплик, то есть как спам."""
+    bot._mod_note_message(91, 910, 'Кто-то', 'первая версия')
+    for text in ('вторая версия', 'третья версия'):
+        bot._mod_note_message(91, 910, 'Кто-то', text, counts_as_new=False)
+    window = list(bot._moderation_windows[91])
+    assert len(window) == 1
+    assert window[0]['text'] == 'третья версия'
+
+
+def test_real_repeats_are_still_spam():
+    """Правка перестала считаться, но настоящий повтор ловиться должен."""
+    for _ in range(bot.MODERATION_REPEAT_LIMIT):
+        bot._mod_note_message(92, 920, 'Кто-то', 'купи подписку')
+    verdict = bot._mod_local_check(92, 920, 'купи подписку')
+    assert verdict is not None and verdict['category'] == 'spam'
+
+
+# ---------- статистика решений ----------
+
+def test_stats_count_decisions_and_overturns(tmp_path):
+    """Доля отмен — единственная цифра, по которой можно решать,
+    давать ли боту больше прав."""
+    store = bot.ChatModerationStore(tmp_path / 'mod.json')
+    for _ in range(4):
+        store.record_decision('toxic', 'warn')
+    store.add_warn(-1, 5, 'toxic')
+    store.record_overturned(-1, 5)
+    data = store.stats()
+    assert sum(data['by_action'].values()) == 4
+    assert data['overturned_total'] == 1
+    assert data['by_category']['toxic']['overturned'] == 1
+
+
+def test_overturn_is_attributed_to_the_right_category(tmp_path):
+    store = bot.ChatModerationStore(tmp_path / 'mod.json')
+    store.add_warn(-1, 5, 'spam')
+    store.record_overturned(-1, 5)
+    assert store.stats()['by_category']['spam']['overturned'] == 1
+    assert 'toxic' not in store.stats().get('by_category', {})
+
+
+def test_stats_survive_restart(tmp_path):
+    path = tmp_path / 'mod.json'
+    first = bot.ChatModerationStore(path)
+    first.record_decision('flood', 'mute')
+    assert bot.ChatModerationStore(path).stats()['by_action']['mute'] == 1
