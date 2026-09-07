@@ -17643,6 +17643,10 @@ LLM_PRIMARY_RETRY_MAX_SEC = max(LLM_PRIMARY_RETRY_SEC,
                                 min(24 * 3600, _env_int('LLM_PRIMARY_RETRY_MAX_SEC', 6 * 3600)))
 LLM_TIMEOUT = max(5, min(120, _env_int('LLM_TIMEOUT', 30)))
 LLM_MIN_INTERVAL = max(0.0, min(60.0, _env_float('LLM_MIN_INTERVAL', 1.2)))
+# Потолок самообучаемой паузы. Бесплатные тарифы отличаются по темпу в разы, и
+# единая пауза для всех означает, что для одного провайдера она мала (упрёмся
+# в лимит), а для другого велика (зря простаиваем).
+LLM_PACE_MAX_SEC = max(2.0, min(300.0, _env_float('LLM_PACE_MAX_SEC', 60.0)))
 LLM_DAILY_LIMIT = max(1, min(10000, _env_int('LLM_DAILY_LIMIT', 900)))
 LLM_MAX_TOKENS = max(64, min(4000, _env_int('LLM_MAX_TOKENS', 700)))
 
@@ -17863,6 +17867,56 @@ def _llm_extra_params() -> dict:
     except ValueError:
         logger.warning('LLM_EXTRA_PARAMS: не разобрался как JSON — игнорирую')
         return {}
+
+# Пауза, которую бот подобрал под каждого провайдера сам. Единая константа
+# означала, что предел провайдера бот узнаёт единственным способом — упираясь
+# в него: разогнался до отказа, получил 429, потерял вызов, и по кругу.
+_llm_pace: dict = {}
+# Сколько провайдер просил подождать в последний раз. Нужно, чтобы решить,
+# стоит ли переждать на месте, когда уходить больше некуда.
+_llm_wait_hint_sec = 0.0
+# Максимум, который бот готов прождать внутри одного вызова. Дольше — уже не
+# «подождать», а держать цикл сбора: лучше отдать пост без обогащения.
+LLM_INLINE_RETRY_MAX_SEC = max(0.0, min(120.0, _env_float('LLM_INLINE_RETRY_MAX_SEC', 20.0)))
+
+
+def _llm_pace_for(slot: str) -> float:
+    """Сколько ждать перед следующим запросом к этому провайдеру."""
+    return max(LLM_MIN_INTERVAL, float(_llm_pace.get(slot, LLM_MIN_INTERVAL)))
+
+
+def _llm_pace_slower(slot: str, retry_after: float = 0.0) -> float:
+    """Провайдер попросил сбавить — сбавляем и запоминаем.
+
+    Удваиваем, а не прибавляем: если текущий темп слишком быстрый, мелкий шаг
+    приведёт к череде отказов, пока пауза доползёт до нужной. Подсказку
+    Retry-After уважаем как нижнюю границу — провайдер знает свой лимит лучше.
+    """
+    current = _llm_pace_for(slot)
+    pace = min(LLM_PACE_MAX_SEC, max(current * 2, float(retry_after or 0)))
+    _llm_pace[slot] = pace
+    metrics.set('anime_bot_llm_pace_seconds', pace)
+    logger.info('LLM: сбавляю темп для %s до %.1f с между запросами', slot, pace)
+    return pace
+
+
+def _llm_pace_faster(slot: str) -> None:
+    """Провайдер отвечает — осторожно возвращаемся к обычному темпу.
+
+    Шаг вниз мельче шага вверх намеренно: разогнаться обратно можно долго,
+    а вот упереться в лимит — один раз и сразу.
+    """
+    current = _llm_pace.get(slot)
+    if current is None or current <= LLM_MIN_INTERVAL:
+        return
+    pace = max(LLM_MIN_INTERVAL, current * 0.9)
+    if pace <= LLM_MIN_INTERVAL * 1.05:
+        _llm_pace.pop(slot, None)
+        pace = LLM_MIN_INTERVAL
+    else:
+        _llm_pace[slot] = pace
+    metrics.set('anime_bot_llm_pace_seconds', pace)
+
 
 _llm_lock = asyncio.Lock()          # запросы строго по одному (лимит req/sec)
 _llm_last_call = 0.0
@@ -18305,6 +18359,12 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
         # Раньше мы всегда пережидали на месте: это верно, когда провайдер
         # один, но при живом соседе бот молчал вместо того, чтобы спросить
         # его. Ждём, только если идти больше некуда.
+        # Темп подбираем ДО решения о переключении: даже если уйдём к соседу,
+        # к этому провайдеру мы вернёмся, и вернуться надо уже с новой паузой.
+        global _llm_wait_hint_sec
+        hint = float(_parse_retry_after(r.headers.get('Retry-After')) or 0)
+        _llm_wait_hint_sec = hint or LLM_CIRCUIT_BASE_SEC
+        _llm_pace_slower(_llm_candidate[0] if _llm_candidate else _llm_primary_slot(), hint)
         if _llm_fallback_configured():
             _remember_provider_error(r.status_code, r.text)
             _llm_note_failure('rate_limit', f'HTTP 429: {r.text[:150]}', model=model)
@@ -18415,6 +18475,7 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: s
     """Вызов модели с соблюдением лимитов: по одному запросу за раз,
     с паузой между ними и дневным потолком."""
     global _llm_last_call, _llm_disabled_runtime, _llm_disabled_reason, _llm_circuit_until, _llm_circuit_level
+    global _llm_wait_hint_sec
     global _llm_last_usage_tokens, _llm_budget_exhausted_alert_day
     if not _llm_active():
         return None
@@ -18489,7 +18550,8 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: s
                 _queue_admin_alert(
                     f'💰 LLM budget использован на {int(100 * snap["tokens"] / max(1, LLM_DAILY_TOKEN_BUDGET))}%. '
                     f'Осталось примерно {snap["remaining"]} tokens.')
-        wait = LLM_MIN_INTERVAL - (time.time() - _llm_last_call)
+        active_slot = _llm_candidate[0] if _llm_candidate else _llm_primary_slot()
+        wait = _llm_pace_for(active_slot) - (time.time() - _llm_last_call)
         if wait > 0:
             await asyncio.sleep(wait)
         _llm_count_call()
@@ -18505,8 +18567,26 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: s
         else:
             metrics.inc('anime_bot_llm_route_total', labels={'task': task, 'route': 'quality'})
             result = await asyncio.to_thread(_llm_request, messages, max_tokens)
+        # Уходить некуда, а провайдер сказал, сколько ждать. Переждать и
+        # повторить дешевле, чем отдать пост без перевода и тегов: пауза
+        # бесплатных тарифов обычно секунды, а «модели нет» — это уже
+        # заметная просадка качества.
+        if (result is None and not _llm_fallback_configured()
+                and _llm_last_failure.get('kind') == 'rate_limit'
+                and 0 < _llm_wait_hint_sec <= LLM_INLINE_RETRY_MAX_SEC):
+            pause = _llm_wait_hint_sec
+            _llm_wait_hint_sec = 0.0
+            logger.info('LLM: жду %.0f с по просьбе провайдера и повторяю', pause)
+            metrics.inc('anime_bot_llm_inline_retry_total')
+            await asyncio.sleep(pause)
+            if route_config is not None:
+                result = await asyncio.to_thread(_llm_request, messages, max_tokens,
+                                                 route_config=route_config)
+            else:
+                result = await asyncio.to_thread(_llm_request, messages, max_tokens)
         _llm_last_call = time.time()
         if result is not None:
+            _llm_pace_faster(active_slot)
             _llm_note_primary_recovered()
             _llm_circuit_level = 0
             _llm_circuit_until = 0.0
@@ -19228,6 +19308,14 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append('  ℹ️ запасной не задан: при отказе провайдера обогащение '
                      'выключится до перезапуска')
+    # Подобранный темп виден: иначе непонятно, почему бот вдруг стал реже
+    # обращаться к модели, и выглядит это как поломка.
+    slot_now = _llm_candidate[0] if _llm_candidate else slot
+    pace = _llm_pace_for(slot_now)
+    if pace > LLM_MIN_INTERVAL:
+        lines.append(f'⏱ Темп подобран: {pace:.1f} с между запросами '
+                     f'(обычный — {LLM_MIN_INTERVAL:.1f} с). '
+                     'Провайдер просил сбавить; вернётся сам, когда перестанет.')
     lines.append(f'Prompt version: <code>{html.escape(LLM_PROMPT_VERSION)}</code>')
     # Команд нет в синем меню — значит про них надо сказать там, где их ищут.
     lines.append('')

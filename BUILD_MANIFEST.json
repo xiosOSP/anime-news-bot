@@ -1,12 +1,12 @@
 {
   "schema": 1,
   "python_target": "3.11",
-  "git_commit": "3775fe98b3bbe1836e82fa05d7dba9b061b90543",
-  "generated_at_utc": "2026-09-07T12:23:51.470706+00:00",
+  "git_commit": "86d50196773178b2b0db291a5c2ce7efb6c5afc3",
+  "generated_at_utc": "2026-09-07T12:42:28.911075+00:00",
   "files": {
     ".env.example": {
-      "sha256": "d354db5ca65d5cc6020c46d60b9a533037c0933d3ca40973455f3fdf844cdcba",
-      "bytes": 11247
+      "sha256": "853fea7a9d9974b1824dcfe028548b1c9ae14dac191f47bc926589e2bc52d892",
+      "bytes": 11775
     },
     ".github/workflows/ci.yml": {
       "sha256": "1150bb30676a5f83023e2468a526708140445c0055bb3f1b86fde15310553380",
@@ -25,8 +25,8 @@
       "bytes": 2989
     },
     "anime_news_bot.py": {
-      "sha256": "b9fc769f8807d664bd8375a4595e5916fc0043c51a19b412aabdfcabc7bf1075",
-      "bytes": 1285930
+      "sha256": "8a09bf08da7a9b9e3e1b6953960f680f349a4c43d6bda18f92caa8ee44794ed1",
+      "bytes": 1291886
     },
     "pytest.ini": {
       "sha256": "e28a989e765f6f1fc37e02fb00a351f56391f749cafcd3f93057abbfb17ba26b",
