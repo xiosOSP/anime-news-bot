@@ -92,11 +92,13 @@ class TestFailoverOnFatalErrors:
 
 
 class TestFailoverIsConservative:
-    def test_transient_errors_do_not_switch(self, providers):
-        """503 проходит сам — менять провайдера из-за него нельзя."""
+    def test_transient_error_switches_with_recovery_cooldown(self, providers):
+        """A temporary outage can use the backup and schedule primary recovery."""
         _router(providers, 503, 'временно недоступен')
         bot._llm_request([{'role': 'user', 'content': 'hi'}], 100)
-        assert bot._llm_using_fallback is False
+        assert bot._llm_using_fallback is True
+        assert bot._llm_primary_retry_at > bot.time.monotonic()
+        assert bot._llm_disabled_runtime is False
 
     def _rate_limited(self, providers):
         response = MagicMock()

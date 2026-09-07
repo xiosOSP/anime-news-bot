@@ -39,7 +39,7 @@ def _stream_patch(monkeypatch, mapping):
         if resp is None:
             raise OSError('network down')
         return resp
-    monkeypatch.setattr(anime_news_bot.requests, 'get', fake_get)
+    monkeypatch.setattr(anime_news_bot, 'public_get', fake_get)
     # Unit-тесты не должны зависеть от DNS окружения; SSRF-валидация тестируется отдельно.
     monkeypatch.setattr(anime_news_bot, '_is_public_http_url', lambda _url: True)
 
@@ -241,7 +241,7 @@ class TestVideoResolver:
 
     def test_regular_url_passes_through(self, monkeypatch):
         called = []
-        monkeypatch.setattr(anime_news_bot.requests, 'get',
+        monkeypatch.setattr(anime_news_bot, 'public_get',
                             lambda *a, **k: called.append(1))
         out = asyncio.run(anime_news_bot._resolve_video('https://site.com/v.mp4'))
         assert out == 'https://site.com/v.mp4'

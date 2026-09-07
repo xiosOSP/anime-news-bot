@@ -137,7 +137,7 @@ class TestStreamingDownload:
         monkeypatch.setattr(anime_news_bot, '_is_public_http_url', lambda _url: True)
 
     def test_downloads_within_limit(self, monkeypatch):
-        monkeypatch.setattr(anime_news_bot.requests, 'get',
+        monkeypatch.setattr(anime_news_bot, 'public_get',
                             lambda *a, **k: _FakeStream(b'MP4'))
         assert anime_news_bot._download_media_bytes('http://x/v.mp4') == b'MP4'
 
@@ -145,24 +145,24 @@ class TestStreamingDownload:
         huge = _FakeStream(b'x', declared=str(200 * 1024 * 1024))
         pulled = []
         huge.iter_content = lambda chunk_size=1: pulled.append(1) or iter([])
-        monkeypatch.setattr(anime_news_bot.requests, 'get', lambda *a, **k: huge)
+        monkeypatch.setattr(anime_news_bot, 'public_get', lambda *a, **k: huge)
         assert anime_news_bot._download_media_bytes('http://x/v.mp4', 48) is None
         assert pulled == []            # тело даже не начали читать
 
     def test_aborts_when_content_length_lies(self, monkeypatch):
         lying = _FakeStream(b'y' * (3 * 1024 * 1024), declared='10')
-        monkeypatch.setattr(anime_news_bot.requests, 'get', lambda *a, **k: lying)
+        monkeypatch.setattr(anime_news_bot, 'public_get', lambda *a, **k: lying)
         assert anime_news_bot._download_media_bytes('http://x/v.mp4', 1) is None
 
     def test_wrong_content_type_rejected(self, monkeypatch):
-        monkeypatch.setattr(anime_news_bot.requests, 'get',
+        monkeypatch.setattr(anime_news_bot, 'public_get',
                             lambda *a, **k: _FakeStream(b'<html>', ctype='text/html'))
         assert anime_news_bot._download_media_bytes('http://x/v.mp4') is None
 
     def test_network_error_is_none(self, monkeypatch):
         def boom(*a, **k):
             raise OSError('down')
-        monkeypatch.setattr(anime_news_bot.requests, 'get', boom)
+        monkeypatch.setattr(anime_news_bot, 'public_get', boom)
         assert anime_news_bot._download_media_bytes('http://x/v.mp4') is None
 
 
@@ -186,6 +186,11 @@ class TestGuestRateLimit:
 
 
 class TestConcurrentCollection:
+    @pytest.fixture(autouse=True)
+    def isolate_collection(self, monkeypatch):
+        # Parser concurrency does not depend on crawling links discovered in its results.
+        monkeypatch.setitem(anime_news_bot.FEATURE_FLAGS, 'source_discovery', False)
+
     def test_sources_fetched_concurrently_in_order(self, monkeypatch):
         import asyncio
         from unittest.mock import AsyncMock

@@ -44,7 +44,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import feedparser
 import requests
 from bs4 import BeautifulSoup
-from deep_translator import GoogleTranslator
+from translation import GoogleTranslator
+from safe_http import public_get
 from telegram import (
     Bot,
     BotCommand,
@@ -2155,6 +2156,7 @@ def http_get_with_retry(
     proxies: Optional[dict] = None,
     allow_redirects: bool = True,
     stream: bool = False,
+    public_only: bool = False,
 ) -> Optional[requests.Response]:
     """GET с автоматическим retry на сетевых ошибках и 5xx/429.
     Возвращает Response при успехе или None при провале всех попыток.
@@ -2163,7 +2165,7 @@ def http_get_with_retry(
     for attempt in range(HTTP_RETRY_ATTEMPTS):
         retry_after = None
         try:
-            r = requests.get(
+            r = (public_get if public_only else requests.get)(
                 url,
                 headers=headers,
                 timeout=timeout,
@@ -2260,7 +2262,7 @@ def http_get_public_with_retry(
             return None
         response = http_get_with_retry(
             current, headers=headers, timeout=timeout, proxies=proxies,
-            allow_redirects=False, stream=stream,
+            allow_redirects=False, stream=stream, public_only=True,
         )
         if response is None:
             return None
@@ -2956,10 +2958,13 @@ class PostQueue:
                 changed = True
             require_img = settings.require_image
             skipped = 0
-            while self._items:
+            for _ in range(len(self._items)):
                 item = self._items.pop(0)
                 changed = True
                 news = item['news']
+                if self._retry_pending(news):
+                    self._items.append(item)
+                    continue
                 if require_img and not news.get('images'):
                     skipped += 1
                     continue
@@ -3007,6 +3012,32 @@ class PostQueue:
                 self._inflight = old_inflight
                 self._inflight_owner = old_owner
                 logger.error('Очередь: ack не записан; сохраняю inflight до восстановления storage')
+                return False
+            return True
+
+    @staticmethod
+    def _retry_pending(news: dict) -> bool:
+        try:
+            return float(news.get('_queue_retry_at', 0)) > time.time()
+        except (TypeError, ValueError):
+            return False
+
+    async def defer(self, news: dict) -> bool:
+        """Persist LLM deferral without consuming delivery retries or resetting TTL."""
+        async with self._lock:
+            if self._inflight is None:
+                return False
+            if str(self._inflight['news'].get('link')) != str(news.get('link')):
+                return False
+            old_items, old_inflight, old_owner = list(self._items), self._inflight, self._inflight_owner
+            clean = {k: v for k, v in news.items() if k != 'published_parsed'}
+            clean['_queue_retry_at'] = time.time() + LLM_DEFER_RETRY_SEC
+            self._items.append({'news': clean, 'queued_at': old_inflight['queued_at']})
+            self._inflight = None
+            self._inflight_owner = None
+            if not self._save():
+                self._items, self._inflight, self._inflight_owner = old_items, old_inflight, old_owner
+                logger.error('Очередь: отсрочка не записана; сохраняю inflight')
                 return False
             return True
 
@@ -3107,8 +3138,9 @@ class PostQueue:
         влиять на то, что и когда публикуется.
         """
         async with self._lock:
-            return [item['news'] for item in self._items[:max(0, int(limit))]
-                    if isinstance(item.get('news'), dict)]
+            return [item['news'] for item in self._items
+                    if isinstance(item.get('news'), dict) and not self._is_expired(item)
+                    and not self._retry_pending(item['news'])][:max(0, int(limit))]
 
 
 post_queue: Optional['PostQueue'] = None
@@ -9607,6 +9639,9 @@ class DeliveryUncertain(RuntimeError):
 
 
 def _raise_if_ambiguous_tg_error(exc: BaseException) -> None:
+    # BadRequest inherits NetworkError in PTB, but confirms rejection by Telegram.
+    if isinstance(exc, BadRequest):
+        return
     # PTB NetworkError/TimedOut означают отсутствие достоверного ответа сервера.
     # По имени проверяем также лёгкие test-stubs и совместимые версии PTB.
     ambiguous = bool(_TG_AMBIGUOUS_ERROR_TYPES and
@@ -9621,7 +9656,7 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
                      thread_id: Optional[int] = None) -> bool:
     """Главная отправка: собирает альбом из видео и фото, шлёт media group или одиночное сообщение.
     Если thread_id указан — отправляет в конкретную тему форума (ветку обсуждения)."""
-    text = format_news_post(news)
+    text = await asyncio.to_thread(format_news_post, news)
     video_url = news.get('video')
 
     # Доп. kwargs для отправки в тему форума
@@ -9865,8 +9900,9 @@ async def _send_post_fallback(
                     parse_mode=ParseMode.HTML,
                     **thread_kw,
                 )
-            except TelegramError:
+            except TelegramError as exc:
                 # URL не принят — качаем байтами (типично для cdn-telegram.org)
+                _raise_if_ambiguous_tg_error(exc)
                 data = None
                 if isinstance(photos[0], str):
                     data = await asyncio.to_thread(_download_image_bytes, photos[0])
@@ -10132,7 +10168,7 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
                 if experiments is not None:
                     await asyncio.to_thread(experiments.record, str(news.get('_format_variant') or 'standard'), 'published')
                 if story_history is not None:
-                    await asyncio.to_thread(story_history.record, news, format_news_short(news))
+                    await asyncio.to_thread(_record_story_history, news)
                 if analytics_store is not None:
                     await asyncio.to_thread(analytics_store.record, 'delivery', news,
                                             result='sent', mode='channel')
@@ -12722,7 +12758,7 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     thread_kw = {'message_thread_id': DISCUSSION_THREAD_ID}
     target = DISCUSSION_CHAT_ID
 
-    text = format_news_text_long(news)
+    text = await asyncio.to_thread(format_news_text_long, news)
     video_url = news.get('video')
     # Что реально отправим как видео: файл | bytes | url. cdn-telegram качаем сами.
     saved_file_id = news.get('_telegram_video_file_id')
@@ -12883,7 +12919,9 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
             except TelegramError as e:
                 _raise_if_ambiguous_tg_error(e)
                 logger.error(f"Альбом ушёл, но кнопки модерации не отправились: {e}")
-                return False
+                # The album is already delivered. Preserve pending/ledger state;
+                # treating the whole operation as failed would resend the album.
+                raise DeliveryUncertain('Альбом доставлен, кнопки модерации не отправлены') from e
         logger.info(f"🧵 {news['source']}: {news['title'][:60]} (альбом {len(media)}+подпись)")
         return True
     except TelegramError as e:
@@ -13014,7 +13052,8 @@ async def _send_thread_media_then_text(bot, news, photos, has_inline_video, vide
                     await bot.send_photo(chat_id=target, photo=ph, **thread_kw)
                     media_sent = True
                     break
-                except TelegramError:
+                except TelegramError as exc:
+                    _raise_if_ambiguous_tg_error(exc)
                     continue
 
     if settings.require_image and not media_sent:
@@ -13030,8 +13069,8 @@ async def _send_thread_media_then_text(bot, news, photos, has_inline_video, vide
     except TelegramError as e:
         _raise_if_ambiguous_tg_error(e)
         logger.error(f"Текст в ветку не отправился: {e}")
-        # Без текста/кнопок пост нельзя нормально модерировать. Медиа могло уже
-        # появиться в ветке, но ledger не коммитим и pending-запись откатываем.
+        if media_sent:
+            raise DeliveryUncertain('Медиа доставлено, текст модерации не отправлен') from e
         return False
 
 
@@ -15419,7 +15458,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.to_thread(
                     story_registry.mark_delivery, news, published=True)
             if story_history is not None:
-                await asyncio.to_thread(story_history.record, news, format_news_short(news))
+                await asyncio.to_thread(_record_story_history, news)
             if pending_cleanup_ok:
                 await query.answer('📢 Опубликовано в канал!')
             else:
@@ -15448,7 +15487,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _safe_edit(query, text, markup)
             return
         if data.startswith('sview:'):
-            text, markup = _scheduled_detail(data.split(':', 1)[1])
+            text, markup = await asyncio.to_thread(_scheduled_detail, data.split(':', 1)[1])
             await query.answer()
             await _safe_edit(query, text, markup)
             return
@@ -15555,7 +15594,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error('Отложка: ручной пост %s отправлен, но cleanup не записался', key)
             _mark_published()
             if story_history is not None:
-                await asyncio.to_thread(story_history.record, news, format_news_short(news))
+                await asyncio.to_thread(_record_story_history, news)
             if scheduled_cleanup_ok:
                 await query.answer('📢 Опубликовано!')
             else:
@@ -16499,6 +16538,10 @@ def _media_summary(news: dict) -> str:
     return ' + '.join(bits) if bits else 'нет'
 
 
+def _record_story_history(news: dict) -> None:
+    story_history.record(news, format_news_short(news))
+
+
 def _post_card(news: dict, meta: dict, *, countdown: bool = False,
                with_body: bool = False) -> str:
     """Карточка поста: что уйдёт, откуда, кто отложил, когда, с каким медиа.
@@ -16629,7 +16672,7 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.to_thread(
                     story_registry.mark_delivery, news, published=True)
             if story_history is not None:
-                await asyncio.to_thread(story_history.record, news, format_news_short(news))
+                await asyncio.to_thread(_record_story_history, news)
             logger.info(f"📅 Опубликован отложенный пост: {news.get('title', '')[:60]}")
             await notify_admin(
                 context.bot,
@@ -17227,6 +17270,10 @@ async def _publish_one_from_queue(bot_api) -> tuple[Optional[str], Optional[dict
         if sent_result == 'sent':
             await post_queue.ack_done(next_post)
             break
+        if sent_result == 'deferred':
+            if not await post_queue.defer(next_post):
+                break
+            continue
         if sent_result == 'failed':
             requeued = await post_queue.requeue_failed(next_post)
             if requeued is True:
@@ -17340,7 +17387,7 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
     if feature_enabled('story_registry') and story_registry is not None:
         await asyncio.to_thread(story_registry.mark_delivery, news, published=True)
     if story_history is not None:
-        await asyncio.to_thread(story_history.record, news, format_news_short(news))
+        await asyncio.to_thread(_record_story_history, news)
     metrics.inc('anime_bot_publish_attempts_total',
                 labels={'mode': 'autopost', 'result': 'sent'})
     _event_log('publish_result', story_id=news.get('_story_id'), mode='autopost',
@@ -18071,6 +18118,7 @@ def _llm_try_failover(reason: str, hint: str = '', retry_after_sec: float = 0.0)
     global _llm_using_fallback, _llm_failover_at, _llm_primary_retry_at
     global _llm_failover_level, _llm_failover_alert_key
     global _llm_candidate, _llm_tried_candidates
+    global _llm_fail_streak
     # Раньше переключение было одноразовым: сходили на запасного и всё. Третий
     # настроенный провайдер не использовался никогда, а когда два первых легли
     # по разным временным причинам — а это норма для бесплатных тарифов, —
@@ -18104,6 +18152,7 @@ def _llm_try_failover(reason: str, hint: str = '', retry_after_sec: float = 0.0)
         return False
     _llm_tried_candidates = tried
     _llm_candidate = nxt_pair
+    _llm_fail_streak = 0  # Failures of one provider must not pause its replacement.
     nxt = nxt_pair[0]
     _llm_using_fallback = True
     _llm_failover_at = datetime.now(timezone.utc).isoformat()
@@ -18181,6 +18230,7 @@ def _llm_reset_provider_state(why: str) -> None:
     # Строгий JSON снимался под конкретного провайдера: у нового он может
     # поддерживаться, и начинать с ослабленного режима незачем.
     _llm_json_mode = True
+    _llm_extra_ok.clear()
     _llm_last_provider_error = ''
     logger.info('LLM: состояние провайдера сброшено (%s)', why)
     metrics.inc('anime_bot_llm_provider_reset_total')
@@ -18396,11 +18446,12 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
     slot = 'fast' if route_config is not None else (
         _llm_candidate[0] if _llm_candidate else _llm_primary_slot())
     payload = {
+        **_llm_extra_params(slot),
         'model': model,
         'messages': messages,
         'temperature': 0.2,           # факты важнее фантазии
         'max_tokens': max_tokens,
-        **_llm_extra_params(slot),
+        'stream': False,
     }
     # Строгий JSON поддерживают Mistral, Groq, OpenAI и большинство совместимых.
     # Если провайдер параметр не понял — снимаем его и дальше работаем без него.
@@ -18419,139 +18470,153 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
         if not routed_task:
             _llm_fail_streak += 1
         _llm_note_failure('network', f'{type(e).__name__}: {e}', model=model)
-        logger.warning(f"LLM: запрос не удался ({type(e).__name__}: {e})")
-        return None
-
-    # A task-specific fast route is an optimization. Its health must never open
-    # the global circuit, trigger provider failover, or disable the quality route.
-    if routed_task and r.status_code != 200:
-        metrics.inc('anime_bot_llm_route_error_total', labels={'status': str(r.status_code)})
-        _llm_note_failure('http', f'быстрый маршрут: HTTP {r.status_code}', model=model)
-        logger.warning('LLM fast route: HTTP %s — fallback to quality route', r.status_code)
-        return None
-
-    if r.status_code == 429:
-        # Провайдер в Retry-After прямо говорит, сколько ждать. Раньше слой
-        # модели этот заголовок игнорировал: бот просто увеличивал счётчик
-        # неудач и шёл дальше, а следующий запрос упирался в тот же лимит.
-        # На бесплатных тарифах с жёстким лимитом запросов в минуту это
-        # означало серию 429 подряд и выключение модели по счётчику ошибок —
-        # хотя достаточно было подождать несколько секунд.
-        wait = _parse_retry_after(r.headers.get('Retry-After'))
-        # Лимит запросов у одного провайдера ничего не говорит об остальных.
-        # Раньше мы всегда пережидали на месте: это верно, когда провайдер
-        # один, но при живом соседе бот молчал вместо того, чтобы спросить
-        # его. Ждём, только если идти больше некуда.
-        # Темп подбираем ДО решения о переключении: даже если уйдём к соседу,
-        # к этому провайдеру мы вернёмся, и вернуться надо уже с новой паузой.
-        global _llm_wait_hint_sec
-        hint = float(_parse_retry_after(r.headers.get('Retry-After')) or 0)
-        _llm_wait_hint_sec = hint or LLM_CIRCUIT_BASE_SEC
-        _llm_pace_slower(_llm_candidate[0] if _llm_candidate else _llm_primary_slot(), hint)
-        if _llm_fallback_configured():
-            _remember_provider_error(r.status_code, r.text)
-            _llm_note_failure('rate_limit', f'HTTP 429: {r.text[:150]}', model=model)
-            if _llm_try_failover('rate_limit',
-                                 'провайдер ограничил темп запросов. Это временно: '
-                                 'к нему вернёмся сами, когда пауза выйдет.',
-                                 float(wait or LLM_CIRCUIT_BASE_SEC)):
-                metrics.inc('anime_bot_llm_rate_limited_total', labels={'source': 'failover'})
-                return None
-        if wait and wait > 0:
-            pause = min(LLM_CIRCUIT_MAX_SEC, float(wait))
-            _llm_circuit_until = max(_llm_circuit_until, time.monotonic() + pause)
-            _llm_disabled_runtime = True
-            _llm_disabled_reason = 'circuit'
-            # Счётчик провалов намеренно не трогаем: это не отказ провайдера, а
-            # просьба сбавить темп. Мы её выполняем, значит следующий запрос
-            # должен пройти — наказывать модель длинной паузой не за что.
-            metrics.inc('anime_bot_llm_rate_limited_total', labels={'source': 'retry_after'})
-            _llm_note_failure('rate_limit', f'просит подождать {pause:.0f} с', model=model)
-            logger.warning('LLM: провайдер просит подождать %.0f с (429) — жду ровно столько', pause)
-        else:
-            # Без заголовка мы не знаем, сколько ждать, поэтому обычная защита
-            # по счётчику провалов остаётся: она не даст долбить провайдера.
-            _llm_fail_streak += 1
-            metrics.inc('anime_bot_llm_rate_limited_total', labels={'source': 'no_header'})
-            _llm_note_failure('rate_limit', 'без заголовка Retry-After', model=model)
-            logger.warning('LLM: провайдер вернул 429 (лимит запросов) — притормаживаю')
-        return None
-    if r.status_code in (401, 403):
-        _remember_provider_error(r.status_code, r.text)
-        _llm_note_failure('http', f'HTTP {r.status_code}: ключ отклонён', model=model)
-        if _llm_try_failover('auth', 'провайдер отклонил ключ основного аккаунта. '
-                                     'Проверь LLM_API_KEY: у бесплатных роутеров тот же '
-                                     '401 приходит и при исчерпанной квоте, и при '
-                                     'приостановленном аккаунте.'):
-            return None          # следующий вызов пойдёт к запасному провайдеру
-        _llm_disabled_runtime = True
-        _llm_disabled_reason = 'auth'
-        logger.error(f"LLM: ключ отклонён (HTTP {r.status_code}) — выключаю до рестарта")
-        _queue_admin_alert('🤖 Языковая модель отключена: провайдер не принял ключ '
-                           f'(HTTP {r.status_code}). Проверь LLM_API_KEY. '
-                           'Бот продолжает работать на DeepL/Google.')
-        return None
-    # Неустранимые ошибки конфигурации: сами не рассосутся, повторять бессмысленно.
-    # Раньше они попадали в общую ветку и ретраились каждым циклом — провайдер
-    # получал десятки запросов подряд, а в логе копились одинаковые предупреждения
-    # без единой подсказки, что именно чинить.
-    fatal = _llm_fatal_reason(r.status_code, r.text)
-    if fatal:
-        _remember_provider_error(r.status_code, r.text)
-        _llm_note_failure('http', f'HTTP {r.status_code}: {fatal["log"]}', model=model)
-        if _llm_try_failover(fatal['reason'], fatal['admin'],
-                             float(fatal.get('retry_after_sec') or 0.0)):
-            return None          # следующий вызов пойдёт к запасному провайдеру
-        _llm_disabled_runtime = True
-        _llm_disabled_reason = fatal['reason']
-        logger.error('LLM: %s (HTTP %s) — выключаю до рестарта', fatal['log'], r.status_code)
-        _queue_admin_alert(f'🤖 Языковая модель отключена: {fatal["admin"]}\n'
-                           f'HTTP {r.status_code}. Бот продолжает работать на DeepL/Google.')
-        return None
-    if r.status_code in (400, 422) and _llm_json_mode:
-        # Скорее всего провайдер не знает response_format — пробуем без него
-        _llm_json_mode = False
-        logger.info("LLM: провайдер не принял строгий JSON — повторяю без него")
-        return _llm_request(messages, max_tokens, route_config=route_config)
-    if (r.status_code in (400, 422) and _llm_extra_params(slot)
-            and _llm_extra_ok.get(slot) is not False):
-        # Вторая частая причина 400 — LLM_EXTRA_PARAMS. Переменная одна на
-        # всех провайдеров, а нужна обычно одному: reasoning_effort понимает
-        # Mistral, а чужой роутер на него отвечает отказом. Раньше повтор
-        # снимал только строгий JSON, и такой отказ выглядел неустранимым.
-        _llm_extra_ok[slot] = False
-        _remember_provider_error(r.status_code, r.text)
-        logger.info('LLM: %s не принял LLM_EXTRA_PARAMS — повторяю без них', slot)
-        metrics.inc('anime_bot_llm_extra_params_dropped_total', labels={'slot': str(slot)})
-        return _llm_request(messages, max_tokens, route_config=route_config)
-    if r.status_code != 200:
-        _llm_fail_streak += 1
-        _remember_provider_error(r.status_code, r.text)
-        _llm_note_failure('http', f'HTTP {r.status_code}: {r.text[:200]}', model=model)
-        logger.warning(f"LLM: HTTP {r.status_code} — {r.text[:150]}")
+        logger.warning('LLM: запрос не удался (%s: %s)', type(e).__name__, _redact_secrets(str(e)))
+        if not routed_task:
+            _llm_try_failover('network', 'ошибка соединения с провайдером', LLM_PRIMARY_RETRY_SEC)
         return None
 
     try:
-        data = r.json()
-        usage = data.get('usage') if isinstance(data, dict) else None
-        if isinstance(usage, dict):
-            total_tokens = usage.get('total_tokens')
-            if isinstance(total_tokens, (int, float)) and total_tokens >= 0:
-                _llm_last_usage_tokens = int(total_tokens)
-        content = data['choices'][0]['message']['content']
-    except (ValueError, KeyError, IndexError, TypeError) as e:
-        if not routed_task:
-            _llm_fail_streak += 1
-        _llm_note_failure('bad_body', f'{type(e).__name__}: {e} | {r.text[:150]}', model=model)
-        logger.warning(f"LLM: непонятный ответ ({e})")
-        return None
+        # A task-specific fast route is an optimization. Its health must never open
+        # the global circuit, trigger provider failover, or disable the quality route.
+        if routed_task and r.status_code != 200:
+            metrics.inc('anime_bot_llm_route_error_total', labels={'status': str(r.status_code)})
+            _llm_note_failure('http', f'быстрый маршрут: HTTP {r.status_code}', model=model)
+            logger.warning('LLM fast route: HTTP %s — fallback to quality route', r.status_code)
+            return None
 
-    if not routed_task:
-        _llm_fail_streak = 0
-        # Ответ пришёл: прошлая причина больше не актуальна. Иначе /llm будет
-        # неделю показывать давно ушедший таймаут как текущую проблему.
-        _llm_last_failure.clear()
-    return (content or '').strip()
+        if r.status_code == 429:
+            # Провайдер в Retry-After прямо говорит, сколько ждать. Раньше слой
+            # модели этот заголовок игнорировал: бот просто увеличивал счётчик
+            # неудач и шёл дальше, а следующий запрос упирался в тот же лимит.
+            # На бесплатных тарифах с жёстким лимитом запросов в минуту это
+            # означало серию 429 подряд и выключение модели по счётчику ошибок —
+            # хотя достаточно было подождать несколько секунд.
+            wait = _parse_retry_after(r.headers.get('Retry-After'))
+            # Лимит запросов у одного провайдера ничего не говорит об остальных.
+            # Раньше мы всегда пережидали на месте: это верно, когда провайдер
+            # один, но при живом соседе бот молчал вместо того, чтобы спросить
+            # его. Ждём, только если идти больше некуда.
+            # Темп подбираем ДО решения о переключении: даже если уйдём к соседу,
+            # к этому провайдеру мы вернёмся, и вернуться надо уже с новой паузой.
+            global _llm_wait_hint_sec
+            hint = float(_parse_retry_after(r.headers.get('Retry-After')) or 0)
+            _llm_wait_hint_sec = hint or LLM_CIRCUIT_BASE_SEC
+            _llm_pace_slower(_llm_candidate[0] if _llm_candidate else _llm_primary_slot(), hint)
+            if _llm_fallback_configured():
+                _remember_provider_error(r.status_code, r.text)
+                _llm_note_failure('rate_limit', f'HTTP 429: {r.text[:150]}', model=model)
+                if _llm_try_failover('rate_limit',
+                                     'провайдер ограничил темп запросов. Это временно: '
+                                     'к нему вернёмся сами, когда пауза выйдет.',
+                                     float(wait or LLM_CIRCUIT_BASE_SEC)):
+                    metrics.inc('anime_bot_llm_rate_limited_total', labels={'source': 'failover'})
+                    return None
+            if wait and wait > 0:
+                pause = min(LLM_CIRCUIT_MAX_SEC, float(wait))
+                _llm_circuit_until = max(_llm_circuit_until, time.monotonic() + pause)
+                _llm_disabled_runtime = True
+                _llm_disabled_reason = 'circuit'
+                # Счётчик провалов намеренно не трогаем: это не отказ провайдера, а
+                # просьба сбавить темп. Мы её выполняем, значит следующий запрос
+                # должен пройти — наказывать модель длинной паузой не за что.
+                metrics.inc('anime_bot_llm_rate_limited_total', labels={'source': 'retry_after'})
+                _llm_note_failure('rate_limit', f'просит подождать {pause:.0f} с', model=model)
+                logger.warning('LLM: провайдер просит подождать %.0f с (429) — жду ровно столько', pause)
+            else:
+                # Без заголовка мы не знаем, сколько ждать, поэтому обычная защита
+                # по счётчику провалов остаётся: она не даст долбить провайдера.
+                _llm_fail_streak += 1
+                metrics.inc('anime_bot_llm_rate_limited_total', labels={'source': 'no_header'})
+                _llm_note_failure('rate_limit', 'без заголовка Retry-After', model=model)
+                logger.warning('LLM: провайдер вернул 429 (лимит запросов) — притормаживаю')
+            return None
+        if r.status_code in (401, 403):
+            _remember_provider_error(r.status_code, r.text)
+            _llm_note_failure('http', f'HTTP {r.status_code}: ключ отклонён', model=model)
+            if _llm_try_failover('auth', 'провайдер отклонил ключ основного аккаунта. '
+                                         'Проверь LLM_API_KEY: у бесплатных роутеров тот же '
+                                         '401 приходит и при исчерпанной квоте, и при '
+                                         'приостановленном аккаунте.'):
+                return None          # следующий вызов пойдёт к запасному провайдеру
+            _llm_disabled_runtime = True
+            _llm_disabled_reason = 'auth'
+            logger.error(f"LLM: ключ отклонён (HTTP {r.status_code}) — выключаю до рестарта")
+            _queue_admin_alert('🤖 Языковая модель отключена: провайдер не принял ключ '
+                               f'(HTTP {r.status_code}). Проверь LLM_API_KEY. '
+                               'Бот продолжает работать на DeepL/Google.')
+            return None
+        # Неустранимые ошибки конфигурации: сами не рассосутся, повторять бессмысленно.
+        # Раньше они попадали в общую ветку и ретраились каждым циклом — провайдер
+        # получал десятки запросов подряд, а в логе копились одинаковые предупреждения
+        # без единой подсказки, что именно чинить.
+        fatal = _llm_fatal_reason(r.status_code, r.text)
+        if fatal:
+            _remember_provider_error(r.status_code, r.text)
+            _llm_note_failure('http', f'HTTP {r.status_code}: {fatal["log"]}', model=model)
+            if _llm_try_failover(fatal['reason'], fatal['admin'],
+                                 float(fatal.get('retry_after_sec') or 0.0)):
+                return None          # следующий вызов пойдёт к запасному провайдеру
+            _llm_disabled_runtime = True
+            _llm_disabled_reason = fatal['reason']
+            if fatal.get('retry_after_sec'):
+                _llm_disabled_reason = 'circuit'
+                _llm_circuit_until = time.monotonic() + min(
+                    LLM_CIRCUIT_MAX_SEC, float(fatal['retry_after_sec']))
+                return None
+            logger.error('LLM: %s (HTTP %s) — выключаю до рестарта', fatal['log'], r.status_code)
+            _queue_admin_alert(f'🤖 Языковая модель отключена: {fatal["admin"]}\n'
+                               f'HTTP {r.status_code}. Бот продолжает работать на DeepL/Google.')
+            return None
+        if r.status_code in (400, 422) and _llm_json_mode:
+            # Скорее всего провайдер не знает response_format — пробуем без него
+            _llm_json_mode = False
+            logger.info("LLM: провайдер не принял строгий JSON — повторяю без него")
+            return None
+        if (r.status_code in (400, 422) and _llm_extra_params(slot)
+                and _llm_extra_ok.get(slot) is not False):
+            # Вторая частая причина 400 — LLM_EXTRA_PARAMS. Переменная одна на
+            # всех провайдеров, а нужна обычно одному: reasoning_effort понимает
+            # Mistral, а чужой роутер на него отвечает отказом. Раньше повтор
+            # снимал только строгий JSON, и такой отказ выглядел неустранимым.
+            _llm_extra_ok[slot] = False
+            _remember_provider_error(r.status_code, r.text)
+            logger.info('LLM: %s не принял LLM_EXTRA_PARAMS — повторяю без них', slot)
+            metrics.inc('anime_bot_llm_extra_params_dropped_total', labels={'slot': str(slot)})
+            return None
+        if r.status_code != 200:
+            _llm_fail_streak += 1
+            _remember_provider_error(r.status_code, r.text)
+            _llm_note_failure('http', f'HTTP {r.status_code}: {r.text[:200]}', model=model)
+            logger.warning('LLM: HTTP %s — %s', r.status_code, _redact_secrets(r.text)[:150])
+            if r.status_code >= 500:
+                _llm_try_failover('server', f'временная ошибка HTTP {r.status_code}', LLM_PRIMARY_RETRY_SEC)
+            return None
+
+        try:
+            data = r.json()
+            usage = data.get('usage') if isinstance(data, dict) else None
+            if isinstance(usage, dict):
+                total_tokens = usage.get('total_tokens')
+                if isinstance(total_tokens, (int, float)) and total_tokens >= 0:
+                    _llm_last_usage_tokens = int(total_tokens)
+            content = data['choices'][0]['message']['content']
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError('empty or non-text completion')
+        except (ValueError, KeyError, IndexError, TypeError) as e:
+            if not routed_task:
+                _llm_fail_streak += 1
+            _llm_note_failure('bad_body', f'{type(e).__name__}: {e} | {r.text[:150]}', model=model)
+            logger.warning('LLM: непонятный ответ (%s)', _redact_secrets(str(e)))
+            return None
+
+        if not routed_task:
+            _llm_fail_streak = 0
+            # Ответ пришёл: прошлая причина больше не актуальна. Иначе /llm будет
+            # неделю показывать давно ушедший таймаут как текущую проблему.
+            _llm_last_failure.clear()
+        return content.strip()
+    finally:
+        r.close()
 
 
 def _llm_fast_configured() -> bool:
@@ -18565,20 +18630,16 @@ def _llm_route_for(task: str) -> Optional[tuple[str, str, str]]:
     return None
 
 
-async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: str = 'editorial') -> Optional[str]:
-    """Вызов модели с соблюдением лимитов: по одному запросу за раз,
-    с паузой между ними и дневным потолком."""
-    global _llm_last_call, _llm_disabled_runtime, _llm_disabled_reason, _llm_circuit_until, _llm_circuit_level
-    global _llm_wait_hint_sec
-    global _llm_last_usage_tokens, _llm_budget_exhausted_alert_day
+def _llm_can_call() -> bool:
+    global _llm_disabled_runtime, _llm_disabled_reason, _llm_circuit_until, _llm_circuit_level
     if not _llm_active():
-        return None
+        return False
     if _llm_quota_left() <= 0:
         if not _llm_disabled_runtime:
             logger.info(f"LLM: дневной лимит {LLM_DAILY_LIMIT} исчерпан — "
                         f"до завтра работаю без модели")
         _llm_note_failure('quota', f'лимит {LLM_DAILY_LIMIT} вызовов в сутки')
-        return None
+        return False
     if _llm_fail_streak >= LLM_FAIL_PAUSE_AFTER:
         if not _llm_disabled_runtime:
             if feature_enabled('circuit_breakers'):
@@ -18615,83 +18676,107 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: s
                 logger.error(f"LLM: {_llm_fail_streak} ошибок подряд — выключаю до рестарта")
                 _queue_admin_alert('🤖 Языковая модель отключена: слишком много ошибок подряд. '
                                    'Бот продолжает работать на DeepL/Google. Подробности — /llm')
+        return False
+
+    return True
+
+
+async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: str = 'editorial') -> Optional[str]:
+    """Serialize and account for every HTTP attempt, including retries/failover."""
+    global _llm_last_call, _llm_last_usage_tokens, _llm_budget_exhausted_alert_day
+    global _llm_disabled_runtime, _llm_disabled_reason, _llm_circuit_until, _llm_circuit_level
+    global _llm_wait_hint_sec
+    async with _llm_lock:
+        route_config = _llm_route_for(task)
+        inline_retried = False
+        # Provider rotation + two parameter fallbacks + at most one 429 retry.
+        for _attempt in range(min(16, len(_llm_candidates()) + 5)):
+            if not _llm_can_call():
+                return None
+            _llm_current()  # Apply any elapsed primary recovery cooldown first.
+            active_slot = 'fast' if route_config else (
+                _llm_candidate[0] if _llm_candidate else _llm_primary_slot())
+            wait = _llm_pace_for(active_slot) - (time.time() - _llm_last_call)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            if not _llm_can_call():
+                return None
+            estimated_tokens = _estimate_llm_tokens(messages, max_tokens)
+            reserved_tokens = 0
+            if (feature_enabled('llm_budget') and LLM_DAILY_TOKEN_BUDGET > 0
+                    and llm_budget is not None):
+                if not llm_budget.can_charge(estimated_tokens):
+                    llm_budget.deny()
+                    metrics.inc('anime_bot_llm_budget_denied_total')
+                    today = _local_now().strftime('%Y-%m-%d')
+                    if _llm_budget_exhausted_alert_day != today:
+                        _llm_budget_exhausted_alert_day = today
+                        _queue_admin_alert(
+                            f'💰 Дневной LLM token budget ({LLM_DAILY_TOKEN_BUDGET}) исчерпан. '
+                            'До следующего дня бот продолжит работу через fallback без LLM.')
+                    _llm_note_failure('token_budget', f'лимит {LLM_DAILY_TOKEN_BUDGET} токенов')
+                    return None
+                reserved_tokens = llm_budget.charge(estimated_tokens)
+                metrics.set('anime_bot_llm_budget_tokens', llm_budget.snapshot()['tokens'])
+                if llm_budget.should_warn():
+                    snap = llm_budget.snapshot()
+                    _queue_admin_alert(
+                        f'💰 LLM budget использован на {int(100 * snap["tokens"] / max(1, LLM_DAILY_TOKEN_BUDGET))}%. '
+                        f'Осталось примерно {snap["remaining"]} tokens.')
+            previous = (_llm_candidate, _llm_json_mode, dict(_llm_extra_ok))
+            _llm_count_call()
+            _llm_last_usage_tokens = None
+            metrics.inc('anime_bot_llm_route_total', labels={
+                'task': task, 'route': 'fast' if route_config else 'quality'})
+            kwargs = {'route_config': route_config} if route_config else {}
+            request = asyncio.create_task(asyncio.to_thread(_llm_request, messages, max_tokens, **kwargs))
+            try:
+                try:
+                    result = await asyncio.shield(request)
+                except asyncio.CancelledError:
+                    # to_thread keeps running after cancellation. Keep the lock
+                    # until it finishes, so another call cannot exceed the budget.
+                    await asyncio.shield(request)
+                    raise
+            finally:
+                _llm_last_call = time.time()
+                if reserved_tokens and llm_budget is not None:
+                    llm_budget.reconcile(reserved_tokens, _llm_last_usage_tokens)
+                    metrics.set('anime_bot_llm_budget_tokens', llm_budget.snapshot()['tokens'])
+            if result is not None:
+                _llm_pace_faster(active_slot)
+                if route_config is None:
+                    _llm_note_primary_recovered()
+                    _llm_circuit_level = 0
+                    _llm_circuit_until = 0.0
+                    if _llm_disabled_reason == 'circuit':
+                        _llm_disabled_reason = ''
+                        _llm_disabled_runtime = False
+                return result
+            if route_config is not None:
+                metrics.inc('anime_bot_llm_route_fallback_total', labels={'task': task})
+                route_config = None
+                continue
+            if previous != (_llm_candidate, _llm_json_mode, dict(_llm_extra_ok)):
+                continue
+            if (not inline_retried and _llm_quota_left() > 0
+                    and not _llm_fallback_configured()
+                    and _llm_last_failure.get('kind') == 'rate_limit'
+                    and 0 < _llm_wait_hint_sec <= LLM_INLINE_RETRY_MAX_SEC):
+                pause = _llm_wait_hint_sec
+                _llm_wait_hint_sec = 0.0
+                inline_retried = True
+                metrics.inc('anime_bot_llm_inline_retry_total')
+                await asyncio.sleep(pause)
+                # This exact provider-requested cooldown has now been served.
+                if _llm_disabled_reason == 'circuit':
+                    _llm_circuit_until = 0.0
+                    _llm_disabled_runtime = False
+                    _llm_disabled_reason = ''
+                continue
+            return None
         return None
 
-    async with _llm_lock:
-        # Квоту обязательно перепроверяем уже ВНУТРИ lock: иначе десяток
-        # параллельных задач может одновременно увидеть "остался 1 вызов".
-        if _llm_quota_left() <= 0:
-            return None
-        estimated_tokens = _estimate_llm_tokens(messages, max_tokens)
-        reserved_tokens = 0
-        if (feature_enabled('llm_budget') and LLM_DAILY_TOKEN_BUDGET > 0
-                and llm_budget is not None):
-            if not llm_budget.can_charge(estimated_tokens):
-                llm_budget.deny()
-                metrics.inc('anime_bot_llm_budget_denied_total')
-                today = _local_now().strftime('%Y-%m-%d')
-                if _llm_budget_exhausted_alert_day != today:
-                    _llm_budget_exhausted_alert_day = today
-                    _queue_admin_alert(
-                        f'💰 Дневной LLM token budget ({LLM_DAILY_TOKEN_BUDGET}) исчерпан. '
-                        'До следующего дня бот продолжит работу через fallback без LLM.')
-                _llm_note_failure('token_budget', f'лимит {LLM_DAILY_TOKEN_BUDGET} токенов')
-                return None
-            reserved_tokens = llm_budget.charge(estimated_tokens)
-            metrics.set('anime_bot_llm_budget_tokens', llm_budget.snapshot()['tokens'])
-            if llm_budget.should_warn():
-                snap = llm_budget.snapshot()
-                _queue_admin_alert(
-                    f'💰 LLM budget использован на {int(100 * snap["tokens"] / max(1, LLM_DAILY_TOKEN_BUDGET))}%. '
-                    f'Осталось примерно {snap["remaining"]} tokens.')
-        active_slot = _llm_candidate[0] if _llm_candidate else _llm_primary_slot()
-        wait = _llm_pace_for(active_slot) - (time.time() - _llm_last_call)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _llm_count_call()
-        _llm_last_usage_tokens = None
-        route_config = _llm_route_for(task)
-        if route_config is not None:
-            metrics.inc('anime_bot_llm_route_total', labels={'task': task, 'route': 'fast'})
-            result = await asyncio.to_thread(_llm_request, messages, max_tokens, route_config=route_config)
-            if result is None and _llm_active() and _llm_quota_left() > 0:
-                metrics.inc('anime_bot_llm_route_fallback_total', labels={'task': task})
-                _llm_count_call()
-                result = await asyncio.to_thread(_llm_request, messages, max_tokens)
-        else:
-            metrics.inc('anime_bot_llm_route_total', labels={'task': task, 'route': 'quality'})
-            result = await asyncio.to_thread(_llm_request, messages, max_tokens)
-        # Уходить некуда, а провайдер сказал, сколько ждать. Переждать и
-        # повторить дешевле, чем отдать пост без перевода и тегов: пауза
-        # бесплатных тарифов обычно секунды, а «модели нет» — это уже
-        # заметная просадка качества.
-        if (result is None and not _llm_fallback_configured()
-                and _llm_last_failure.get('kind') == 'rate_limit'
-                and 0 < _llm_wait_hint_sec <= LLM_INLINE_RETRY_MAX_SEC):
-            pause = _llm_wait_hint_sec
-            _llm_wait_hint_sec = 0.0
-            logger.info('LLM: жду %.0f с по просьбе провайдера и повторяю', pause)
-            metrics.inc('anime_bot_llm_inline_retry_total')
-            await asyncio.sleep(pause)
-            if route_config is not None:
-                result = await asyncio.to_thread(_llm_request, messages, max_tokens,
-                                                 route_config=route_config)
-            else:
-                result = await asyncio.to_thread(_llm_request, messages, max_tokens)
-        _llm_last_call = time.time()
-        if result is not None:
-            _llm_pace_faster(active_slot)
-            _llm_note_primary_recovered()
-            _llm_circuit_level = 0
-            _llm_circuit_until = 0.0
-            if _llm_disabled_reason == 'circuit':
-                _llm_disabled_reason = ''
-                _llm_disabled_runtime = False
-        if reserved_tokens and llm_budget is not None:
-            llm_budget.reconcile(reserved_tokens, _llm_last_usage_tokens)
-            snap = llm_budget.snapshot()
-            metrics.set('anime_bot_llm_budget_tokens', snap['tokens'])
-    return result
 
 
 MODERATION_SYSTEM_PROMPT = (
@@ -19140,6 +19225,7 @@ async def _llm_judge_generated(news: dict, source_fact_text: str) -> str:
 # Сколько раз откладываем новость, пока модель молчит. Дальше публикуем как
 # есть: свежая новость без тегов лучше идеальной, но вчерашней.
 LLM_DEFER_MAX_ATTEMPTS = max(0, min(20, _env_int('LLM_DEFER_MAX_ATTEMPTS', 3)))
+LLM_DEFER_RETRY_SEC = max(15, min(3600, _env_int('LLM_DEFER_RETRY_SEC', 300)))
 _llm_deferred: dict = {}
 
 
@@ -19165,10 +19251,12 @@ def _llm_defer_news(news: dict) -> bool:
         return False
     if len(_llm_deferred) > 500:
         _llm_deferred.clear()
-    seen = int(_llm_deferred.get(key, 0))
+    seen = max(_safe_nonnegative_int(news.get('_llm_defer_attempts', 0)),
+               _safe_nonnegative_int(_llm_deferred.get(key, 0)))
     if seen >= LLM_DEFER_MAX_ATTEMPTS:
         return False
     _llm_deferred[key] = seen + 1
+    news['_llm_defer_attempts'] = seen + 1
     return True
 
 
@@ -19229,7 +19317,7 @@ def _llm_editorial_cached(news: dict) -> Optional[dict]:
     entry = _llm_editorial_cache.get(_llm_content_key(news))
     if not isinstance(entry, dict):
         return None
-    if time.time() - float(entry.get('at') or 0) > LLM_EDITORIAL_CACHE_TTL_SEC:
+    if time.time() - float(entry.get('at') or 0) >= LLM_EDITORIAL_CACHE_TTL_SEC:
         return None
     data = entry.get('data')
     return dict(data) if isinstance(data, dict) and data else None
@@ -19581,6 +19669,8 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
         if not data:
             if raw:
                 logger.info(f"LLM: ответ не разобрался, беру обычный путь — {raw[:80]}")
+            if _llm_wanted() and _llm_defer_news(news):
+                return 'defer'
             return 'off'
         # Тот же пост готовится повторно после ошибки отправки, из очереди и по
         # ручной кнопке. Раньше каждый такой заход стоил отдельного вызова.

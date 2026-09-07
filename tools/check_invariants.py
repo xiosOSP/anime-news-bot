@@ -175,7 +175,7 @@ def _check_ssrf_guard(bot) -> tuple[bool, str]:
     for url in blocked:
         if bot._is_public_http_url(url):
             return False, f'{url} признан безопасным'
-    if not bot._is_public_http_url('https://example.com/feed'):
+    if not bot._is_public_http_url('https://8.8.8.8/feed'):
         return False, 'обычный публичный URL заблокирован'
     return True, 'приватные адреса и metadata-endpoint закрыты'
 

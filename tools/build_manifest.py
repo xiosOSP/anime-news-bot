@@ -57,6 +57,23 @@ def _python_target() -> str:
     return f'{sys.version_info.major}.{sys.version_info.minor}'
 
 
+def _content_bytes(path: Path) -> bytes:
+    """Hash canonical UTF-8 source independently of Git's Windows CRLF checkout.
+
+    Binary bytes are preserved. Text contents and sizes use LF, matching the
+    repository's .gitattributes and source archives.
+    """
+    data = path.read_bytes()
+    if b'\0' not in data:
+        try:
+            data.decode('utf-8')
+        except UnicodeDecodeError:
+            pass
+        else:
+            data = data.replace(b'\r\n', b'\n')
+    return data
+
+
 def build() -> dict:
     previous = {}
     if MANIFEST.exists():
@@ -70,13 +87,14 @@ def build() -> dict:
         path = ROOT / name
         if not path.is_file():
             continue                     # удалённый, но ещё не закоммиченный файл
-        data = path.read_bytes()
+        data = _content_bytes(path)
         files[name] = {'sha256': hashlib.sha256(data).hexdigest(), 'bytes': len(data)}
 
     manifest = {key: previous.get(key) for key in PROVENANCE_KEYS if key in previous}
     manifest.setdefault('schema', 1)
     manifest.update({
         'python_target': _python_target(),
+        'content_normalization': 'UTF-8 text uses LF; binary files are unchanged',
         'git_commit': _git('rev-parse', 'HEAD') or None,
         'generated_at_utc': datetime.now(timezone.utc).isoformat(),
         'files': files,
@@ -95,11 +113,18 @@ def main() -> int:
         current = json.loads(MANIFEST.read_text(encoding='utf-8'))
         stale = sorted(set(current.get('files') or {}) - set(manifest['files']))
         missing = sorted(set(manifest['files']) - set(current.get('files') or {}))
+        changed = sorted(name for name in set(manifest['files']) & set(current.get('files') or {})
+                         if current['files'][name] != manifest['files'][name])
         if stale:
             print(f'В манифесте числятся отсутствующие файлы: {stale}')
         if missing:
             print(f'В манифест не попали файлы репозитория: {missing}')
-        return 1 if (stale or missing) else 0
+        if changed:
+            print(f'Содержимое файлов изменилось: {changed}')
+        target_changed = current.get('python_target') != manifest.get('python_target')
+        if target_changed:
+            print('Версия Python в манифесте не совпадает с runtime.txt')
+        return 1 if (stale or missing or changed or target_changed) else 0
 
     MANIFEST.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n',
                         encoding='utf-8')

@@ -28,6 +28,9 @@ class _Reply:
     def json(self):
         return self._payload
 
+    def close(self):
+        self.closed = True
+
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch, tmp_path):
@@ -94,11 +97,12 @@ def test_success_clears_the_old_reason(monkeypatch):
     assert bot._llm_last_failure_text() == ''
 
 
-def test_reason_never_leaks_the_key(monkeypatch):
+def test_reason_never_leaks_the_key(monkeypatch, caplog):
     """Причина уходит админу в личку, а роутеры цитируют ключ в тексте ошибки."""
     _answer(monkeypatch, _Reply(500, 'rejected key key-primary-aaaaaaaa'))
     bot._llm_request([{'role': 'user', 'content': 'x'}])
     assert 'key-primary-aaaaaaaa' not in bot._llm_last_failure_text()
+    assert 'key-primary-aaaaaaaa' not in caplog.text
 
 
 # ---------- прямая проба провайдера ----------
