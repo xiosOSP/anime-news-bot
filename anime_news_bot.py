@@ -9112,6 +9112,89 @@ def matches_keywords(news: dict) -> bool:
     return any(kw.lower() in text for kw in KEYWORDS)
 
 
+# Ссылки в тексте поста. Ловим и голые домены: RSS-описания и телеграм-посты
+# сплошь и рядом пишут «читайте на animenewsnetwork.com» без схемы.
+_POST_URL_RE = re.compile(
+    r'\b(?:https?://|www\.)\S+'
+    r'|\bt\.me/\S+'
+    r'|\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|net|org|ru|io|tv|jp|me|one|gg|co|info|news)'
+    r'(?:/\S*)?',
+    re.IGNORECASE)
+# Подводка к ссылке. После выкидывания URL она остаётся висеть предлогом в
+# никуда: «читайте на .», «подписывайтесь на».
+_LINK_LEADIN_WORDS = (
+    r'читайте|читать|смотрите|смотреть|подробности|подробнее|источник|'
+    r'подписывайтесь|подписаться|больше|оригинал|via|source|read\s+more|'
+    r'read|watch|see|more|full\s+story|details'
+)
+_LEADIN_BEFORE_RE = re.compile(
+    rf'(?:\b(?:{_LINK_LEADIN_WORDS})\b[^.!?]{{0,30}}?)?'
+    rf'[\s,:;—–-]*\b(?:на|в|по|у|at|on|in|to|by|from)?\s*$', re.IGNORECASE)
+_TRAILING_CONNECTOR_RE = re.compile(
+    r'[\s,;:—–-]*\b(?:и|а|но|или|же|что|чтобы|как|где|когда|the|and|or|but|'
+    r'with|for|of|to|in|on|at|by|from)\s*$', re.IGNORECASE)
+
+
+# Слова, которые сами по себе ничего не сообщают: служебные и те, что были
+# подводкой к ссылке. Предложение, состоящее только из них, — не текст.
+_LOW_CONTENT_WORDS = frozenset("""
+читайте читать смотрите смотреть подробности подробнее источник подписывайтесь
+подписаться больше оригинал сайте сайт здесь тут ниже выше наш нашем нашего
+и а но или же что чтобы как где когда на в по у из от для про при об о
+read more watch see source via full story details here our site link click
+the and or but with for of to in on at by from you it this that all
+""".split())
+
+
+def _sentence_is_empty_without_link(text: str) -> bool:
+    """Осталось ли в предложении хоть что-то своё после удаления ссылки.
+
+    «Читайте на сайте» без ссылки не несёт ничего, а вот «Премьера в апреле»
+    несёт — и выбрасывать её вместе со ссылкой нельзя. Считаем не длину, а
+    содержательные слова: длинная подводка длиннее короткого факта, и по
+    длине их не различить.
+    """
+    words = re.sub(r'[^\w]+', ' ', text, flags=re.UNICODE).strip().lower().split()
+    meaningful = [w for w in words if len(w) > 2 and w not in _LOW_CONTENT_WORDS]
+    return len(meaningful) < 2
+
+
+def _strip_links(text: str) -> str:
+    """Убирает ссылки из текста поста вместе с подводкой к ним.
+
+    В канал ссылки не идут: подписчику некуда по ним ходить, а чужой t.me в
+    своём канале — прямая реклама конкурента. Убирать надо до перевода:
+    переводчик коверкает домены («www.Crunchyroll.com») и тратит на них лимит.
+
+    Чистим по предложениям. Предложение, от которого после удаления ссылки
+    осталась одна подводка, выбрасываем целиком: «Читайте на» без адреса —
+    это не текст, а огрызок. Предложение с собственным смыслом сохраняем,
+    убрав ссылку и подводку к ней.
+    """
+    if not text or not _POST_URL_RE.search(str(text)):
+        return text or ''
+    out = []
+    for sentence in re.split(r'(?<=[.!?…])\s+', str(text)):
+        if not _POST_URL_RE.search(sentence):
+            out.append(sentence)
+            continue
+        cleaned = _POST_URL_RE.sub('\u0001', sentence)
+        head, _, tail = cleaned.partition('\u0001')
+        head = _LEADIN_BEFORE_RE.sub('', head)
+        tail = tail.replace('\u0001', ' ')
+        merged = f'{head.strip()} {tail.strip()}'.strip()
+        merged = re.sub(r'\s+([.,;:!?…])', r'\1', merged)
+        merged = re.sub(r'\s{2,}', ' ', merged).strip(' ,;:—–-')
+        if not merged or _sentence_is_empty_without_link(merged):
+            continue
+        if merged and merged[0].islower():
+            merged = merged[0].upper() + merged[1:]
+        if not merged.endswith(('.', '!', '?', '…')):
+            merged += '.'
+        out.append(merged)
+    return ' '.join(x.strip() for x in out if x.strip()).strip()
+
+
 def _extract_first_sentence(text: str, max_len: int = 300) -> str:
     """Извлекает первое предложение из текста.
     Обрезает на границе предложения (. ! ?). Если предложение слишком длинное —
@@ -9184,7 +9267,34 @@ def _extract_sentences(text: str, max_sentences: int = 3, max_len: int = 700) ->
     result = re.sub(r'\s*,\s*(?:…|\.{2,3})\s*$', '', result)
     result = re.sub(r'\s*\([^)]{0,6}$', '', result)
     result = re.sub(r'[\s,;:—–-]+$', '', result)
-    return result.strip()
+    return _drop_unfinished_tail(result.strip())
+
+
+def _drop_unfinished_tail(text: str) -> str:
+    """Отрезает незаконченный хвост, оставляя только целые предложения.
+
+    RSS-описания часто обрываются на полуслове, и граница предложения в них
+    просто не встречается. Тогда в пост уходило что-то вроде «…снят человеком,
+    чьё имя действительно очень длинное и» — читателю от такого хвоста нет
+    никакой пользы, а пост выглядит сломанным.
+
+    Лучше короче, но целиком: если целого предложения не осталось вовсе,
+    отдаём пустоту, и пост живёт одним заголовком — он самодостаточен.
+    """
+    text = (text or '').strip()
+    if not text:
+        return ''
+    if text.endswith(('.', '!', '?', '…', '。', '！', '？')):
+        return text
+    # Ищем последнюю настоящую границу предложения и обрезаем по ней.
+    bounds = list(re.finditer(r'(?<!\s\d)[.!?](?=\s|$)|[。！？]', text))
+    if bounds:
+        return text[:bounds[-1].end()].strip()
+    # Целого предложения нет. Обрывок на союзе или предлоге — это мусор:
+    # такой хвост не сообщает ничего и только портит вид поста.
+    if _TRAILING_CONNECTOR_RE.search(text):
+        return ''
+    return text
 
 
 def _format_post_date(published_struct) -> str:
@@ -9224,7 +9334,8 @@ def format_news_short(news: dict) -> str:
     # Текст от языковой модели (если она включена и ответила адекватно)
     llm_text = news.get('_llm_text')
     if llm_text:
-        return _apply_editorial_rules(_with_tags(llm_text, news), news)
+        # Модель пересказывает статью и иногда переносит из неё адрес.
+        return _apply_editorial_rules(_with_tags(_strip_links(llm_text), news), news)
     is_ru = news.get('lang') == 'ru'
 
     # Эпизоды форматируем отдельно (они и так короткие); парсер английский
@@ -9234,7 +9345,7 @@ def format_news_short(news: dict) -> str:
             return _apply_editorial_rules(format_episode_post(ep, news.get('published_parsed')), news)
 
     # Заголовок
-    raw_title = news['title']
+    raw_title = _strip_links(news['title'])
     ru_title = (raw_title if is_ru else translate_text(raw_title)).rstrip('.')
     # Санити-чек: если перевод «съел» заголовок до огрызка («Netflix.») —
     # лучше показать оригинал целиком, чем обрывок.
@@ -9247,7 +9358,7 @@ def format_news_short(news: dict) -> str:
         ru_title += '.'
 
     # До трёх предложений из описания (более полный текст, влезает в caption 1024)
-    summary = news.get('summary') or ''
+    summary = _strip_links(news.get('summary') or '')
     ru_summary = ''
     if summary:
         compact = str(news.get('_format_variant') or '') == 'compact'
@@ -9257,7 +9368,8 @@ def format_news_short(news: dict) -> str:
         excerpt = _extract_sentences(summary, max_sentences=max_sentences, max_len=source_max)
         if excerpt:
             ru_summary = excerpt if is_ru else translate_text(excerpt, input_limit=1200)
-            ru_summary = _extract_sentences(ru_summary, max_sentences=max_sentences, max_len=translated_max)
+            ru_summary = _extract_sentences(_strip_links(ru_summary),
+                                            max_sentences=max_sentences, max_len=translated_max)
 
     # Если предложение дублирует заголовок — не показываем
     if ru_summary and ru_title.rstrip('.').lower() in ru_summary.lower():
@@ -9352,11 +9464,27 @@ async def _prepare_video_file(news: dict) -> Optional[Path]:
     return path
 
 
-def _add_video_link_to_text(text: str, video_url: str) -> str:
+def _is_channel_target(target) -> bool:
+    """Пост идёт подписчикам канала, а не модераторам в ветку."""
+    try:
+        return str(target) == str(CHANNEL_ID)
+    except Exception:
+        return False
+
+
+def _add_video_link_to_text(text: str, video_url: str, target=None) -> str:
     """Добавляет ссылку на видео в текст поста (когда не встраиваем его).
-    Для cdn-telegram/telesco ссылку НЕ добавляем: она гигантская, нечитаемая
-    и быстро протухает — читателю бесполезна."""
+
+    В канал ссылку не добавляем никогда: подписчику нужен готовый пост, а не
+    адрес, по которому надо идти. В ветку — добавляем: там сидят модераторы,
+    и для них это способ проверить ролик до публикации.
+
+    Для cdn-telegram/telesco ссылку не добавляем нигде: она гигантская,
+    нечитаемая и быстро протухает.
+    """
     if _download_needed_host(video_url):
+        return text
+    if _is_channel_target(target):
         return text
     return f'{text}\n\n🎬 Смотреть: {video_url}'
 
@@ -9399,7 +9527,7 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
         video_file is not None or video_media is not None
     )
     if video_url and not has_inline_video:
-        text = _add_video_link_to_text(text, video_url)
+        text = _add_video_link_to_text(text, video_url, target)
 
     # Считаем превью один раз и заранее, в потоке: ниже оно нужно в трёх
     # разных ветках отправки, а генерация — это ffprobe + ffmpeg.
@@ -9475,7 +9603,7 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
                     return False
                 logger.warning(f"Видео не отправилось ({e}), шлю текстом")
                 # fallback на текст
-                fallback_text = _add_video_link_to_text(text, video_url) if video_url else text
+                fallback_text = _add_video_link_to_text(text, video_url, target) if video_url else text
                 try:
                     await bot.send_message(
                         chat_id=target,
