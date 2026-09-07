@@ -4,12 +4,12 @@
   "base_archive": "anime news bot autosend repaired.zip",
   "base_archive_sha256": "961b270d3325cddfae4b276a6d35c8e85d223fa0bfb5db2f8c5ec49be4d00108",
   "python_target": "3.11",
-  "git_commit": "d437b41a1ab1fd2b705e79d087c64837b6f8fd82",
-  "generated_at_utc": "2026-09-07T05:57:09.709607+00:00",
+  "git_commit": "d21f04dd1df6a24919c5c4bffc4b51cee298366f",
+  "generated_at_utc": "2026-09-07T07:59:05.464531+00:00",
   "files": {
     ".env.example": {
-      "sha256": "e1f067b8a676a7d6c3b701b3b88981b925b63314aa8f817b4a7c4accbd5f3b8b",
-      "bytes": 8879
+      "sha256": "d354db5ca65d5cc6020c46d60b9a533037c0933d3ca40973455f3fdf844cdcba",
+      "bytes": 11247
     },
     ".github/workflows/ci.yml": {
       "sha256": "1150bb30676a5f83023e2468a526708140445c0055bb3f1b86fde15310553380",
@@ -28,8 +28,8 @@
       "bytes": 2989
     },
     "anime_news_bot.py": {
-      "sha256": "673711da1926933d9802b6db946e60ce0caf83856437930a12381cfac4a931fd",
-      "bytes": 1260233
+      "sha256": "414e134bfa84b2bca09a0bcbd7de4b4bcb2bf54a9e61e54d2b7bd1fe5e9f5e5c",
+      "bytes": 1264070
     },
     "pytest.ini": {
       "sha256": "e28a989e765f6f1fc37e02fb00a351f56391f749cafcd3f93057abbfb17ba26b",
@@ -102,6 +102,10 @@
     "tests/test_article_fetch.py": {
       "sha256": "fc560f7ab6768f2ea18d9138b507f6b25e03f8aa1788688355def3ef03579cf2",
       "bytes": 4077
+    },
+    "tests/test_audit_findings.py": {
+      "sha256": "bec45e7f784624fb2983d9bb4db8aa6782a3eff42f68b49aa2d8eeca7ad50cb9",
+      "bytes": 9974
     },
     "tests/test_auto_persistence_regression.py": {
       "sha256": "b260cb2f12231a3ee1092cdc2594f0c274586728644cd5dffd92352913d39710",
@@ -380,8 +384,8 @@
       "bytes": 4744
     },
     "tools/check_invariants.py": {
-      "sha256": "a55d6a0f0c6e3ce869f22c8421efb46de6ebeddd702a02497a9cad7186c80386",
-      "bytes": 29686
+      "sha256": "209f67472fab13f11df10bd08810201deb2fac87b9d29ac0d7163f0d20b5a711",
+      "bytes": 31038
     }
   }
 }

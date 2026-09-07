@@ -497,6 +497,29 @@ def _check_bot_never_bans_on_its_own(tree) -> tuple[bool, str]:
     return True, f'единственный бан — по кнопке в {name}'
 
 
+def _check_every_store_has_a_lock(tree) -> tuple[bool, str]:
+    """Хранилище с ``_data`` и ``_save`` обязано иметь замок.
+
+    Прежняя проверка смотрела только на тех, кого зовут через
+    ``asyncio.to_thread``, и пропустила AdaptivePublishingStore: пишет в него
+    event loop, а читает поток дашборда — встреча двух потоков на общих данных
+    без всякой защиты. Правило «есть данные и запись на диск — есть замок»
+    проще и не зависит от того, откуда именно придёт второй поток.
+    """
+    missing = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        body = ast.unparse(node)
+        if 'self._data' not in body or 'def _save' not in body:
+            continue
+        if 'self._lock' not in body:
+            missing.append(node.name)
+    if missing:
+        return False, f'хранилища без замка: {", ".join(sorted(missing))}'
+    return True, 'у всех хранилищ с диском есть замок'
+
+
 def checks(bot, tree) -> list[tuple[str, bool, str]]:
     """Полный список инвариантов. Порядок стабилен: на него смотрит pytest."""
     rows: list[tuple[str, bool, str]] = []
@@ -527,6 +550,7 @@ def checks(bot, tree) -> list[tuple[str, bool, str]]:
     add('кеш картинок ограничен по объёму', _check_image_cache_is_capped_in_bytes(bot))
     add('потоковые хранилища под блокировкой', _check_threaded_stores_are_locked(tree))
     add('бан только по кнопке человека', _check_bot_never_bans_on_its_own(tree))
+    add('у всех хранилищ есть замок', _check_every_store_has_a_lock(tree))
     add('манифест описывает существующие файлы', _check_manifest_describes_reality())
     return rows
 
