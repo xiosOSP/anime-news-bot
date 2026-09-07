@@ -17853,11 +17853,19 @@ def _llm_fatal_reason(status: int, body: str) -> Optional[dict]:
     return None
 
 
-def _llm_extra_params() -> dict:
+# Провайдеры, которые не приняли дополнительные параметры. LLM_EXTRA_PARAMS
+# одна на всех, а провайдеров теперь трое: параметр вроде reasoning_effort
+# нужен одному и ломает запрос у другого. Кто не принял — тому больше не шлём.
+_llm_extra_ok: dict = {}
+
+
+def _llm_extra_params(slot: str = '') -> dict:
     """Необязательные параметры запроса из LLM_EXTRA_PARAMS (JSON-строка).
     Нужны для моделей с режимом рассуждений: например
     LLM_EXTRA_PARAMS={"reasoning_effort":"none"} у Mistral Small 4 —
     иначе модель тратит лимит токенов на размышления, и JSON не долетает."""
+    if slot and _llm_extra_ok.get(slot) is False:
+        return {}
     raw = _env('LLM_EXTRA_PARAMS', '').strip()
     if not raw:
         return {}
@@ -18312,12 +18320,14 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
     # Без этого маршрут вычислялся, но запрос всё равно уходил к основному —
     # то есть дешёвая модель не использовалась вовсе.
     base_url, api_key, model = route_config or _llm_current()
+    slot = 'fast' if route_config is not None else (
+        _llm_candidate[0] if _llm_candidate else _llm_primary_slot())
     payload = {
         'model': model,
         'messages': messages,
         'temperature': 0.2,           # факты важнее фантазии
         'max_tokens': max_tokens,
-        **_llm_extra_params(),
+        **_llm_extra_params(slot),
     }
     # Строгий JSON поддерживают Mistral, Groq, OpenAI и большинство совместимых.
     # Если провайдер параметр не понял — снимаем его и дальше работаем без него.
@@ -18429,6 +18439,17 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
         # Скорее всего провайдер не знает response_format — пробуем без него
         _llm_json_mode = False
         logger.info("LLM: провайдер не принял строгий JSON — повторяю без него")
+        return _llm_request(messages, max_tokens, route_config=route_config)
+    if (r.status_code in (400, 422) and _llm_extra_params(slot)
+            and _llm_extra_ok.get(slot) is not False):
+        # Вторая частая причина 400 — LLM_EXTRA_PARAMS. Переменная одна на
+        # всех провайдеров, а нужна обычно одному: reasoning_effort понимает
+        # Mistral, а чужой роутер на него отвечает отказом. Раньше повтор
+        # снимал только строгий JSON, и такой отказ выглядел неустранимым.
+        _llm_extra_ok[slot] = False
+        _remember_provider_error(r.status_code, r.text)
+        logger.info('LLM: %s не принял LLM_EXTRA_PARAMS — повторяю без них', slot)
+        metrics.inc('anime_bot_llm_extra_params_dropped_total', labels={'slot': str(slot)})
         return _llm_request(messages, max_tokens, route_config=route_config)
     if r.status_code != 200:
         _llm_fail_streak += 1
@@ -19282,6 +19303,15 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
     used = settings.llm_calls_today if settings.llm_day == _local_now().strftime('%Y-%m-%d') else 0
     slot = _llm_primary_slot()
     lines.append(f'Провайдер: {html.escape(LLM_PROVIDER or "свой адрес")}')
+    # LLM_PROVIDER даёт только значения по умолчанию. Если адрес задан руками и
+    # ведёт к другому сервису, надпись начинает врать: в отчёте один провайдер,
+    # запросы уходят другому, и разбирать поломку становится не по чему.
+    preset_url = (LLM_PRESETS.get(LLM_PROVIDER) or ('', ''))[0]
+    actual_url = _llm_slot_env('primary')[0]
+    if preset_url and actual_url and preset_url.rstrip('/') != actual_url.rstrip('/'):
+        lines.append(f'  ⚠️ но запросы идут на <code>{html.escape(actual_url)}</code> — '
+                     f'это не {html.escape(LLM_PROVIDER)}. Имя провайдера стоит '
+                     'привести в соответствие, иначе отчёты вводят в заблуждение.')
     _, _, current_model = _llm_current()
     lines.append(f'Модель: <code>{html.escape(current_model)}</code>')
     # Роль провайдера теперь выбирается в настройках, а не только переменными.
