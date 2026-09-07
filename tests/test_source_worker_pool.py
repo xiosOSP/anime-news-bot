@@ -8,6 +8,7 @@
 """
 import asyncio
 import threading
+import time
 
 import pytest
 
@@ -38,6 +39,14 @@ def hung():
     stop = threading.Event()
     yield lambda: stop.wait(30), stop
     stop.set()
+    # Ждём, пока поток действительно отпустит слот в пуле. Раньше teardown
+    # только выставлял флаг и уходил: следующий тест мог начаться, пока
+    # прошлый сбор ещё числится активным, и получал «пул занят» вместо
+    # ожидаемого таймаута. Падало это редко и только в общем прогоне — то
+    # есть ровно там, где разбираться труднее всего.
+    deadline = time.monotonic() + 5
+    while bot._source_worker_active and time.monotonic() < deadline:
+        time.sleep(0.02)
 
 
 class TestHungSourceCannotStarveThePool:
