@@ -666,3 +666,76 @@ def test_belittling_phrases_reach_the_model(text):
 def test_ordinary_disagreement_is_not_routed(text):
     """Спор и несогласие не должны даже доходить до модели: это норма чата."""
     assert bot._mod_local_check(-1, 1, text) is None, text
+
+
+# ---------- локальный слой умеет решать сам ----------
+
+@pytest.mark.parametrize('text', [
+    'Муратик пидорасик',
+    'ты пидорас',
+    'нигер',
+    'понаехали хачи',
+])
+def test_hard_slur_is_decided_without_the_model(text):
+    """Ждать модель, которой сегодня нет, значит не поймать ничего.
+
+    Правила чата не делают для оскорбления группы исключений ни по
+    адресности, ни по контексту — значит и спрашивать модель не о чем.
+    """
+    verdict = bot._mod_local_check(-1, 1, text)
+    assert verdict == {'category': 'hate', 'confident': True}, text
+
+
+@pytest.mark.parametrize('text', [
+    'пид0р',                 # цифра вместо буквы
+    'пидoрас',               # латинская o
+    'п и д о р',             # разбито пробелами
+    'п.и.д.о.р',             # разбито точками
+    'пииидор',               # растянутые буквы
+])
+def test_obfuscated_slur_is_still_caught(text):
+    """Подмена одной буквы ломала весь поиск — слово проходило насквозь."""
+    assert bot._mod_hard_slur(text) == 'hate', text
+
+
+@pytest.mark.parametrize('text', [
+    'он написал «пидорас», забаньте его',
+    'мне тут пишут пидор, что делать',
+    'она назвала его пидором в лс',
+])
+def test_quoting_a_slur_is_not_decided_locally(text):
+    """Наказать за пересказ — значит наказать того, кто пришёл жаловаться.
+
+    Локальный слой такие случаи не решает: сомнение уходит модели, как раньше.
+    """
+    assert bot._mod_hard_slur(text) == '', text
+
+
+@pytest.mark.parametrize('text', [
+    'у брата синдром Дауна',
+    'он аутист, это диагноз',
+    'ты дебил',
+])
+def test_medical_and_soft_words_still_go_to_the_model(text):
+    """«Даун» живёт в «синдроме Дауна»: локально такое решать нельзя."""
+    verdict = bot._mod_local_check(-1, 1, text)
+    assert verdict is None or verdict.get('confident') is False, text
+
+
+@pytest.mark.parametrize('text', [
+    'спид оратор выступает',
+    'отличный тайтл, всем советую',
+    'координация в команде хромает',
+])
+def test_ordinary_text_is_not_touched(text):
+    """Склейка разделителей не должна порождать совпадения на пустом месте."""
+    assert bot._mod_local_check(-1, 1, text) is None, text
+
+
+def test_deobfuscation_does_not_glue_everything():
+    """«спид оратор» → «спидоратор» содержит «пидор» — так делать нельзя.
+
+    Склеиваем только там, где видно нарочное разбиение слова.
+    """
+    assert 'спидоратор' not in bot._mod_variants('спид оратор')
+    assert 'пидор' in bot._mod_variants('п и д о р')

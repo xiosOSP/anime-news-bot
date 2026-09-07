@@ -172,3 +172,44 @@ def test_moderation_ui_never_names_a_command_that_does_not_exist():
     assert mentioned, 'тексты модерации перестали ссылаться на команды — проверка ослепла'
     unknown = sorted(mentioned - registered)
     assert not unknown, f'в текстах модерации названы несуществующие команды: {unknown}'
+
+
+# ---------- сброс статистики после проверок ----------
+
+@pytest.mark.asyncio
+async def test_reset_clears_counters_but_keeps_warnings(_mod):
+    """Тестовый прогон не должен оставаться в статистике навсегда.
+
+    Пара нарочно сделанных ошибок давала «100% неверных», и экран включения
+    наказаний честно, но бессмысленно отговаривал от них до конца жизни бота.
+    Предупреждения при этом трогать нельзя: они про людей, а не про то, как
+    бот себя показал.
+    """
+    _mod.record_decision('warn', 'toxic')
+    _mod.record_decision('mute', 'hate')
+    _mod.add_warn(-100, 5, 'toxic', 'проверка')
+    assert _mod.stats()
+
+    await _press('mods:reset')
+    assert _mod.stats(), 'сброс без подтверждения'
+
+    await _press('mods:reset_yes')
+    assert _mod.stats() == {}
+    assert _mod.warn_count(-100, 5) == 1, 'предупреждение участника пропало'
+
+
+@pytest.mark.asyncio
+async def test_reset_also_clears_the_decision_log(_mod):
+    """Журнал — часть той же картины: старые тестовые решения только мешают."""
+    _mod.log_decision(-100, 5, 'Тестер', 'toxic', 'warn', 'модель', 'проверка', 'текст')
+    assert _mod.recent_log(10)
+    await _press('mods:reset')
+    await _press('mods:reset_yes')
+    assert _mod.recent_log(10) == []
+
+
+@pytest.mark.asyncio
+async def test_failed_reset_does_not_report_success(_mod, monkeypatch):
+    monkeypatch.setattr(_mod, 'reset_stats', lambda: False)
+    query = await _press('mods:reset_yes')
+    assert query.answer.await_args.kwargs.get('show_alert') is True

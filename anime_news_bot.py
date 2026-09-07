@@ -1568,6 +1568,36 @@ def _mod_normalize(text: str) -> str:
     return re.sub(r'\s+', ' ', str(text or '')).strip().lower()
 
 
+# Латиница, которой подменяют кириллицу, и цифры вместо букв. Подмена одной
+# буквы ломала весь поиск: «пид0р» и «пидoр» с латинской o проходили насквозь.
+_MOD_HOMOGLYPHS = str.maketrans({
+    'a': 'а', 'b': 'в', 'c': 'с', 'e': 'е', 'h': 'н', 'k': 'к', 'm': 'м',
+    'o': 'о', 'p': 'р', 't': 'т', 'x': 'х', 'y': 'у',
+    '0': 'о', '3': 'е', '4': 'ч', '6': 'б', '1': 'и', '@': 'а', '$': 'ѕ',
+})
+# Признак того, что слово РАЗБИВАЛИ нарочно: буквы через разделители подряд.
+# Проверять по такому признаку важно — если склеивать всё подряд, «спид оратор»
+# превращается в «спидоратор» и ловится как оскорбление.
+_MOD_SPACED_OUT_RE = re.compile(r'(?:\w[\s.\-_*|]){3,}\w')
+
+
+def _mod_variants(text: str) -> tuple:
+    """Варианты написания, по которым ищем запрещённые слова.
+
+    Первый — обычный: подменённые буквы возвращены на место, растянутые
+    повторы сжаты («пииидор» → «пидор»). Второй — со склеенными разделителями,
+    и он добавляется ТОЛЬКО если в тексте видно нарочное разбиение. Иначе
+    склейка сама порождает совпадения там, где их нет.
+    """
+    base = _mod_normalize(text)
+    folded = base.translate(_MOD_HOMOGLYPHS)
+    folded = re.sub(r'(.)\1{2,}', r'\1', folded)
+    variants = [base, folded]
+    if _MOD_SPACED_OUT_RE.search(folded):
+        variants.append(re.sub(r'[\s.\-_*|]+', '', folded))
+    return tuple(dict.fromkeys(v for v in variants if v))
+
+
 def _mod_message_text(message) -> str:
     """Текст сообщения либо подстановка для медиа.
 
@@ -1638,6 +1668,46 @@ def _mod_note_message(chat_id: int, user_id: int, name: str, text: str,
 # подстрока нужна из-за склонений, здесь же она вредна: «наци» сидит внутри
 # «координации» и «вакцинации», и каждое такое слово впустую тратило бы
 # дневной бюджет модели.
+# Слова, по которым локальный слой выносит решение САМ, без модели.
+# Список нарочно узкий: сюда попадает только то, что оскорбляет группу людей
+# в любом контексте. Правила чата это уже говорят прямо — «оскорбление группы
+# — нарушение всегда, даже брошенное в пустоту», — значит и спрашивать модель
+# не о чем. А спрашивать её стало не у кого: бесплатные провайдеры молчат
+# сутками, и локальный слой, умеющий только звать модель, в такие дни не
+# ловит ничего.
+#
+# Медицинских и спорных слов здесь нет намеренно: «даун» живёт в «синдроме
+# Дауна», «аутист» — в разговоре о диагнозе. Их по-прежнему судит модель.
+_MOD_HARD_SLURS = (
+    'пидор', 'пидар', 'пидр', 'педик', 'пидорас', 'пидараc',
+    'нигер', 'ниггер', 'нигга', 'жид', 'хач', 'чурк', 'узкоглаз',
+    'faggot', 'nigger', 'tranny',
+)
+# Пересказ и жалоба — не нарушение: наказать за них значит наказать того, кто
+# пришёл жаловаться. Правила это уже оговаривают для модели; локальному слою
+# нужен свой признак, иначе он накажет там, где модель бы оправдала.
+_MOD_QUOTING_RE = re.compile(
+    r'написа[лн]|сказа[лн]|пишет|обозва|назва[лн]|жалоб|пожалуй|'
+    r'забань|забаньте|удалит[еь]|скрин|цитат|он мне|она мне|мне тут|'
+    r'[«"\u201c].{0,40}[»"\u201d]',
+    re.IGNORECASE)
+
+
+def _mod_hard_slur(text: str) -> str:
+    """Однозначное оскорбление группы, если оно есть. Иначе пусто.
+
+    Пересказ («он написал “…”, забаньте его») пропускаем: это жалоба, и
+    наказывать за неё нельзя. Сомнение здесь решается в пользу человека —
+    сообщение просто уйдёт модели, как раньше.
+    """
+    variants = _mod_variants(text)
+    if not any(stem in v for v in variants for stem in _MOD_HARD_SLURS):
+        return ''
+    if _MOD_QUOTING_RE.search(str(text or '')):
+        return ''
+    return 'hate'
+
+
 _MOD_IDENTITY_RE = re.compile(
     r'\b(?:'
     r'евре|жид|мусульман|ислам|христиан|православн|католик|буддист|иуде|'
@@ -1714,7 +1784,17 @@ def _mod_local_check(chat_id: int, user_id: int, text: str) -> Optional[dict]:
 
     # Подстрокой, а не по словам: русский язык склоняет, и «хуесосы» не совпало
     # бы ни с одним словом из списка при точном сравнении.
-    if any(stem in normalized for stem in _MOD_SUSPECT_STEMS):
+    # Однозначное оскорбление группы решаем здесь же: правила чата не делают
+    # для него исключений ни по адресности, ни по контексту, а ждать модель,
+    # которой сегодня нет, значит не поймать ничего.
+    slur = _mod_hard_slur(text)
+    if slur:
+        return {'category': slur, 'confident': True}
+
+    # Подмену букв ищем и в развёрнутых вариантах: «пид0р» и «п и д о р»
+    # раньше проходили насквозь мимо всего списка.
+    if any(stem in variant for variant in _mod_variants(text)
+           for stem in _MOD_SUSPECT_STEMS):
         return {'category': '', 'confident': False}
     if _MOD_IDENTITY_RE.search(normalized):
         # Только показать модели. Решать за неё нельзя: обсуждать религию,
@@ -1933,6 +2013,20 @@ class ChatModerationStore:
     def stats(self) -> dict:
         with self._lock:
             return copy.deepcopy(self._data.get('stats') or {})
+
+    def reset_stats(self) -> bool:
+        """Обнуляет счётчики решений, не трогая предупреждения участников.
+
+        Тестовый прогон навсегда оставался в статистике: пара нарочно
+        сделанных ошибок давала «100% неверных», и экран включения наказаний
+        честно, но бессмысленно отговаривал от них до конца жизни бота.
+        Предупреждения при этом не трогаем — они про людей, а не про то, как
+        бот себя показал.
+        """
+        with self._lock:
+            self._data['stats'] = {}
+            self._data['log'] = []
+        return self._save()
 
     def history(self, chat_id, user_id) -> list[dict]:
         with self._lock:
@@ -14718,6 +14812,7 @@ def _menu_moderation() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(label, callback_data='mods:mode')],
         [InlineKeyboardButton('📊 Статистика', callback_data='mods:stats'),
          InlineKeyboardButton('🧾 Решения', callback_data='mods:log')],
+        [InlineKeyboardButton('🧹 Забыть тестовые решения', callback_data='mods:reset')],
         [InlineKeyboardButton('⬅️ Назад', callback_data='settings:back')],
     ]
     return InlineKeyboardMarkup(rows)
@@ -19506,6 +19601,20 @@ async def moderation_settings_callback(update: Update, context: ContextTypes.DEF
         await _safe_edit(query, text, _menu_moderation())
         return
 
+    if action == 'reset':
+        await query.answer()
+        await _safe_edit(query, _moderation_reset_text(), _menu_moderation_reset())
+        return
+
+    if action == 'reset_yes':
+        if not chat_moderation.reset_stats():
+            await query.answer('Не удалось записать настройку', show_alert=True)
+            return
+        _audit_update(update, 'moderation_stats_reset')
+        await query.answer('Счётчики обнулены')
+        await _safe_edit(query, _moderation_stats_text(), _menu_moderation())
+        return
+
     if action == 'mode':
         if chat_moderation.mode == 'active':
             # Выключение наказаний — безопасная сторона: делаем сразу.
@@ -19530,6 +19639,29 @@ async def moderation_settings_callback(update: Update, context: ContextTypes.DEF
         await _safe_edit(query, _moderation_mode_text(), _menu_moderation())
         return
     await query.answer()
+
+
+def _menu_moderation_reset() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('🧹 Да, обнулить счётчики', callback_data='mods:reset_yes')],
+        [InlineKeyboardButton('⬅️ Отмена', callback_data='settings:sec:moderation')],
+    ])
+
+
+def _moderation_reset_text() -> str:
+    """Экран подтверждения сброса статистики."""
+    stats = chat_moderation.stats() if chat_moderation is not None else {}
+    total = sum(int(v) for v in (stats.get('by_action') or {}).values())
+    overturned = int(stats.get('overturned_total') or 0)
+    return (
+        '🧹 <b>Забыть тестовые решения?</b>\n\n'
+        f'Сейчас в статистике {total} решений, из них отменённых {overturned}.\n\n'
+        'Счётчики и журнал решений обнулятся. Это нужно после проверок: '
+        'нарочно сделанные ошибки остаются в статистике навсегда и потом '
+        'честно, но бессмысленно отговаривают включать наказания.\n\n'
+        'Предупреждения участников останутся: они про людей, а не про то, '
+        'как бот себя показал. Снять их отдельно — /unwarn ответом на '
+        'сообщение.')
 
 
 def _moderation_mode_text() -> str:
@@ -22519,8 +22651,16 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
     if not local.get('confident'):
         verdict = await _moderation_classify(chat.id, text)
         if verdict is None:
-            # Модель недоступна — молчим. Наказывать по догадке нельзя.
+            # Модель недоступна — наказывать по догадке нельзя. Но и молчать
+            # нельзя: раньше такие сообщения исчезали бесследно, и в дни, когда
+            # бесплатные провайдеры лежат сутками, чат оставался без присмотра
+            # незаметно для админа. Пишем в журнал — человек разберётся сам.
             metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'no_llm'})
+            chat_moderation.log_decision(
+                chat.id, user_id, getattr(user, 'full_name', ''),
+                str(local.get('category') or 'подозрительно'),
+                'не проверено', 'модель недоступна',
+                _llm_last_failure_text()[:200], text)
             return
         if not verdict.get('violation'):
             return
