@@ -181,10 +181,24 @@ class TestQuota:
             assert asyncio.run(llm._llm_enrich(dict(NEWS))) == 'off'
 
     def test_counter_increments(self, llm):
+        """Две разные новости — два вызова: счётчик считает именно обращения."""
+        second = dict(NEWS, title='Another headline', summary='Another body.')
         with patch.object(llm.requests, 'post', return_value=_reply(OK_ANSWER)):
             asyncio.run(llm._llm_enrich(dict(NEWS)))
-            asyncio.run(llm._llm_enrich(dict(NEWS)))
+            asyncio.run(llm._llm_enrich(second))
         assert llm.settings.llm_calls_today == 2
+
+    def test_same_news_twice_costs_one_call(self, llm):
+        """Без кеша повторная подготовка того же поста жгла бы второй вызов.
+
+        Тот же материал приходит с зеркал ленты и возвращается в очередь после
+        ошибки отправки. На бесплатных пулах такие повторы и съедали лимит.
+        """
+        with patch.object(llm.requests, 'post', return_value=_reply(OK_ANSWER)):
+            first = asyncio.run(llm._llm_enrich(dict(NEWS)))
+            second = asyncio.run(llm._llm_enrich(dict(NEWS)))
+        assert (first, second) == ('ok', 'ok')
+        assert llm.settings.llm_calls_today == 1
 
     def test_counter_resets_next_day(self, llm):
         llm.settings.llm_day = '2020-01-01'

@@ -1,12 +1,12 @@
 {
   "schema": 1,
   "python_target": "3.11",
-  "git_commit": "075a78f57539e717fb7c51c021423884bcee7eed",
-  "generated_at_utc": "2026-09-07T13:18:38.554216+00:00",
+  "git_commit": "dd0eeae155326b963e8662fa70f8ad77c9761688",
+  "generated_at_utc": "2026-09-07T14:31:03.809233+00:00",
   "files": {
     ".env.example": {
-      "sha256": "853fea7a9d9974b1824dcfe028548b1c9ae14dac191f47bc926589e2bc52d892",
-      "bytes": 11775
+      "sha256": "174a26968659047bf38e822d153cd8be8c16fc75933bcfb059d097a0dc537453",
+      "bytes": 13025
     },
     ".github/workflows/ci.yml": {
       "sha256": "1150bb30676a5f83023e2468a526708140445c0055bb3f1b86fde15310553380",
@@ -21,12 +21,12 @@
       "bytes": 33
     },
     "README.md": {
-      "sha256": "3930c6947795e9d1e757d4f14713e0793d5675aee8175b8c4f921ca51fb4ee28",
-      "bytes": 2989
+      "sha256": "45bb15ae191daf0b0fcae8be7157eaefafd3a13fd30136f794c6e85aee3f854b",
+      "bytes": 3211
     },
     "anime_news_bot.py": {
-      "sha256": "06cb6fb623d0d27f58d7a732c00e87bc7bfb61601edf3680c277df26fbb16aa3",
-      "bytes": 1298233
+      "sha256": "bfc5f97d32c9531895899551bc4cc4cc1543b25d9af5b2dc80ab1669db97f417",
+      "bytes": 1325783
     },
     "pytest.ini": {
       "sha256": "e28a989e765f6f1fc37e02fb00a351f56391f749cafcd3f93057abbfb17ba26b",
@@ -197,8 +197,16 @@
       "bytes": 5242
     },
     "tests/test_llm.py": {
-      "sha256": "1ecb8cba7af163257d82c1beb61ebfeec4f42c675f078f6c3d1a6a6358b12a05",
-      "bytes": 32221
+      "sha256": "371af9c7d1cdf26b59f5d3c6eb638c05a49fe45b8dad21acd9f921f8fd5ad3fd",
+      "bytes": 33204
+    },
+    "tests/test_llm_batching.py": {
+      "sha256": "cb71fd1f36469f8bd673ef3c4a5c25845045715346dd15c75f210a9f1004bb0d",
+      "bytes": 26187
+    },
+    "tests/test_llm_defer.py": {
+      "sha256": "a38a572b82edd9623182b8b97de53e117ff6e8a5d36657e1782789b0f487ca0a",
+      "bytes": 4415
     },
     "tests/test_llm_diagnostics.py": {
       "sha256": "2f4b97ee35880d163ad5b8fe2da654aa4391a87041e77d2995a1f823e9f6cbfc",
@@ -397,8 +405,8 @@
       "bytes": 4744
     },
     "tools/check_invariants.py": {
-      "sha256": "209f67472fab13f11df10bd08810201deb2fac87b9d29ac0d7163f0d20b5a711",
-      "bytes": 31038
+      "sha256": "e3d67eb36e41bb43c5c76a86245a95d2ad73dd81b6ffd9d4ad80eee20bd188cc",
+      "bytes": 34063
     }
   }
 }
