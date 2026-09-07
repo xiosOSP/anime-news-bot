@@ -528,3 +528,57 @@ async def test_failed_model_call_does_not_spend_budget(monkeypatch):
     monkeypatch.setattr(bot, '_llm_call', _silent)
     assert await bot._moderation_classify(-1, 'ты дебил') is None
     assert spent == []
+
+
+# ---------- принижение по признаку без грубых слов ----------
+
+@pytest.mark.parametrize('text', [
+    'все мусульмане фанатики',
+    'евреи опять всё скупили',
+    'от этой нации ничего умного не дождёшься',
+    'цыгане все воруют',
+])
+def test_group_contempt_without_swearing_reaches_the_model(text):
+    """Принижение по признаку не обязано содержать брань.
+
+    Локальный фильтр искал только грубые слова, поэтому вежливо сказанное
+    «все мусульмане — фанатики» до модели не доходило вовсе: разбирать было
+    нечего, и бот молчал.
+    """
+    assert bot._mod_local_check(-1, 1, text) is not None, text
+
+
+@pytest.mark.parametrize('text', [
+    'я мусульманин, у нас в пост так не делают',
+    'в Японии другая культура отношения к труду',
+])
+def test_neutral_mentions_only_ask_the_model(text):
+    """Само по себе упоминание группы — не нарушение.
+
+    Локальный фильтр обязан лишь показать такое сообщение модели, а не решать
+    за неё: иначе разговор о культуре стал бы наказуемым.
+    """
+    verdict = bot._mod_local_check(-1, 1, text)
+    assert verdict is None or verdict.get('confident') is False
+
+
+def test_group_contempt_is_muted_not_just_warned():
+    """У оскорбления группы своя ступень: оно бьёт по всем, кто это читает."""
+    assert bot.MODERATION_RULES['hate']['action'] == 'mute'
+    for severity in (1, 2, 3):
+        assert bot._mod_decide('hate', severity, 0)['action'] == 'mute'
+
+
+@pytest.mark.parametrize('text', [
+    'нужно больше координации в команде',
+    'после вакцинации болела рука',
+    'это лучшая комбинация приёмов',
+    'спасибо за информацию',
+])
+def test_identity_search_does_not_fire_on_ordinary_words(text):
+    """«наци» сидит внутри «координации» — подстрокой такое искать нельзя.
+
+    Каждое ложное срабатывание — это впустую потраченный вызов модели, а
+    дневной бюджет модерации маленький и общий на весь чат.
+    """
+    assert bot._mod_local_check(-1, 1, text) is None, text
