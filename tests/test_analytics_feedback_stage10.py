@@ -129,9 +129,18 @@ def test_feedback_report_respects_requested_window(monkeypatch, tmp_path):
 
 
 def test_publication_hours_use_admin_timezone(monkeypatch, tmp_path):
+    """Час публикации считается в зоне админа, а не в UTC.
+
+    Дата берётся от «сейчас», а не зашита в код: окно у отчёта скользящее, и
+    зашитая дата однажды из него выпадает. Так и случилось — тест сломался
+    ровно в тот день, когда событие стало старше тридцати суток, и выглядело
+    это как поломка кода.
+    """
     store = bot.AnalyticsStore(tmp_path / 'a.json')
+    recent = datetime.now(timezone.utc).replace(
+        hour=12, minute=0, second=0, microsecond=0) - timedelta(days=2)
     store._data['events'] = [{
-        'at': '2026-08-08T12:00:00+00:00', 'kind': 'delivery', 'result': 'sent', 'source': 'A'
+        'at': recent.isoformat(), 'kind': 'delivery', 'result': 'sent', 'source': 'A'
     }]
     monkeypatch.setattr(bot, 'settings', SimpleNamespace(timezone_name='UTC', tz_offset=0))
     rows = dict(store.publication_hours(30))
