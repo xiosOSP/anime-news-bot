@@ -1934,6 +1934,20 @@ class ChatModerationStore:
         with self._lock:
             return copy.deepcopy(self._data.get('stats') or {})
 
+    def reset_stats(self) -> bool:
+        """Обнуляет счётчики решений, не трогая предупреждения участников.
+
+        Тестовый прогон навсегда оставался в статистике: пара нарочно
+        сделанных ошибок давала «100% неверных», и экран включения наказаний
+        честно, но бессмысленно отговаривал от них до конца жизни бота.
+        Предупреждения при этом не трогаем — они про людей, а не про то, как
+        бот себя показал.
+        """
+        with self._lock:
+            self._data['stats'] = {}
+            self._data['log'] = []
+        return self._save()
+
     def history(self, chat_id, user_id) -> list[dict]:
         with self._lock:
             row = (self._data.get('users') or {}).get(self._key(chat_id, user_id)) or {}
@@ -14718,6 +14732,7 @@ def _menu_moderation() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(label, callback_data='mods:mode')],
         [InlineKeyboardButton('📊 Статистика', callback_data='mods:stats'),
          InlineKeyboardButton('🧾 Решения', callback_data='mods:log')],
+        [InlineKeyboardButton('🧹 Забыть тестовые решения', callback_data='mods:reset')],
         [InlineKeyboardButton('⬅️ Назад', callback_data='settings:back')],
     ]
     return InlineKeyboardMarkup(rows)
@@ -19506,6 +19521,20 @@ async def moderation_settings_callback(update: Update, context: ContextTypes.DEF
         await _safe_edit(query, text, _menu_moderation())
         return
 
+    if action == 'reset':
+        await query.answer()
+        await _safe_edit(query, _moderation_reset_text(), _menu_moderation_reset())
+        return
+
+    if action == 'reset_yes':
+        if not chat_moderation.reset_stats():
+            await query.answer('Не удалось записать настройку', show_alert=True)
+            return
+        _audit_update(update, 'moderation_stats_reset')
+        await query.answer('Счётчики обнулены')
+        await _safe_edit(query, _moderation_stats_text(), _menu_moderation())
+        return
+
     if action == 'mode':
         if chat_moderation.mode == 'active':
             # Выключение наказаний — безопасная сторона: делаем сразу.
@@ -19530,6 +19559,29 @@ async def moderation_settings_callback(update: Update, context: ContextTypes.DEF
         await _safe_edit(query, _moderation_mode_text(), _menu_moderation())
         return
     await query.answer()
+
+
+def _menu_moderation_reset() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('🧹 Да, обнулить счётчики', callback_data='mods:reset_yes')],
+        [InlineKeyboardButton('⬅️ Отмена', callback_data='settings:sec:moderation')],
+    ])
+
+
+def _moderation_reset_text() -> str:
+    """Экран подтверждения сброса статистики."""
+    stats = chat_moderation.stats() if chat_moderation is not None else {}
+    total = sum(int(v) for v in (stats.get('by_action') or {}).values())
+    overturned = int(stats.get('overturned_total') or 0)
+    return (
+        '🧹 <b>Забыть тестовые решения?</b>\n\n'
+        f'Сейчас в статистике {total} решений, из них отменённых {overturned}.\n\n'
+        'Счётчики и журнал решений обнулятся. Это нужно после проверок: '
+        'нарочно сделанные ошибки остаются в статистике навсегда и потом '
+        'честно, но бессмысленно отговаривают включать наказания.\n\n'
+        'Предупреждения участников останутся: они про людей, а не про то, '
+        'как бот себя показал. Снять их отдельно — /unwarn ответом на '
+        'сообщение.')
 
 
 def _moderation_mode_text() -> str:
