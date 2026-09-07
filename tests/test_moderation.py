@@ -6,6 +6,8 @@
 """
 from types import SimpleNamespace
 
+import time
+
 import pytest
 import telegram.error as bot_error
 
@@ -528,3 +530,139 @@ async def test_failed_model_call_does_not_spend_budget(monkeypatch):
     monkeypatch.setattr(bot, '_llm_call', _silent)
     assert await bot._moderation_classify(-1, 'ты дебил') is None
     assert spent == []
+
+
+# ---------- принижение по признаку без грубых слов ----------
+
+@pytest.mark.parametrize('text', [
+    'все мусульмане фанатики',
+    'евреи опять всё скупили',
+    'от этой нации ничего умного не дождёшься',
+    'цыгане все воруют',
+])
+def test_group_contempt_without_swearing_reaches_the_model(text):
+    """Принижение по признаку не обязано содержать брань.
+
+    Локальный фильтр искал только грубые слова, поэтому вежливо сказанное
+    «все мусульмане — фанатики» до модели не доходило вовсе: разбирать было
+    нечего, и бот молчал.
+    """
+    assert bot._mod_local_check(-1, 1, text) is not None, text
+
+
+@pytest.mark.parametrize('text', [
+    'я мусульманин, у нас в пост так не делают',
+    'в Японии другая культура отношения к труду',
+])
+def test_neutral_mentions_only_ask_the_model(text):
+    """Само по себе упоминание группы — не нарушение.
+
+    Локальный фильтр обязан лишь показать такое сообщение модели, а не решать
+    за неё: иначе разговор о культуре стал бы наказуемым.
+    """
+    verdict = bot._mod_local_check(-1, 1, text)
+    assert verdict is None or verdict.get('confident') is False
+
+
+def test_group_contempt_is_muted_not_just_warned():
+    """У оскорбления группы своя ступень: оно бьёт по всем, кто это читает."""
+    assert bot.MODERATION_RULES['hate']['action'] == 'mute'
+    for severity in (1, 2, 3):
+        assert bot._mod_decide('hate', severity, 0)['action'] == 'mute'
+
+
+@pytest.mark.parametrize('text', [
+    'нужно больше координации в команде',
+    'после вакцинации болела рука',
+    'это лучшая комбинация приёмов',
+    'спасибо за информацию',
+])
+def test_identity_search_does_not_fire_on_ordinary_words(text):
+    """«наци» сидит внутри «координации» — подстрокой такое искать нельзя.
+
+    Каждое ложное срабатывание — это впустую потраченный вызов модели, а
+    дневной бюджет модерации маленький и общий на весь чат.
+    """
+    assert bot._mod_local_check(-1, 1, text) is None, text
+
+
+# ---------- принижение наказывается по повтору, а не по фразе ----------
+
+@pytest.fixture(autouse=True)
+def _clean_belittling():
+    bot._moderation_belittling.clear()
+    yield
+    bot._moderation_belittling.clear()
+
+
+def test_single_belittling_is_not_punished():
+    """Одна колкость — это спор, а не травля.
+
+    Наказывать за неё значило бы переехать через живое общение: в чате, где
+    «оскорбления только рофл», такие фразы звучат постоянно.
+    """
+    assert bot._mod_decide('belittling', 2, warns=0, streak=1)['action'] == 'none'
+    assert bot._mod_decide('belittling', 3, warns=0, streak=2)['action'] == 'none'
+
+
+def test_repeated_belittling_is_punished():
+    """Разница между спором и травлей — в рисунке, а не во фразе."""
+    decision = bot._mod_decide('belittling', 2, warns=0,
+                               streak=bot.MODERATION_BELITTLING_STREAK)
+    assert decision['action'] == 'warn'
+
+
+def test_streak_counts_per_pair_not_per_chat():
+    """Двое подкалывают друг друга — это не травля одного человека.
+
+    Считать принижения общей кучей на чат значило бы наказывать за оживлённый
+    спор нескольких людей сразу.
+    """
+    for _ in range(bot.MODERATION_BELITTLING_STREAK):
+        streak_a = bot._mod_note_belittling(-100, author_id=1, target_id=2)
+    streak_b = bot._mod_note_belittling(-100, author_id=3, target_id=4)
+    assert streak_a >= bot.MODERATION_BELITTLING_STREAK
+    assert streak_b == 1, 'чужая пара попала в общий счёт'
+
+
+def test_old_marks_do_not_count(monkeypatch):
+    """У ссоры есть срок давности: вчерашняя перепалка не делает травли."""
+    monkeypatch.setattr(bot, 'MODERATION_BELITTLING_WINDOW_SEC', 1)
+    bot._mod_note_belittling(-100, 1, 2)
+    bot._moderation_belittling[(-100, 1, 2)] = [time.time() - 60]
+    assert bot._mod_note_belittling(-100, 1, 2) == 1
+
+
+def test_belittling_never_deletes_the_message_before_the_threshold():
+    """До порога бот не трогает ни человека, ни сообщение."""
+    decision = bot._mod_decide('belittling', 3, warns=0, streak=1)
+    assert decision['action'] == 'none'
+    assert not decision.get('delete')
+
+
+def test_belittling_never_leads_to_a_ban():
+    """Ограничение владельца: бот не банит ни за что и ни при каких повторах."""
+    for streak in range(1, 12):
+        for warns in range(6):
+            assert bot._mod_decide('belittling', 3, warns, streak)['action'] != 'ban'
+
+
+@pytest.mark.parametrize('text', [
+    'твоё мнение в унитаз слили',
+    'ты тут никто чтобы решать',
+    'сиди молчи взрослые разговаривают',
+    'кто ты такой вообще',
+])
+def test_belittling_phrases_reach_the_model(text):
+    """Брани в таких фразах нет — без своего списка они до модели не дойдут."""
+    assert bot._mod_local_check(-1, 1, text) is not None, text
+
+
+@pytest.mark.parametrize('text', [
+    'не согласен, по-моему слабый тайтл',
+    'ты не прав, вот пруф',
+    'мне кажется, второй сезон лучше',
+])
+def test_ordinary_disagreement_is_not_routed(text):
+    """Спор и несогласие не должны даже доходить до модели: это норма чата."""
+    assert bot._mod_local_check(-1, 1, text) is None, text
