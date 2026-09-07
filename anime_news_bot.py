@@ -17814,6 +17814,17 @@ def _llm_current() -> tuple[str, str, str]:
     return _llm_primary_config()
 
 
+def _llm_free_quota_exhausted(body: str) -> bool:
+    """Ответ говорит про исчерпанную бесплатную квоту АККАУНТА, а не модели.
+
+    Разница практическая: «у этой модели нет мощности» лечится соседней
+    моделью на том же ключе, а «бесплатная квота кончилась» — нет, там общий
+    потолок, и соседи упрутся в него же.
+    """
+    text = str(body or '').lower()
+    return 'free_rate_limited' in text or 'free model capacity' in text
+
+
 def _llm_try_failover(reason: str, hint: str = '', retry_after_sec: float = 0.0) -> bool:
     """Переключает на запасного провайдера. True, если переключились.
 
@@ -17850,6 +17861,14 @@ def _llm_try_failover(reason: str, hint: str = '', retry_after_sec: float = 0.0)
         # переключение, и тогда набор остался бы от прошлого круга, а перебор
         # застрял бы, не дойдя ни до кого.
         tried = {current}
+    if _llm_free_quota_exhausted(_llm_last_provider_error):
+        # Лимит бесплатного тарифа общий на аккаунт: соседние модели того же
+        # ключа упрутся в тот же потолок. Перебирать их — значит бить в
+        # исчерпанную квоту ещё несколько раз и только отдалять момент, когда
+        # мы дойдём до живого провайдера.
+        busy_slot = current[0] if current else _llm_primary_slot()
+        tried |= {pair for pair in candidates if pair[0] == busy_slot}
+        metrics.inc('anime_bot_llm_slot_skipped_total', labels={'reason': 'free_quota'})
     nxt_pair = next((pair for pair in candidates if pair not in tried), None)
     if nxt_pair is None:
         return False
@@ -19234,6 +19253,26 @@ def _llm_probe_slot(slot: str, timeout: float = 12.0, model: str = '') -> dict:
             'detail': _redact_secrets(' '.join((r.text or '').split()))[:200]}
 
 
+def _llm_shared_free_limit(results: list) -> str:
+    """Провайдер, у которого лимит общий на все бесплатные модели.
+
+    Отличается по коду ответа: free_rate_limited говорит не «эта модель
+    занята», а «бесплатная квота аккаунта исчерпана». Разница практическая —
+    в первом случае помогает соседняя модель, во втором нет.
+    """
+    by_slot: dict = {}
+    for row in results:
+        if row.get('status') != 429:
+            continue
+        detail = str(row.get('detail') or '').lower()
+        if 'free_rate_limited' in detail or 'free model capacity' in detail:
+            by_slot[row.get('slot')] = by_slot.get(row.get('slot'), 0) + 1
+    for slot, count in by_slot.items():
+        if count > 1:
+            return LLM_SLOT_HUMAN.get(slot, str(slot)).split(' (')[0]
+    return ''
+
+
 @admin_only
 async def llmping_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Живая проверка каждого провайдера по отдельности: /llmping.
@@ -19252,9 +19291,28 @@ async def llmping_command(update, context: ContextTypes.DEFAULT_TYPE):
             '<code>LLM_API_KEY</code> — подробности в /llm',
             parse_mode=ParseMode.HTML)
         return
+    only = ' '.join(context.args or []).strip()
+    if only:
+        # Проверить один вариант, не тревожа остальных. Нужно ровно тогда,
+        # когда бьёшься об лимит: лишний запрос в такой момент делает хуже.
+        candidates = [(slot, model) for slot, model in candidates if model == only]
+        if not candidates:
+            await update.message.reply_text(
+                f'Вариант <code>{html.escape(only)}</code> не настроен. '
+                'Без аргумента команда проверит все.', parse_mode=ParseMode.HTML)
+            return
     msg = await update.message.reply_text(f'📡 Проверяю варианты ({len(candidates)})…')
-    results = [await asyncio.to_thread(_llm_probe_slot, slot, 12.0, model)
-               for slot, model in candidates]
+    results = []
+    seen_slots: set = set()
+    for slot, model in candidates:
+        # Пауза между запросами К ОДНОМУ провайдеру. Без неё проба выпускала
+        # три запроса за полторы секунды и сама получала 429 — то есть
+        # диагностика создавала ровно ту поломку, о которой докладывала.
+        # У разных провайдеров лимиты свои, их разделять незачем.
+        if slot in seen_slots:
+            await asyncio.sleep(max(1.0, LLM_MIN_INTERVAL))
+        seen_slots.add(slot)
+        results.append(await asyncio.to_thread(_llm_probe_slot, slot, 12.0, model))
 
     lines = ['📡 <b>Проверка провайдеров</b>', '']
     for row in results:
@@ -19314,8 +19372,23 @@ async def llmping_command(update, context: ContextTypes.DEFAULT_TYPE):
             lines.append('')
             lines.append('Все отказы временные: нет свободной мощности или '
                          'превышен темп запросов. Настройки править не нужно — '
-                         'но пока это так, бот работает без модели. '
-                         'Третий провайдер снял бы такие совпадения.')
+                         'но пока это так, бот работает без модели.')
+            # Лимит бесплатного тарифа считается на аккаунт, а не на модель:
+            # соседние модели того же ключа упираются в тот же потолок. Не
+            # сказать об этом — значит оставить человека менять модели по
+            # кругу в надежде, что какая-то сработает.
+            shared = _llm_shared_free_limit(results)
+            if shared:
+                lines.append('')
+                lines.append(f'⚠️ У провайдера «{html.escape(shared)}» лимит '
+                             'считается на аккаунт, а не на модель: соседние '
+                             'бесплатные модели упираются в тот же потолок. '
+                             'Запасные модели на одном ключе здесь не спасают — '
+                             'помогает только ключ другого сервиса.')
+            if len(results) > 1:
+                lines.append('')
+                lines.append('Проверить один вариант, не тревожа остальных: '
+                             '<code>/llmping имя-модели</code>')
     else:
         alive = ', '.join(LLM_SLOT_HUMAN[r['slot']].split(' (')[0] for r in working)
         current = _llm_primary_slot()
