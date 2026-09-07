@@ -520,6 +520,46 @@ def _check_every_store_has_a_lock(tree) -> tuple[bool, str]:
     return True, 'у всех хранилищ с диском есть замок'
 
 
+def _check_llm_batch_never_mixes_news(bot) -> tuple[bool, str]:
+    """Разбор пачки сопоставляется по id, а не по порядку.
+
+    Пачка существует ради экономии вызовов: бесплатные пулы не дают одного
+    запроса на каждую новость. Но если ответ приложить к новостям по порядку,
+    модель, переставившая элементы местами, выдаст посту чужой заголовок —
+    то есть выдуманную новость. Ошибка при этом молчаливая: пост выглядит
+    нормальным, просто он не о том.
+    """
+    answer = ('{"items":[{"id":3,"title":"третья"},'
+              '{"id":1,"title":"первая"},{"id":2,"title":"вторая"}]}')
+    parsed = bot._llm_parse_batch(answer)
+    if [parsed.get(i, {}).get('title') for i in (1, 2, 3)] != ['первая', 'вторая', 'третья']:
+        return False, f'разбор разъехался с id: {parsed}'
+    # Оборванный по лимиту токенов ответ не должен стоить всей пачки.
+    truncated = '{"items":[{"id":1,"title":"первая"},{"id":2,"title":"вто'
+    salvaged = bot._llm_parse_batch(truncated)
+    if list(salvaged) != [1]:
+        return False, f'из оборванного ответа спасено не то: {salvaged}'
+    # Пустышка не запоминается: иначе кеш навсегда лишил бы новость модели.
+    if bot._llm_batch_usable({}):
+        return False, 'пустой разбор считается пригодным'
+    return True, 'разбор пачки идёт по id и переживает обрыв ответа'
+
+
+def _check_llm_editorial_cache_is_bounded(bot) -> tuple[bool, str]:
+    """Кеш разборов не имеет права расти без предела.
+
+    Бот живёт неделями. Структура, в которую только кладут, однажды съедает
+    память сервера — а это единственное, за что владелец платит.
+    """
+    cache: dict = {}
+    for i in range(bot.LLM_EDITORIAL_CACHE_MAX + 25):
+        bot._bounded_cache_put(cache, f'k{i}', {'at': 0, 'data': {'title': 'x'}},
+                               bot.LLM_EDITORIAL_CACHE_MAX)
+    if len(cache) > bot.LLM_EDITORIAL_CACHE_MAX:
+        return False, f'кеш вырос до {len(cache)} при потолке {bot.LLM_EDITORIAL_CACHE_MAX}'
+    return True, f'кеш разборов ограничен {bot.LLM_EDITORIAL_CACHE_MAX} записями'
+
+
 def checks(bot, tree) -> list[tuple[str, bool, str]]:
     """Полный список инвариантов. Порядок стабилен: на него смотрит pytest."""
     rows: list[tuple[str, bool, str]] = []
@@ -551,6 +591,8 @@ def checks(bot, tree) -> list[tuple[str, bool, str]]:
     add('потоковые хранилища под блокировкой', _check_threaded_stores_are_locked(tree))
     add('бан только по кнопке человека', _check_bot_never_bans_on_its_own(tree))
     add('у всех хранилищ есть замок', _check_every_store_has_a_lock(tree))
+    add('разбор пачки не путает новости', _check_llm_batch_never_mixes_news(bot))
+    add('кеш разборов модели ограничен', _check_llm_editorial_cache_is_bounded(bot))
     add('манифест описывает существующие файлы', _check_manifest_describes_reality())
     return rows
 
