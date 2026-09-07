@@ -1,4 +1,5 @@
 """Общие фикстуры для тестов."""
+import asyncio
 import os
 import sys
 import tempfile
@@ -14,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # доставались другому, и часть падений зависела от порядка файлов. Уводим
 # данные во временную папку ДО импорта: пути считаются один раз при импорте.
 _TEST_DATA_DIR = tempfile.mkdtemp(prefix='anime-bot-tests-')
-os.environ.setdefault('DATA_DIR', _TEST_DATA_DIR)
+os.environ['DATA_DIR'] = _TEST_DATA_DIR
 
 import anime_news_bot as _bot
 
@@ -70,6 +71,11 @@ def _isolate_bot_globals():
     # ломался дедуп по теме: тест в одиночку проходил, в общем прогоне нет.
     contents = {name: value.copy() for name, value in saved.items()
                 if isinstance(value, (dict, list, set))}
+    # A contended asyncio.Lock binds to its event loop. pytest uses a new
+    # loop per test; restoring the original reference cannot unbind it.
+    for name, value in saved.items():
+        if isinstance(value, asyncio.Lock):
+            setattr(_bot, name, asyncio.Lock())
     _wipe_data_dir()
     yield
     _wipe_data_dir()

@@ -4,6 +4,7 @@
 другого. Раньше повтор после 400 снимал только строгий JSON, и такой отказ
 выглядел неустранимым: провайдер жив, ключ верный, а бот его списывал.
 """
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -19,7 +20,8 @@ def _env(monkeypatch, tmp_path):
         ('LLM_MODEL', 'model-one'), ('LLM_MODEL_ALTERNATES', ()),
         ('LLM_FALLBACK_API_KEY', ''), ('LLM_FAST_API_KEY', ''),
         ('_llm_extra_ok', {}), ('_llm_candidate', ()), ('_llm_using_fallback', False),
-        ('_llm_json_mode', False), ('_llm_fail_streak', 0),
+        ('LLM_MIN_INTERVAL', 0), ('_llm_last_call', 0),
+        ('_llm_lock', asyncio.Lock()), ('_llm_json_mode', False), ('_llm_fail_streak', 0),
         ('_llm_disabled_runtime', False), ('_llm_disabled_reason', ''),
         ('settings', bot.BotSettings(tmp_path / 's.json')),
         ('_queue_admin_alert', lambda _m: None),
@@ -50,7 +52,7 @@ def test_provider_that_refused_them_stops_getting_them(_env):
         return _reply(400, 'unknown parameter reasoning_effort') if len(sent) == 1 else _reply(200)
 
     _env.setattr(bot.requests, 'post', post)
-    assert bot._llm_request([{'role': 'user', 'content': 'hi'}], 100) == 'готово'
+    assert asyncio.run(bot._llm_call([{'role': 'user', 'content': 'hi'}], 100)) == 'готово'
     assert len(sent) == 2, 'повтора без лишних параметров не было'
     assert 'reasoning_effort' in sent[0]
     assert 'reasoning_effort' not in sent[1], 'повторили с тем же параметром'
@@ -79,7 +81,7 @@ def test_no_endless_retry_when_params_are_not_the_cause(_env):
         return _reply(400, 'что-то другое')
 
     _env.setattr(bot.requests, 'post', post)
-    assert bot._llm_request([{'role': 'user', 'content': 'hi'}], 100) is None
+    assert asyncio.run(bot._llm_call([{'role': 'user', 'content': 'hi'}], 100)) is None
     assert len(calls) == 2, f'повторов должно быть ровно два, было {len(calls)}'
 
 

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {"id": "identical-trailer", "kind": "cluster", "a": "Dandadan anime releases a new trailer", "b": "Dandadan anime releases a new trailer", "expected_same_story": true},
+    {"id": "separate-series", "kind": "cluster", "a": "Dandadan anime releases a new trailer", "b": "One Piece manga announces final chapter release date", "expected_same_story": false},
+    {"id": "different-seasons", "kind": "cluster", "a": "Blue Lock Season 2 premiere date announced", "b": "Blue Lock Season 3 premiere date announced", "expected_same_story": false},
+    {"id": "case-insensitive", "kind": "cluster", "a": "Witch Hat Atelier Anime Adaptation Gets a Trailer", "b": "witch hat atelier anime adaptation gets a trailer", "expected_same_story": true},
+    {"id": "studio-case", "kind": "glossary", "alias": "mappa", "preferred": "MAPPA", "input": "mappa и Mappa работают над проектом", "expected": "MAPPA и MAPPA работают над проектом"},
+    {"id": "localized-title", "kind": "glossary", "alias": "Attack on Titan", "preferred": "Атака титанов", "input": "Attack on Titan получит новый постер", "expected": "Атака титанов получит новый постер"},
+    {"id": "premiere-update", "kind": "update", "old_title": "Witch Hat Atelier anime adaptation gets a trailer", "old_summary": "The anime adaptation was officially announced by the production committee.", "new_title": "Witch Hat Atelier anime adaptation gets a new trailer", "new_summary": "The new trailer confirms the premiere on October 4 and names the streaming platform.", "expected_update": true},
+    {"id": "plain-repeat", "kind": "update", "old_title": "Dandadan anime releases a new trailer", "old_summary": "A new trailer was released for the anime project.", "new_title": "Dandadan anime releases a new trailer", "new_summary": "A new trailer was released for the anime project.", "expected_update": false}
+  ]
+}

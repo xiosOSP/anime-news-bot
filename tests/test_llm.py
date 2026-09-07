@@ -133,23 +133,23 @@ class TestEnrichment:
 
 
 class TestFailureFallback:
-    """При любой проблеме бот обязан работать как раньше."""
+    """Настроенная модель при отказе откладывает новость на ограниченное число попыток."""
 
     def test_network_error(self, llm):
         news = dict(NEWS)
         with patch.object(llm.requests, 'post', side_effect=OSError('down')):
-            assert asyncio.run(llm._llm_enrich(news)) == 'off'
+            assert asyncio.run(llm._llm_enrich(news)) == 'defer'
         assert '_llm_text' not in news
 
     def test_http_500(self, llm):
         with patch.object(llm.requests, 'post',
                           return_value=MagicMock(status_code=500, text='oops')):
-            assert asyncio.run(llm._llm_enrich(dict(NEWS))) == 'off'
+            assert asyncio.run(llm._llm_enrich(dict(NEWS))) == 'defer'
 
     def test_rate_limit_429(self, llm):
         with patch.object(llm.requests, 'post',
                           return_value=MagicMock(status_code=429, text='slow down')):
-            assert asyncio.run(llm._llm_enrich(dict(NEWS))) == 'off'
+            assert asyncio.run(llm._llm_enrich(dict(NEWS))) == 'defer'
 
     def test_bad_key_disables_and_alerts(self, llm):
         with patch.object(llm.requests, 'post',
@@ -162,13 +162,13 @@ class TestFailureFallback:
         bad = MagicMock(status_code=200, text='',
                         json=lambda: {'choices': [{'message': {'content': 'привет!'}}]})
         with patch.object(llm.requests, 'post', return_value=bad):
-            assert asyncio.run(llm._llm_enrich(dict(NEWS))) == 'off'
+            assert asyncio.run(llm._llm_enrich(dict(NEWS))) == 'defer'
 
     def test_fail_streak_pauses(self, llm, monkeypatch):
         monkeypatch.setattr(anime_news_bot, '_llm_fail_streak',
                             anime_news_bot.LLM_FAIL_PAUSE_AFTER)
         with patch.object(llm.requests, 'post', side_effect=AssertionError('не вызывать')):
-            assert asyncio.run(llm._llm_enrich(dict(NEWS))) == 'off'
+            assert asyncio.run(llm._llm_enrich(dict(NEWS))) == 'defer'
         assert llm._llm_disabled_runtime is True
 
 
@@ -178,7 +178,7 @@ class TestQuota:
         llm.settings.llm_day = llm._local_now().strftime('%Y-%m-%d')
         llm.settings.llm_calls_today = 2
         with patch.object(llm.requests, 'post', side_effect=AssertionError('не вызывать')):
-            assert asyncio.run(llm._llm_enrich(dict(NEWS))) == 'off'
+            assert asyncio.run(llm._llm_enrich(dict(NEWS))) == 'defer'
 
     def test_counter_increments(self, llm):
         """Две разные новости — два вызова: счётчик считает именно обращения."""
