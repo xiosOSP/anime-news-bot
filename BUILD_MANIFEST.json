@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "python_target": "3.11",
-  "git_commit": "dd798cf396f781345137d2c251bb3fb964f72781",
-  "generated_at_utc": "2026-09-07T12:50:56.133149+00:00",
+  "git_commit": "075a78f57539e717fb7c51c021423884bcee7eed",
+  "generated_at_utc": "2026-09-07T13:18:38.554216+00:00",
   "files": {
     ".env.example": {
       "sha256": "853fea7a9d9974b1824dcfe028548b1c9ae14dac191f47bc926589e2bc52d892",
@@ -25,8 +25,8 @@
       "bytes": 2989
     },
     "anime_news_bot.py": {
-      "sha256": "75c8d6a5e4e0ec15d102762dea72ad4da264efbe0d7a1f9a8f2d9c8f563ee478",
-      "bytes": 1294412
+      "sha256": "06cb6fb623d0d27f58d7a732c00e87bc7bfb61601edf3680c277df26fbb16aa3",
+      "bytes": 1298233
     },
     "pytest.ini": {
       "sha256": "e28a989e765f6f1fc37e02fb00a351f56391f749cafcd3f93057abbfb17ba26b",
@@ -203,6 +203,10 @@
     "tests/test_llm_diagnostics.py": {
       "sha256": "2f4b97ee35880d163ad5b8fe2da654aa4391a87041e77d2995a1f823e9f6cbfc",
       "bytes": 14405
+    },
+    "tests/test_llm_extra_params.py": {
+      "sha256": "8fba1282f096fdccbee0a7192518e3a9f9badd4c5de13ca1108c4537d8ce64b5",
+      "bytes": 4499
     },
     "tests/test_llm_failover.py": {
       "sha256": "1e970892328be5b7c49dbbd69dbb19cb6722ae0499428240b689519f84ea2753",

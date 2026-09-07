@@ -9971,10 +9971,18 @@ async def _prepare_news_for_send(news: dict, source: str,
     _assign_format_variant(news)
 
     # Модель: перевод, чистый текст, теги, отсев непрофильного и повторов
-    if await _llm_enrich(news, side_effects=llm_side_effects) == 'skip':
+    enriched = await _llm_enrich(news, side_effects=llm_side_effects)
+    if enriched == 'skip':
         if count_stats:
             await stats.record_skipped('filtered', source)
         return 'skipped_filter'
+    if enriched == 'defer':
+        # Не публикуем сырым и не хороним: новость вернётся в следующем цикле,
+        # когда модель отойдёт. Резервирование при этом снимается, иначе
+        # ссылка осталась бы занятой и второго шанса не получила.
+        logger.info('⏸ Пост отложен до живой модели: %s', str(news.get('title', ''))[:60])
+        metrics.inc('anime_bot_llm_deferred_total')
+        return 'deferred'
 
     if not apply_dedup:
         return None
@@ -10055,8 +10063,14 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
                                             llm_side_effects=llm_side_effects)
         if skip:
             if track_history and ledger_claimed:
-                await sent_links.reject(link, title, skip)
-                rejected = True
+                if skip == 'deferred':
+                    # release, а не reject: reject хоронит ссылку, и новость
+                    # больше никогда не вернётся. Здесь же мы всего лишь ждём
+                    # модель и хотим попробовать ещё раз.
+                    await sent_links.release(link, title)
+                else:
+                    await sent_links.reject(link, title, skip)
+                    rejected = True
             return skip
 
         video_file = await _prepare_video_file(news)
@@ -13032,8 +13046,13 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
     try:
         skip = await _prepare_news_for_send(news, source)
         if skip:
-            await sent_links.reject(link, title, skip)
-            rejected = True
+            if skip == 'deferred':
+                # То же, что и на пути в канал: ждём модель, а не хороним
+                # новость. reject не дал бы ей второго шанса.
+                await sent_links.release(link, title)
+            else:
+                await sent_links.reject(link, title, skip)
+                rejected = True
             return skip
 
         video_file = await _prepare_video_file(news)
@@ -17023,7 +17042,7 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                 # Пауза нужна только после пути, который мог обратиться к
                 # Telegram. Дубликаты/фильтр физически ничего не отправляют и
                 # раньше зря растягивали цикл на минуты.
-                if result not in ('skipped_dup', 'skipped_filter'):
+                if result not in ('skipped_dup', 'skipped_filter', 'deferred'):
                     await asyncio.sleep(PAUSE_BETWEEN_SENDS)
                     if thread_budget is not None:
                         thread_budget -= 1
@@ -19064,14 +19083,55 @@ async def _llm_judge_generated(news: dict, source_fact_text: str) -> str:
     return 'rejected'
 
 
+# Сколько раз откладываем новость, пока модель молчит. Дальше публикуем как
+# есть: свежая новость без тегов лучше идеальной, но вчерашней.
+LLM_DEFER_MAX_ATTEMPTS = max(0, min(20, _env_int('LLM_DEFER_MAX_ATTEMPTS', 3)))
+_llm_deferred: dict = {}
+
+
+def _llm_wanted() -> bool:
+    """Владелец хочет модель: она настроена и не выключена в настройках.
+
+    Отличать это от «модели нет вовсе» важно. Если модель не настроена —
+    работать без неё нормально, так и задумано. А если настроена, но сейчас
+    не отвечает, публиковать сырой пост незачем: отказ бесплатных тарифов
+    длится минуты, а пост остаётся навсегда.
+    """
+    return bool(_llm_configured() and settings is not None and settings.llm_enabled)
+
+
+def _llm_defer_news(news: dict) -> bool:
+    """Стоит ли придержать новость до живой модели. Считает попытки.
+
+    Ждать бесконечно нельзя: новость протухнет. Поэтому попытки ограничены, и
+    после них пост выходит без обогащения — как и раньше.
+    """
+    key = normalize_url(str(news.get('link') or '')) or str(news.get('title') or '')[:120]
+    if not key:
+        return False
+    if len(_llm_deferred) > 500:
+        _llm_deferred.clear()
+    seen = int(_llm_deferred.get(key, 0))
+    if seen >= LLM_DEFER_MAX_ATTEMPTS:
+        return False
+    _llm_deferred[key] = seen + 1
+    return True
+
+
 async def _llm_enrich(news: dict, *, side_effects: bool = True) -> str:
     """Прогоняет новость через модель: перевод, чистый текст, тема и теги.
 
     Возвращает:
       'off'  — модель не используется, работаем как раньше;
       'ok'   — обогатили (результат лежит в news['_llm_*']);
-      'skip' — модель считает новость непрофильной, пост публиковать не надо."""
+      'skip' — модель считает новость непрофильной, пост публиковать не надо;
+      'defer' — модель настроена, но сейчас молчит: подождём следующего цикла."""
     if not _llm_active():
+        # Модель не настроена — работаем без неё, так и задумано. Настроена, но
+        # молчит — это временно, и лучше подождать: отказ бесплатных тарифов
+        # длится минуты, а сырой пост остаётся в канале навсегда.
+        if _llm_wanted() and _llm_defer_news(news):
+            return 'defer'
         return 'off'
     title = (news.get('title') or '').strip()
     if not title:
