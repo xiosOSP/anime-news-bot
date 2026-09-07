@@ -3471,15 +3471,21 @@ class BotSettings:
         self.save()
 
     def increment_llm_call(self, day: str) -> int:
-        """Обновляет дневной LLM-счётчик одной атомарной записью на диск."""
+        """Обновляет дневной LLM-счётчик одной атомарной записью на диск.
+
+        Под блокировкой: «прочитать, прибавить, записать» без неё теряет
+        обновления, когда два пути считают одновременно, — а это ровно тот
+        счётчик, по которому бот решает, не пора ли остановиться.
+        """
         day = str(day)
-        if self._data.get('llm_day') != day:
-            self._data['llm_day'] = day
-            self._data['llm_calls_today'] = 0
-        self._data['llm_calls_today'] = _safe_nonnegative_int(
-            self._data.get('llm_calls_today')) + 1
+        with self._lock:
+            if self._data.get('llm_day') != day:
+                self._data['llm_day'] = day
+                self._data['llm_calls_today'] = 0
+            total = _safe_nonnegative_int(self._data.get('llm_calls_today')) + 1
+            self._data['llm_calls_today'] = total
         self.save()
-        return self._data['llm_calls_today']
+        return total
 
     @property
     def startup_report(self) -> bool:
@@ -3536,15 +3542,23 @@ class BotSettings:
         self.save()
 
     def add_deepl_chars(self, month: str, count: int) -> tuple[int, int]:
-        """(before, after) с одной записью JSON вместо 2–3 fsync на перевод."""
+        """(before, after) с одной записью JSON вместо 2–3 fsync на перевод.
+
+        Под блокировкой, потому что зовут отсюда из рабочего потока:
+        format_news_short уходит в asyncio.to_thread и переводит по сети.
+        Без блокировки часть символов терялась бы в гонке, и счётчик, который
+        существует ровно для того, чтобы не упереться в лимит DeepL молча,
+        показывал бы меньше израсходованного.
+        """
         month = str(month)
         count = max(0, int(count))
-        if self._data.get('deepl_month') != month:
-            self._data['deepl_month'] = month
-            self._data['deepl_chars'] = 0
-        before = _safe_nonnegative_int(self._data.get('deepl_chars'))
-        after = before + count
-        self._data['deepl_chars'] = after
+        with self._lock:
+            if self._data.get('deepl_month') != month:
+                self._data['deepl_month'] = month
+                self._data['deepl_chars'] = 0
+            before = _safe_nonnegative_int(self._data.get('deepl_chars'))
+            after = before + count
+            self._data['deepl_chars'] = after
         self.save()
         return before, after
 
@@ -3580,10 +3594,11 @@ class BotSettings:
         return [x for x in self._data.get('extra_admins', []) if isinstance(x, int) and x > 0]
 
     def add_admin(self, user_id: int) -> bool:
-        ids = self._data.setdefault('extra_admins', [])
-        if int(user_id) in ids or int(user_id) == ADMIN_ID:
-            return False
-        ids.append(int(user_id))
+        with self._lock:
+            ids = self._data.setdefault('extra_admins', [])
+            if int(user_id) in ids or int(user_id) == ADMIN_ID:
+                return False
+            ids.append(int(user_id))
         self.save()
         return True
 
@@ -3601,16 +3616,20 @@ class BotSettings:
 
     def toggle_source(self, source_name: str) -> bool:
         """Переключает источник. Возвращает новое состояние (True = включён)."""
-        disabled = [s.lower() for s in self._data['disabled_sources']]
         key = source_name.lower()
-        if key in disabled:
-            self._data['disabled_sources'] = [s for s in self._data['disabled_sources'] if s.lower() != key]
-            new_state = True
-            if source_health is not None:
-                source_health.reset(source_name)   # включили руками — даём чистый старт
-        else:
-            self._data['disabled_sources'].append(source_name)
-            new_state = False
+        with self._lock:
+            disabled = [s.lower() for s in self._data['disabled_sources']]
+            if key in disabled:
+                self._data['disabled_sources'] = [
+                    s for s in self._data['disabled_sources'] if s.lower() != key]
+                new_state = True
+            else:
+                self._data['disabled_sources'].append(source_name)
+                new_state = False
+        if new_state and source_health is not None:
+            # Вне блокировки: чужое хранилище со своим замком, и держать наш
+            # ради него — прямая дорога к взаимной блокировке.
+            source_health.reset(source_name)   # включили руками — даём чистый старт
         self.save()
         return new_state
 
@@ -4001,6 +4020,11 @@ class AdaptivePublishingStore:
 
     def __init__(self, path: Path):
         self.path = path
+        # Замок, как у остальных хранилищ. Пишет сюда event loop, а читает —
+        # поток дашборда: список рекомендаций уходит в /health-payload. Без
+        # замка это единственное хранилище, где два потока встречаются на
+        # общих данных без всякой защиты.
+        self._lock = threading.RLock()
         self._data = {'schema_version': 1, 'history': []}
         try:
             if path.exists():
@@ -4014,25 +4038,33 @@ class AdaptivePublishingStore:
             logger.warning(f'adaptive publishing store не загружен: {e}')
 
     def _save(self) -> None:
+        with self._lock:
+            snapshot = copy.deepcopy(self._data)
         try:
-            _atomic_write_json(self.path, self._data, indent=2)
+            # Снимок берём под замком, а пишем на диск уже без него: держать
+            # замок на время записи значило бы останавливать цикл сбора на
+            # каждый fsync.
+            _atomic_write_json(self.path, snapshot, indent=2)
         except OSError as e:
             logger.warning(f'adaptive publishing store не сохранён: {e}')
 
     def record(self, snapshot: dict) -> None:
         row = dict(snapshot or {})
         row['at'] = datetime.now(timezone.utc).isoformat()
-        history = self._data.setdefault('history', [])
-        history.append(row)
-        self._data['history'] = history[-self.MAX_HISTORY:]
+        with self._lock:
+            history = self._data.setdefault('history', [])
+            history.append(row)
+            self._data['history'] = history[-self.MAX_HISTORY:]
         self._save()
 
     def latest(self) -> dict:
-        history = self._data.get('history', [])
-        return dict(history[-1]) if history else {}
+        with self._lock:
+            history = self._data.get('history', [])
+            return dict(history[-1]) if history else {}
 
     def history(self, limit: int = 20) -> list[dict]:
-        return [dict(x) for x in self._data.get('history', [])[-max(1, int(limit)):]]
+        with self._lock:
+            return [dict(x) for x in self._data.get('history', [])[-max(1, int(limit)):]]
 
 
 adaptive_publishing: Optional['AdaptivePublishingStore'] = None
@@ -6794,7 +6826,11 @@ def fetch_full_article_text(url: str) -> Optional[str]:
                     r.close()
                 except Exception:
                     pass
-            _article_text_cache[url] = ''
+            # Через ограничитель, как и удачный разбор. Прямая запись
+            # обходила потолок в 200 записей, а неудач больше, чем удач:
+            # мёртвые ссылки, пейволы и таймауты копились до конца жизни
+            # процесса, и кеш рос без предела именно на них.
+            _bounded_cache_put(_article_text_cache, url, '', ARTICLE_CACHE_MAX)
             return None
         html_text = _read_limited_text(r)
         try:
@@ -6802,7 +6838,11 @@ def fetch_full_article_text(url: str) -> Optional[str]:
         except Exception:
             pass
         if html_text is None:
-            _article_text_cache[url] = ''
+            # Через ограничитель, как и удачный разбор. Прямая запись
+            # обходила потолок в 200 записей, а неудач больше, чем удач:
+            # мёртвые ссылки, пейволы и таймауты копились до конца жизни
+            # процесса, и кеш рос без предела именно на них.
+            _bounded_cache_put(_article_text_cache, url, '', ARTICLE_CACHE_MAX)
             return None
 
         soup = BeautifulSoup(html_text, 'html.parser')
@@ -6858,7 +6898,7 @@ def fetch_full_article_text(url: str) -> Optional[str]:
         return text or None
     except Exception as e:
         logger.debug(f"full article fail для {url}: {e}")
-        _article_text_cache[url] = ''
+        _bounded_cache_put(_article_text_cache, url, '', ARTICLE_CACHE_MAX)
         return None
 
 
@@ -17476,9 +17516,14 @@ def _llm_candidates() -> list[tuple[str, str]]:
     model = _llm_slot_config(chosen)[2]
     if model:
         out.append((chosen, model))
-    for alternate in LLM_MODEL_ALTERNATES:
-        if (chosen, alternate) not in out:
-            out.append((chosen, alternate))
+    # Запасные модели только у слота, у которого есть ключ и адрес. Иначе
+    # запрос уходил бы на пустой адрес с пустым ключом: гарантированный отказ,
+    # который ещё и засчитывается в серию неудач и открывает circuit —
+    # провайдеру, который вообще не был настроен.
+    if _llm_slot_ready(chosen):
+        for alternate in LLM_MODEL_ALTERNATES:
+            if (chosen, alternate) not in out:
+                out.append((chosen, alternate))
     for slot in LLM_SLOTS:
         if slot == chosen or not _llm_slot_ready(slot):
             continue
