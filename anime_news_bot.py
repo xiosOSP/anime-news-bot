@@ -46,6 +46,8 @@ import requests
 from bs4 import BeautifulSoup
 from translation import GoogleTranslator
 from safe_http import public_get
+from moderation_rules import check_text as check_moderation_text, normalize as normalize_moderation_text
+from moderation_media import MediaScanner, media_attachment
 from telegram import (
     Bot,
     BotCommand,
@@ -1483,6 +1485,18 @@ MODERATION_BELITTLING_WINDOW_SEC = max(
 # Сколько последних решений храним для разбора. Тексты чужих сообщений на
 # диске — вещь чувствительная, поэтому список короткий и обрезанный.
 MODERATION_LOG_MAX = max(0, min(500, _env_int('MODERATION_LOG_MAX', 50)))
+MODERATION_REPEAT_WINDOW_SEC = max(10, min(3600, _env_int('MODERATION_REPEAT_WINDOW_SEC', 120)))
+MODERATION_MEDIA_ENABLED = _env('MODERATION_MEDIA_ENABLED', 'true').lower() == 'true'
+MODERATION_LLM_ENABLED = _env('MODERATION_LLM_ENABLED', 'false').lower() == 'true'
+_moderation_media_scanner = MediaScanner(
+    timeout=_env_int('MODERATION_MEDIA_TIMEOUT_SEC', 25),
+    explicit_threshold=_env_float('MODERATION_MEDIA_EXPLICIT_THRESHOLD', .80),
+    suggestive_threshold=_env_float('MODERATION_MEDIA_SUGGESTIVE_THRESHOLD', .85))
+_moderation_action_lock = asyncio.Lock()
+_moderation_update_lock = asyncio.Lock()
+_moderation_seen_updates = {}
+_moderation_media_reports = {}
+_moderation_report_recent = {}
 
 # Правила сообщества в машиночитаемом виде. Модель без них судила бы по своим
 # представлениям, а не по нормам этого чата.
@@ -1496,8 +1510,8 @@ MODERATION_RULES = {
     'doxxing': {'action': 'escalate', 'human': 'публикация личных данных'},
     'scam': {'action': 'escalate', 'human': 'скам'},
     'raid': {'action': 'escalate', 'human': 'рейд'},
-    'nsfw': {'action': 'escalate', 'human': 'контент 18+'},
-    'spoiler_16': {'action': 'delete', 'human': 'материал 16+ без спойлера'},
+    'nsfw': {'action': 'mute', 'human': 'контент 18+'},
+    'spoiler_16': {'action': 'warn', 'human': 'материал 16+ без спойлера'},
     # Оскорбление группы по признаку — не то же самое, что мат и не то же
     # самое, что личное оскорбление: адресат не нужен, чтобы такое сообщение
     # било по людям в чате. Отдельная категория появилась после того, как
@@ -1572,7 +1586,7 @@ _MOD_SUSPECT_STEMS = (
 
 
 def _mod_normalize(text: str) -> str:
-    return re.sub(r'\s+', ' ', str(text or '')).strip().lower()
+    return normalize_moderation_text(text)
 
 
 # Латиница, которой подменяют кириллицу, и цифры вместо букв. Подмена одной
@@ -1614,22 +1628,27 @@ def _mod_message_text(message) -> str:
     Подстановка заодно даёт работать проверке повторов: пять одинаковых
     стикеров — это пять одинаковых строк.
     """
-    text = message.text or message.caption or ''
+    text = getattr(message, 'text', None) or getattr(message, 'caption', None) or ''
     if text.strip():
         return text
     sticker = getattr(message, 'sticker', None)
     if sticker is not None:
-        return f'[стикер {getattr(sticker, "emoji", "") or getattr(sticker, "file_unique_id", "")}]'
+        return f'[стикер {getattr(sticker, "file_unique_id", "") or getattr(sticker, "emoji", "")}]'
     for attr, label in (('photo', 'фото'), ('animation', 'гиф'), ('video', 'видео'),
                         ('video_note', 'кружок'), ('voice', 'голосовое'),
                         ('audio', 'аудио'), ('document', 'файл')):
-        if getattr(message, attr, None):
-            return f'[{label}]'
+        item = getattr(message, attr, None)
+        if item:
+            if attr == 'photo':
+                item = item[-1]
+            identity = getattr(item, 'file_unique_id', '') or getattr(message, 'message_id', '')
+            return f'[{label} {identity}]' if identity else f'[{label}]'
     return ''
 
 
 def _mod_note_message(chat_id: int, user_id: int, name: str, text: str,
-                      *, counts_as_new: bool = True) -> None:
+                      *, counts_as_new: bool = True, message_id=None, media_group_id=None,
+                      repeat_key=None) -> None:
     """Кладёт сообщение в окно контекста и в счётчик частоты.
 
     ``counts_as_new=False`` — для правок уже отправленного сообщения. Правка
@@ -1645,19 +1664,28 @@ def _mod_note_message(chat_id: int, user_id: int, name: str, text: str,
         _moderation_windows.pop(next(iter(_moderation_windows)), None)
     window = _moderation_windows.setdefault(int(chat_id), deque(maxlen=MODERATION_CONTEXT_SIZE))
     row = {'user_id': int(user_id), 'name': str(name)[:64],
-           'text': str(text or '')[:MODERATION_MAX_MESSAGE_CHARS],
-           'at': time.time()}
+            'text': str(text or '')[:MODERATION_MAX_MESSAGE_CHARS],
+           'message_id': message_id, 'media_group_id': media_group_id,
+           'repeat_key': repeat_key,
+            'at': time.time()}
+    if message_id is not None and any(m.get('message_id') == message_id for m in window):
+        counts_as_new = False
     if not counts_as_new:
         # Правка заменяет прошлую версию того же сообщения, а не добавляется
         # рядом: иначе восемь исправлений одной опечатки выглядели бы как
         # восемь одинаковых реплик, то есть как спам.
         for index in range(len(window) - 1, -1, -1):
-            if window[index].get('user_id') == int(user_id):
+            if window[index].get('user_id') == int(user_id) and (
+                    message_id is None or window[index].get('message_id') == message_id):
                 window[index] = row
                 return
         window.append(row)
         return
+    same_album = media_group_id is not None and any(
+        m.get('media_group_id') == media_group_id and m.get('user_id') == user_id for m in window)
     window.append(row)
+    if same_album:
+        return
     key = f'{chat_id}:{user_id}'
     recent = _moderation_recent.setdefault(key, deque(maxlen=MODERATION_FLOOD_MESSAGES * 3))
     recent.append(time.time())
@@ -1750,7 +1778,8 @@ def _mod_note_belittling(chat_id: int, author_id: int, target_id: int) -> int:
     return len(marks)
 
 
-def _mod_local_check(chat_id: int, user_id: int, text: str) -> Optional[dict]:
+def _mod_local_check(chat_id: int, user_id: int, text: str, *, reply_to_user=False,
+                     reply_to_admin=False, repeat_key=None) -> Optional[dict]:
     """Первый уровень: дёшево и без модели.
 
     Возвращает ``{'category', 'confident'}``. ``confident=True`` означает
@@ -1762,6 +1791,10 @@ def _mod_local_check(chat_id: int, user_id: int, text: str) -> Optional[dict]:
     пропускала его целиком.
     """
     normalized = _mod_normalize(text)
+    verdict = check_moderation_text(text, reply_to_user=reply_to_user,
+                                    reply_to_admin=reply_to_admin)
+    if verdict is not None:
+        return verdict.as_dict()
 
     # Флуд — считается, а не оценивается: тут модель не нужна.
     key = f'{chat_id}:{user_id}'
@@ -1775,8 +1808,12 @@ def _mod_local_check(chat_id: int, user_id: int, text: str) -> Optional[dict]:
     window = _moderation_windows.get(int(chat_id)) or deque()
     if normalized:
         same = [m for m in window if m['user_id'] == user_id
-                and _mod_normalize(m['text']) == normalized]
-        if len(same) >= MODERATION_REPEAT_LIMIT:
+                and m.get('at', 0) > time.time() - MODERATION_REPEAT_WINDOW_SEC
+                and (m.get('repeat_key') == repeat_key if repeat_key is not None
+                     else _mod_normalize(m['text']) == normalized)]
+        repeat_groups = {('album', m['media_group_id']) if m.get('media_group_id') else ('message', i)
+                         for i, m in enumerate(same)}
+        if len(repeat_groups) >= MODERATION_REPEAT_LIMIT:
             return {'category': 'spam', 'confident': True}
     if not normalized:
         return None                      # медиа без текста: дальше судить не по чему
@@ -1845,6 +1882,7 @@ class ChatModerationStore:
                 'stats': stats_row if isinstance(stats_row, dict) else {},
                 'mode': str(raw.get('mode') or ''),
                 'log': raw.get('log') if isinstance(raw.get('log'), list) else [],
+                'incidents': raw.get('incidents') if isinstance(raw.get('incidents'), dict) else {},
             }
         except (OSError, ValueError, TypeError) as e:
             logger.warning(f'Модерация: состояние не загружено: {e}')
@@ -1852,12 +1890,84 @@ class ChatModerationStore:
     def _save(self) -> bool:
         with self._lock:
             snapshot = copy.deepcopy(self._data)
-        try:
-            _atomic_write_json(self.path, snapshot, indent=2)
+            try:
+                _atomic_write_json(self.path, snapshot, indent=2)
+                return True
+            except OSError as e:
+                logger.error(f'Модерация: состояние не сохранено: {e}')
+                return False
+
+    def incident(self, incident_id: str) -> dict:
+        with self._lock:
+            return copy.deepcopy(self._data.get('incidents', {}).get(incident_id, {}))
+
+    def recent_penalty(self, chat_id, user_id, seconds: int) -> bool:
+        with self._lock:
+            edge = time.time() - seconds
+            return any(row.get('chat_id') == chat_id and row.get('user_id') == user_id
+                       and row.get('at', 0) > edge and row.get('status') == 'confirmed'
+                       and row.get('action') in ('warn', 'mute')
+                       for row in self._data.get('incidents', {}).values())
+
+    def reserve_incident(self, incident_id: str, chat_id, user_id, category, action) -> bool:
+        """Persist intent before Telegram writes; replay never repeats a sanction."""
+        with self._lock:
+            before = copy.deepcopy(self._data)
+            incidents = self._data.setdefault('incidents', {})
+            if incident_id in incidents:
+                return False
+            edge = time.time() - MODERATION_WARN_TTL_HOURS * 3600
+            for key, value in list(incidents.items()):
+                if value.get('at', 0) < edge:
+                    incidents.pop(key, None)
+            while len(incidents) >= MODERATION_STORE_MAX_USERS:
+                incidents.pop(next(iter(incidents)))
+            incidents[incident_id] = dict(at=time.time(), chat_id=int(chat_id),
+                                         user_id=int(user_id), category=category,
+                                         action=action, status='pending')
+            if not self._save():
+                self._data = before
+                return False
             return True
-        except OSError as e:
-            logger.error(f'Модерация: состояние не сохранено: {e}')
-            return False
+
+    def update_incident(self, incident_id: str, *, add_warning=False, **changes) -> bool:
+        with self._lock:
+            before = copy.deepcopy(self._data)
+            incident = self._data.get('incidents', {}).get(incident_id)
+            if not incident:
+                return False
+            incident.update(changes)
+            if add_warning:
+                users = self._data.setdefault('users', {})
+                row = users.setdefault(self._key(incident['chat_id'], incident['user_id']), {'warns': []})
+                if not any(w.get('incident') == incident_id for w in row['warns']):
+                    row['warns'].append(dict(at=time.time(), category=incident['category'],
+                                             note=str(incident.get('reason', ''))[:200], incident=incident_id))
+                self._prune_locked()
+            if not self._save():
+                self._data = before
+                return False
+            return True
+
+    def undo_incident(self, incident_id: str) -> bool:
+        """Undo one report only; older buttons cannot wipe unrelated warnings."""
+        with self._lock:
+            incident = self._data.get('incidents', {}).get(incident_id)
+            if not incident or incident.get('status') == 'undone':
+                return False
+            before = copy.deepcopy(self._data)
+            row = self._data.get('users', {}).get(self._key(incident['chat_id'], incident['user_id']), {})
+            row['warns'] = [w for w in row.get('warns', []) if w.get('incident') != incident_id]
+            incident['status'] = 'undone'
+            stats = self._data.setdefault('stats', {})
+            stats['overturned_total'] = int(stats.get('overturned_total', 0)) + 1
+            category = stats.setdefault('by_category', {}).setdefault(
+                incident['category'], {'total': 0, 'overturned': 0})
+            category['overturned'] = int(category.get('overturned', 0)) + 1
+            if not self._save():
+                self._data = before
+                return False
+            return True
 
     # --- режим работы ---
 
@@ -1871,8 +1981,12 @@ class ChatModerationStore:
         if mode not in MODERATION_MODES:
             raise ValueError(f'неизвестный режим модерации: {mode!r}')
         with self._lock:
+            before = copy.deepcopy(self._data)
             self._data['mode'] = mode
-        return self._save()
+            if not self._save():
+                self._data = before
+                return False
+            return True
 
     # --- какие чаты модерируем ---
 
@@ -1893,13 +2007,17 @@ class ChatModerationStore:
 
     def set_chat(self, chat_id: int, enabled: bool) -> bool:
         with self._lock:
+            before = copy.deepcopy(self._data)
             chats = [int(x) for x in (self._data.get('chats') or [])]
             if enabled and int(chat_id) not in chats:
                 chats.append(int(chat_id))
             elif not enabled:
                 chats = [x for x in chats if x != int(chat_id)]
             self._data['chats'] = chats
-        return self._save()
+            if not self._save():
+                self._data = before
+                return False
+            return True
 
     # --- предупреждения ---
 
@@ -1932,6 +2050,7 @@ class ChatModerationStore:
     def add_warn(self, chat_id, user_id, category: str, note: str = '') -> int:
         """Записывает предупреждение и возвращает их суммарное число."""
         with self._lock:
+            before = copy.deepcopy(self._data)
             users = self._data.setdefault('users', {})
             row = users.setdefault(self._key(chat_id, user_id), {'warns': []})
             row.setdefault('warns', []).append({
@@ -1942,21 +2061,20 @@ class ChatModerationStore:
             self._prune_locked()
             total = len(((self._data.get('users') or {}).get(
                 self._key(chat_id, user_id)) or {}).get('warns') or [])
-        if not self._save():
-            # Предупреждение осталось только в памяти: после перезапуска счётчик
-            # обнулится. Направление ошибки безопасное (человека простят, а не
-            # накажут лишний раз), но знать об этом админ должен.
-            logger.error('Модерация: предупреждение не записано на диск, '
-                         'после перезапуска счётчик сбросится')
-        return total
+            if not self._save():
+                self._data = before
+                raise OSError('Предупреждение не удалось сохранить')
+            return total
 
     def clear_warns(self, chat_id, user_id) -> bool:
         with self._lock:
+            before = copy.deepcopy(self._data)
             users = self._data.get('users') or {}
             existed = users.pop(self._key(chat_id, user_id), None) is not None
-        if existed:
-            self._save()
-        return existed
+            if existed and not self._save():
+                self._data = before
+                raise OSError('Предупреждения не удалось сохранить')
+            return existed
 
     # --- статистика решений ---
     #
@@ -2010,7 +2128,7 @@ class ChatModerationStore:
                 'text': str(text)[:400],
             })
             if len(log) > MODERATION_LOG_MAX:
-                self._data['log'] = log[-MODERATION_LOG_MAX:]
+                self._data['log'] = log[-MODERATION_LOG_MAX:] if MODERATION_LOG_MAX else []
         self._save()
 
     def recent_log(self, limit: int = 10) -> list[dict]:
@@ -18928,7 +19046,7 @@ async def _moderation_classify(chat_id: int, text: str) -> Optional[dict]:
     if not isinstance(parsed, dict):
         return None
     category = str(parsed.get('category') or '').strip().lower()
-    if not bool(parsed.get('violation')) or category not in MODERATION_RULES:
+    if parsed.get('violation') is not True or category not in MODERATION_RULES:
         # Неизвестная категория — тоже «не знаю». Придумывать действие под
         # выдуманное моделью слово нельзя.
         return {'violation': False, 'category': '', 'severity': 0, 'reason': ''}
@@ -23140,7 +23258,7 @@ def _mod_decide(category: str, severity: int, warns: int, streak: int = 0) -> di
 _MOD_LAST_ACTION: dict[str, float] = {}
 
 
-def _mod_cooldown_active(chat_id: int, user_id: int) -> bool:
+def _mod_cooldown_active(chat_id: int, user_id: int, *, mark: bool = True) -> bool:
     """Недавно этому человеку уже что-то выдали — второй раз подряд не наказываем.
 
     Если модель начнёт ошибаться, серия наказаний за минуту хуже одной ошибки:
@@ -23156,74 +23274,147 @@ def _mod_cooldown_active(chat_id: int, user_id: int) -> bool:
         return True
     if len(_MOD_LAST_ACTION) > 2000:
         _MOD_LAST_ACTION.clear()
-    _MOD_LAST_ACTION[key] = now
+    if mark:
+        _MOD_LAST_ACTION[key] = now
+    if not mark and chat_moderation is not None:
+        return chat_moderation.recent_penalty(chat_id, user_id, MODERATION_ACTION_COOLDOWN_SEC)
     return False
+
+
+def _mod_until_timestamp(value) -> int:
+    if isinstance(value, datetime):
+        return int(value.replace(tzinfo=value.tzinfo or timezone.utc).timestamp())
+    return int(value or 0)
+
+
+def _mod_member_permissions(member) -> dict:
+    return {name: bool(getattr(member, name, False))
+            for name in ChatPermissions.no_permissions().to_dict()}
+
+
+async def _mod_media_unchecked(bot: Bot, message, reason: str) -> None:
+    chat_id = message.chat_id
+    user_id = message.from_user.id
+    if chat_moderation is not None:
+        chat_moderation.log_decision(chat_id, user_id, getattr(message.from_user, 'full_name', ''),
+                                    'media', 'не проверено', 'локальный детектор', reason,
+                                    _mod_message_text(message))
+    metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'media_unchecked'})
+    now = time.monotonic()
+    if now - _moderation_media_reports.get(chat_id, -3600) < 60:
+        return
+    _moderation_media_reports[chat_id] = now
+    while len(_moderation_media_reports) > 200:
+        _moderation_media_reports.pop(next(iter(_moderation_media_reports)))
+    link = getattr(message, 'link', None)
+    text = (f'🛡 Медиа не проверено: {html.escape(reason)}.\n'
+            f'Чат <code>{chat_id}</code>, сообщение <code>{message.message_id}</code>.\n'
+            'Нужна ручная проверка; автоматический варн/мут за медиа не выдан.')
+    if link:
+        text += f'\n<a href="{html.escape(link, quote=True)}">Открыть сообщение</a>'
+    for admin_id in _all_admin_ids():
+        try:
+            await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML, disable_notification=True)
+        except TelegramError:
+            logger.info('Модерация: отчёт о непроверенном медиа не доставлен')
 
 
 async def _mod_apply(bot: Bot, message, decision: dict, category: str,
                      reason: str) -> str:
-    """Выполняет решение. Возвращает то, что реально сделано.
-
-    В режиме observe не делает ничего: оценка и отчёт админам остаются, но чат
-    бот не трогает. Это ступень, на которой копится статистика ошибок, прежде
-    чем ему дают права.
-    """
-    chat_id = message.chat_id
-    user = message.from_user
-    user_id = int(getattr(user, 'id', 0) or 0)
+    """Apply a durable incident, recording only confirmed Telegram outcomes."""
+    chat_id, user_id = int(message.chat_id), int(message.from_user.id)
     action = str(decision.get('action') or 'none')
-    done = []
-
-    observing = chat_moderation is not None and chat_moderation.mode == 'observe'
-    if observing:
-        if chat_moderation is not None:
-            chat_moderation.record_decision(category, f'observe:{action}')
-        metrics.inc('anime_bot_moderation_actions_total',
-                    labels={'action': 'observe', 'category': category})
-        _event_log('moderation_observed', chat_id=chat_id, action=action,
-                   category=category)
+    decision['applied_action'] = 'none'
+    if chat_moderation is None:
+        return 'хранилище модерации недоступно'
+    if chat_moderation.mode == 'observe':
+        decision['applied_action'] = 'observe:' + action
+        chat_moderation.record_decision(category, decision['applied_action'])
         return f'режим наблюдения: бот сделал бы «{action}», но ничего не сделал'
+    if not feature_enabled('chat_moderation') or not chat_moderation.is_enabled(chat_id):
+        return 'модерация отключена до выполнения решения'
+    try:
+        # Cached membership is useful for screening; refresh before sanctions.
+        member = await bot.get_chat_member(chat_id, user_id)
+        if user_id in _all_admin_ids() or getattr(member, 'status', '') in ('creator', 'administrator'):
+            return 'участник — администратор; санкция отменена'
+    except TelegramError as exc:
+        decision['applied_action'] = 'unknown'
+        return f'статус участника не проверен ({type(exc).__name__}); санкция не выдана'
 
+    group = getattr(message, 'media_group_id', None)
+    identity = f'{chat_id}:{user_id}:{"album:" + str(group) if group else message.message_id}'
+    incident_id = hashlib.sha256(identity.encode()).hexdigest()[:20]
+    decision['incident_id'] = incident_id
+    existing = chat_moderation.incident(incident_id)
+    cooldown = _mod_cooldown_active(chat_id, user_id, mark=False)
+    if not existing and not chat_moderation.reserve_incident(
+            incident_id, chat_id, user_id, category, 'delete' if cooldown else action):
+        decision['applied_action'] = 'failed'
+        return 'не удалось сохранить решение; санкция не выдана'
+    done = []
     if decision.get('delete'):
         try:
-            await bot.delete_message(chat_id, message.message_id)
+            if await bot.delete_message(chat_id, message.message_id) is False:
+                raise BadRequest('Telegram returned false')
             done.append('сообщение удалено')
-        except TelegramError as e:
-            logger.info('Модерация: не удалось удалить сообщение: %s', e)
+            decision['applied_action'] = 'delete'
+        except TelegramError as exc:
+            done.append(f'удаление не подтверждено ({type(exc).__name__})')
+    if existing:
+        return ', '.join(done + ['санкция за это сообщение/альбом уже учтена'])
+    if cooldown and action in ('warn', 'mute'):
+        chat_moderation.update_incident(incident_id, status='suppressed', reason=reason)
+        return ', '.join(done + ['новый варн/мут не выдан: действует интервал между наказаниями'])
 
+    succeeded = action != 'mute'
+    until = None
     if action == 'mute':
         minutes = int(decision.get('minutes') or MODERATION_MUTE_LADDER[0])
         until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
         try:
-            await bot.restrict_chat_member(
-                chat_id, user_id,
-                permissions=ChatPermissions(can_send_messages=False),
-                until_date=until,
-            )
+            previous = _mod_member_permissions(member)
+            previous_until = _mod_until_timestamp(getattr(member, 'until_date', None))
+            # Never overwrite or shorten an administrator's restriction.
+            if getattr(member, 'status', '') == 'restricted':
+                chat_moderation.update_incident(incident_id, status='failed', reason='already restricted')
+                decision['applied_action'] = 'failed'
+                return ', '.join(done + ['существующее ограничение сохранено; новый мут не выдан'])
+            if not chat_moderation.update_incident(
+                    incident_id, previous_permissions=previous, previous_until=previous_until,
+                    mute_until=int(until.timestamp()), reason=reason):
+                return ', '.join(done + ['мут не выдан: состояние не сохранено'])
+            result = await bot.restrict_chat_member(
+                chat_id, user_id, permissions=ChatPermissions.no_permissions(),
+                until_date=until, use_independent_chat_permissions=True)
+            if result is False:
+                raise BadRequest('Telegram returned false')
+            succeeded = True
             done.append(f'мут на {minutes} мин')
-        except TelegramError as e:
-            logger.warning('Модерация: мут не выдан: %s', e)
-            done.append('мут не удался — не хватает прав')
-    elif action == 'warn':
-        done.append('предупреждение')
+        except TelegramError as exc:
+            status = 'failed' if isinstance(exc, BadRequest) else 'unknown'
+            chat_moderation.update_incident(incident_id, status=status, reason=reason)
+            decision['applied_action'] = status
+            return ', '.join(done + [f'мут не подтверждён ({type(exc).__name__}); варн не добавлен'])
 
-    warns_total = 0
-    if action in ('warn', 'mute') and chat_moderation is not None:
-        warns_total = chat_moderation.add_warn(chat_id, user_id, category, reason)
-    if chat_moderation is not None:
-        chat_moderation.record_decision(category, action)
-
-    # Молчаливое предупреждение бесполезно: человек не узнает ни что нарушил,
-    # ни что следующий раз будет мутом. Пишем коротко и в чат, чтобы правило
-    # видели и остальные — это и есть смысл предупреждения.
-    if action in ('warn', 'mute'):
-        await _mod_tell_user(bot, message, decision, category, warns_total)
-
-    metrics.inc('anime_bot_moderation_actions_total',
-                labels={'action': action, 'category': category})
-    _event_log('moderation_action', chat_id=chat_id, action=action,
-               category=category, severity=int(decision.get('severity') or 0))
-    return ', '.join(done) if done else 'без действий'
+    add_warning = succeeded and action in ('warn', 'mute')
+    saved = chat_moderation.update_incident(
+        incident_id, status='confirmed', add_warning=add_warning, reason=reason)
+    if not saved:
+        decision['applied_action'] = 'unknown' if action == 'mute' else 'failed'
+        return ', '.join(done + ['не удалось записать результат; требуется проверка админа'])
+    decision['applied_action'] = action
+    if add_warning:
+        _MOD_LAST_ACTION[f'{chat_id}:{user_id}'] = time.monotonic()
+        if len(_MOD_LAST_ACTION) > 2000:
+            _MOD_LAST_ACTION.pop(next(iter(_MOD_LAST_ACTION)))
+        total = chat_moderation.warn_count(chat_id, user_id)
+        done.append(f'предупреждений: {total}')
+        await _mod_tell_user(bot, message, decision, category, total)
+    chat_moderation.record_decision(category, action)
+    metrics.inc('anime_bot_moderation_actions_total', labels={'action': action, 'category': category})
+    _event_log('moderation_action', chat_id=chat_id, action=action, category=category)
+    return ', '.join(done) if done else 'передано администратору'
 
 
 async def _mod_tell_user(bot: Bot, message, decision: dict, category: str,
@@ -23244,6 +23435,8 @@ async def _mod_tell_user(bot: Bot, message, decision: dict, category: str,
         осталось = max(0, len(MODERATION_MUTE_LADDER) - warns_total)
         tail = (f'Предупреждение {warns_total}. '
                 + ('Следующее — мут.' if осталось <= 0 else 'Дальше будет мут.'))
+    if category == 'spoiler_16':
+        tail += ' Отправьте контент заново под спойлером (стикер — как фото/видео).'
     try:
         await bot.send_message(
             message.chat_id,
@@ -23256,12 +23449,12 @@ async def _mod_tell_user(bot: Bot, message, decision: dict, category: str,
         logger.info('Модерация: предупреждение в чат не отправлено: %s', e)
 
 
-def _mod_report_markup(chat_id: int, user_id: int) -> InlineKeyboardMarkup:
-    """Кнопки для человека: отменить решение бота или наказать сильнее."""
+def _mod_report_markup(chat_id: int, user_id: int, incident_id: str = '') -> InlineKeyboardMarkup:
+    suffix = f':{incident_id}' if incident_id else ''
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton('✅ Верно', callback_data=f'mod:ok:{chat_id}:{user_id}'),
-        InlineKeyboardButton('↩️ Снять', callback_data=f'mod:undo:{chat_id}:{user_id}'),
-        InlineKeyboardButton('🚫 Забанить', callback_data=f'mod:ban:{chat_id}:{user_id}'),
+        InlineKeyboardButton('✅ Верно', callback_data=f'mod:ok:{chat_id}:{user_id}{suffix}'),
+        InlineKeyboardButton('↩️ Снять', callback_data=f'mod:undo:{chat_id}:{user_id}{suffix}'),
+        InlineKeyboardButton('🚫 Забанить', callback_data=f'mod:ban:{chat_id}:{user_id}{suffix}'),
     ]])
 
 
@@ -23270,6 +23463,15 @@ async def _mod_report(bot: Bot, message, category: str, decision: dict,
     """Отчёт админам. Для категорий уровня бана — с явной пометкой."""
     user = message.from_user
     user_id = int(getattr(user, 'id', 0) or 0)
+    # Repeated removals/failed actions must not flood administrators' inboxes.
+    report_key = (message.chat_id, user_id, category, decision.get('applied_action', 'none'))
+    now = time.monotonic()
+    if decision.get('applied_action') not in ('warn', 'mute'):
+        if now - _moderation_report_recent.get(report_key, -3600) < 60:
+            return
+    _moderation_report_recent[report_key] = now
+    while len(_moderation_report_recent) > 2000:
+        _moderation_report_recent.pop(next(iter(_moderation_report_recent)))
     name = html.escape(str(getattr(user, 'full_name', '') or user_id)[:64])
     human = str(decision.get('human') or category)
     head = ('🚨 <b>Нарушение уровня бана</b>' if category in MODERATION_HUMAN_ONLY
@@ -23282,25 +23484,20 @@ async def _mod_report(bot: Bot, message, category: str, decision: dict,
         f'Сделано: {html.escape(applied)}\n'
     )
     if reason:
-        text += f'Пояснение модели: {html.escape(reason)}\n'
+        text += f'Основание: {html.escape(reason)}\n'
     if category in MODERATION_HUMAN_ONLY:
         text += '\n⚠️ Бот сам не банит. Решение за вами.\n'
     text += f'\n<blockquote>{_escape_to_limit(_mod_message_text(message), 400)}</blockquote>'
     for admin_id in _all_admin_ids():
         try:
             await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML,
-                                   reply_markup=_mod_report_markup(message.chat_id, user_id))
+                                   reply_markup=_mod_report_markup(message.chat_id, user_id, decision.get('incident_id', '')))
         except TelegramError:
             logger.debug('Модерация: отчёт админу %s не доставлен', admin_id)
 
 
 async def moderation_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Смотрит сообщения в модерируемых чатах и принимает решение.
-
-    Порядок намеренный: сначала дешёвые локальные проверки, и только для
-    подозрительного — модель. Вызов модели на каждое сообщение исчерпал бы
-    дневной лимит за час и оставил бы без модели новостной цикл.
-    """
+    """Text and media have independent checks; LLM outages do not disable rules."""
     if not feature_enabled('chat_moderation') or chat_moderation is None:
         return
     message = getattr(update, 'effective_message', None)
@@ -23310,84 +23507,91 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
         return
     if getattr(user, 'is_bot', False) or not chat_moderation.is_enabled(chat.id):
         return
-    # Сообщение от имени канала или анонимного админа: from_user там служебный
-    # (GroupAnonymousBot), реального участника за ним нет, и наказывать некого.
-    # Отдельно это закрывает автопересылку постов канала в связанную группу:
-    # без проверки бот модерировал бы собственные новости.
     if getattr(message, 'sender_chat', None) is not None:
-        metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'sender_chat'})
         return
     text = _mod_message_text(message)
     if not text:
-        return                           # служебное событие: считать нечего
-
+        return
     user_id = int(user.id)
-    # Правка — это то же сообщение, а не новое: считать её флудом нельзя.
-    is_edit = getattr(update, 'edited_message', None) is not None
-    _mod_note_message(chat.id, user_id, getattr(user, 'full_name', ''), text,
-                      counts_as_new=not is_edit)
+    attachment = media_attachment(message)
+    attachment_key = getattr(attachment[0], 'file_unique_id', '') if attachment else ''
+    repeat_key = hashlib.sha256((_mod_normalize(text) + '\0' + attachment_key).encode()).hexdigest()
+    # Update id is stable on Telegram retries. A changed edit is checked again.
+    identity = (chat.id, getattr(message, 'message_id', 0),
+                str(getattr(message, 'edit_date', '')), text, attachment_key,
+                bool(getattr(message, 'has_media_spoiler', False)))
+    fingerprint = hashlib.sha256(repr(identity).encode()).hexdigest()
+    async with _moderation_update_lock:
+        if fingerprint in _moderation_seen_updates:
+            return
+        _moderation_seen_updates[fingerprint] = time.monotonic()
+        while len(_moderation_seen_updates) > 4000:
+            _moderation_seen_updates.pop(next(iter(_moderation_seen_updates)))
+        _mod_note_message(chat.id, user_id, getattr(user, 'full_name', ''), text,
+                          counts_as_new=getattr(update, 'edited_message', None) is None,
+                          message_id=getattr(message, 'message_id', None),
+                          media_group_id=getattr(message, 'media_group_id', None), repeat_key=repeat_key)
 
-    local = _mod_local_check(chat.id, user_id, text)
-    if local is None:
+    replied = getattr(message, 'reply_to_message', None)
+    target = getattr(getattr(replied, 'from_user', None), 'id', 0) or 0
+    local = _mod_local_check(chat.id, user_id, text, reply_to_user=bool(target), repeat_key=repeat_key)
+    # Resolve admin targeting only for a potentially insulting reply.
+    if target and local is not None:
+        try:
+            member = await context.bot.get_chat_member(chat.id, target)
+            target_admin = getattr(member, 'status', '') in ('creator', 'administrator')
+        except TelegramError:
+            target_admin = False
+        if target_admin or target in _all_admin_ids():
+            local = _mod_local_check(chat.id, user_id, text, reply_to_user=True,
+                                     reply_to_admin=True, repeat_key=repeat_key)
+    if local is None and attachment is None:
         return
     if await _mod_is_immune(context.bot, chat.id, user_id):
         return
-
-    category = str(local.get('category') or '')
-    severity = 2
-    reason = ''
     source = 'локальные правила'
+    media = None
+    if attachment is not None:
+        if MODERATION_MEDIA_ENABLED:
+            media = await _moderation_media_scanner.check(context.bot, message)
+        if media is None or media.status == 'unchecked':
+            await _mod_media_unchecked(context.bot, message,
+                media.reason if media else 'Локальный детектор отключён')
+        elif media.category and not (media.category == 'spoiler_16' and
+                                    getattr(message, 'has_media_spoiler', False)):
+            # Ban-level text takes priority over media; both require deletion.
+            if not (local and local.get('confident') and local.get('category') in MODERATION_HUMAN_ONLY):
+                local = dict(category=media.category, confident=True, severity=2,
+                             reason=f'{media.reason}; оценка детектора {media.score:.2f}; кадров {media.frames}')
+                source = 'локальный детектор медиа'
+    if local is None:
+        return
     if not local.get('confident'):
-        verdict = await _moderation_classify(chat.id, text)
+        verdict = await _moderation_classify(chat.id, text) if MODERATION_LLM_ENABLED else None
         if verdict is None:
-            # Модель недоступна — наказывать по догадке нельзя. Но и молчать
-            # нельзя: раньше такие сообщения исчезали бесследно, и в дни, когда
-            # бесплатные провайдеры лежат сутками, чат оставался без присмотра
-            # незаметно для админа. Пишем в журнал — человек разберётся сам.
-            metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'no_llm'})
-            chat_moderation.log_decision(
-                chat.id, user_id, getattr(user, 'full_name', ''),
-                str(local.get('category') or 'подозрительно'),
-                'не проверено', 'модель недоступна',
-                _llm_last_failure_text()[:200], text)
+            chat_moderation.log_decision(chat.id, user_id, getattr(user, 'full_name', ''),
+                str(local.get('category') or 'подозрительно'), 'не проверено',
+                'локальные правила', 'Неоднозначный текст; LLM отключена или недоступна', text)
             return
-        if not verdict.get('violation'):
+        if verdict.get('violation') is not True:
             return
-        category = str(verdict.get('category') or '')
-        severity = int(verdict.get('severity') or 1)
-        reason = str(verdict.get('reason') or '')
+        local = verdict
         source = 'модель'
+    category = str(local.get('category') or '')
     if category not in MODERATION_RULES:
         return
-
-    warns = chat_moderation.warn_count(chat.id, user_id)
-    streak = 0
-    if category == 'belittling':
-        # Адресат — из ответа на сообщение. Модель имён не называет, и это
-        # правильно: решать, кого наказать, она не должна.
-        replied = getattr(message, 'reply_to_message', None)
-        target = getattr(getattr(replied, 'from_user', None), 'id', 0) or 0
-        streak = _mod_note_belittling(chat.id, user_id, target)
-    decision = _mod_decide(category, severity, warns, streak)
-    decision['severity'] = severity
-    if decision['action'] == 'none':
-        if category == 'belittling':
-            # Пишем в журнал даже без наказания: по нему видно, зреет ли в
-            # чате травля, и стоит ли вмешаться человеку раньше бота.
-            chat_moderation.log_decision(
-                chat.id, user_id, getattr(user, 'full_name', ''), category,
-                f'замечено {streak}/{MODERATION_BELITTLING_STREAK}',
-                source, reason, text)
-        return
-    # Кулдаун не применяем к режиму наблюдения: там ничего не происходит,
-    # а статистику собирать надо по всем случаям.
-    if chat_moderation.mode == 'active' and _mod_cooldown_active(chat.id, user_id):
-        metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'cooldown'})
-        return
-    applied = await _mod_apply(context.bot, message, decision, category, reason)
-    chat_moderation.log_decision(
-        chat.id, user_id, getattr(user, 'full_name', ''), category,
-        decision['action'], source, reason, text)
+    severity, reason = int(local.get('severity') or 2), str(local.get('reason') or '')
+    async with _moderation_action_lock:
+        streak = _mod_note_belittling(chat.id, user_id, target) if category == 'belittling' else 0
+        decision = _mod_decide(category, severity, chat_moderation.warn_count(chat.id, user_id), streak)
+        decision['severity'] = severity
+        if decision['action'] == 'none':
+            chat_moderation.log_decision(chat.id, user_id, getattr(user, 'full_name', ''), category,
+                                        f'замечено {streak}/{MODERATION_BELITTLING_STREAK}', source, reason, text)
+            return
+        applied = await _mod_apply(context.bot, message, decision, category, reason)
+        chat_moderation.log_decision(chat.id, user_id, getattr(user, 'full_name', ''), category,
+                                    decision.get('applied_action', 'none'), source, reason, text)
     await _mod_report(context.bot, message, category, decision, reason, applied, source)
 
 
@@ -23438,6 +23642,21 @@ async def modtest_command(update, context: ContextTypes.DEFAULT_TYPE):
     что ответила модель и какое действие получилось бы.
     """
     text = ' '.join(context.args or '').strip()
+    replied = getattr(update.message, 'reply_to_message', None)
+    if not text and replied is not None and media_attachment(replied) is not None:
+        scan = await _moderation_media_scanner.check(context.bot, replied) if MODERATION_MEDIA_ENABLED else None
+        if scan is None or scan.status != 'checked':
+            detail = scan.reason if scan else 'Проверка медиа отключена'
+        elif not scan.category:
+            detail = f'На {scan.frames} проверенных кадрах нагота не обнаружена. Это не гарантия безопасности всего файла.'
+        elif scan.category == 'spoiler_16' and getattr(replied, 'has_media_spoiler', False):
+            detail = 'Откровенный контент уже под спойлером — нарушения по этому признаку нет.'
+        else:
+            decision = _mod_decide(scan.category, 2, 0)
+            detail = (f'{scan.reason}. Оценка детектора: {scan.score:.2f}, кадров: {scan.frames}. '
+                      f'Первое нарушение: {decision["action"]}; удаление сообщения.')
+        await update.message.reply_text('🧪 Локальная проверка медиа (без наказания):\n' + detail)
+        return
     if not text and update.message.reply_to_message is not None:
         text = (update.message.reply_to_message.text
                 or update.message.reply_to_message.caption or '')
@@ -23471,9 +23690,13 @@ async def modtest_command(update, context: ContextTypes.DEFAULT_TYPE):
     if local.get('confident'):
         lines.append(f'\n1️⃣ Локальные правила: <b>{html.escape(local["category"])}</b> '
                      f'(уверенно, модель не нужна)')
-        category, severity, reason = local['category'], 2, ''
+        category, severity, reason = local['category'], int(local.get('severity') or 2), str(local.get('reason') or '')
     else:
         hint = local.get('category') or 'подозрительно'
+        if not MODERATION_LLM_ENABLED:
+            lines.append('\nНеоднозначный текст. LLM отключена; автоматического наказания нет.')
+            await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
+            return
         lines.append(f'\n1️⃣ Локальные правила: <i>{html.escape(str(hint))}</i> → спрашиваем модель')
         # Причину спрашиваем ДО вызова: после него часть состояний уже изменится,
         # а «недоступна» без объяснения — это тупик, из которого нечего чинить.
@@ -23595,18 +23818,21 @@ def _moderation_stats_text() -> str:
     by_category = data.get('by_category') or {}
     total = sum(int(v) for v in by_action.values())
     overturned = int(data.get('overturned_total', 0))
+    engines = ('Локальные текстовые правила: включены\n'
+               + f'Проверка медиа: {"включена" if MODERATION_MEDIA_ENABLED else "отключена"}\n'
+               + f'Дополнительная LLM: {"включена" if MODERATION_LLM_ENABLED else "отключена"}')
     if not total:
         return ('🛡 Решений пока не было.\n'
                 f'Модерируемых чатов: {len(chat_moderation.enabled_chats())}\n'
                 f'Бюджет модели: {_moderation_llm_budget_left()} из '
-                f'{MODERATION_LLM_DAILY_LIMIT} на сегодня')
+                f'{MODERATION_LLM_DAILY_LIMIT} на сегодня\n{engines}')
 
     accuracy = 100.0 * (total - overturned) / max(1, total)
     lines = [
         '🛡 <b>Модерация: статистика</b>', '',
         f'Решений всего: <b>{total}</b>',
         f'Отменено людьми: <b>{overturned}</b> ({100 - accuracy:.0f}%)',
-        f'Похоже на верные: <b>{accuracy:.0f}%</b>',
+        f'Не отменено: <b>{max(0, accuracy):.0f}%</b> (это не оценка точности)',
         '',
         '<b>По действиям:</b>',
     ]
@@ -23625,7 +23851,7 @@ def _moderation_stats_text() -> str:
                   + (' — бот только докладывает' if chat_moderation.mode == 'observe' else ''),
               f'Бюджет модели: {_moderation_llm_budget_left()} из '
               f'{MODERATION_LLM_DAILY_LIMIT} на сегодня',
-              f'Чатов под модерацией: {len(chat_moderation.enabled_chats())}']
+              f'Чатов под модерацией: {len(chat_moderation.enabled_chats())}', engines]
     if overturned and accuracy < 80:
         lines += ['', '⚠️ Отмен много. Расширять полномочия бота рано — '
                       'сначала стоит поправить правила или пороги.']
@@ -23691,65 +23917,102 @@ async def unwarn_command(update, context: ContextTypes.DEFAULT_TYPE):
     if chat is None or reply is None or chat_moderation is None:
         await update.message.reply_text('Ответь этой командой на сообщение участника.')
         return
-    cleared = chat_moderation.clear_warns(chat.id, reply.from_user.id)
+    try:
+        cleared = chat_moderation.clear_warns(chat.id, reply.from_user.id)
+    except OSError:
+        await update.message.reply_text('❌ Не удалось сохранить отмену; предупреждения остались.')
+        return
     await update.message.reply_text('✅ Предупреждения сняты.' if cleared
                                     else 'У участника и так нет предупреждений.')
 
 
 async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Кнопки под отчётом модерации. True — событие обработано здесь."""
+    """Human actions are bound to one incident; undo never clears later warns."""
     query = update.callback_query
     data = str(getattr(query, 'data', '') or '')
     if not data.startswith('mod:'):
         return False
     parts = data.split(':')
-    if len(parts) != 4:
+    if len(parts) not in (4, 5):
         await query.answer()
         return True
-    _, verb, raw_chat, raw_user = parts
     if not is_admin(update):
         await query.answer('Только для админов', show_alert=True)
         return True
+    _, verb, raw_chat, raw_user = parts[:4]
     try:
         chat_id, user_id = int(raw_chat), int(raw_user)
     except ValueError:
         await query.answer()
         return True
-
     if verb == 'ok':
         await query.answer('Принято')
         await query.edit_message_reply_markup(reply_markup=None)
         return True
-    if verb == 'undo':
-        if chat_moderation is not None:
-            # Порядок важен: категорию отменённого решения берём из последнего
-            # предупреждения, поэтому фиксируем ошибку ДО очистки.
-            chat_moderation.record_overturned(chat_id, user_id)
-            chat_moderation.clear_warns(chat_id, user_id)
-        try:
-            await context.bot.restrict_chat_member(
-                chat_id, user_id,
-                permissions=ChatPermissions(
-                    can_send_messages=True, can_send_other_messages=True,
-                    can_add_web_page_previews=True),
-            )
-        except TelegramError as e:
-            logger.info('Модерация: снятие ограничений не удалось: %s', e)
-        await query.answer('Ограничения сняты, предупреждения обнулены')
-        await query.edit_message_reply_markup(reply_markup=None)
-        return True
-    if verb == 'ban':
-        # Бан выполняется только по явному нажатию человека — сам бот сюда
-        # никогда не приходит.
-        try:
-            await context.bot.ban_chat_member(chat_id, user_id)
-            _audit_update(update, 'chat_ban', chat=chat_id, user=user_id)
-            await query.answer('Участник забанен')
-        except TelegramError as e:
-            await query.answer(f'Не удалось забанить: {e}', show_alert=True)
+    incident_id = parts[4] if len(parts) == 5 else ''
+    async with _moderation_action_lock:
+        incident = chat_moderation.incident(incident_id) if chat_moderation is not None else {}
+        if not incident or incident.get('chat_id') != chat_id or incident.get('user_id') != user_id:
+            await query.answer('Отчёт устарел или создан в режиме наблюдения. Используйте команды модерации.', show_alert=True)
             return True
-        await query.edit_message_reply_markup(reply_markup=None)
-        return True
+        if incident.get('status') == 'undone':
+            await query.answer('Это решение уже отменено')
+            return True
+        if verb == 'undo':
+            restored = False
+            if incident.get('action') == 'mute' and incident.get('mute_until'):
+                try:
+                    member = await context.bot.get_chat_member(chat_id, user_id)
+                    owned = (getattr(member, 'status', '') == 'restricted'
+                             and _mod_until_timestamp(getattr(member, 'until_date', None)) == incident['mute_until']
+                             and not any(_mod_member_permissions(member).values()))
+                    if owned:
+                        chat = await context.bot.get_chat(chat_id)
+                        permissions = getattr(chat, 'permissions', None)
+                        if permissions is None:
+                            raise BadRequest('chat permissions unavailable')
+                        result = await context.bot.restrict_chat_member(
+                            chat_id, user_id, permissions=permissions, until_date=0,
+                            use_independent_chat_permissions=True)
+                        if result is False:
+                            raise BadRequest('Telegram returned false')
+                        restored = True
+                except TelegramError as exc:
+                    await query.answer(f'Снятие мута не подтверждено ({type(exc).__name__}); варн сохранён', show_alert=True)
+                    return True
+            if not chat_moderation.undo_incident(incident_id):
+                await query.answer('Не удалось сохранить отмену; проверьте /modlog', show_alert=True)
+                return True
+            _MOD_LAST_ACTION.pop(f'{chat_id}:{user_id}', None)
+            await query.answer('Варн за это нарушение снят. ' + ('Мут снят.' if restored else 'Другие ограничения сохранены.'))
+            await query.edit_message_reply_markup(reply_markup=None)
+            return True
+        if verb == 'ban':
+            # The only ban call remains an explicit administrator button.
+            if incident.get('ban_status') in ('pending', 'confirmed', 'unknown'):
+                await query.answer('Бан уже запрошен; проверьте участника в чате', show_alert=True)
+                return True
+            try:
+                member = await context.bot.get_chat_member(chat_id, user_id)
+                if user_id in _all_admin_ids() or getattr(member, 'status', '') in ('creator', 'administrator'):
+                    await query.answer('Администратор защищён от бана', show_alert=True)
+                    return True
+                if not chat_moderation.update_incident(incident_id, ban_status='pending'):
+                    await query.answer('Не удалось сохранить решение', show_alert=True)
+                    return True
+                result = await context.bot.ban_chat_member(chat_id, user_id)
+                if result is False:
+                    raise BadRequest('Telegram returned false')
+                chat_moderation.update_incident(incident_id, ban_status='confirmed')
+                _audit_update(update, 'chat_ban', chat=chat_id, user=user_id)
+                await query.answer('Участник забанен')
+            except TelegramError as exc:
+                status = 'failed' if isinstance(exc, BadRequest) else 'unknown'
+                chat_moderation.update_incident(incident_id, ban_status=status)
+                await query.answer(f'Бан не подтверждён ({type(exc).__name__})', show_alert=True)
+                return True
+            await query.edit_message_reply_markup(reply_markup=None)
+            return True
     await query.answer()
     return True
 
@@ -25207,8 +25470,8 @@ def main():
     # картинками — такой же флуд, а фильтр по TEXT|CAPTION делал его невидимым.
     app.add_handler(
         MessageHandler(
-            ~filters.COMMAND & filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL,
-            moderation_message_handler,
+            filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL,
+            moderation_message_handler, block=False,
         ),
         group=1,
     )
