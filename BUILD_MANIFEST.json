@@ -2,20 +2,20 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "3252ddf42068abc010d8c6e3a54c68149a93388f",
-  "generated_at_utc": "2026-09-07T22:20:07.290928+00:00",
+  "git_commit": "c131821c5cf4ff27d1a9caa66a4a0063aea94e28",
+  "generated_at_utc": "2026-09-08T05:37:11.431825+00:00",
   "files": {
     ".env.example": {
-      "sha256": "9c5e962a28baa88185a72a7cce70aca8f2002b1324973e3b76e08c78e6aef792",
-      "bytes": 13451
+      "sha256": "363dd04b783149498def08b625988b24b66ba971cf5815ac70932e1e02eedc6e",
+      "bytes": 14377
     },
     ".gitattributes": {
       "sha256": "d60f352d0db1404c70afb4bb8b2ca3fd1c610572aa40720e8a0b7baa7885418c",
       "bytes": 19
     },
     ".github/workflows/ci.yml": {
-      "sha256": "83cf6da28541183f15fdfb522eedc03c941df41cd094d709eec637e94c03c58f",
-      "bytes": 2632
+      "sha256": "2e3459dcbfdf269a1bf48f24e168155aa5110fffe533df44154c3ff403308d61",
+      "bytes": 2712
     },
     ".gitignore": {
       "sha256": "136df05441de574d1d8147187f83fbaf32fddb65c4bc4df83ac7fdb4bec7de11",
@@ -26,16 +26,28 @@
       "bytes": 33
     },
     "README.md": {
-      "sha256": "0e176c4c9a510266843f5b68371c7c065fc8a691c6540f0a67363e1d68dbd879",
-      "bytes": 5470
+      "sha256": "a05a1bc19081cb92a70c5cf683d8735f6baaf9bef1af56c98535f9e0463eacfd",
+      "bytes": 5695
     },
     "anime_news_bot.py": {
-      "sha256": "d990ea2189ded49808380417764525b23b216041e208faaff541bf88f96d0931",
-      "bytes": 1330070
+      "sha256": "4b151c50222aee788e8e68cb233121bbf853acebc6a4a6875558b5db3d60f179",
+      "bytes": 1346979
+    },
+    "docs/chat-moderation.md": {
+      "sha256": "39cd96a87bdeebd21c3444b40d6d431d426dba4d07b089dc86f885a593ead3cf",
+      "bytes": 10001
     },
     "golden/editorial_cases.json": {
       "sha256": "ea93df6c274244cc67cee1a7456b4d3889b659d56e32b32cd8753dc0424a5a61",
       "bytes": 1999
+    },
+    "moderation_media.py": {
+      "sha256": "3e554379c8878f6e158bfadafd348519de44bbd75f8ad86a86631b4662f6f98d",
+      "bytes": 14072
+    },
+    "moderation_rules.py": {
+      "sha256": "0c6215159c2aa90fdc8956529b938087d819d586de99d1b08dcbdbdc2afab11f",
+      "bytes": 8151
     },
     "pytest.ini": {
       "sha256": "e28a989e765f6f1fc37e02fb00a351f56391f749cafcd3f93057abbfb17ba26b",
@@ -46,8 +58,8 @@
       "bytes": 333
     },
     "requirements.txt": {
-      "sha256": "fade3bdd863478c530ab5a141ad6988467e9bd912704ece741b0205944bb21e9",
-      "bytes": 157
+      "sha256": "324deb35ac1eb18d62f0a07f7683828e999fd8905ec63d7cac2cdbba1e60feae",
+      "bytes": 194
     },
     "runtime.txt": {
       "sha256": "22fa90cd1f8121c0165c6df911d1ea71452a179460fbe371834bb792ba42f6c9",
@@ -300,6 +312,10 @@
     "tests/test_moderation_menu.py": {
       "sha256": "a2cfb83413a5784f7eae9a60e7f618ef04e737b8a6d979e1d05a21fbe2409aee",
       "bytes": 10090
+    },
+    "tests/test_moderation_offline.py": {
+      "sha256": "2a26320ed2f7f784a8fb6e1f18fa9ca4cbd6e5482fa4effac85b479aa89d9fa5",
+      "bytes": 21808
     },
     "tests/test_normalization.py": {
       "sha256": "bc27122ac04567808b43bed40b05587a1d8cad434f68dbc48ddc549eb5fb8192",
