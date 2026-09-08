@@ -17690,7 +17690,8 @@ def _scheduled_status_block(context) -> str:
 # провайдера — это две переменные окружения, а не правка кода.
 #
 # Настройка на хостинге:
-#   LLM_PROVIDER=mistral   (или groq / gemini / openrouter / nvidia / cerebras)
+#   LLM_PROVIDER=mistral   (или groq / gemini / openrouter / nvidia /
+#                           cerebras / orcarouter / tokenator)
 #   LLM_API_KEY=<ключ>
 # Необязательно: LLM_MODEL, LLM_BASE_URL — если хочется другую модель/адрес.
 
@@ -17707,6 +17708,10 @@ LLM_PRESETS = {
     # Каталог у роутеров свой: имя, живущее у одного, у другого даёт
     # 400 invalid_model. Пресет избавляет от подбора вручную.
     'orcarouter': ('https://api.orcarouter.ai/v1', 'deepseek/deepseek-v4-flash-free'),
+    # Ключ платный, но в каталоге есть и бесплатные модели с лимитами. Пресет
+    # ведёт на бесплатную: провайдер должен подключаться, ничего не тратя, а
+    # платную модель задаёт LLM_MODEL, когда это осознанное решение.
+    'tokenator':  ('https://api.tokenator.top/v1', 'free-gemini-3.8-flash'),
 }
 
 LLM_PROVIDER = _env('LLM_PROVIDER', '').strip().lower()
