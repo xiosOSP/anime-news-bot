@@ -331,16 +331,18 @@ def test_unknown_mode_is_rejected(tmp_path):
 
 # ---------- кулдаун наказаний ----------
 
-def test_second_action_in_a_row_is_blocked():
+def test_second_action_in_a_row_is_blocked_when_cooldown_configured(monkeypatch):
     """Серия наказаний за минуту хуже одной ошибки: человек уйдёт раньше,
     чем админ успеет разобраться."""
+    monkeypatch.setattr(bot, 'MODERATION_ACTION_COOLDOWN_SEC', 60)
     bot._MOD_LAST_ACTION.clear()
     assert bot._mod_cooldown_active(500, 5000) is False
     assert bot._mod_cooldown_active(500, 5000) is True
 
 
-def test_cooldown_is_per_user():
+def test_cooldown_is_per_user(monkeypatch):
     """Один нарушитель не должен прикрывать другого."""
+    monkeypatch.setattr(bot, 'MODERATION_ACTION_COOLDOWN_SEC', 60)
     bot._MOD_LAST_ACTION.clear()
     bot._mod_cooldown_active(500, 5001)
     assert bot._mod_cooldown_active(500, 5002) is False
@@ -513,15 +515,10 @@ async def test_channel_posts_are_not_moderated(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_failed_model_call_does_not_spend_budget(monkeypatch):
-    """Раунд 1. Молчание провайдера съедало дневной лимит вызовов.
-
-    Бюджет существует, чтобы модерация не оставила без модели новостной цикл.
-    Считать неотвеченные попытки — значит выключать модерацию тем быстрее, чем
-    хуже работает провайдер.
-    """
-    spent = []
-    monkeypatch.setattr(bot, '_moderation_llm_count', lambda: spent.append(1))
+async def test_failed_model_call_does_not_invent_violation(monkeypatch):
+    """Unavailable chat model is unknown, not a violation. HTTP quotas are
+    independently covered by the dedicated chat-client tests."""
+    monkeypatch.setattr(bot, '_moderation_llm_ready', lambda: True)
     monkeypatch.setattr(bot, '_moderation_llm_budget_left', lambda: 100)
 
     async def _silent(*a, **k):
@@ -529,7 +526,6 @@ async def test_failed_model_call_does_not_spend_budget(monkeypatch):
 
     monkeypatch.setattr(bot, '_llm_call', _silent)
     assert await bot._moderation_classify(-1, 'ты дебил') is None
-    assert spent == []
 
 
 # ---------- принижение по признаку без грубых слов ----------

@@ -150,7 +150,8 @@ async def test_mute_disables_all_media_and_survives_restart(state, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cooldown_still_deletes_forbidden_content(state):
+async def test_cooldown_still_deletes_forbidden_content(state, monkeypatch):
+    monkeypatch.setattr(bot, 'MODERATION_ACTION_COOLDOWN_SEC', 60)
     telegram = telegram_bot()
     await bot._mod_apply(telegram, message(), bot._mod_decide('aggression', 2, 0), 'aggression', '')
     await bot._mod_apply(telegram, message(number=2), bot._mod_decide('nsfw', 2, 1), 'nsfw', '')
@@ -413,7 +414,7 @@ async def test_media_probe_uses_detector_without_sanctions(state, monkeypatch):
 @pytest.mark.asyncio
 async def test_llm_boolean_string_is_not_a_violation(monkeypatch):
     # Explicitly call classifier: text path defaults to offline mode.
-    monkeypatch.setattr(bot, '_llm_active', lambda: True)
+    monkeypatch.setattr(bot, '_moderation_llm_ready', lambda: True)
     monkeypatch.setattr(bot, '_moderation_llm_budget_left', lambda: 100)
     monkeypatch.setattr(bot, '_llm_call', AsyncMock(return_value='{"violation":"false","category":"nsfw"}'))
     assert (await bot._moderation_classify(-100, 'test'))['violation'] is False
