@@ -463,3 +463,25 @@ async def test_pending_decision_respects_disabled_chat_and_new_admin(state):
     await bot._mod_apply(telegram, message(), decision, 'aggression', '')
     telegram.delete_message.assert_not_awaited()
     assert state.warn_count(-100, 7) == 0
+
+
+# ---------- условная «угроза» — это шутка чата, а не намерение ----------
+
+def test_conditional_threat_is_not_punished():
+    """«Убью, если заспойлеришь» — обычная шутка аниме-чата.
+
+    Тяжесть 3 пропускает ступень предупреждения, поэтому такая фраза стоила
+    человеку часа мута с первого раза — без модели и без единого человека в
+    решении. Правила чата прямо разрешают дружеские подколы; настоящая угроза
+    условия не ставит.
+    """
+    assert check_text('я тебя убью если заспойлеришь') is None
+    assert check_text('убью тебя когда встретимся в рейде') is None
+
+
+def test_unconditional_threat_is_still_caught():
+    """Послабление не должно распространяться на прямую угрозу."""
+    for text in ('я тебя убью', 'сдохни тварь', 'убью тебя сука'):
+        verdict = check_text(text)
+        assert verdict is not None and verdict.category == 'aggression', text
+        assert verdict.severity == 3
