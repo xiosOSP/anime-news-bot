@@ -3,6 +3,8 @@ import pytest
 
 from moderation_rules import check_text, normalize
 
+import anime_news_bot as bot
+
 
 @pytest.mark.parametrize(('text', 'category'), [
     ('Твоей матери, шлюхе, привет', 'family'),
@@ -133,3 +135,44 @@ def test_normalization_preserves_unrelated_words_and_urls(text):
 def test_normalization_is_idempotent():
     text = 'Твoя ма\u200bма ш.л.ю.х.а https://example.org/мanga'
     assert normalize(normalize(text)) == normalize(text)
+
+
+# ---------- слово названо, но никого не обзывают ----------
+
+class TestTalkingAboutTheSlur:
+    """Категория hate мутит сразу, без ступени предупреждения.
+
+    Поэтому цена ошибки здесь — час немоты за фразу, в которой никого не
+    оскорбили. Отрицание и разговор о самом слове — самые частые такие фразы,
+    и обе приходят как раз от тех, кто правила чата соблюдает.
+    """
+
+    @pytest.mark.parametrize('text', [
+        'я не пидор если что',
+        'нельзя говорить пидор в чате',
+        'слово «пидор» у нас запрещено',
+        'за это слово банят?',
+        'по правилам чата пидор нельзя',
+        'я не дебил, я просто не понял',
+    ])
+    def test_no_punishment_for_talking_about_the_word(self, text):
+        assert bot._mod_hard_slur(text) == '', text
+
+    @pytest.mark.parametrize('text', [
+        'ты пидор',
+        'пидорасы вы все',
+        'Муратик пидорасик',
+        'пидор конченый',
+        'пид0р',
+        'п и д о р',
+        'чурка тупая',
+    ])
+    def test_real_insults_are_still_caught(self, text):
+        """Послабление не должно превратиться в дыру: обход подстановкой
+        букв и разрядкой ловился и обязан ловиться дальше."""
+        assert bot._mod_hard_slur(text) == 'hate', text
+
+    def test_exempted_message_still_reaches_the_second_level(self):
+        """Пропущенное здесь не исчезает из виду, а уходит на разбор."""
+        verdict = bot._mod_local_check(-100, 5, 'я не пидор если что')
+        assert verdict is not None and verdict.get('confident') is False
