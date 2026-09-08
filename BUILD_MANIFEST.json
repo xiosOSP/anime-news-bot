@@ -2,12 +2,12 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "0f4e51a07b6e139458f5ba4322912fa0a2c82a93",
-  "generated_at_utc": "2026-09-08T17:57:56.116591+00:00",
+  "git_commit": "d5bbc26152fdcfd4dd6d7e6fc372db3659b2d8f1",
+  "generated_at_utc": "2026-09-08T18:23:12.681495+00:00",
   "files": {
     ".env.example": {
-      "sha256": "951fb6e90955202df373a04c9f693882642bcc7fa51239bd2515abbc60415726",
-      "bytes": 15202
+      "sha256": "f564a75769e10ac0c71dab56f23b41e21e98894b0e538708342144bd8af714f4",
+      "bytes": 14910
     },
     ".gitattributes": {
       "sha256": "d60f352d0db1404c70afb4bb8b2ca3fd1c610572aa40720e8a0b7baa7885418c",
@@ -30,12 +30,12 @@
       "bytes": 6203
     },
     "anime_news_bot.py": {
-      "sha256": "83b5b6ad6ad8a684142262539d4307aa7f9c13dff04ae89c64a3fb139314ef8f",
-      "bytes": 1339885
+      "sha256": "d86d8b3e1a0d44b66735360059306c8e7370cfb0384f697c1782011848aac0e1",
+      "bytes": 1340616
     },
     "docs/chat-moderation.md": {
-      "sha256": "4cf290de84568f533000ec0b0022be5f89a34560c04add3345393aa28a114411",
-      "bytes": 13847
+      "sha256": "32d385084a9033cebf02ee147c70b8dc1b31f1ca845c76448f115da154fca008",
+      "bytes": 16531
     },
     "golden/editorial_cases.json": {
       "sha256": "ea93df6c274244cc67cee1a7456b4d3889b659d56e32b32cd8753dc0424a5a61",
@@ -314,8 +314,12 @@
       "bytes": 10513
     },
     "tests/test_moderation.py": {
-      "sha256": "556be510233e2ffe40413da67da808fd7cae831cdd409442869a1a0212ba4a4f",
-      "bytes": 34968
+      "sha256": "bba2114e6baef3b717641bf3bdb298f7ecb5069fba8a1e012efd3d740d01c84c",
+      "bytes": 33088
+    },
+    "tests/test_moderation_admins.py": {
+      "sha256": "35691ae5950747170209ca7286d77114480dd459c6e6adf9d245afa880e54e8f",
+      "bytes": 11400
     },
     "tests/test_moderation_llm_client.py": {
       "sha256": "48fa2dd0acac49b26f88e4305301abac601603a801ac151e3a43fbccd0e0bfb0",
@@ -326,16 +330,16 @@
       "bytes": 10090
     },
     "tests/test_moderation_offline.py": {
-      "sha256": "d5e602111a3c612a892c9dc3f130ccb9d266fc4150d417958fb9641c9c394112",
-      "bytes": 23232
+      "sha256": "49c3388fe9a4f8d39f06bc7a737393988579e5d801f86909d109a3471fe143a8",
+      "bytes": 23289
     },
     "tests/test_moderation_rules_extended.py": {
       "sha256": "5dd95fc2e8ff2685e6578974a5abd56cbb6ce25a934db83544275153322dcae1",
       "bytes": 7130
     },
     "tests/test_moderation_strict_routing.py": {
-      "sha256": "f5a32c44db9416dc98abd31bf4468ab1cd58604956658e2fcb2f25fe99af14e6",
-      "bytes": 9514
+      "sha256": "6bee108443631a1a1aedff222069aff2be85ac70790d7faacdaeacd10036c437",
+      "bytes": 9494
     },
     "tests/test_news_parser_quality.py": {
       "sha256": "2fe9d96259ef0ffac009b9c43c2dba4e4a7a38b13a748ac381b67e9fd25cd6ae",

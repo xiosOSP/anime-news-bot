@@ -4,12 +4,10 @@
 несправедливое наказание — это ушедший из сообщества человек. Поэтому тесты
 проверяют в первую очередь то, чего бот делать НЕ должен.
 """
-from types import SimpleNamespace
 
 import time
 
 import pytest
-import telegram.error as bot_error
 
 import anime_news_bot as bot
 
@@ -426,21 +424,6 @@ def test_slur_still_never_leads_to_ban():
 
 # ---------- находки автономных раундов ----------
 
-@pytest.mark.asyncio
-async def test_unverifiable_status_makes_user_immune():
-    """Раунд 1. Сбой Telegram делал участника наказуемым.
-
-    _mod_is_immune возвращал False, а False означает «не иммунен». Комментарий
-    обещал обратное: при недоступности Telegram админ чата мог получить мут
-    из-за таймаута.
-    """
-    class _Broken:
-        async def get_chat_member(self, *a, **k):
-            raise bot_error.TelegramError('timeout')
-
-    assert await bot._mod_is_immune(_Broken(), -100, 777) is True
-
-
 def test_escalation_uses_every_rung():
     """Раунд 2. Первая ступень лестницы не использовалась вовсе.
 
@@ -488,30 +471,6 @@ def test_decision_log_is_bounded_and_persistent(tmp_path):
         store.log_decision(-1, i, 'x', 'spam', 'warn', 'локальные правила', '', f'текст {i}')
     assert len(store.recent_log(1000)) <= bot.MODERATION_LOG_MAX
     assert bot.ChatModerationStore(path).recent_log(1000)      # переживает перезапуск
-
-
-@pytest.mark.asyncio
-async def test_channel_posts_are_not_moderated(tmp_path, monkeypatch):
-    """Раунд 1. За sender_chat нет участника, которого можно наказать.
-
-    Отдельно это закрывает автопересылку постов канала в связанную группу:
-    без проверки бот модерировал бы собственные новости.
-    """
-    store = bot.ChatModerationStore(tmp_path / 'm.json')
-    store.set_chat(-100, True)
-    monkeypatch.setattr(bot, 'chat_moderation', store)
-    monkeypatch.setattr(bot, 'feature_enabled', lambda name: True)
-
-    def _boom(_message):
-        raise AssertionError('до разбора сообщения дойти не должно')
-
-    monkeypatch.setattr(bot, '_mod_message_text', _boom)
-    update = SimpleNamespace(
-        effective_message=SimpleNamespace(sender_chat=SimpleNamespace(id=-100)),
-        effective_user=SimpleNamespace(is_bot=False, id=1, full_name='x'),
-        effective_chat=SimpleNamespace(id=-100),
-    )
-    await bot.moderation_message_handler(update, SimpleNamespace(bot=None))
 
 
 @pytest.mark.asyncio
