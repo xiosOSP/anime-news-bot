@@ -80,7 +80,6 @@ def state(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, '_moderation_windows', {})
     monkeypatch.setattr(bot, '_moderation_recent', {})
     monkeypatch.setattr(bot, '_MOD_LAST_ACTION', {})
-    monkeypatch.setattr(bot, '_MOD_ADMIN_CACHE', {})
     monkeypatch.setattr(bot, '_moderation_media_reports', {})
     monkeypatch.setattr(bot, '_all_admin_ids', lambda: [])
     monkeypatch.setattr(bot, 'feature_enabled', lambda name: True)
@@ -462,8 +461,10 @@ async def test_pending_decision_respects_disabled_chat_and_new_admin(state):
     state.set_chat(-100, True)
     telegram.get_chat_member.return_value = NS(status='administrator')
     await bot._mod_apply(telegram, message(), decision, 'aggression', '')
-    telegram.delete_message.assert_not_awaited()
-    assert state.warn_count(-100, 7) == 0
+    telegram.delete_message.assert_awaited_once()
+    telegram.restrict_chat_member.assert_not_awaited()
+    assert decision['restriction_blocked'] == 'admin'
+    assert state.warn_count(-100, 7) == 1
 
 
 # ---------- условная «угроза» — это шутка чата, а не намерение ----------

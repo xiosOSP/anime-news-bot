@@ -23008,38 +23008,13 @@ async def blacklist_command(update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============== МОДЕРАЦИЯ ЧАТА: РЕШЕНИЕ И ДЕЙСТВИЕ ==============
 
-_MOD_ADMIN_CACHE: dict[str, tuple[float, bool]] = {}
-MODERATION_ADMIN_CACHE_SEC = max(30, min(3600, _env_int('MODERATION_ADMIN_CACHE_SEC', 300)))
-
-
-async def _mod_is_immune(bot: Bot, chat_id: int, user_id: int) -> bool:
-    """Админов чата и админов бота не трогаем.
-
-    Ответ кешируется: состав админов меняется редко, а без кеша каждое
-    подозрительное сообщение стоило бы отдельного обращения к Telegram.
-    """
-    if user_id in _all_admin_ids():
-        return True
-    key = f'{chat_id}:{user_id}'
-    cached = _MOD_ADMIN_CACHE.get(key)
-    now = time.monotonic()
-    if cached and now - cached[0] < MODERATION_ADMIN_CACHE_SEC:
-        return cached[1]
-    try:
-        member = await bot.get_chat_member(chat_id, user_id)
-        is_admin_here = getattr(member, 'status', '') in ('creator', 'administrator')
-    except TelegramError as e:
-        # False здесь означало «не иммунен», то есть наказуемый. Комментарий
-        # обещал обратное, а код при сбое Telegram открывал дорогу к наказанию
-        # админа чата. Не смогли проверить — считаем иммунным: пропустить
-        # нарушение дешевле, чем замутить модератора из-за таймаута.
-        logger.info('Модерация: статус участника не проверен (%s) — считаю иммунным', e)
-        metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'status_unknown'})
-        return True
-    if len(_MOD_ADMIN_CACHE) > 2000:
-        _MOD_ADMIN_CACHE.clear()
-    _MOD_ADMIN_CACHE[key] = (now, is_admin_here)
-    return is_admin_here
+def _mod_actor(message) -> tuple[int, str]:
+    """A sender chat is not its fake from_user and does not identify a person."""
+    sender = getattr(message, 'sender_chat', None)
+    if sender is not None:
+        return int(sender.id), str(getattr(sender, 'title', '') or 'от имени чата')
+    user = getattr(message, 'from_user', None)
+    return int(getattr(user, 'id', 0) or 0), str(getattr(user, 'full_name', '') or 'участник')
 
 
 def _mod_decide(category: str, severity: int, warns: int, streak: int = 0) -> dict:
@@ -23115,9 +23090,9 @@ def _mod_member_permissions(member) -> dict:
 
 async def _mod_media_unchecked(bot: Bot, message, reason: str) -> None:
     chat_id = message.chat_id
-    user_id = message.from_user.id
+    user_id, name = _mod_actor(message)
     if chat_moderation is not None:
-        chat_moderation.log_decision(chat_id, user_id, getattr(message.from_user, 'full_name', ''),
+        chat_moderation.log_decision(chat_id, user_id, name,
                                     'media', 'не проверено', 'локальный детектор', reason,
                                     _mod_message_text(message))
     metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'media_unchecked'})
@@ -23143,7 +23118,9 @@ async def _mod_media_unchecked(bot: Bot, message, reason: str) -> None:
 async def _mod_apply(bot: Bot, message, decision: dict, category: str,
                      reason: str) -> str:
     """Apply a durable incident, recording only confirmed Telegram outcomes."""
-    chat_id, user_id = int(message.chat_id), int(message.from_user.id)
+    chat_id = int(message.chat_id)
+    user_id, _ = _mod_actor(message)
+    anonymous = getattr(message, 'sender_chat', None) is not None
     action = str(decision.get('action') or 'none')
     decision['applied_action'] = 'none'
     if chat_moderation is None:
@@ -23154,14 +23131,24 @@ async def _mod_apply(bot: Bot, message, decision: dict, category: str,
         return f'режим наблюдения: бот сделал бы «{action}», но ничего не сделал'
     if not feature_enabled('chat_moderation') or not chat_moderation.is_enabled(chat_id):
         return 'модерация отключена до выполнения решения'
-    try:
-        # Cached membership is useful for screening; refresh before sanctions.
-        member = await bot.get_chat_member(chat_id, user_id)
-        if user_id in _all_admin_ids() or getattr(member, 'status', '') in ('creator', 'administrator'):
-            return 'участник — администратор; санкция отменена'
-    except TelegramError as exc:
-        decision['applied_action'] = 'unknown'
-        return f'статус участника не проверен ({type(exc).__name__}); санкция не выдана'
+    member = None
+    if anonymous:
+        # Telegram does not reveal the author. Never warn/restrict the fake user.
+        decision['restriction_blocked'] = 'anonymous'
+        action = 'delete' if decision.get('delete') else 'escalate'
+        decision.update(action=action, minutes=0)
+    else:
+        try:
+            # Check current Telegram status, not the bot's management allowlist.
+            member = await bot.get_chat_member(chat_id, user_id)
+        except TelegramError as exc:
+            decision['applied_action'] = 'unknown'
+            return f'статус участника не проверен ({type(exc).__name__}); санкция не выдана'
+        if getattr(member, 'status', '') in ('creator', 'administrator'):
+            decision['restriction_blocked'] = 'admin'
+            if action in ('warn', 'mute', 'escalate'):
+                action = 'warn'
+                decision.update(action=action, minutes=0)
 
     group = getattr(message, 'media_group_id', None)
     identity = f'{chat_id}:{user_id}:{"album:" + str(group) if group else message.message_id}'
@@ -23174,6 +23161,11 @@ async def _mod_apply(bot: Bot, message, decision: dict, category: str,
         decision['applied_action'] = 'failed'
         return 'не удалось сохранить решение; санкция не выдана'
     done = []
+    if decision.get('restriction_blocked') == 'admin':
+        done.append('администратор: мут/бан недоступен в Telegram; требуется решение владельца чата')
+    elif anonymous:
+        done.append('автор скрыт Telegram: личный варн, мут и бан не назначены')
+    deletion_status = 'confirmed'
     if decision.get('delete'):
         try:
             if await bot.delete_message(chat_id, message.message_id) is False:
@@ -23181,12 +23173,18 @@ async def _mod_apply(bot: Bot, message, decision: dict, category: str,
             done.append('сообщение удалено')
             decision['applied_action'] = 'delete'
         except TelegramError as exc:
+            deletion_status = 'failed' if isinstance(exc, BadRequest) else 'unknown'
             done.append(f'удаление не подтверждено ({type(exc).__name__})')
     if existing:
         return ', '.join(done + ['санкция за это сообщение/альбом уже учтена'])
     if cooldown and action in ('warn', 'mute'):
         chat_moderation.update_incident(incident_id, status='suppressed', reason=reason)
         return ', '.join(done + ['новый варн/мут не выдан: действует интервал между наказаниями'])
+
+    if anonymous and deletion_status != 'confirmed':
+        chat_moderation.update_incident(incident_id, status=deletion_status, reason=reason)
+        decision['applied_action'] = deletion_status
+        return ', '.join(done)
 
     succeeded = action != 'mute'
     until = None
@@ -23249,6 +23247,8 @@ async def _mod_apply(bot: Bot, message, decision: dict, category: str,
         total = chat_moderation.warn_count(chat_id, user_id)
         done.append(f'предупреждений: {total}')
         await _mod_tell_user(bot, message, decision, category, total)
+    if anonymous:
+        await _mod_tell_user(bot, message, decision, category, 0)
     chat_moderation.record_decision(category, action)
     metrics.inc('anime_bot_moderation_actions_total', labels={'action': action, 'category': category})
     _event_log('moderation_action', chat_id=chat_id, action=action, category=category)
@@ -23258,11 +23258,19 @@ async def _mod_apply(bot: Bot, message, decision: dict, category: str,
 async def _mod_tell_user(bot: Bot, message, decision: dict, category: str,
                          warns_total: int) -> None:
     """Update one recent notice per participant instead of flooding the chat."""
-    user = message.from_user
-    mention = f'<a href="tg://user?id={int(user.id)}">{html.escape(str(user.full_name or "участник")[:48])}</a>'
+    user_id, name = _mod_actor(message)
+    mention = html.escape(name[:48])
+    if user_id > 0:
+        mention = f'<a href="tg://user?id={user_id}">{mention}</a>'
+    else:
+        mention = 'сообщение от имени «' + mention + '»'
     human = html.escape(str(decision.get('human') or category))
     action, minutes = str(decision.get('action')), int(decision.get('minutes') or 0)
-    if action == 'mute':
+    if decision.get('restriction_blocked') == 'anonymous':
+        tail = 'Автор скрыт Telegram; личная санкция не назначена. Нужна проверка владельца чата.'
+    elif decision.get('restriction_blocked') == 'admin':
+        tail = f'Предупреждение {warns_total}. Правила действуют и для администраторов. Мут/бан требует снятия админских прав владельцем чата.'
+    elif action == 'mute':
         duration = f'{minutes // 60} ч' if minutes >= 60 else f'{minutes} мин'
         tail = f'Мут на {duration}. Предупреждений: {warns_total}.'
     else:
@@ -23272,7 +23280,7 @@ async def _mod_tell_user(bot: Bot, message, decision: dict, category: str,
     text = (f'⚠️ {mention}, нарушение: <b>{human}</b>. {tail}\n'
             '<i>Если это ошибка — напишите админам, решение снимут.</i>')
     topic = getattr(message, 'message_thread_id', None)
-    key = (message.chat_id, user.id, topic)
+    key = (message.chat_id, user_id, topic)
     previous = _moderation_user_notices.get(key)
     now = time.monotonic()
     if previous and now - previous['at'] < 120:
@@ -23302,20 +23310,21 @@ async def _mod_tell_user(bot: Bot, message, decision: dict, category: str,
         logger.info('Модерация: объяснение не отправлено (%s)', type(exc).__name__)
 
 
-def _mod_report_markup(chat_id: int, user_id: int, incident_id: str = '') -> InlineKeyboardMarkup:
+def _mod_report_markup(chat_id: int, user_id: int, incident_id: str = '', *, allow_ban: bool = True) -> InlineKeyboardMarkup:
     suffix = f':{incident_id}' if incident_id else ''
-    return InlineKeyboardMarkup([[
+    buttons = [
         InlineKeyboardButton('✅ Верно', callback_data=f'mod:ok:{chat_id}:{user_id}{suffix}'),
         InlineKeyboardButton('↩️ Снять', callback_data=f'mod:undo:{chat_id}:{user_id}{suffix}'),
-        InlineKeyboardButton('🚫 Забанить', callback_data=f'mod:ban:{chat_id}:{user_id}{suffix}'),
-    ]])
+    ]
+    if allow_ban and user_id > 0:
+        buttons.append(InlineKeyboardButton('🚫 Забанить', callback_data=f'mod:ban:{chat_id}:{user_id}{suffix}'))
+    return InlineKeyboardMarkup([buttons])
 
 
 async def _mod_report(bot: Bot, message, category: str, decision: dict,
                       reason: str, applied: str, source: str) -> None:
     """Отчёт админам. Для категорий уровня бана — с явной пометкой."""
-    user = message.from_user
-    user_id = int(getattr(user, 'id', 0) or 0)
+    user_id, actor_name = _mod_actor(message)
     # Repeated removals/failed actions must not flood administrators' inboxes.
     report_key = (message.chat_id, user_id, category, decision.get('applied_action', 'none'))
     now = time.monotonic()
@@ -23325,7 +23334,7 @@ async def _mod_report(bot: Bot, message, category: str, decision: dict,
     _moderation_report_recent[report_key] = now
     while len(_moderation_report_recent) > 2000:
         _moderation_report_recent.pop(next(iter(_moderation_report_recent)))
-    name = html.escape(str(getattr(user, 'full_name', '') or user_id)[:64])
+    name = html.escape(actor_name[:64])
     human = str(decision.get('human') or category)
     head = ('🚨 <b>Нарушение уровня бана</b>' if category in MODERATION_HUMAN_ONLY
             else '🛡 <b>Модерация чата</b>')
@@ -23344,7 +23353,8 @@ async def _mod_report(bot: Bot, message, category: str, decision: dict,
     for admin_id in _all_admin_ids():
         try:
             await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML,
-                                   reply_markup=_mod_report_markup(message.chat_id, user_id, decision.get('incident_id', '')))
+                                   reply_markup=_mod_report_markup(message.chat_id, user_id, decision.get('incident_id', ''),
+                                        allow_ban=not decision.get('restriction_blocked')))
         except TelegramError:
             logger.debug('Модерация: отчёт админу %s не доставлен', admin_id)
 
@@ -23356,16 +23366,17 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
     message = getattr(update, 'effective_message', None)
     user = getattr(update, 'effective_user', None)
     chat = getattr(update, 'effective_chat', None)
-    if message is None or user is None or chat is None:
+    if message is None or chat is None:
         return
-    if getattr(user, 'is_bot', False) or not chat_moderation.is_enabled(chat.id):
+    sender_chat = getattr(message, 'sender_chat', None)
+    if not chat_moderation.is_enabled(chat.id):
         return
-    if getattr(message, 'sender_chat', None) is not None:
+    if sender_chat is None and (user is None or getattr(user, 'is_bot', False)):
         return
     text = _mod_message_text(message)
     if not text:
         return
-    user_id = int(user.id)
+    user_id, actor_name = _mod_actor(message)
     attachment = media_attachment(message)
     attachment_key = getattr(attachment[0], 'file_unique_id', '') if attachment else ''
     repeat_key = hashlib.sha256((_mod_normalize(text) + '\0' + attachment_key).encode()).hexdigest()
@@ -23380,13 +23391,13 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
         _moderation_seen_updates[fingerprint] = time.monotonic()
         while len(_moderation_seen_updates) > 4000:
             _moderation_seen_updates.pop(next(iter(_moderation_seen_updates)))
-        _mod_note_message(chat.id, user_id, getattr(user, 'full_name', ''), text,
+        _mod_note_message(chat.id, user_id, actor_name, text,
                           counts_as_new=getattr(update, 'edited_message', None) is None,
                           message_id=getattr(message, 'message_id', None),
                           media_group_id=getattr(message, 'media_group_id', None), repeat_key=repeat_key)
 
     replied = getattr(message, 'reply_to_message', None)
-    target = getattr(getattr(replied, 'from_user', None), 'id', 0) or 0
+    target = (getattr(getattr(replied, 'from_user', None), 'id', 0) or 0) if getattr(replied, 'sender_chat', None) is None else 0
     local = _mod_local_check(chat.id, user_id, text, reply_to_user=bool(target), repeat_key=repeat_key)
     # Resolve admin targeting only for a potentially insulting reply.
     if target and local is not None:
@@ -23399,8 +23410,6 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
             local = _mod_local_check(chat.id, user_id, text, reply_to_user=True,
                                      reply_to_admin=True, repeat_key=repeat_key)
     if local is None and attachment is None:
-        return
-    if await _mod_is_immune(context.bot, chat.id, user_id):
         return
     source = 'локальные правила'
     media = None
@@ -23424,7 +23433,7 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
     if not local.get('confident'):
         verdict = await _moderation_classify(chat.id, text) if MODERATION_LLM_ENABLED else None
         if verdict is None:
-            chat_moderation.log_decision(chat.id, user_id, getattr(user, 'full_name', ''),
+            chat_moderation.log_decision(chat.id, user_id, actor_name,
                 str(local.get('category') or 'подозрительно'), 'не проверено',
                 'локальные правила', 'Неоднозначный текст; LLM отключена или недоступна', text)
             return
@@ -23441,11 +23450,11 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
         decision = _mod_decide(category, severity, chat_moderation.warn_count(chat.id, user_id), streak)
         decision['severity'] = severity
         if decision['action'] == 'none':
-            chat_moderation.log_decision(chat.id, user_id, getattr(user, 'full_name', ''), category,
+            chat_moderation.log_decision(chat.id, user_id, actor_name, category,
                                         f'замечено {streak}/{MODERATION_BELITTLING_STREAK}', source, reason, text)
             return
         applied = await _mod_apply(context.bot, message, decision, category, reason)
-        chat_moderation.log_decision(chat.id, user_id, getattr(user, 'full_name', ''), category,
+        chat_moderation.log_decision(chat.id, user_id, actor_name, category,
                                     decision.get('applied_action', 'none'), source, reason, text)
     await _mod_report(context.bot, message, category, decision, reason, applied, source)
 
@@ -23845,14 +23854,17 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.edit_message_reply_markup(reply_markup=None)
             return True
         if verb == 'ban':
+            if user_id <= 0:
+                await query.answer('Telegram не раскрывает автора сообщения от имени чата', show_alert=True)
+                return True
             # The only ban call remains an explicit administrator button.
             if incident.get('ban_status') in ('pending', 'confirmed', 'unknown'):
                 await query.answer('Бан уже запрошен; проверьте участника в чате', show_alert=True)
                 return True
             try:
                 member = await context.bot.get_chat_member(chat_id, user_id)
-                if user_id in _all_admin_ids() or getattr(member, 'status', '') in ('creator', 'administrator'):
-                    await query.answer('Администратор защищён от бана', show_alert=True)
+                if getattr(member, 'status', '') in ('creator', 'administrator'):
+                    await query.answer('Telegram не позволяет забанить администратора; сначала владелец должен снять его права', show_alert=True)
                     return True
                 if not chat_moderation.update_incident(incident_id, ban_status='pending'):
                     await query.answer('Не удалось сохранить решение', show_alert=True)

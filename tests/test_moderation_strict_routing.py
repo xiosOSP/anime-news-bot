@@ -20,7 +20,7 @@ def state(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, 'chat_moderation', store)
     monkeypatch.setattr(bot, '_moderation_action_lock', asyncio.Lock())
     monkeypatch.setattr(bot, '_moderation_update_lock', asyncio.Lock())
-    for name in ('_MOD_LAST_ACTION', '_MOD_ADMIN_CACHE', '_moderation_seen_updates',
+    for name in ('_MOD_LAST_ACTION', '_moderation_seen_updates',
                  '_moderation_windows', '_moderation_recent', '_moderation_user_notices', '_moderation_report_recent'):
         monkeypatch.setattr(bot, name, {})
     monkeypatch.setattr(bot, 'MODERATION_ACTION_COOLDOWN_SEC', 0)
