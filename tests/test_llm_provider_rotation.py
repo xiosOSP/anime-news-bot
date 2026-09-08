@@ -249,3 +249,16 @@ def test_duplicate_alternate_is_not_tried_twice(three, monkeypatch):
                         ('deepseek/deepseek-v4-pro-free', 'qwen/qwen3.8-27b-free'))
     order = bot._llm_candidates()
     assert order.count(('primary', 'deepseek/deepseek-v4-pro-free')) == 1
+
+
+def test_tokenator_preset_defaults_to_a_free_model():
+    """Подключение провайдера не должно молча начать тратить деньги.
+
+    У tokenator ключ платный, а в каталоге есть и бесплатные модели с
+    лимитами. Пресет — это то, что получает человек, задавший только
+    LLM_PROVIDER и LLM_API_KEY: он обязан вести на бесплатную модель, а
+    платную выбирают осознанно через LLM_MODEL.
+    """
+    base_url, model = bot.LLM_PRESETS['tokenator']
+    assert base_url == 'https://api.tokenator.top/v1'
+    assert model.startswith('free-'), 'пресет ведёт на платную модель'
