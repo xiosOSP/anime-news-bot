@@ -94,9 +94,15 @@ def check_text(text: str, *, reply_to_user: bool = False,
     if raid and (_LINK.search(value) or re.search(r'\b(?:чужой чат|их чат|этот чат|канал|группу)\b', direct)):
         if not re.search(r'\b(?:не спамим|не флудим|не рейдим|запрещен\w*|нельзя)\b', direct):
             return Verdict('raid', 'Призыв к атаке на чат или канал', 3)
-    if _THREAT.search(direct):
-        threat = _THREAT.search(direct)
-        if not re.search(r'\bне\s+$', direct[:threat.start()]):
+    threat = _THREAT.search(direct)
+    if threat:
+        before = direct[:threat.start()]
+        # Отрицание и условие снимают угрозу. «Убью, если заспойлеришь» — это
+        # шутка на языке аниме-чата, а не намерение: наказывать за неё мутом
+        # с первого раза значит переехать через обычное общение. Настоящая
+        # угроза условия не ставит.
+        conditional = re.search(r'\bесли\b|\bкогда\b', direct[threat.start():threat.end() + 40])
+        if not re.search(r'\bне\s+$', before) and not conditional:
             return Verdict('aggression', 'Прямая угроза или пожелание смерти', 3)
     insult = re.search(_INSULT, direct)
     addressed_admin = reply_to_admin or bool(re.search(r'\b(?:админ\w*|модератор\w*)\b', direct))

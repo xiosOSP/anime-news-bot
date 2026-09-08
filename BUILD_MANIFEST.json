@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "c131821c5cf4ff27d1a9caa66a4a0063aea94e28",
-  "generated_at_utc": "2026-09-08T05:37:11.431825+00:00",
+  "git_commit": "1b937819cf44583471bb298f625197d819f4839e",
+  "generated_at_utc": "2026-09-08T08:23:28.057334+00:00",
   "files": {
     ".env.example": {
       "sha256": "363dd04b783149498def08b625988b24b66ba971cf5815ac70932e1e02eedc6e",
@@ -46,8 +46,8 @@
       "bytes": 14072
     },
     "moderation_rules.py": {
-      "sha256": "0c6215159c2aa90fdc8956529b938087d819d586de99d1b08dcbdbdc2afab11f",
-      "bytes": 8151
+      "sha256": "f08d589cae82731b8af4c304779fddd1bb65a918cbfaf30385358133a66b37f6",
+      "bytes": 8733
     },
     "pytest.ini": {
       "sha256": "e28a989e765f6f1fc37e02fb00a351f56391f749cafcd3f93057abbfb17ba26b",
@@ -314,8 +314,8 @@
       "bytes": 10090
     },
     "tests/test_moderation_offline.py": {
-      "sha256": "2a26320ed2f7f784a8fb6e1f18fa9ca4cbd6e5482fa4effac85b479aa89d9fa5",
-      "bytes": 21808
+      "sha256": "01abdda0c9e72ea0f33fa2dfc98724e3463d265b00e245fad951372752b5d6f6",
+      "bytes": 23142
     },
     "tests/test_normalization.py": {
       "sha256": "bc27122ac04567808b43bed40b05587a1d8cad434f68dbc48ddc549eb5fb8192",
@@ -330,8 +330,8 @@
       "bytes": 6949
     },
     "tests/test_parser_scope_limits.py": {
-      "sha256": "849509af5a368d00942f87eaec8d8c2e4529a6ba8ad4c77a0d8b0f1fa7e45fb6",
-      "bytes": 37114
+      "sha256": "95a7ffc8a682323f94bfc3ca0f89a6a95a03f27db7e508bc2c2072f05acf805e",
+      "bytes": 37817
     },
     "tests/test_pipeline.py": {
       "sha256": "d86a3f8751af3223b7b832790fd90ac990b16cb156df546343f6fe7eed581052",

@@ -1,6 +1,7 @@
 """Тесты: изоляция постов в TG-парсере, лимит видео 5 минут,
 потоковое скачивание и лимит действий гостей."""
 import asyncio
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -195,10 +196,17 @@ class TestConcurrentCollection:
         import asyncio
         from unittest.mock import AsyncMock
         order = []
+        active, peak = [0], [0]
+        gate = threading.Lock()
 
         def make(name):
             def fn():
+                with gate:
+                    active[0] += 1
+                    peak[0] = max(peak[0], active[0])
                 time.sleep(0.05)
+                with gate:
+                    active[0] -= 1
                 order.append(name)
                 return [{'title': name, 'link': f'http://x/{name}', 'images': ['i']}]
             return fn
@@ -212,11 +220,14 @@ class TestConcurrentCollection:
                             MagicMock(record_collected=AsyncMock(),
                                       record_skipped=AsyncMock(),
                                       record_source_error=AsyncMock()))
-        t0 = time.perf_counter()
         news, _lines, errors = asyncio.run(anime_news_bot.collect_all_news())
-        elapsed = time.perf_counter() - t0
         assert errors == []
-        assert elapsed < 6 * 0.05          # быстрее последовательного
+        # Проверяем саму одновременность, а не время прогона: на занятом
+        # раннере CI последовательный порог уже давал ложное падение
+        # (0.3066 против 0.30), хотя сбор шёл параллельно.
+        assert peak[0] > 1, 'источники опрашиваются по одному'
+        assert peak[0] <= anime_news_bot.SOURCE_FETCH_CONCURRENCY, (
+            'предел одновременных запросов к источникам не соблюдается')
         # порядок результатов — как в SOURCES, независимо от порядка ответов
         assert [n['title'] for n in news] == [f'S{i}' for i in range(6)]
 
