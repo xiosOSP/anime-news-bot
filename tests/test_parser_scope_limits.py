@@ -1,7 +1,6 @@
 """Тесты: изоляция постов в TG-парсере, лимит видео 5 минут,
 потоковое скачивание и лимит действий гостей."""
 import asyncio
-import threading
 import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -194,25 +193,37 @@ class TestConcurrentCollection:
 
     def test_sources_fetched_concurrently_in_order(self, monkeypatch):
         import asyncio
+        import threading
         from unittest.mock import AsyncMock
         order = []
-        active, peak = [0], [0]
+        rendezvous = threading.Barrier(2, timeout=5)
+        second_finished = threading.Event()
+        active, peak = 0, 0
         gate = threading.Lock()
 
         def make(name):
             def fn():
+                nonlocal active, peak
                 with gate:
-                    active[0] += 1
-                    peak[0] = max(peak[0], active[0])
-                time.sleep(0.05)
-                with gate:
-                    active[0] -= 1
-                order.append(name)
-                return [{'title': name, 'link': f'http://x/{name}', 'images': ['i']}]
+                    active += 1
+                    peak = max(peak, active)
+                try:
+                    if name in ('S0', 'S1'):
+                        rendezvous.wait()  # sequential execution cannot pass this
+                    if name == 'S0':
+                        assert second_finished.wait(5)
+                    order.append(name)
+                    if name == 'S1':
+                        second_finished.set()
+                    return [{'title': name, 'link': f'http://x/{name}', 'images': ['i']}]
+                finally:
+                    with gate:
+                        active -= 1
             return fn
 
         monkeypatch.setattr(anime_news_bot, 'SOURCES',
                             [(f'S{i}', make(f'S{i}')) for i in range(6)])
+        monkeypatch.setattr(anime_news_bot, 'SOURCE_FETCH_CONCURRENCY', 5)
         monkeypatch.setattr(anime_news_bot, 'settings',
                             MagicMock(is_source_enabled=lambda n: True,
                                       require_image=False))
@@ -222,12 +233,8 @@ class TestConcurrentCollection:
                                       record_source_error=AsyncMock()))
         news, _lines, errors = asyncio.run(anime_news_bot.collect_all_news())
         assert errors == []
-        # Проверяем саму одновременность, а не время прогона: на занятом
-        # раннере CI последовательный порог уже давал ложное падение
-        # (0.3066 против 0.30), хотя сбор шёл параллельно.
-        assert peak[0] > 1, 'источники опрашиваются по одному'
-        assert peak[0] <= anime_news_bot.SOURCE_FETCH_CONCURRENCY, (
-            'предел одновременных запросов к источникам не соблюдается')
+        assert order.index('S1') < order.index('S0')
+        assert 1 < peak <= anime_news_bot.SOURCE_FETCH_CONCURRENCY
         # порядок результатов — как в SOURCES, независимо от порядка ответов
         assert [n['title'] for n in news] == [f'S{i}' for i in range(6)]
 

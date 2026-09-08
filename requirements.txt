@@ -1,6 +1,7 @@
 python-telegram-bot[job-queue]>=20.0
 feedparser>=6.0
 requests>=2.31
+httpx>=0.27,<0.29
 urllib3>=2.2,<3
 beautifulsoup4>=4.12
 deep-translator>=1.11
