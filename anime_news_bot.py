@@ -3051,7 +3051,7 @@ class PostQueue:
 
     async def push_many(self, news_list: list[dict]) -> int:
         """Кладёт новости в очередь. Возвращает сколько добавлено.
-        Если включён require_image — посты без картинок не попадают в очередь."""
+        Если включён require_image — посты без доступного медиа не попадают в очередь."""
         if not news_list:
             return 0
         async with self._lock:
@@ -3073,8 +3073,8 @@ class PostQueue:
                 if norm_link in existing_links or (
                         story_registry_id and story_registry_id in existing_story_ids):
                     continue
-                # Доп. фильтр: посты без картинок не пускаем в очередь
-                if require_img and not news.get('images'):
+                # Фильтр совпадает со сбором: фото либо включённое видео.
+                if require_img and not _news_has_media_candidate(news):
                     continue
                 clean_news = {k: v for k, v in news.items() if k != 'published_parsed'}
                 clean_news.setdefault('_queue_first_at', now_iso)
@@ -3140,11 +3140,11 @@ class PostQueue:
                 if self._retry_pending(news):
                     self._items.append(item)
                     continue
-                if require_img and not news.get('images'):
+                if require_img and not _news_has_media_candidate(news):
                     skipped += 1
                     continue
                 if skipped:
-                    logger.info(f"⊘ Из очереди выброшено {skipped} постов без картинок")
+                    logger.info(f"⊘ Из очереди выброшено {skipped} постов без доступного медиа")
                 self._inflight = item
                 self._inflight_owner = asyncio.current_task()
                 if not self._save():
@@ -3156,7 +3156,7 @@ class PostQueue:
                 return news
 
             if skipped:
-                logger.info(f"⊘ Из очереди выброшено {skipped} постов без картинок")
+                logger.info(f"⊘ Из очереди выброшено {skipped} постов без доступного медиа")
             if changed and not self._save():
                 self._items = old_items
                 self._inflight = old_inflight
@@ -8063,6 +8063,13 @@ def _parse_rss_bytes(
     return news_list
 
 
+class SourceFetchFailure(list):
+    """Empty collector result with a transport/parser failure for diagnostics."""
+    def __init__(self, reason: str):
+        super().__init__()
+        self.reason = _redact_secrets(str(reason))[:300]
+
+
 def _parse_rss_with_fallback(
     rss_url: str,
     source_name: str,
@@ -8071,6 +8078,7 @@ def _parse_rss_with_fallback(
     public_only: bool = False,
 ) -> list[dict]:
     """Downloads a bounded RSS feed and delegates parsing to ``_parse_rss_bytes``."""
+    response = None
     try:
         getter = http_get_public_with_retry if public_only else http_get_with_retry
         response = getter(
@@ -8081,25 +8089,22 @@ def _parse_rss_with_fallback(
         )
         if response is None or response.status_code >= 400:
             status = getattr(response, 'status_code', 'нет ответа')
-            if response is not None:
-                try:
-                    response.close()
-                except Exception:
-                    pass
             logger.warning(f"{source_name}: RSS недоступен (HTTP {status})")
-            return []
+            return SourceFetchFailure(f'RSS HTTP {status}')
         rss_data = _read_limited_response(response, HTTP_RSS_MAX_BYTES)
-        try:
-            response.close()
-        except Exception:
-            pass
         if not rss_data:
             logger.warning(f"{source_name}: RSS пустой или превышает лимит {HTTP_RSS_MAX_BYTES // (1024*1024)} МБ")
-            return []
+            return SourceFetchFailure('RSS пустой или превышает лимит размера')
         return _parse_rss_bytes(rss_data, source_name, fetch_og=fetch_og, force_og=force_og)
     except Exception as e:
         logger.error(f"{source_name} error: {e}")
-        return []
+        return SourceFetchFailure(f'RSS {type(e).__name__}: {e}')
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
 
 
 def get_animenewsnetwork():
@@ -8263,11 +8268,11 @@ def _fetch_listing_source(
         if not response or response.status_code != 200:
             logger.warning('%s: HTTP %s', source_name,
                            response.status_code if response is not None else 'нет ответа')
-            return []
+            return SourceFetchFailure(f'HTML HTTP {response.status_code if response is not None else "нет ответа"}')
         page_text = _read_limited_text(response)
         if page_text is None:
             logger.warning('%s: HTML слишком большой', source_name)
-            return []
+            return SourceFetchFailure('HTML превышает лимит размера')
         return _parse_listing_html(
             page_text,
             source_name=source_name,
@@ -8278,7 +8283,7 @@ def _fetch_listing_source(
         )
     except Exception as e:
         logger.error('%s error: %s', source_name, e)
-        return []
+        return SourceFetchFailure(f'HTML {type(e).__name__}: {e}')
     finally:
         if response is not None:
             try:
@@ -14447,6 +14452,43 @@ async def _run_source_collector_bounded(name: str, collector, timeout: float):
     raise value
 
 
+def _news_has_media_candidate(news: dict) -> bool:
+    """Use the same photo/video eligibility in collection and the durable queue."""
+    if news.get('images'):
+        return True
+    return bool(getattr(settings, 'video_enabled', False) and any(
+        isinstance(news.get(key), str) and news[key].strip()
+        for key in ('video', '_telegram_video_file_id')))
+
+
+def _normalize_collected_news(item, source: str) -> Optional[dict]:
+    """Reject a broken row without losing the rest of a source's batch."""
+    if not isinstance(item, dict):
+        return None
+    title, link = item.get('title'), item.get('link')
+    if not isinstance(title, str) or not title.strip() or not isinstance(link, str):
+        return None
+    try:
+        parsed = urlparse(link.strip())
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            return None
+    except ValueError:
+        return None
+    news = dict(item)
+    news['title'], news['link'] = title.strip(), link.strip()
+    news['source'] = str(news.get('source') or source)
+    if not isinstance(news.get('summary'), str):
+        news['summary'] = ''
+    images = news.get('images') or []
+    if isinstance(images, str):
+        images = [images]
+    news['images'] = ([value.strip() for value in images if isinstance(value, str) and value.strip()]
+                      if isinstance(images, (list, tuple)) else [])
+    if not isinstance(news.get('video'), str):
+        news['video'] = None
+    return news
+
+
 async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
     """Собирает свежие новости со всех включённых источников.
     Возвращает (all_news, stats_lines, errors)."""
@@ -14454,7 +14496,7 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
     stats_lines: list[str] = []
     errors: list[str] = []
     seen_urls: set[str] = set()
-    seen_titles: dict[str, str] = {}
+    seen_titles: set[tuple[str, str]] = set()
 
     # Сбор идёт параллельно (сеть — самая долгая часть цикла), но результаты
     # обрабатываются в исходном порядке источников: дедуп остаётся предсказуемым.
@@ -14487,6 +14529,18 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
             if isinstance(result, BaseException):
                 raise result
             items, fetch_seconds = result
+            if isinstance(items, SourceFetchFailure):
+                raise RuntimeError(items.reason)
+            if not isinstance(items, (list, tuple)):
+                raise ValueError('collector returned an invalid batch')
+            raw_count = len(items)
+            items = [news for item in items if (news := _normalize_collected_news(item, name)) is not None]
+            invalid_count = raw_count - len(items)
+            if invalid_count:
+                metrics.inc('anime_bot_source_invalid_items_total', invalid_count, {'source': name})
+                logger.warning('%s: пропущено повреждённых записей: %d/%d', name, invalid_count, raw_count)
+                if not items:
+                    raise ValueError(f'все записи источника повреждены: {invalid_count}')
             metrics.inc('anime_bot_source_fetch_total', labels={'source': name, 'status': 'ok'})
             metrics.observe('anime_bot_source_fetch_seconds', fetch_seconds, {'source': name})
             metrics.inc('anime_bot_source_items_total', len(items), {'source': name})
@@ -14508,18 +14562,18 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
                     continue
                 # Exact titles from *different* sources are valuable corroboration.
                 # Only collapse title duplicates within the same source before clustering.
-                if norm_title and seen_titles.get(norm_title) == name:
+                if norm_title and (name, norm_title) in seen_titles:
                     logger.info(f"Дубль внутри источника (заголовок): {item['title'][:60]}")
                     duplicate_skipped += 1
                     continue
                 # Фильтр: посты без картинок не публикуем
-                if settings.require_image and not item.get('images'):
+                if settings.require_image and not _news_has_media_candidate(item):
                     no_image_skipped += 1
                     continue
                 if norm_url:
                     seen_urls.add(norm_url)
                 if norm_title:
-                    seen_titles.setdefault(norm_title, name)
+                    seen_titles.add((name, norm_title))
                 unique_items.append(item)
 
             # Здоровье источника считаем по СЫРОМУ ответу: живой источник может
@@ -14538,6 +14592,8 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
             stat_line = f"{name}: {len(unique_items)}"
             if no_image_skipped:
                 stat_line += f" (⊘{no_image_skipped} без фото)"
+            if invalid_count:
+                stat_line += f' (⚠️{invalid_count} повреждено)'
             stats_lines.append(stat_line)
             logger.info(f"{name}: {len(unique_items)} новостей (из {len(items)} собранных, {no_image_skipped} без фото)")
 
@@ -14569,6 +14625,7 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
                 suffix = (f" (повтор {fingerprint.get('count')})"
                           if int(fingerprint.get('count', 1)) > 1 else '')
                 errors.append(f"{name}: {e}{suffix}")
+            stats_lines.append(f'{name}: ❌')
             logger.error(f"{name} failed: {e}")
             metrics.inc('anime_bot_source_fetch_total', labels={'source': name, 'status': 'error'})
             _event_log('source_fetch', source=name, status='error',
@@ -19313,6 +19370,22 @@ def _llm_content_key(news: dict) -> str:
     return hashlib.sha256(raw.encode('utf-8', errors='ignore')).hexdigest()
 
 
+def _llm_editorial_data(value) -> dict:
+    """Keep only supported editorial field types; never publish repr(JSON)."""
+    if not isinstance(value, dict):
+        return {}
+    data = {field: value[field].strip() for field in ('title', 'summary', 'topic', 'kind', 'subject')
+            if isinstance(value.get(field), str) and value[field].strip()}
+    if type(value.get('relevant')) is bool:
+        data['relevant'] = value['relevant']
+    tags = value.get('tags')
+    if isinstance(tags, list):
+        valid_tags = [tag.strip() for tag in tags[:20] if isinstance(tag, str) and tag.strip()]
+        if valid_tags:
+            data['tags'] = valid_tags[:3]
+    return data
+
+
 def _llm_editorial_cached(news: dict) -> Optional[dict]:
     """Готовый разбор этой же новости, если он ещё не протух.
 
@@ -19326,12 +19399,13 @@ def _llm_editorial_cached(news: dict) -> Optional[dict]:
     if time.time() - float(entry.get('at') or 0) >= LLM_EDITORIAL_CACHE_TTL_SEC:
         return None
     data = entry.get('data')
-    return dict(data) if isinstance(data, dict) and data else None
+    return _llm_editorial_data(data) or None
 
 
 def _llm_editorial_remember(news: dict, data: dict) -> None:
     """Запоминает разбор новости, чтобы второй раз за него не платить."""
-    if not isinstance(data, dict) or not data:
+    data = _llm_editorial_data(data)
+    if not data:
         return
     _bounded_cache_put(_llm_editorial_cache, _llm_content_key(news),
                        {'at': time.time(), 'data': dict(data)}, LLM_EDITORIAL_CACHE_MAX)
@@ -19445,7 +19519,8 @@ def _llm_batch_usable(data: dict) -> bool:
     Пустышка вида ``{"id":3}`` формально разбирается, но запомнить её — значит
     навсегда лишить новость модели: кеш ответит на все следующие попытки.
     """
-    return any(str(data.get(field) or '').strip()
+    data = _llm_editorial_data(data)
+    return any(data.get(field)
                for field in ('title', 'summary', 'topic', 'kind', 'subject'))
 
 
@@ -19471,7 +19546,9 @@ def _llm_parse_batch(raw: str) -> dict:
             continue
         if item_id in found:
             continue        # повтор id — доверяем первому ответу
-        data = {k: v for k, v in item.items() if k != 'id'}
+        data = _llm_editorial_data(item)
+        if isinstance(item.get('src'), str):
+            data['src'] = item['src']
         if _llm_batch_usable(data):
             found[item_id] = data
     return found
@@ -19671,7 +19748,7 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
             {'role': 'system', 'content': LLM_SYSTEM_PROMPT},
             {'role': 'user', 'content': payload},
         ], task='editorial')
-        data = _llm_parse_json(raw or '')
+        data = _llm_editorial_data(_llm_parse_json(raw or ''))
         if not data:
             if raw:
                 logger.info(f"LLM: ответ не разобрался, беру обычный путь — {raw[:80]}")
@@ -21165,6 +21242,7 @@ DEEPL_WARN_AT = (0.8, 0.95)     # на каких долях лимита пре
 # Разовые сообщения админам, которые накопились вне контекста бота
 # (в парсерах и джобах бота под рукой нет) — check_news их разошлёт.
 _pending_admin_alerts: list[str] = []
+_silence_retry_at = 0.0
 _silence_reported = False       # чтобы не повторять тревогу каждый цикл
 
 
@@ -21178,8 +21256,9 @@ def _queue_admin_alert(text: str) -> None:
 
 def _mark_published() -> None:
     """Отмечает факт успешной публикации — питание для сторожа тишины."""
-    global _silence_reported
+    global _silence_reported, _silence_retry_at
     _silence_reported = False
+    _silence_retry_at = 0.0
     if settings is not None:
         settings.last_publish_at = datetime.now(timezone.utc).isoformat()
 
@@ -21202,25 +21281,33 @@ async def _check_silence(bot: Bot) -> None:
     """Сторож: если бот давно ничего не опубликовал, значит что-то тихо сломалось.
     Ровно этот сценарий повторялся раньше — отложка, видео и картинки отваливались
     молча, и узнавали мы об этом только глазами."""
-    global _silence_reported
+    global _silence_reported, _silence_retry_at
     hours = _silence_hours()
     if hours is None:
         _mark_published()            # первая отметка — точка отсчёта
         return
     if hours < WATCHDOG_SILENCE_HOURS:
         return
-    if _silence_reported:
+    if _silence_reported or time.monotonic() < _silence_retry_at:
         return
     _silence_reported = True
     enabled = sum(1 for n, _ in SOURCES if settings.is_source_enabled(n))
-    await notify_admin(
-        bot,
-        f'🔇 Тревога: {int(hours)} ч без единой публикации\n\n'
-        f'Источников включено: {enabled}\n'
-        f'В отложке: {len(scheduled_posts.all()) if scheduled_posts else 0}\n'
-        f'Ждут решения в ветке: {len(pending_posts._items) if pending_posts else 0}\n\n'
-        f'Обычно это значит: источники перестали отдавать новости, всё уходит '
-        f'в дубли или отправка падает. Диагностика — /health и /logs.')
+    try:
+        delivered = await notify_admin(
+            bot,
+            f'🔇 Тревога: {int(hours)} ч без единой публикации\n\n'
+            f'Источников включено: {enabled}\n'
+            f'В отложке: {len(scheduled_posts.all()) if scheduled_posts else 0}\n'
+            f'Ждут решения в ветке: {len(pending_posts._items) if pending_posts else 0}\n\n'
+            f'Обычно это значит: источники перестали отдавать новости, всё уходит '
+            f'в дубли или отправка падает. Диагностика — /health и /logs.')
+    except BaseException:
+        _silence_reported = False
+        _silence_retry_at = time.monotonic() + 300
+        raise
+    if delivered == 0:
+        _silence_reported = False
+        _silence_retry_at = time.monotonic() + 300
 
 
 def _deepl_usage_local() -> tuple[int, str]:
@@ -23188,6 +23275,9 @@ def _mod_member_permissions(member) -> dict:
 
 async def _mod_media_unchecked(bot: Bot, message, reason: str) -> None:
     chat_id = message.chat_id
+    if (chat_moderation is None or not feature_enabled('chat_moderation')
+            or not chat_moderation.is_enabled(chat_id)):
+        return
     user_id, name = _mod_actor(message)
     if chat_moderation is not None:
         chat_moderation.log_decision(chat_id, user_id, name,
@@ -23251,6 +23341,12 @@ async def _mod_apply(bot: Bot, message, decision: dict, category: str,
             if action in ('warn', 'mute', 'escalate'):
                 action = 'warn'
                 decision.update(action=action, minutes=0)
+
+    if not feature_enabled('chat_moderation') or not chat_moderation.is_enabled(chat_id):
+        return 'модерация отключена до выполнения решения'
+    if chat_moderation.mode != 'active':
+        decision['applied_action'] = 'observe:' + action
+        return 'режим изменён на наблюдение; санкция не выдана'
 
     group = getattr(message, 'media_group_id', None)
     identity = f'{chat_id}:{user_id}:{"album:" + str(group) if group else message.message_id}'
