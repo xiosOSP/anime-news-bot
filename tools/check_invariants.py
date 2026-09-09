@@ -560,6 +560,46 @@ def _check_llm_editorial_cache_is_bounded(bot) -> tuple[bool, str]:
     return True, f'кеш разборов ограничен {bot.LLM_EDITORIAL_CACHE_MAX} записями'
 
 
+def _check_local_topic_filter_knows_real_sources(bot) -> tuple[bool, str]:
+    """Локальный отсев обязан называть существующие источники.
+
+    Список лент общей тематики задан строками, а имя источника переименовать
+    ничего не мешает. Опечатка здесь не ломается громко: фильтр просто
+    перестаёт срабатывать, и в канал снова идут Zelda и «Ходячие мертвецы» —
+    ровно то, ради чего он написан.
+    """
+    known = {name for name, _ in bot.SOURCES}
+    unknown = sorted(bot.GENERAL_TOPIC_SOURCES - known)
+    if unknown:
+        return False, f'в списке общих лент нет таких источников: {unknown}'
+    return True, f'все {len(bot.GENERAL_TOPIC_SOURCES)} общих лент существуют'
+
+
+def _check_local_topic_filter_yields_to_the_model(tree) -> tuple[bool, str]:
+    """Локальный отсев работает только там, где вердикта модели нет.
+
+    Он грубее модели: судит по словам в заголовке и о профильной новости без
+    приметных слов ничего не знает. Применённый поверх живой модели, он начнёт
+    выбрасывать разобранные ею аниме-новости — то есть чинить одно, ломая
+    другое. Отсюда проверка на 'off' рядом с вызовом.
+    """
+    func = _func(tree, '_prepare_news_for_send')
+    if func is None:
+        return False, 'функция _prepare_news_for_send пропала'
+    for node in ast.walk(func):
+        if not isinstance(node, ast.If):
+            continue
+        try:
+            test = ast.unparse(node.test)
+        except Exception:
+            continue
+        if 'off_topic_without_llm' in test:
+            if "'off'" in test or '"off"' in test:
+                return True, 'отсев без модели вызывается только при отсутствии разбора'
+            return False, f'отсев без модели вызван без проверки на off: {test}'
+    return False, 'в конвейере публикации не осталось локального отсева непрофильного'
+
+
 def checks(bot, tree) -> list[tuple[str, bool, str]]:
     """Полный список инвариантов. Порядок стабилен: на него смотрит pytest."""
     rows: list[tuple[str, bool, str]] = []
@@ -593,6 +633,10 @@ def checks(bot, tree) -> list[tuple[str, bool, str]]:
     add('у всех хранилищ есть замок', _check_every_store_has_a_lock(tree))
     add('разбор пачки не путает новости', _check_llm_batch_never_mixes_news(bot))
     add('кеш разборов модели ограничен', _check_llm_editorial_cache_is_bounded(bot))
+    add('локальный отсев знает реальные источники',
+        _check_local_topic_filter_knows_real_sources(bot))
+    add('локальный отсев уступает модели',
+        _check_local_topic_filter_yields_to_the_model(tree))
     add('манифест описывает существующие файлы', _check_manifest_describes_reality())
     return rows
 

@@ -3372,6 +3372,10 @@ class BotSettings:
         'llm_enabled': True,     # использовать языковую модель (если задан ключ)
         'llm_rewrite': True,     # брать у модели перевод и текст поста
         'llm_filter': True,      # отсеивать непрофильные новости
+        # Тот же отсев, но без модели: по словам-маркерам в заголовке и
+        # только у источников общей тематики. Включается там, где вердикта
+        # модели нет, — иначе эти ленты идут в канал вообще без фильтра.
+        'local_topic_filter': True,
         'llm_tags': True,        # добавлять хэштеги
         'llm_read_article': True,  # читать статью, если в ленте только тизер
         'llm_skip_filler': True,   # отсеивать подборки и авторские колонки
@@ -3726,6 +3730,15 @@ class BotSettings:
     @llm_filter.setter
     def llm_filter(self, value: bool) -> None:
         self._data['llm_filter'] = bool(value)
+        self.save()
+
+    @property
+    def local_topic_filter(self) -> bool:
+        return bool(self._data.get('local_topic_filter', True))
+
+    @local_topic_filter.setter
+    def local_topic_filter(self, value: bool) -> None:
+        self._data['local_topic_filter'] = bool(value)
         self.save()
 
     @property
@@ -9294,6 +9307,94 @@ def matches_keywords(news: dict) -> bool:
     return any(kw.lower() in text for kw in KEYWORDS)
 
 
+# ============== ЛОКАЛЬНЫЙ ОТСЕВ НЕПРОФИЛЬНОГО ==============
+# Шесть лент ниже — общей тематики: аниме лежит в них вперемешку с кино,
+# сериалами и играми, и по одному имени источника новость не отличить.
+# Остальные источники профильные, там отсеивать нечего.
+GENERAL_TOPIC_SOURCES = frozenset({
+    'Collider', '/Film', 'Variety', 'Polygon', 'ComingSoon', 'Filmix',
+})
+
+# Маркеры аниме-новости. Латиница проверяется словом целиком: подстрокой
+# «manga» находится в «manganese», и такой фильтр пропускал бы что угодно.
+_TOPIC_MARKERS_LAT = (
+    # Сама тематика
+    'anime', 'manga', 'mangaka', 'manhwa', 'manhua', 'otaku', 'isekai',
+    'shonen', 'shounen', 'shoujo', 'shojo', 'seinen', 'josei', 'light novel',
+    'ova', 'ona', 'seiyuu', 'simulcast', 'doujin', 'japanese animation',
+    # Студии, издатели и площадки, у которых не бывает не-аниме новостей
+    'mappa', 'ufotable', 'madhouse', 'kyoto animation', 'kyoani', 'wit studio',
+    'cloverworks', 'gainax', 'studio trigger', 'science saru', 'studio pierrot',
+    'david production', 'toei animation', 'tms entertainment', 'ghibli',
+    'aniplex', 'shueisha', 'kodansha', 'shogakukan', 'kadokawa', 'crunchyroll',
+    'funimation', 'comiket', 'shonen jump', 'miyazaki', 'makoto shinkai',
+    # Франшизы: про них пишут и кино-издания, и это как раз профильные новости
+    'one piece', 'naruto', 'boruto', 'bleach', 'dragon ball', 'jujutsu kaisen',
+    'demon slayer', 'kimetsu', 'attack on titan', 'shingeki', 'chainsaw man',
+    'my hero academia', 'spy x family', 'frieren', 'solo leveling', 'oshi no ko',
+    'dandadan', 'hunter x hunter', 'fullmetal alchemist', 'death note',
+    'tokyo ghoul', 'jojo', 'haikyu', 'blue lock', 'vinland saga', 'mob psycho',
+    'cowboy bebop', 'ghost in the shell', 'evangelion', 'gundam', 'sailor moon',
+    'pokemon', 'pokémon', 'digimon', 'sword art online', 'berserk', 'doraemon',
+    'gintama', 'fairy tail', 'black clover', 'kaiju no', 'sakamoto days',
+    'inuyasha', 'yu-gi-oh', 'suzume', 'gachiakuta',
+)
+# Кириллица ищется по началу слова: падежные окончания иначе пришлось бы
+# перечислять руками («манга», «манги», «мангой»). Цена — «манго» сойдёт за
+# мангу, но лишний пропущенный пост дешевле потерянной новости.
+_TOPIC_MARKERS_CYR = (
+    'аниме', 'манг', 'манхв', 'ранобэ', 'ранобе', 'отаку', 'исекай',
+    'сёнэн', 'сенэн', 'сэйнэн', 'сёдзё', 'седзе', 'дзёсэй', 'сэйю',
+    'гибли', 'миядзаки', 'синкай', 'кранчиролл',
+    'ван-пис', 'ван пис', 'наруто', 'боруто', 'блич', 'евангелион', 'гандам',
+    'покемон', 'дораэмон', 'сейлор мун', 'атака титанов', 'магическая битва',
+    'человек-бензопила', 'истребитель демонов', 'клинок, рассекающий',
+    'ходячий замок', 'унесённые призраками', 'унесенные призраками',
+    'токийский гуль', 'тетрадь смерти', 'стальной алхимик', 'ковбой бибоп',
+)
+# Начало текста, где маркер ещё считается: заголовок кино-издания часто
+# называет только тайтл («Gachiakuta gets a second season»), а слово «аниме»
+# стоит первой строкой лида. Дальше по тексту оно значит уже что угодно —
+# упоминание в списке похожего или в подписи под баннером.
+TOPIC_LEAD_CHARS = 200
+
+
+def _build_topic_marker_re() -> re.Pattern:
+    """Собирает поиск маркеров: латиница — слово целиком, кириллица — начало."""
+    def spaced(word: str) -> str:
+        # «one piece» в заголовке легко оказывается «One-Piece» или с двумя
+        # пробелами после переноса строки в RSS.
+        return r'[\s\-]+'.join(re.escape(part) for part in word.split())
+
+    parts = [spaced(word) + r'(?:s|es)?(?![\w-])' for word in _TOPIC_MARKERS_LAT]
+    parts += [spaced(word) for word in _TOPIC_MARKERS_CYR]
+    return re.compile(r'(?<![\w-])(?:' + '|'.join(parts) + r')', re.IGNORECASE)
+
+
+_TOPIC_MARKER_RE = _build_topic_marker_re()
+
+
+def looks_like_anime_news(news: dict) -> bool:
+    """Есть ли в заголовке (или в начале текста) хоть один аниме-маркер."""
+    if _TOPIC_MARKER_RE.search(str(news.get('title') or '')):
+        return True
+    lead = str(news.get('summary') or '')[:TOPIC_LEAD_CHARS]
+    return bool(_TOPIC_MARKER_RE.search(lead))
+
+
+def off_topic_without_llm(news: dict) -> bool:
+    """Непрофильная новость из ленты общей тематики.
+
+    Нужна там, где вердикта модели нет: она и была единственным, что отличало
+    аниме от всего остального в этих шести лентах, и без неё в канал уходили
+    Zelda, Том Круз и «Ходячие мертвецы». Профильные источники не трогаем
+    вовсе: там отсутствие слова «аниме» в заголовке ничего не значит.
+    """
+    if str(news.get('source') or '') not in GENERAL_TOPIC_SOURCES:
+        return False
+    return not looks_like_anime_news(news)
+
+
 # Ссылки в тексте поста. Ловим и голые домены: RSS-описания и телеграм-посты
 # сплошь и рядом пишут «читайте на animenewsnetwork.com» без схемы.
 _POST_URL_RE = re.compile(
@@ -10065,6 +10166,19 @@ async def _prepare_news_for_send(news: dict, source: str,
     # Модель: перевод, чистый текст, теги, отсев непрофильного и повторов
     enriched = await _llm_enrich(news, side_effects=llm_side_effects)
     if enriched == 'skip':
+        if count_stats:
+            await stats.record_skipped('filtered', source)
+        return 'skipped_filter'
+    if (enriched == 'off' and '_llm_topic' not in news
+            and settings.local_topic_filter and off_topic_without_llm(news)):
+        # Вердикта модели нет — фильтр непрофильного отработал бы вхолостую, и
+        # ленты общей тематики пошли бы в канал целиком. Проверяем сами.
+        # Разбор мог прийти и раньше: пост ушёл в ветку при живой модели, а в
+        # канал его отправляют кнопкой уже без неё. Такой вердикт есть, он
+        # точнее словаря, и второй раз новость не судим.
+        logger.info('⊘ Без модели: не видно, что новость про аниме — %s: %s',
+                    news.get('source', '?'), str(news.get('title', ''))[:60])
+        metrics.inc('anime_bot_local_topic_skips_total')
         if count_stats:
             await stats.record_skipped('filtered', source)
         return 'skipped_filter'
@@ -14930,6 +15044,11 @@ def _menu_llm() -> InlineKeyboardMarkup:
     else:
         rows.append([InlineKeyboardButton('🤖 Модель не настроена — /llm',
                                           callback_data='settings:llm_help')])
+    # Вне ветки про модель: этот отсев как раз для тех минут, когда модели нет,
+    # и прятать его в меню, доступном только при живой модели, бессмысленно.
+    rows.append([InlineKeyboardButton(
+        f'{_sw(settings.local_topic_filter)} Отсев чужих тем без модели',
+        callback_data='settings:toggle_localtopic')])
     rows.append([InlineKeyboardButton(tr, callback_data='settings:toggle_translator')])
     rows.append([InlineKeyboardButton('⬅️ Назад', callback_data='settings:back')])
     return InlineKeyboardMarkup(rows)
@@ -15016,7 +15135,7 @@ _TOGGLE_SECTION = {
     'toggle_llm': 'llm', 'toggle_llm_rewrite': 'llm', 'toggle_llm_filter': 'llm',
     'toggle_llm_tags': 'llm', 'toggle_llm_article': 'llm', 'toggle_llm_filler': 'llm',
     'toggle_llm_dedup': 'llm', 'toggle_llm_repeats': 'llm',
-    'toggle_translator': 'llm', 'llmslot': 'llm',
+    'toggle_translator': 'llm', 'llmslot': 'llm', 'toggle_localtopic': 'llm',
     'toggle_autodis': 'sources', 'sources': 'sources',
     'mods': 'moderation',
     'toggle_backup': 'system', 'toggle_startup': 'system',
@@ -15075,7 +15194,9 @@ def _section_state(name: str) -> str:
         return f'Сейчас: включено {on} из {len(SOURCES)}.'
     if name == 'llm':
         if not _llm_configured():
-            return 'Модель не настроена — /llm'
+            # Без модели работает только локальный отсев — про него и говорим.
+            local = 'вкл' if settings.local_topic_filter else 'выкл'
+            return f'Модель не настроена — /llm. Отсев чужих тем без модели: {local}.'
         if not settings.llm_enabled:
             return 'Модель выключена: перевод идёт через DeepL/Google.'
         return f'Сейчас: <code>{html.escape(_llm_current()[2])}</code>.'
@@ -15844,6 +15965,18 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'🧵 В ветку раз в {_fmt_minutes(settings.check_interval_min)}',
             reply_markup=_menu_for(data), parse_mode=ParseMode.HTML,
         )
+        return
+
+    if data == "settings:toggle_localtopic":
+        settings.local_topic_filter = not settings.local_topic_filter
+        state = 'включён' if settings.local_topic_filter else 'выключён'
+        await query.answer(f'Отсев без модели {state}')
+        note = (f'🧹 Отсев чужих тем без модели: {state.upper()}\n\n'
+                'Работает, только когда модель молчит: новости из лент общей '
+                'тематики (' + ', '.join(sorted(GENERAL_TOPIC_SOURCES)) + ') '
+                'публикуются, лишь если в заголовке видно аниме или мангу.')
+        await query.edit_message_text(f"⚙️ Настройки\n\n{note}",
+                                      reply_markup=_menu_for(data))
         return
 
     if data.startswith("settings:toggle_llm"):
@@ -20017,6 +20150,10 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
     lines.append('  📄 Читать статьи: ' + ('ВКЛ' if settings.llm_read_article else 'ВЫКЛ'))
     lines.append('  🗑 Отсев подборок: ' + ('ВКЛ' if settings.llm_skip_filler else 'ВЫКЛ'))
     lines.append('  ♻️ Ловить повторы: ' + ('ВКЛ' if settings.llm_dedup_subject else 'ВЫКЛ'))
+    # Отдельной строкой и вне списка «Включено»: этот отсев не про модель, он
+    # как раз про минуты, когда её нет.
+    lines.append('🧹 Отсев чужих тем без модели: '
+                 + ('ВКЛ' if settings.local_topic_filter else 'ВЫКЛ'))
     lines.append('')
     lines.append(f'Вызовов сегодня: {used} из {LLM_DAILY_LIMIT}')
     if _llm_disabled_runtime:
