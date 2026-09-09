@@ -122,6 +122,16 @@ async def test_quiet_mode_explains_zero_sent_after_filtering(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_quiet_mode_names_llm_deferral_instead_of_generic_filter(monkeypatch):
+    ctx = _common_cycle_stubs(monkeypatch, [_news(1)], quiet=True)
+    monkeypatch.setattr(bot, 'send_news_to_thread', AsyncMock(return_value='deferred'))
+    await bot._check_news_cycle(ctx)
+    text = bot.notify_admin.await_args.args[1]
+    assert 'Ждут модель: 1' in text
+    assert 'прочее 1' not in text
+
+
+@pytest.mark.asyncio
 async def test_confidence_review_exception_does_not_block_channel_queue(monkeypatch):
     review, normal = _news(1, review=True), _news(2, review=False)
     ctx = _common_cycle_stubs(monkeypatch, [review, normal], thread_mode=False,
