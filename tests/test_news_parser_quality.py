@@ -7,6 +7,29 @@ import anime_news_bot as bot
 from news_parser import clean_html_fragment, extract_article_text, parse_listing_html
 
 
+def test_sibling_div_cards_do_not_borrow_first_title_or_picture():
+    markup = '<section><div class="grid">' + ''.join(
+        f'<div class="card"><div class="image"><img src="/{i}.jpg"></div>'
+        f'<div class="text"><h3>Unique announcement number {i}</h3><p>Summary for {i}.</p>'
+        f'<a href="/news/{i}">Read more</a></div></div>' for i in range(3)) + '</div></section>'
+    rows = parse_listing_html(markup, source_name='Official', base_url='https://official.example/',
+        href_pattern=r'/news/\d+$', limit=5, normalize_image=lambda value, link: value,
+        normalize_url=lambda link: link)
+    assert [row['title'] for row in rows] == [f'Unique announcement number {i}' for i in range(3)]
+    assert [row['images'] for row in rows] == [[f'/{i}.jpg'] for i in range(3)]
+    assert [row['summary'] for row in rows] == [f'Summary for {i}.' for i in range(3)]
+
+
+def test_listing_wide_heading_does_not_become_unrelated_article_title():
+    markup = '<section><h2>News and announcements</h2><div><h3>First announcement</h3>'
+    markup += '<a href="/news/first">Read more</a></div><div><h3>Second announcement</h3>'
+    markup += '<a href="/news/second">Continue reading</a></div></section>'
+    rows = parse_listing_html(markup, source_name='Official', base_url='https://official.example/',
+        href_pattern=r'/news/\w+$', limit=5, normalize_image=lambda value, link: value,
+        normalize_url=lambda link: link)
+    assert [row['title'] for row in rows] == ['First announcement', 'Second announcement']
+
+
 @pytest.mark.parametrize('raw, expected', [
     ('<p>Первый сезон.</p><p>Второй сезон.</p>', 'Первый сезон. Второй сезон.'),
     ('Дата:<br>12 октября<ul><li>Студия: Bones</li><li>Режиссёр: Ито</li></ul>',

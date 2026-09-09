@@ -143,6 +143,28 @@ def _host(parsed) -> str:
     return (parsed.hostname or '').casefold().removeprefix('www.')
 
 
+def _listing_card(anchor):
+    """Stay inside one card, including sibling image/text divs.
+
+    Preferring any article/li/section ancestor over a nearer div can select the
+    entire listing section: every Read more link then borrows its first title.
+    """
+    card = None
+    for depth, node in enumerate(anchor.parents):
+        if depth >= 8:
+            break
+        if node.name not in ('article', 'li', 'section', 'div'):
+            continue
+        headings = node.select('h1, h2, h3, h4, h5, h6', limit=2)
+        if len(headings) > 1:
+            break
+        if card is None or headings:
+            card = node
+        if headings and (node.find('img') is not None or node.name in ('article', 'li')):
+            break
+    return card
+
+
 def parse_listing_html(
     html_text: str, *, source_name: str, base_url: str, href_pattern: str,
     limit: int, normalize_image: Callable, normalize_url: Callable,
@@ -177,10 +199,11 @@ def parse_listing_html(
         key = normalize_url(link)
         if key in seen:
             continue
-        card = anchor.find_parent(['article', 'li', 'section']) or anchor.find_parent('div')
+        card = _listing_card(anchor)
         title = re.sub(r'\s+', ' ', anchor.get_text(' ', strip=True)).strip()
-        if len(title) < 10 and card is not None:
-            heading = card.select_one('h1, h2, h3, h4')
+        if (len(title) < 10 or title.casefold().rstrip(' .»→') in
+                ('read more', 'continue reading', 'learn more', 'читать далее', 'подробнее')) and card is not None:
+            heading = card.select_one('h1, h2, h3, h4, h5, h6')
             if heading is not None:
                 title = re.sub(r'\s+', ' ', heading.get_text(' ', strip=True)).strip()
         if not 10 <= len(title) <= 300:

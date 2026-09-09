@@ -91,7 +91,7 @@ def sample_indices(count, limit=MAX_FRAMES):
 
 
 def _pillow_frames(path):
-    from PIL import Image
+    from PIL import Image, ImageOps
     Image.MAX_IMAGE_PIXELS = MAX_PIXELS
     with Image.open(path) as image:
         if image.width * image.height > MAX_PIXELS:
@@ -101,7 +101,7 @@ def _pillow_frames(path):
             raise ValueError('animation too long')
         for index in sample_indices(count):
             image.seek(index)
-            frame = image.convert('RGBA')
+            frame = ImageOps.exif_transpose(image).convert('RGBA')
             frame.thumbnail((1280, 1280))
             background = Image.new('RGBA', frame.size, 'white')
             background.alpha_composite(frame)
@@ -163,8 +163,43 @@ def _video_frames(path):
         capture.release()
 
 
-def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
+def detection_variants(frame):
+    """Three bounded views reduce sensitivity to tint and contrast changes."""
+    from PIL import ImageOps
+    frame = frame.convert('RGB')
+    yield frame
+    yield ImageOps.autocontrast(ImageOps.grayscale(frame), cutoff=1).convert('RGB')
+    yield ImageOps.autocontrast(frame, cutoff=1)
+
+
+def scan_frame(detector, frame, explicit_threshold=.80, suggestive_threshold=.85):
     import numpy as np
+    best = Scan('checked')
+    suspicious = False
+    for variant in detection_variants(frame):
+        # NudeNet expects OpenCV BGR, Pillow yields RGB. Keep the thresholds:
+        # transforming an image does not make the detector infallible.
+        detections = detector.detect(np.asarray(variant)[:, :, ::-1].copy())
+        result = classify_detections(detections, explicit_threshold, suggestive_threshold)
+        if result.category == 'nsfw':
+            return result
+        if result.category and (not best.category or result.score > best.score):
+            best = result
+        for item in detections:
+            try:
+                score = float(item.get('score', 0))
+            except (ValueError, TypeError):
+                continue
+            label = item.get('class')
+            if math.isfinite(score) and ((label in EXPLICIT and score >= explicit_threshold - .15)
+                                         or (label in SUGGESTIVE and score >= suggestive_threshold - .15)):
+                suspicious = True
+    if not best.category and suspicious:
+        return Scan('unchecked', reason='Пограничная оценка наготы; нужна ручная проверка')
+    return best
+
+
+def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
     from nudenet import NudeDetector
     from PIL import Image, UnidentifiedImageError
     if not 0 < Path(path).stat().st_size <= MAX_BYTES:
@@ -187,17 +222,20 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
             frames = _video_frames(path)
     detector = NudeDetector()  # 320n.onnx is included in the pinned wheel.
     best, count = Scan('checked'), 0
+    uncertain = None
     for frame in frames:
-        # NudeNet expects OpenCV BGR, Pillow yields RGB.
-        detection = classify_detections(detector.detect(np.asarray(frame)[:, :, ::-1].copy()),
-                                        explicit_threshold, suggestive_threshold)
+        detection = scan_frame(detector, frame, explicit_threshold, suggestive_threshold)
         count += 1
         if detection.category == 'nsfw':
             return Scan('checked', detection.category, detection.reason, count, detection.score)
         if detection.category:
             best = detection
+        if detection.status == 'unchecked':
+            uncertain = detection
     if not count:
         return Scan('unchecked', reason='Нет декодированных кадров')
+    if not best.category and uncertain is not None:
+        return Scan('unchecked', reason=uncertain.reason, frames=count)
     return Scan('checked', best.category, best.reason, count, best.score)
 
 

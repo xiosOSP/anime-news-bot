@@ -358,11 +358,13 @@ async def test_cancel_during_channel_send_keeps_ledger_ambiguous(tmp_path, monke
     monkeypatch.setattr(bot, 'matches_keywords', lambda _n: True)
     monkeypatch.setattr(bot, '_prepare_news_for_send', AsyncMock(return_value=None))
     monkeypatch.setattr(bot, '_prepare_video_file', AsyncMock(return_value=None))
-    monkeypatch.setattr(bot, '_send_channel_post', AsyncMock(side_effect=asyncio.CancelledError()))
+    async def send(delivery, *args):
+        await delivery.send_message(chat_id=1, text='test')
+    monkeypatch.setattr(bot, '_send_channel_post', send)
     commit_media = patch.object(bot, '_commit_image_fingerprint')
     news = {'title': 'Cancellation boundary', 'link': 'https://e/cancel', 'source': 'A'}
     with commit_media as cm, pytest.raises(asyncio.CancelledError):
-        await bot.send_news(object(), news)
+        await bot.send_news(SimpleNamespace(send_message=AsyncMock(side_effect=asyncio.CancelledError())), news)
     assert news['link'] in store
     assert store.uncertain_count() == 1
     cm.assert_called_once_with(news)
@@ -370,13 +372,17 @@ async def test_cancel_during_channel_send_keeps_ledger_ambiguous(tmp_path, monke
 
 @pytest.mark.asyncio
 async def test_cancel_during_scheduled_send_becomes_uncertain(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, '_prepare_video_file', AsyncMock(return_value=None))
     store = bot.ScheduledPosts(tmp_path / 'scheduled.json')
     key = store.add({'title': 'Scheduled cancel', 'link': 'https://e/sched-cancel'},
                     bot.datetime.now(bot.timezone.utc) - bot.timedelta(minutes=1))
     monkeypatch.setattr(bot, 'scheduled_posts', store)
-    monkeypatch.setattr(bot, '_send_channel_post', AsyncMock(side_effect=asyncio.CancelledError()))
+    async def send(delivery, *args):
+        await delivery.send_message(chat_id=1, text='test')
+    monkeypatch.setattr(bot, '_send_channel_post', send)
     with pytest.raises(asyncio.CancelledError):
-        await bot.publish_scheduled(SimpleNamespace(bot=object()))
+        await bot.publish_scheduled(SimpleNamespace(
+            bot=SimpleNamespace(send_message=AsyncMock(side_effect=asyncio.CancelledError()))))
     assert store.meta(key)['state'] == 'uncertain'
     assert store.due() == []
 
@@ -507,6 +513,7 @@ async def test_network_ambiguous_send_is_not_released_for_retry(tmp_path, monkey
 
 @pytest.mark.asyncio
 async def test_scheduled_network_timeout_disables_automatic_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, '_prepare_video_file', AsyncMock(return_value=None))
     store = bot.ScheduledPosts(tmp_path / 'scheduled.json')
     key = store.add({'title': 'Maybe scheduled', 'link': 'https://e/s-maybe'},
                     bot.datetime.now(bot.timezone.utc) - bot.timedelta(minutes=1))

@@ -49,6 +49,8 @@ from safe_http import public_get
 from moderation_rules import check_text as check_moderation_text, normalize as normalize_moderation_text
 from moderation_media import MediaScanner, media_attachment
 from moderation_llm import ChatModelClient
+from news_deferral import NewsDeferralStore
+from publication_delivery import PublicationBot
 from telegram import (
     Bot,
     BotCommand,
@@ -1470,6 +1472,7 @@ MODERATION_STORE_MAX_USERS = max(50, min(20000, _env_int('MODERATION_STORE_MAX_U
 # ему дают что-то делать. По умолчанию именно она, включение прав — отдельное
 # осознанное действие.
 MODERATION_MODES = ('observe', 'active')
+MODERATION_ADMINS_DEFAULT = _env('MODERATION_ADMINS_ENABLED', 'true').lower() == 'true'
 MODERATION_DEFAULT_MODE = (
     'active' if _env('MODERATION_MODE', '').strip().lower() == 'active' else 'observe')
 # Не больше одного наказания на человека за это время. Если модель начнёт
@@ -1877,12 +1880,15 @@ class ChatModerationStore:
             self._data = {
                 'schema_version': 1,
                 'chats': chats,
+                'disabled_chats': [int(x) for x in (raw.get('disabled_chats') or [])
+                                   if re.fullmatch(r'-?\d+', str(x))],
                 'users': users if isinstance(users, dict) else {},
                 # Статистика решений обязана переживать перезапуск: по ней
                 # оценивается, ошибается бот или нет, а такая оценка имеет
                 # смысл только накопительно.
                 'stats': stats_row if isinstance(stats_row, dict) else {},
                 'mode': str(raw.get('mode') or ''),
+                'moderate_admins': raw.get('moderate_admins') if type(raw.get('moderate_admins')) is bool else MODERATION_ADMINS_DEFAULT,
                 'log': raw.get('log') if isinstance(raw.get('log'), list) else [],
                 'incidents': raw.get('incidents') if isinstance(raw.get('incidents'), dict) else {},
             }
@@ -1999,16 +2005,34 @@ class ChatModerationStore:
                 return False
             return True
 
+    @property
+    def moderate_admins(self) -> bool:
+        with self._lock:
+            value = self._data.get('moderate_admins')
+            return value if type(value) is bool else MODERATION_ADMINS_DEFAULT
+
+    def set_moderate_admins(self, enabled: bool) -> bool:
+        if type(enabled) is not bool:
+            raise ValueError('moderate_admins must be bool')
+        with self._lock:
+            before = copy.deepcopy(self._data)
+            self._data['moderate_admins'] = enabled
+            if not self._save():
+                self._data = before
+                return False
+            return True
+
     # --- какие чаты модерируем ---
 
     def enabled_chats(self) -> set[int]:
         with self._lock:
             stored = set(self._data.get('chats') or [])
+            disabled = set(self._data.get('disabled_chats') or [])
         for raw in str(MODERATION_CHATS_ENV or '').replace(';', ',').split(','):
             raw = raw.strip()
             if raw and re.fullmatch(r'-?\d+', raw):
                 stored.add(int(raw))
-        return stored
+        return stored - disabled
 
     def is_enabled(self, chat_id) -> bool:
         try:
@@ -2025,6 +2049,12 @@ class ChatModerationStore:
             elif not enabled:
                 chats = [x for x in chats if x != int(chat_id)]
             self._data['chats'] = chats
+            disabled = set(self._data.get('disabled_chats') or [])
+            if enabled:
+                disabled.discard(int(chat_id))
+            else:
+                disabled.add(int(chat_id))
+            self._data['disabled_chats'] = sorted(disabled)
             if not self._save():
                 self._data = before
                 return False
@@ -3300,6 +3330,8 @@ class BotSettings:
             'AnimeHunch', 'AnimateTimes(JP)', 'Collider', '/Film', 'Variety',
             'ComingSoon', 'Filmix', 'TG: CurrentAnime',
         ],
+        'publish_mode': '',    # Empty keeps legacy thread_mode migration intact.
+        'channel_interval_min': 0,
         'thread_mode': False,    # True = слать все новости пачкой в ветку обсуждения
         'translator_engine': 'deepl',  # 'deepl' (если ключ задан, с fallback) или 'google' (принудительно)
         'quiet_mode': True,      # True = уведомлять админа только при ошибках + сводка раз в день
@@ -3396,6 +3428,8 @@ class BotSettings:
         """Санитизирует значения из вручную отредактированного/старого JSON."""
         self._data['check_interval_min'] = max(5, _safe_nonnegative_int(
             self._data.get('check_interval_min'), self.DEFAULTS['check_interval_min']))
+        self._data['channel_interval_min'] = max(0, _safe_nonnegative_int(
+            self._data.get('channel_interval_min'), 0))
         self._data['post_max_age_hours'] = max(1, _safe_nonnegative_int(
             self._data.get('post_max_age_hours'), self.DEFAULTS['post_max_age_hours']))
         try:
@@ -10092,7 +10126,7 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
     video_file = None
     committed = False
     rejected = False
-    send_started = False
+    delivery = PublicationBot(bot, (lambda: sent_links.mark_sending(link)) if track_history and ledger_claimed else None)
     preserve_ambiguous = False
     try:
         skip = await _prepare_news_for_send(news, source, count_stats=is_channel,
@@ -10111,16 +10145,11 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
             return skip
 
         video_file = await _prepare_video_file(news)
-        if track_history and ledger_claimed:
-            if not await sent_links.mark_sending(link):
-                logger.warning(f'Ledger reservation исчез перед отправкой: {link[:100]}')
-                return 'failed'
-            send_started = True
         try:
             if is_channel:
-                ok = await _send_channel_post(bot, news, video_file)
+                ok = await _send_channel_post(delivery, news, video_file)
             else:
-                ok = await _send_post(bot, news, target, video_file)
+                ok = await _send_post(delivery, news, target, video_file)
         except DeliveryUncertain:
             raise
         except Exception:
@@ -10158,7 +10187,7 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
         return 'sent'
     except DeliveryUncertain as e:
         logger.warning(f'Результат отправки неизвестен, автоповтор запрещён: {title[:60]} ({e})')
-        if track_history and ledger_claimed and send_started and not committed:
+        if track_history and ledger_claimed and not committed:
             await sent_links.mark_uncertain(link)
             _commit_image_fingerprint(news)
             preserve_ambiguous = True
@@ -10173,7 +10202,7 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
                                         result='uncertain', mode='channel')
         return 'uncertain'
     except asyncio.CancelledError:
-        if track_history and ledger_claimed and send_started and not committed:
+        if track_history and ledger_claimed and delivery.started and not committed:
             # После входа в Telegram API отмена неоднозначна: сообщение могло
             # уже уйти. Пессимистично сохраняем дедуп, чтобы рестарт/следующий
             # тик не создал дубль. Админ увидит uncertain в /health.
@@ -12413,9 +12442,14 @@ class PendingPosts:
                 return float(item.get('ts', 0) or 0)
             except (TypeError, ValueError):
                 return 0.0
-        self._items = {k: v for k, v in self._items.items() if _ts(v) >= cutoff}
+        def protected(key, item):
+            return (str(item.get('channel_state') or 'pending') in ('sending', 'uncertain')
+                    or f'pending:{key}' in _publishing_now)
+        self._items = {k: v for k, v in self._items.items()
+                       if _ts(v) >= cutoff or protected(k, v)}
         if len(self._items) > self.MAX_ITEMS:
             overflow = len(self._items) - self.MAX_ITEMS
+            candidates = [k for k, v in self._items.items() if not protected(k, v)]
             if feature_enabled('value_moderation_queue'):
                 now = time.time()
                 def _value(k: str) -> tuple[float, float]:
@@ -12428,9 +12462,9 @@ class PendingPosts:
                     if news.get('_breaking_news'): score += 8.0
                     if _is_official_news(news): score += 3.0
                     return (score, _ts(item))
-                victims = sorted(self._items, key=_value)[:overflow]
+                victims = sorted(candidates, key=_value)[:overflow]
             else:
-                victims = sorted(self._items, key=lambda k: _ts(self._items[k]))[:overflow]
+                victims = sorted(candidates, key=lambda k: _ts(self._items[k]))[:overflow]
             for k in victims: del self._items[k]
 
     def add(self, news: dict) -> str:
@@ -13081,7 +13115,7 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
     pending_key = None
     committed = False
     rejected = False
-    send_started = False
+    delivery = PublicationBot(bot, (lambda: sent_links.mark_sending(link)))
     preserve_ambiguous = False
     try:
         skip = await _prepare_news_for_send(news, source)
@@ -13096,12 +13130,8 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
             return skip
 
         video_file = await _prepare_video_file(news)
-        if not await sent_links.mark_sending(link):
-            logger.warning(f'Ledger reservation исчез перед отправкой в ветку: {link[:100]}')
-            return 'failed'
-        send_started = True
         try:
-            ok = await _send_post_thread_split(bot, news, video_file)
+            ok = await _send_post_thread_split(delivery, news, video_file)
         except DeliveryUncertain:
             raise
         except Exception:
@@ -13125,7 +13155,7 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
         return 'sent'
     except DeliveryUncertain as e:
         logger.warning(f'Результат отправки в ветку неизвестен: {title[:60]} ({e})')
-        if send_started and not committed:
+        if not committed:
             await sent_links.mark_uncertain(link)
             _commit_image_fingerprint(news)
             preserve_ambiguous = True
@@ -13135,7 +13165,7 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
         await stats.record_failed_send(source)
         return 'uncertain'
     except asyncio.CancelledError:
-        if send_started and not committed:
+        if delivery.started and not committed:
             await sent_links.mark_uncertain(link)
             _commit_image_fingerprint(news)
             preserve_ambiguous = True
@@ -13147,6 +13177,9 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
         if not committed and not rejected and not preserve_ambiguous:
             await sent_links.release(link, title)
         if not committed and not preserve_ambiguous:
+            orphan_key = news.pop('_pending_key', None)
+            if orphan_key and pending_posts is not None:
+                pending_posts.pop(orphan_key)
             _release_publish_reservations(news)
         if video_file:
             try:
@@ -14869,6 +14902,8 @@ def _menu_moderation() -> InlineKeyboardMarkup:
     label = ('🛡 Сейчас наказывает' if active else '👀 Сейчас только смотрит')
     rows = [
         [InlineKeyboardButton(label, callback_data='mods:mode')],
+        [InlineKeyboardButton('Администрация: ' + ('проверяется' if chat_moderation.moderate_admins else 'исключена'),
+                              callback_data='mods:admins')],
         [InlineKeyboardButton('📊 Статистика', callback_data='mods:stats'),
          InlineKeyboardButton('🧾 Решения', callback_data='mods:log')],
         [InlineKeyboardButton('🧹 Забыть тестовые решения', callback_data='mods:reset')],
@@ -15395,12 +15430,9 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not guard.acquired:
                 await query.answer('Этот пост уже публикуется…')
                 return
-            if not pending_posts.mark_channel_sending(key, force=channel_uncertain):
-                await query.answer('Не удалось надёжно зафиксировать отправку — проверь storage.',
-                                   show_alert=True)
-                return
+            delivery = PublicationBot(context.bot, lambda: pending_posts.mark_channel_sending(key, force=channel_uncertain))
             try:
-                ok = await _prepare_and_send_channel_post(context.bot, news)
+                ok = await _prepare_and_send_channel_post(delivery, news)
             except DeliveryUncertain as e:
                 pending_posts.mark_channel_uncertain(key)
                 if feature_enabled('story_registry') and story_registry is not None:
@@ -15413,14 +15445,16 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     show_alert=True)
                 return
             except asyncio.CancelledError:
-                pending_posts.mark_channel_uncertain(key)
-                if feature_enabled('story_registry') and story_registry is not None:
-                    await asyncio.to_thread(
-                        story_registry.mark_delivery, news, published=True,
-                        uncertain=True)
+                if delivery.started:
+                    pending_posts.mark_channel_uncertain(key)
+                    if feature_enabled('story_registry') and story_registry is not None:
+                        await asyncio.to_thread(
+                            story_registry.mark_delivery, news, published=True,
+                            uncertain=True)
                 raise
             except Exception:
-                pending_posts.mark_channel_pending(key)
+                if delivery.started:
+                    pending_posts.mark_channel_pending(key)
                 raise
         if ok:
             pending_cleanup_ok = pending_posts.pop(key) is not None
@@ -15454,7 +15488,8 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f'👥 {actor_name} опубликовал в канал пост из ветки:\n\n'
                     f'{_post_card(news, {})}')
         else:
-            pending_posts.mark_channel_pending(key)
+            if delivery.started:
+                pending_posts.mark_channel_pending(key)
             await query.answer('❌ Не удалось опубликовать — см. /logs', show_alert=True)
         return
 
@@ -15552,11 +15587,9 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not guard.acquired:
                 await query.answer('Этот пост уже публикуется…')
                 return
-            if not scheduled_posts.mark_sending(key, force=True):
-                await query.answer('Состояние поста изменилось — обнови список.', show_alert=True)
-                return
+            delivery = PublicationBot(context.bot, lambda: scheduled_posts.mark_sending(key, force=True))
             try:
-                ok = await _prepare_and_send_channel_post(context.bot, news)
+                ok = await _prepare_and_send_channel_post(delivery, news)
             except DeliveryUncertain as e:
                 scheduled_posts.mark_uncertain(key)
                 await query.answer(
@@ -15565,7 +15598,8 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f'Отложенный пост {key}: ambiguous delivery ({e})')
                 return
             except asyncio.CancelledError:
-                scheduled_posts.mark_uncertain(key)
+                if delivery.started:
+                    scheduled_posts.mark_uncertain(key)
                 raise
             except Exception:
                 logger.exception(f'Ручная отправка отложенного поста упала: {key}')
@@ -15586,7 +15620,8 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text, markup = _scheduled_overview()
             await _safe_edit(query, text, markup)
         else:
-            scheduled_posts.mark_pending(key)
+            if delivery.started:
+                scheduled_posts.mark_pending(key)
             await query.answer('❌ Не удалось опубликовать — см. /logs', show_alert=True)
         return
 
@@ -16608,11 +16643,9 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
             if not guard.acquired:
                 logger.info(f"Пост уже публикуется вручную, пропускаю тик: {key}")
                 continue
-            if not scheduled_posts.mark_sending(key):
-                logger.info(f'Отложенный пост сменил состояние перед отправкой: {key}')
-                continue
+            delivery = PublicationBot(context.bot, lambda: scheduled_posts.mark_sending(key))
             try:
-                ok = await _prepare_and_send_channel_post(context.bot, news)
+                ok = await _prepare_and_send_channel_post(delivery, news)
                 err = None
             except DeliveryUncertain as e:
                 scheduled_posts.mark_uncertain(key)
@@ -16624,11 +16657,12 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
                 err = f'{type(e).__name__}: {e}'
                 logger.warning(f'Отложенный пост {key}: ambiguous delivery ({e})')
             except asyncio.CancelledError:
-                scheduled_posts.mark_uncertain(key)
-                if feature_enabled('story_registry') and story_registry is not None:
-                    await asyncio.to_thread(
-                        story_registry.mark_delivery, news, published=True,
-                        uncertain=True)
+                if delivery.started:
+                    scheduled_posts.mark_uncertain(key)
+                    if feature_enabled('story_registry') and story_registry is not None:
+                        await asyncio.to_thread(
+                            story_registry.mark_delivery, news, published=True,
+                            uncertain=True)
                 raise
             except Exception as e:            # не даём джобу умереть молча
                 ok = False
@@ -17137,10 +17171,13 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                         message += f"♻️ Уже были опубликованы / распознаны как дубли: {dup_n}\n"
                     if filter_n:
                         detail.append(f'фильтр {filter_n}')
-                    other_n = skipped_count - dup_n - filter_n
+                    deferred_n = skipped_reasons.get('deferred', 0)
+                    if deferred_n:
+                        message += f'⏳ Ждут модель: {deferred_n}. Кандидаты не отмечены опубликованными.\n'
+                    other_n = skipped_count - dup_n - filter_n - deferred_n
                     if other_n:
                         detail.append(f'прочее {other_n}')
-                    non_dup_skipped = skipped_count - dup_n
+                    non_dup_skipped = skipped_count - dup_n - deferred_n
                     if non_dup_skipped:
                         suffix = f" ({', '.join(detail)})" if detail else ''
                         message += f"⏭ Отсеяно после подготовки: {non_dup_skipped}{suffix}\n"
@@ -17332,10 +17369,9 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
     with _PublishGuard(f'pending:{key}') as guard:
         if not guard.acquired:
             return None                  # этот пост прямо сейчас публикует человек
-        if not pending_posts.mark_channel_sending(key):
-            return None                  # состояние занято: уже ушёл или в процессе
+        delivery = PublicationBot(bot_api, lambda: pending_posts.mark_channel_sending(key))
         try:
-            ok = await _prepare_and_send_channel_post(bot_api, news)
+            ok = await _prepare_and_send_channel_post(delivery, news)
         except DeliveryUncertain as e:
             pending_posts.mark_channel_uncertain(key)
             logger.warning('Автопостинг в канал: неоднозначная доставка (%s)', e)
@@ -17343,7 +17379,8 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
                         labels={'mode': 'autopost', 'result': 'uncertain'})
             return 'uncertain'
         except asyncio.CancelledError:
-            pending_posts.mark_channel_uncertain(key)
+            if delivery.started:
+                pending_posts.mark_channel_uncertain(key)
             raise
         except Exception:
             pending_posts.mark_channel_pending(key)
@@ -17615,6 +17652,9 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
         f"{_scheduled_status_block(context)}"
         f"В истории ссылок: {len(sent_links._set)}\n"
         f"Канал: {CHANNEL_ID}\n"
+        f"Ветка: чат {DISCUSSION_CHAT_ID}, тема {DISCUSSION_THREAD_ID}\n"
+        f"Итог последней проверки: {_runtime_health.get('last_check_result') or 'ещё нет'}\n"
+        f"Ожидание модели: максимум {LLM_DEFER_MAX_ATTEMPTS} попытки / {LLM_DEFER_MAX_AGE_SEC // 60} мин\n"
         f"Скачивание видео: {video_state}\n"
         f"yt-dlp: {yt_status}\n"
         f"ffmpeg: {ffmpeg_status}\n"
@@ -19169,7 +19209,10 @@ async def _llm_judge_generated(news: dict, source_fact_text: str) -> str:
 # есть: свежая новость без тегов лучше идеальной, но вчерашней.
 LLM_DEFER_MAX_ATTEMPTS = max(0, min(20, _env_int('LLM_DEFER_MAX_ATTEMPTS', 3)))
 LLM_DEFER_RETRY_SEC = max(15, min(3600, _env_int('LLM_DEFER_RETRY_SEC', 300)))
+LLM_DEFER_MAX_AGE_SEC = max(60, min(86400, _env_int('LLM_DEFER_MAX_AGE_SEC', 900)))
 _llm_deferred: dict = {}
+_llm_deferral_store = None
+_llm_deferral_lock = threading.Lock()
 
 
 def _llm_wanted() -> bool:
@@ -19184,23 +19227,27 @@ def _llm_wanted() -> bool:
 
 
 def _llm_defer_news(news: dict) -> bool:
-    """Стоит ли придержать новость до живой модели. Считает попытки.
-
-    Ждать бесконечно нельзя: новость протухнет. Поэтому попытки ограничены, и
-    после них пост выходит без обогащения — как и раньше.
-    """
-    key = normalize_url(str(news.get('link') or '')) or str(news.get('title') or '')[:120]
-    if not key:
-        return False
-    if len(_llm_deferred) > 500:
-        _llm_deferred.clear()
-    seen = max(_safe_nonnegative_int(news.get('_llm_defer_attempts', 0)),
-               _safe_nonnegative_int(_llm_deferred.get(key, 0)))
-    if seen >= LLM_DEFER_MAX_ATTEMPTS:
-        return False
-    _llm_deferred[key] = seen + 1
-    news['_llm_defer_attempts'] = seen + 1
-    return True
+    """Wait at most a bounded number of attempts/minutes, across restarts."""
+    global _llm_deferral_store
+    with _llm_deferral_lock:
+        key = normalize_url(str(news.get('link') or '')) or str(news.get('title') or '')[:120]
+        if not key or LLM_DEFER_MAX_ATTEMPTS <= 0:
+            return False
+        path = DATA_DIR / 'news_llm_deferrals.json'
+        if _llm_deferral_store is None or _llm_deferral_store.path != path:
+            _llm_deferral_store = NewsDeferralStore(path)
+        seen = max(_safe_nonnegative_int(news.get('_llm_defer_attempts', 0)),
+                   _safe_nonnegative_int(_llm_deferred.get(key, 0)))
+        wait, attempts = _llm_deferral_store.reserve(key, seen, LLM_DEFER_MAX_ATTEMPTS, LLM_DEFER_MAX_AGE_SEC)
+        _llm_deferred[key] = attempts
+        while len(_llm_deferred) > 500:
+            _llm_deferred.pop(next(iter(_llm_deferred)))
+        news['_llm_defer_attempts'] = attempts
+        if not wait:
+            news['_llm_fallback_reason'] = ('deferral_storage' if _llm_deferral_store.storage_error else 'wait_limit')
+            logger.info('Модель недоступна: лимит ожидания исчерпан, использую обычную подготовку: %s',
+                        str(news.get('title') or '')[:60])
+        return wait
 
 
 # ============== ПАКЕТНАЯ ОБРАБОТКА И КЕШ ОТВЕТОВ МОДЕЛИ ==============
@@ -19587,7 +19634,7 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
         # Модель не настроена — работаем без неё, так и задумано. Настроена, но
         # молчит — это временно, и лучше подождать: отказ бесплатных тарифов
         # длится минуты, а сырой пост остаётся в канале навсегда.
-        if _llm_wanted() and _llm_defer_news(news):
+        if _llm_wanted() and await asyncio.to_thread(_llm_defer_news, news):
             return 'defer'
         return 'off'
     title = (news.get('title') or '').strip()
@@ -19612,7 +19659,7 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
         if not data:
             if raw:
                 logger.info(f"LLM: ответ не разобрался, беру обычный путь — {raw[:80]}")
-            if _llm_wanted() and _llm_defer_news(news):
+            if _llm_wanted() and await asyncio.to_thread(_llm_defer_news, news):
                 return 'defer'
             return 'off'
         # Тот же пост готовится повторно после ошибки отправки, из очереди и по
@@ -20214,6 +20261,16 @@ async def moderation_settings_callback(update: Update, context: ContextTypes.DEF
 
     if chat_moderation is None:
         await query.answer('Хранилище модерации не готово', show_alert=True)
+        return
+
+    if action == 'admins':
+        enabled = not chat_moderation.moderate_admins
+        if not chat_moderation.set_moderate_admins(enabled):
+            await query.answer('Не удалось сохранить настройку', show_alert=True)
+            return
+        _audit_update(update, 'moderation_admins', enabled=enabled)
+        await query.answer('Проверка администрации ' + ('включена' if enabled else 'выключена'))
+        await _safe_edit(query, _moderation_stats_text(), _menu_moderation())
         return
 
     if action == 'stats':
@@ -21881,6 +21938,8 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f'  📅 В отложке: {sched_total}'
                  + (f' (созрело: {sched_ripe})' if sched_ripe else ''))
     lines.append(f'  🗂 Ждут решения в ветке: {len(pending_posts._items) if pending_posts else 0}')
+    if pending_posts is not None and len(pending_posts._items) >= pending_posts.MAX_ITEMS:
+        lines.append('  ⚠️ Очередь ветки заполнена: новые кандидаты могут быть отклонены. Разберите старые посты.')
     lines.append(f'  🔗 История ссылок: {len(sent_links._set)}')
     lines.append(f'  🖼 Отпечатков картинок: {len(image_hashes) if image_hashes else 0}'
                  + ('' if Image is not None else ' (без Pillow — только точные копии)'))
@@ -23022,6 +23081,24 @@ def _mod_actor(message) -> tuple[int, str]:
     return int(getattr(user, 'id', 0) or 0), str(getattr(user, 'full_name', '') or 'участник')
 
 
+async def _mod_admin_exempt(bot: Bot, message) -> bool:
+    """Only resolve author roles when the explicit admin exemption is enabled."""
+    if chat_moderation is None or chat_moderation.moderate_admins:
+        return False
+    sender = getattr(message, 'sender_chat', None)
+    if sender is not None:
+        # A channel sender is not necessarily an administrator of this group.
+        return int(sender.id) == int(message.chat_id)
+    user_id, _ = _mod_actor(message)
+    if user_id in _all_admin_ids():
+        return True
+    try:
+        member = await bot.get_chat_member(message.chat_id, user_id)
+        return getattr(member, 'status', '') in ('administrator', 'creator')
+    except TelegramError:
+        return False  # Current status is checked again before any sanction.
+
+
 def _mod_decide(category: str, severity: int, warns: int, streak: int = 0) -> dict:
     """Что делать по категории, тяжести и числу прошлых предупреждений.
 
@@ -23130,6 +23207,8 @@ async def _mod_apply(bot: Bot, message, decision: dict, category: str,
     decision['applied_action'] = 'none'
     if chat_moderation is None:
         return 'хранилище модерации недоступно'
+    if await _mod_admin_exempt(bot, message):
+        return 'проверка администрации выключена; решение не применено'
     if chat_moderation.mode == 'observe':
         decision['applied_action'] = 'observe:' + action
         chat_moderation.record_decision(category, decision['applied_action'])
@@ -23150,6 +23229,8 @@ async def _mod_apply(bot: Bot, message, decision: dict, category: str,
             decision['applied_action'] = 'unknown'
             return f'статус участника не проверен ({type(exc).__name__}); санкция не выдана'
         if getattr(member, 'status', '') in ('creator', 'administrator'):
+            if not chat_moderation.moderate_admins:
+                return 'проверка администрации выключена; решение не применено'
             decision['restriction_blocked'] = 'admin'
             if action in ('warn', 'mute', 'escalate'):
                 action = 'warn'
@@ -23416,6 +23497,8 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
                                      reply_to_admin=True, repeat_key=repeat_key)
     if local is None and attachment is None:
         return
+    if await _mod_admin_exempt(context.bot, message):
+        return
     source = 'локальные правила'
     media = None
     remove_locally = bool(local and local.get('confident') and local.get('category') != 'belittling'
@@ -23498,8 +23581,60 @@ async def modoff_command(update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat is None or chat_moderation is None:
         return
-    chat_moderation.set_chat(chat.id, False)
+    if not chat_moderation.set_chat(chat.id, False):
+        await update.message.reply_text('❌ Не удалось сохранить настройку. Модерация не выключена.')
+        return
     await update.message.reply_text('🛡 Модерация в этом чате выключена.')
+
+
+async def moderation_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Allow current group administrators to switch moderation in their group."""
+    chat = update.effective_chat
+    message = update.effective_message
+    user = update.effective_user
+    if chat is None or message is None or chat.type not in ('group', 'supergroup'):
+        if message is not None:
+            await message.reply_text('Используй /moderation on или /moderation off в нужном чате.')
+        return
+    if user is None or getattr(user, 'is_bot', False) or getattr(message, 'sender_chat', None):
+        await message.reply_text('Отправь команду от своего аккаунта администратора, чтобы проверить права.')
+        return
+    authorized = is_admin(update)
+    if not authorized:
+        try:
+            member = await context.bot.get_chat_member(chat.id, user.id)
+            authorized = getattr(member, 'status', '') in ('creator', 'administrator')
+        except TelegramError:
+            authorized = False
+    if not authorized:
+        await message.reply_text('Управлять модерацией могут только администраторы этого чата.')
+        return
+    if chat_moderation is None:
+        await message.reply_text('Хранилище модерации не готово, смотри /health.')
+        return
+    args = context.args or []
+    if not args:
+        enabled = feature_enabled('chat_moderation') and chat_moderation.is_enabled(chat.id)
+        await message.reply_text('🛡 Модерация: ' + ('включена' if enabled else 'выключена')
+                                 + f'. Режим: {chat_moderation.mode}.\n/moderation on | off')
+        return
+    if len(args) != 1 or args[0].lower() not in ('on', 'off'):
+        await message.reply_text('Используй /moderation on или /moderation off.')
+        return
+    enabled = args[0].lower() == 'on'
+    if enabled and not feature_enabled('chat_moderation'):
+        await message.reply_text('Функция выключена на сервере: владелец бота должен задать FEATURE_CHAT_MODERATION=true.')
+        return
+    # Serialize the switch with sanctions already in progress. A decision still
+    # scanning media will recheck the saved switch when it acquires this lock.
+    async with _moderation_action_lock:
+        saved = chat_moderation.set_chat(chat.id, enabled)
+    if not saved:
+        await message.reply_text('❌ Не удалось сохранить настройку. Состояние не изменено.')
+        return
+    _audit_update(update, 'moderation_chat', enabled=enabled, chat_id=chat.id)
+    await message.reply_text('🛡 Модерация в этом чате ' + ('включена' if enabled else 'выключена')
+                             + (f'. Режим: {chat_moderation.mode}.' if enabled else '.'))
 
 
 @admin_only
@@ -23634,6 +23769,26 @@ async def modlog_command(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def modadmins_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Enable/disable admin content checks globally without changing other rules."""
+    if chat_moderation is None:
+        await update.message.reply_text('Хранилище модерации не готово.')
+        return
+    want = str(context.args[0]).lower() if context.args else ''
+    if want not in ('on', 'off'):
+        await update.message.reply_text('Проверка администрации: ' +
+            ('включена' if chat_moderation.moderate_admins else 'выключена') +
+            '. Изменить: /modadmins on или /modadmins off. Настройка действует во всех модерируемых чатах.')
+        return
+    enabled = want == 'on'
+    if not chat_moderation.set_moderate_admins(enabled):
+        await update.message.reply_text('Не удалось сохранить настройку.')
+        return
+    _audit_update(update, 'moderation_admins', enabled=enabled)
+    await update.message.reply_text('Проверка администрации ' + ('включена.' if enabled else 'выключена.'))
+
+
+@admin_only
 async def modmode_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Переключает наблюдение и работу: /modmode observe|active."""
     if chat_moderation is None:
@@ -23684,7 +23839,8 @@ def _moderation_stats_text() -> str:
     by_category = data.get('by_category') or {}
     total = sum(int(v) for v in by_action.values())
     overturned = int(data.get('overturned_total', 0))
-    engines = ('Локальные текстовые правила: включены\n'
+    engines = ('Проверка администрации: ' + ('включена' if chat_moderation.moderate_admins else 'выключена') + '\n'
+               + 'Локальные текстовые правила: включены\n'
                + f'Проверка медиа: {"включена" if MODERATION_MEDIA_ENABLED else "отключена"}\n'
                + html.escape(_moderation_llm_status()))
     if not total:
@@ -25311,10 +25467,12 @@ def main():
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("modhere", modhere_command))
     app.add_handler(CommandHandler("modoff", modoff_command))
+    app.add_handler(CommandHandler("moderation", moderation_command))
     app.add_handler(CommandHandler("modstats", modstats_command))
     app.add_handler(CommandHandler("modtest", modtest_command))
     app.add_handler(CommandHandler("modlog", modlog_command))
     app.add_handler(CommandHandler("modmode", modmode_command))
+    app.add_handler(CommandHandler("modadmins", modadmins_command))
     app.add_handler(CommandHandler("warns", warns_command))
     app.add_handler(CommandHandler("unwarn", unwarn_command))
 
