@@ -657,6 +657,37 @@ def _check_env_reference_is_complete() -> tuple[bool, str]:
     return True, f'все {len(found)} переменных описаны'
 
 
+def _check_noise_filter_keeps_real_news(bot) -> tuple[bool, str]:
+    """Отсев не-новостей не имеет права трогать новости.
+
+    Опасность этого фильтра не в пропущенном шуме, а в обратном: жадное
+    правило молча съедает настоящую новость, и заметить это нельзя — пост
+    просто не выходит, жалобы нет ни у кого. Каждый заголовок ниже похож на
+    шум ровно теми словами, по которым идёт отсев, но новостью быть не
+    перестаёт.
+    """
+    real = (
+        'Attack on Titan Ranked #1 on Oricon Weekly Chart',
+        'Solo Leveling Season 2 Gets 10 New Episodes',
+        '2026 Anime Awards Winners Announced',
+        '5 Centimeters per Second live action film sets date',
+        '86 Eighty-Six Season 3 confirmed',
+        'Review copies of the manga sent to press',
+        'Kagurabachi resumes serialization on September 27',
+        'Аниме «Ван-Пис» получит новый сезон',
+        'Тестирование новой игры по «Наруто» началось',
+        'Обзорные продажи тома выросли вдвое',
+    )
+    caught = [(title, bot.noise_reason({'title': title}))
+              for title in real if bot.noise_reason({'title': title})]
+    if caught:
+        return False, f'отсев съел новости: {caught[:3]}'
+    noise = 'Top 10 Isekai Series, Ranked'
+    if not bot.noise_reason({'title': noise}):
+        return False, 'отсев перестал узнавать подборку — правила потерялись'
+    return True, f'{len(real)} новостей-двойников проходят, подборка отсеивается'
+
+
 def checks(bot, tree) -> list[tuple[str, bool, str]]:
     """Полный список инвариантов. Порядок стабилен: на него смотрит pytest."""
     rows: list[tuple[str, bool, str]] = []
@@ -696,6 +727,8 @@ def checks(bot, tree) -> list[tuple[str, bool, str]]:
         _check_local_topic_filter_knows_real_sources(bot))
     add('локальный отсев уступает модели',
         _check_local_topic_filter_yields_to_the_model(tree))
+    add('отсев не-новостей не трогает новости',
+        _check_noise_filter_keeps_real_news(bot))
     add('справочник переменных полон', _check_env_reference_is_complete())
     add('манифест описывает существующие файлы', _check_manifest_describes_reality())
     return rows
