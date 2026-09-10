@@ -221,12 +221,12 @@ async def test_media_checked_even_without_caption_or_llm(state, category, spoile
 
 
 @pytest.mark.asyncio
-async def test_unchecked_media_is_visible_in_log_without_punishment(state):
+async def test_unchecked_media_is_removed_without_punishment(state):
     bot._moderation_media_scanner.check.return_value = media.Scan('unchecked', reason='timeout')
     telegram = telegram_bot()
     await handle(message('', animation=NS(file_unique_id='gif')), telegram)
     assert state.recent_log()[0]['action'] == 'не проверено'
-    telegram.delete_message.assert_not_awaited()
+    telegram.delete_message.assert_awaited_once()
     assert state.warn_count(-100, 7) == 0
 
 

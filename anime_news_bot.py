@@ -488,7 +488,7 @@ GOLDEN_DATASET_FILE = Path(__file__).with_name('golden') / 'editorial_cases.json
 STORY_UPDATE_LOOKBACK_DAYS = max(1, min(90, _env_int('STORY_UPDATE_LOOKBACK_DAYS', 21)))
 STORY_UPDATE_SIMILARITY = max(0.60, min(0.95, _env_float('STORY_UPDATE_SIMILARITY', 0.76)))
 REPLAY_BUFFER_MAX = max(20, min(2000, _env_int('REPLAY_BUFFER_MAX', 300)))
-LLM_PROMPT_VERSION = _env('LLM_PROMPT_VERSION', 'editorial-v2-2026-08').strip() or 'editorial-v2-2026-08'
+LLM_PROMPT_VERSION = _env('LLM_PROMPT_VERSION', 'editorial-v3-2026-09').strip() or 'editorial-v3-2026-09'
 LLM_JUDGE_MAX_TOKENS = max(80, min(500, _env_int('LLM_JUDGE_MAX_TOKENS', 180)))
 
 # Verification / Telegram media framing — Stage 12
@@ -8841,6 +8841,41 @@ def _fetch_video_from_embed(post_id: str):
 # Строка, в которой нет ни одной буквы и ни одной цифры, — это украшение:
 # эмодзи-разделитель, ряд точек, стрелка. Заголовком она быть не может.
 _TG_MEANINGFUL_RE = re.compile(r'[A-Za-zА-Яа-яЁё0-9]')
+_GENERIC_POST_TITLES = frozenset({
+    'аниме', 'манга', 'манхва', 'маньхуа', 'ранобэ', 'ранобе',
+    'новость', 'новости', 'анонс', 'трейлер', 'тизер', 'релиз',
+    'игра', 'игры', 'кино', 'комикс', 'комиксы',
+    'anime', 'manga', 'manhwa', 'manhua', 'news', 'announcement',
+    'trailer', 'teaser', 'release', 'game', 'games', 'movie', 'comics',
+})
+
+
+def _is_generic_post_title(value: str) -> bool:
+    normalized = re.sub(r'[^0-9a-zа-яё]+', ' ', str(value or '').casefold()).strip()
+    return normalized in _GENERIC_POST_TITLES
+
+
+def _promote_body_headline(value: str, max_len: int = 200) -> tuple[str, str]:
+    """Promote a factual sentence instead of a category-only heading."""
+    body = re.sub(r'\s+', ' ', str(value or '')).strip()
+    if not body:
+        return '', ''
+    parts = re.split(r'(?<=[.!?…])\s+', body, maxsplit=1)
+    first = parts[0].strip()
+    rest = parts[1].strip() if len(parts) > 1 else ''
+    if not 12 <= len(first) <= max_len:
+        return '', body
+    return first, rest
+
+
+def _clean_post_lead(value: str) -> str:
+    """Drop editorial filler that sounds unnatural when copied from a source."""
+    text = re.sub(r'\s+', ' ', str(value or '')).strip()
+    text = re.sub(r'^(?:напоминаем|напомним),?\s+что\s+', '', text, flags=re.IGNORECASE)
+    if text:
+        text = text[0].upper() + text[1:]
+    return text
+
 # Подпись канала под постом: «@channel», ссылка на t.me, либо короткая строка
 # с названием самого источника.
 _TG_SIGNATURE_RE = re.compile(r'(?:^|\s)@[A-Za-z0-9_]{4,}\s*$|t\.me/', re.IGNORECASE)
@@ -8881,8 +8916,12 @@ def _tg_title_and_summary(full_text: str, channel: str, label: str) -> tuple[str
             if _TG_MEANINGFUL_RE.search(ln) and not _tg_is_signature(ln, channel, label)]
     if not kept:
         return '', ''
+    if len(kept) > 1 and _is_generic_post_title(kept[0]):
+        promoted, remainder = _promote_body_headline(' '.join(kept[1:]))
+        if promoted:
+            return promoted[:200], _clean_post_lead(remainder)[:1000]
     title = kept[0][:200]
-    summary = ' '.join(kept[1:])[:1000] if len(kept) > 1 else ''
+    summary = _clean_post_lead(' '.join(kept[1:]))[:1000] if len(kept) > 1 else ''
     return title, summary
 
 
@@ -19158,7 +19197,7 @@ LLM_TOPIC_ANY = LLM_TOPICS_OK + ('прочее',)
 
 LLM_SYSTEM_PROMPT = (
     'Ты — редактор русскоязычного Telegram-канала об аниме, манге, играх, кино '
-    'и гик-культуре. Из сырой новости делаешь готовый пост.\n'
+    'и гик-культуре. Из сырой новости делаешь готовый пост. Заголовок должен быть самостоятельным: название произведения или события плюс то, что произошло. Никогда не используй в title одиночные рубрики вроде «Манга», «Аниме», «Новость», «Трейлер». Текст должен читаться как цельная короткая заметка: 1–3 связанных предложения без обрывков, канцелярита, фраз «напоминаем» и «стоит напомнить», повторов заголовка и дословных кальк. Не добавляй факты, которых нет в исходнике.\n'
     'Ответ — ТОЛЬКО JSON, без markdown и пояснений:\n'
     '{"topic":"аниме|манга|игры|кино|комиксы|прочее",'
     '"kind":"новость|анонс|трейлер|релиз|слух|подборка|обзор|мнение",'
@@ -19934,6 +19973,14 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
 
     new_title = str(data.get('title') or '').strip()
     new_summary = str(data.get('summary') or '').strip()
+    if _is_generic_post_title(new_title):
+        promoted, remainder = _promote_body_headline(new_summary)
+        if promoted:
+            logger.info('LLM: рубричный заголовок %r заменён фактической фразой', new_title)
+            new_title, new_summary = promoted, _clean_post_lead(remainder)
+        else:
+            logger.warning('LLM: отклонён рубричный заголовок %r', new_title)
+            new_title = ''
 
     # --- Текст: только если он адекватен ---
     if settings.llm_rewrite and new_title:
@@ -23416,6 +23463,13 @@ async def _mod_media_unchecked(bot: Bot, message, reason: str) -> None:
             or not chat_moderation.is_enabled(chat_id)):
         return
     user_id, name = _mod_actor(message)
+    removed = False
+    if chat_moderation.mode == 'active':
+        try:
+            removed = bool(await bot.delete_message(chat_id=chat_id, message_id=message.message_id))
+        except TelegramError as exc:
+            logger.warning('Модерация: не удалось удалить непроверенное медиа %s/%s: %s',
+                           chat_id, message.message_id, exc)
     if chat_moderation is not None:
         chat_moderation.log_decision(chat_id, user_id, name,
                                     'media', 'не проверено', 'локальный детектор', reason,
@@ -23431,7 +23485,9 @@ async def _mod_media_unchecked(bot: Bot, message, reason: str) -> None:
     text = (f'🛡 Медиа не проверено: {html.escape(reason)}.\n'
             f'Чат <code>{chat_id}</code>, сообщение <code>{message.message_id}</code>.\n'
             'Нужна ручная проверка; автоматический варн/мут за медиа не выдан.')
-    if link:
+    text += ('\nСообщение удалено до ручной проверки.'
+             if removed else '\n⚠️ Не удалось удалить сообщение автоматически.')
+    if link and not removed:
         text += f'\n<a href="{html.escape(link, quote=True)}">Открыть сообщение</a>'
     for admin_id in _all_admin_ids():
         try:

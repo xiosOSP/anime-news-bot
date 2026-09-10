@@ -50,6 +50,15 @@ class TestTelegramSource:
         assert all(len(p['title']) >= 2 for p in posts)
         assert not any(p['link'].endswith('/103') for p in posts)
 
+    def test_category_only_heading_is_promoted(self):
+        title, summary = anime_news_bot._tg_title_and_summary(
+            'Манга.\n\nKAGURABACHI был приостановлен из-за болезни автора и возобновится 27 сентября. '
+            'Напоминаем, что ранее была анонсирована аниме-адаптация.',
+            'testch', 'TG: Test')
+        assert title.startswith('KAGURABACHI')
+        assert title != 'Манга.'
+        assert summary == 'Ранее была анонсирована аниме-адаптация.'
+
     def test_http_fail_empty(self, monkeypatch):
         monkeypatch.setattr(anime_news_bot, 'http_get_public_with_retry', lambda *a, **k: None)
         assert get_telegram_channel('x', 'TG: X') == []

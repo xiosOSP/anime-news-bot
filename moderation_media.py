@@ -254,7 +254,7 @@ def run_worker(path, kind, timeout, explicit_threshold, suggestive_threshold):
             capture_output=True, text=True, encoding='utf-8', timeout=timeout,
             env=env, creationflags=flags, check=False)
         if result.returncode:
-            return Scan('unchecked', reason='Локальный детектор недоступен или завершился с ошибкой')
+            return Scan('unchecked', reason=f'Локальный детектор аварийно завершился (код {result.returncode})')
         return Scan(**json.loads(result.stdout))
     except subprocess.TimeoutExpired:
         # subprocess.run kills and reaps the worker before returning.
@@ -268,7 +268,7 @@ class MediaScanner:
         self.timeout = max(5, min(60, timeout))
         self.explicit_threshold = max(.65, min(.99, explicit_threshold))
         self.suggestive_threshold = max(.70, min(.99, suggestive_threshold))
-        self._busy = False
+        self._scan_lock = asyncio.Lock()
         self._cache = OrderedDict()
 
     async def check(self, bot, message):
@@ -291,10 +291,11 @@ class MediaScanner:
         if cached and cached[0] > time.monotonic():
             self._cache.move_to_end(key)
             return cached[1]
-        if self._busy:
-            return Scan('unchecked', reason='Локальная проверка занята')
-        self._busy = True
-        try:
+        async with self._scan_lock:
+            cached = self._cache.get(key)
+            if cached and cached[0] > time.monotonic():
+                self._cache.move_to_end(key)
+                return cached[1]
             try:
                 file = await asyncio.wait_for(bot.get_file(item.file_id), timeout=15)
                 remote_size = getattr(file, 'file_size', None)
@@ -320,8 +321,6 @@ class MediaScanner:
                 while len(self._cache) > 512:
                     self._cache.popitem(last=False)
             return result
-        finally:
-            self._busy = False
 
 
 if __name__ == '__main__':
@@ -329,7 +328,9 @@ if __name__ == '__main__':
     # limits and the supervising timeout, but no resource module.
     try:
         import resource
-        resource.setrlimit(resource.RLIMIT_AS, (3 * 1024**3, 3 * 1024**3))
+        # ONNX Runtime/OpenCV reserve large virtual address ranges. A low
+        # RLIMIT_AS can abort a healthy native worker even when resident memory is
+        # modest. File/pixel/frame limits plus the supervisor timeout still bound input.
         resource.setrlimit(resource.RLIMIT_CPU, (50, 50))
     except ImportError:
         pass

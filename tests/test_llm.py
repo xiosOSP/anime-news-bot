@@ -69,6 +69,23 @@ class TestEnrichment:
         assert 'Pokémon' in news['_llm_text']
         assert news['_llm_tags'] == '#покемоны #новость'
 
+    def test_generic_llm_title_is_promoted_from_body(self, llm):
+        news = {
+            'title': 'Манга.',
+            'summary': ('KAGURABACHI был приостановлен из-за болезни автора и возобновится 27 сентября. '
+                        'Напоминаем, что ранее была анонсирована аниме-адаптация.'),
+            'source': 'TG: Test', 'lang': 'ru',
+        }
+        answer = {
+            'topic': 'манга', 'kind': 'новость', 'subject': 'KAGURABACHI',
+            'title': 'Манга', 'summary': news['summary'],
+        }
+        with patch.object(llm.requests, 'post', return_value=_reply(answer)):
+            assert asyncio.run(llm._llm_enrich(news)) == 'ok'
+        assert news['_llm_text'].splitlines()[0].startswith('KAGURABACHI')
+        assert not news['_llm_text'].startswith('Манга.')
+        assert 'Напоминаем' not in news['_llm_text']
+
     def test_filters_off_topic(self, llm):
         news = {'title': 'Нефть подорожала', 'summary': '', 'source': 'X'}
         with patch.object(llm.requests, 'post',
