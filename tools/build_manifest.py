@@ -48,6 +48,19 @@ def _tracked_files() -> list[str]:
     return sorted(names)
 
 
+def _untracked_files() -> list[str]:
+    """Файлы, которые лежат в репозитории, но git о них ещё не знает.
+
+    Опись строится по ``git ls-files``, поэтому новый файл, добавленный в
+    коммит уже ПОСЛЕ пересборки описи, в неё не попадает. Локально всё
+    выглядит согласованным — сверка проходит, потому что файла нет и в git, —
+    а на CI, где он уже отслеживается, сборка падает. Так и случилось: опись
+    собрали до ``git add``, и три файла остались неописанными.
+    """
+    listing = _git('ls-files', '--others', '--exclude-standard', '-z') or ''
+    return sorted(name for name in listing.split('\0') if name and name not in EXCLUDED)
+
+
 def _python_target() -> str:
     """Версия, на которой всё реально запускается, — из runtime.txt."""
     runtime = ROOT / 'runtime.txt'
@@ -125,6 +138,15 @@ def main() -> int:
         if target_changed:
             print('Версия Python в манифесте не совпадает с runtime.txt')
         return 1 if (stale or missing or changed or target_changed) else 0
+
+    untracked = _untracked_files()
+    if untracked:
+        # Не предупреждение, а отказ: опись, собранная в этот момент, будет
+        # неполной, и узнается об этом на CI — после того, как файлы попадут
+        # в коммит.
+        print('Сначала git add — эти файлы ещё не отслеживаются и в опись не '
+              f'попадут: {untracked[:10]}')
+        return 1
 
     MANIFEST.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n',
                         encoding='utf-8')

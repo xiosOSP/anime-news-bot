@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "6477bac9f8266366690ad5732ed6247424ee2cf2",
-  "generated_at_utc": "2026-09-10T21:07:28.026897+00:00",
+  "git_commit": "9c28decadf9ba470ac4e3321cd1def39f0e53f92",
+  "generated_at_utc": "2026-09-10T21:23:28.907252+00:00",
   "files": {
     ".env.example": {
       "sha256": "08eb51469ee82f6f70e3b5d6a175c6a74ff1ca968a88fa9d5b8d8b8a9661dc13",
@@ -330,8 +330,8 @@
       "bytes": 10062
     },
     "tests/test_manifest_content.py": {
-      "sha256": "b9c0b461a40428e8297cfed3bce8207f2cc99418df4c81c081b70428a1d538b7",
-      "bytes": 1358
+      "sha256": "5a09797984d6a999db04a728cccc3b7ae6fbea00296e2fc92160980b1df17254",
+      "bytes": 3181
     },
     "tests/test_media_quality_stage3.py": {
       "sha256": "7639d7271bfbef21d60d716dceffbea1da4ca4370115dc01397d9aefcfb47e83",
@@ -372,6 +372,10 @@
     "tests/test_moderation_strict_routing.py": {
       "sha256": "6bee108443631a1a1aedff222069aff2be85ac70790d7faacdaeacd10036c437",
       "bytes": 9494
+    },
+    "tests/test_news_noise_filter.py": {
+      "sha256": "9c286b97af323cb9ec0091fa62e5c370c99be18a744d4eee4831e1c0b2db59ea",
+      "bytes": 7725
     },
     "tests/test_news_parser_quality.py": {
       "sha256": "2116878d9cb12a8d931fb88c9cc63c3cb94f6879b150266e2421f477de2aba61",
@@ -518,8 +522,8 @@
       "bytes": 11315
     },
     "tools/build_manifest.py": {
-      "sha256": "626dfc67938fc5e81ad99ec61dcbc7761981e56ab937214901752778a42488a9",
-      "bytes": 5855
+      "sha256": "2dea3751af32a9c4a35ab5b1a1faa1d868ec570fbf5754481f10e6d119fcf6a0",
+      "bytes": 7322
     },
     "tools/check_invariants.py": {
       "sha256": "ec9742c913021c108737c05061511d39ce334ddd31e302ed9fb3da84ad4904a8",
