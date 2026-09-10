@@ -71,6 +71,7 @@ async def test_failed_thread_send_removes_ghost_pending(monkeypatch, tmp_path):
     monkeypatch.setattr(botmod, 'stats', stats)
     monkeypatch.setattr(botmod, 'settings', SimpleNamespace(
         video_enabled=False, require_image=False, dedup_final_text=False,
+        local_noise_filter=False,
     ))
 
     async def prepare(_news, _source, count_stats=True):

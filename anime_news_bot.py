@@ -3385,6 +3385,10 @@ class BotSettings:
         # только у источников общей тематики. Включается там, где вердикта
         # модели нет, — иначе эти ленты идут в канал вообще без фильтра.
         'local_topic_filter': True,
+        # Отсев не-новостей по жанру заголовка: подборки, тесты, рецензии,
+        # объяснялки, годовщины, скидки. Работает на сборе, то есть до очереди
+        # и до модели: такой заголовок не стоит ни вызова, ни места в ленте.
+        'local_noise_filter': True,
         'llm_tags': True,        # добавлять хэштеги
         'llm_read_article': True,  # читать статью, если в ленте только тизер
         'llm_skip_filler': True,   # отсеивать подборки и авторские колонки
@@ -3748,6 +3752,15 @@ class BotSettings:
     @local_topic_filter.setter
     def local_topic_filter(self, value: bool) -> None:
         self._data['local_topic_filter'] = bool(value)
+        self.save()
+
+    @property
+    def local_noise_filter(self) -> bool:
+        return bool(self._data.get('local_noise_filter', True))
+
+    @local_noise_filter.setter
+    def local_noise_filter(self, value: bool) -> None:
+        self._data['local_noise_filter'] = bool(value)
         self.save()
 
     @property
@@ -9345,6 +9358,99 @@ DIGEST_SKIP_PATTERNS = [
 ]
 
 
+# ============== ОТСЕВ ШУМА: ЭТО НЕ НОВОСТИ ==============
+# Ленты наполовину состоят из материала, который новостью не является:
+# подборки «10 лучших», тесты, рецензии, объяснялки, годовщины, скидки.
+# Модель это отсеивает (kind=подборка), но по одному вызову на каждый такой
+# заголовок — а он и так виден по самому заголовку. Отсев здесь, на сборе,
+# и бесплатен, и работает, когда модель молчит.
+#
+# Правила смотрят ТОЛЬКО заголовок: в тексте статьи упоминание подборки —
+# обычное дело, а жанр материала объявляет именно заголовок.
+NOISE_TITLE_RULES = (
+    ('подборка', (
+        r'^\s*(?:top|топ)[\s\-–—]*\d{1,3}\b',
+        r'^\s*\d{1,3}\s+(?:best|worst|greatest|most|things|reasons|anime|manga|'
+        r'characters|moments|series|shows|games|facts|times)\b',
+        r'^\s*\d{1,3}\s+(?:лучш|худш|причин|факт|аниме|манг|персонаж|момент|'
+        r'сериал|игр|вещей)',
+        r'\b(?:best|worst|greatest)\s+\d{1,3}\b',
+        r',?\s+ranked\s*$',
+        r'^\s*(?:лучшие|худшие)\s',
+        r'\bподборк[аиуе]\b',
+    )),
+    ('тест или опрос', (
+        r'^\s*(?:quiz|poll|survey)\b',
+        r'\b(?:quiz|poll):\s',
+        r'\bwhich\b.{0,40}\bare you\b',
+        r'^\s*(?:тест|опрос)[:\s]',
+        r'\bкакой ты\b',
+        r'\bгороскоп|\bhoroscope\b',
+    )),
+    ('рецензия или колонка', (
+        r'^\s*review\s*[:\-–—]',
+        r'\breview:\s',
+        r'\breview\s*$',
+        r'^\s*(?:opinion|editorial|column)\s*[:\-–—]',
+        r'\bfirst impressions\b',
+        r'^\s*(?:обзор|рецензия|мнение|колонка)[:\s]',
+    )),
+    ('объяснялка, а не новость', (
+        r'\beverything (?:we know|you need to know)\b',
+        r'\bexplained\s*$',
+        r'\bexplained:\s',
+        r'\bwatch order\b',
+        r"\bbeginner'?s guide\b",
+        r'\bhow to (?:watch|start)\b',
+        r'^\s*всё,? что известно\b',
+        r'\bобъясняем\b',
+        r'\bв каком порядке смотреть\b',
+    )),
+    ('годовщина и ностальгия', (
+        r'\b\d{1,2}\s+years\s+(?:later|ago)\b',
+        r'\bon this day\b',
+        r'\blooking back at\b',
+        r'\bthrowback\b',
+        r'\b\d{1,2}\s+лет спустя\b',
+        r'\bвспоминаем\b',
+    )),
+    ('скидки и распродажа', (
+        r'\b\d{1,3}\s*%\s*off\b',
+        r'\bdeals?\s+of the\b',
+        r'\bon sale (?:now|at)\b',
+        r'\b(?:black friday|prime day)\b',
+        r'\bскидк|\bраспродаж|\bпо промокоду\b',
+    )),
+    ('фан-контент', (
+        r'\bfan\s?art\b',
+        r'\bcosplay of the (?:day|week)\b',
+        r'\bthis cosplay\b',
+        r'\bфанарт\b',
+        r'\bкосплей (?:дня|недели)\b',
+        r'\bлучший косплей\b',
+    )),
+)
+
+_NOISE_TITLE_RE = tuple(
+    (reason, re.compile('|'.join(patterns), re.IGNORECASE))
+    for reason, patterns in NOISE_TITLE_RULES)
+
+
+def noise_reason(news: dict) -> str:
+    """Чем заголовок выдаёт себя как не-новость. Пусто — новость.
+
+    Возвращает причину, а не флаг: она уходит в лог и в метрику, иначе отсев
+    невозможно ни проверить, ни обжаловать — пост просто исчезает.
+    """
+    title = str(news.get('title') or '')
+    if not title:
+        return ''
+    for reason, pattern in _NOISE_TITLE_RE:
+        if pattern.search(title):
+            return reason
+    return ''
+
+
 def matches_keywords(news: dict) -> bool:
     """Применяет whitelist (KEYWORDS) и blacklist. Возвращает True если пост подходит."""
     # 1) Blacklist — жёсткий отказ
@@ -9357,6 +9463,13 @@ def matches_keywords(news: dict) -> bool:
     for pattern in DIGEST_SKIP_PATTERNS:
         if pattern.search(check_text):
             logger.info(f"⊘ Дайджест/промо: {news.get('title', '')[:60]}")
+            return False
+    # 1c) Не новость по жанру: подборка, тест, рецензия, объяснялка
+    if settings is not None and settings.local_noise_filter:
+        noise = noise_reason(news)
+        if noise:
+            logger.info(f"⊘ Не новость ({noise}): {news.get('title', '')[:60]}")
+            metrics.inc('anime_bot_noise_skips_total', labels={'reason': noise})
             return False
     # 2) Whitelist — если задан
     if not KEYWORDS:
@@ -15107,6 +15220,9 @@ def _menu_llm() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(
         f'{_sw(settings.local_topic_filter)} Отсев чужих тем без модели',
         callback_data='settings:toggle_localtopic')])
+    rows.append([InlineKeyboardButton(
+        f'{_sw(settings.local_noise_filter)} Отсев не-новостей по заголовку',
+        callback_data='settings:toggle_localnoise')])
     rows.append([InlineKeyboardButton(tr, callback_data='settings:toggle_translator')])
     rows.append([InlineKeyboardButton('⬅️ Назад', callback_data='settings:back')])
     return InlineKeyboardMarkup(rows)
@@ -15194,6 +15310,7 @@ _TOGGLE_SECTION = {
     'toggle_llm_tags': 'llm', 'toggle_llm_article': 'llm', 'toggle_llm_filler': 'llm',
     'toggle_llm_dedup': 'llm', 'toggle_llm_repeats': 'llm',
     'toggle_translator': 'llm', 'llmslot': 'llm', 'toggle_localtopic': 'llm',
+    'toggle_localnoise': 'llm',
     'toggle_autodis': 'sources', 'sources': 'sources',
     'mods': 'moderation',
     'toggle_backup': 'system', 'toggle_startup': 'system',
@@ -16023,6 +16140,18 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'🧵 В ветку раз в {_fmt_minutes(settings.check_interval_min)}',
             reply_markup=_menu_for(data), parse_mode=ParseMode.HTML,
         )
+        return
+
+    if data == "settings:toggle_localnoise":
+        settings.local_noise_filter = not settings.local_noise_filter
+        state = 'включён' if settings.local_noise_filter else 'выключен'
+        await query.answer(f'Отсев не-новостей {state}')
+        note = (f'🗞 Отсев не-новостей по заголовку: {state.upper()}\n\n'
+                'Отсеиваются ' + ', '.join(reason for reason, _ in NOISE_TITLE_RULES)
+                + '. Решение принимается по заголовку на этапе сбора, '
+                  'поэтому такие материалы не занимают ни очередь, ни вызов модели.')
+        await query.edit_message_text(f"⚙️ Настройки\n\n{note}",
+                                      reply_markup=_menu_for(data))
         return
 
     if data == "settings:toggle_localtopic":
@@ -20223,6 +20352,8 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
     # как раз про минуты, когда её нет.
     lines.append('🧹 Отсев чужих тем без модели: '
                  + ('ВКЛ' if settings.local_topic_filter else 'ВЫКЛ'))
+    lines.append('🗞 Отсев не-новостей по заголовку: '
+                 + ('ВКЛ' if settings.local_noise_filter else 'ВЫКЛ'))
     lines.append('')
     lines.append(f'Вызовов сегодня: {used} из {LLM_DAILY_LIMIT}')
     if _llm_disabled_runtime:
