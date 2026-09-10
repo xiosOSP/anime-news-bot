@@ -16,9 +16,19 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from datetime import timedelta
 
 MAX_BYTES = 20 * 1024 * 1024
+# Потолок адресного пространства воркера. Просить больше, чем есть у хостинга,
+# бессмысленно: лимит не сработает никогда, и вместо аккуратного отказа одного
+# процесса ядро выберет жертву само — может выбрать и самого бота.
+# Замерено: детектор поднимается на 1536 МБ и не поднимается на 1024 (onnxruntime
+# резервирует адресное пространство далеко за пределами своих 120 МБ RSS).
+# Отсюда пол: значение ниже молча превращало бы каждую проверку в отказ.
+WORKER_MEMORY_MB_MIN = 1536
+WORKER_MEMORY_MB_DEFAULT = 1792
+WORKER_MEMORY_ENV = 'MEDIA_WORKER_MEMORY_MB'
 MAX_PIXELS = 16_000_000
 MAX_FRAMES = 16
 MAX_DURATION = 180
@@ -240,9 +250,20 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
     return Scan('checked', best.category, best.reason, count, best.score)
 
 
-def _invoke_worker(path, kind, timeout, explicit_threshold, suggestive_threshold):
+def clamp_worker_memory(memory_mb):
+    """Приводит запрошенный лимит к тому, на чём детектор действительно живёт."""
+    try:
+        value = int(memory_mb)
+    except (TypeError, ValueError):
+        return WORKER_MEMORY_MB_DEFAULT
+    return max(WORKER_MEMORY_MB_MIN, min(8192, value))
+
+
+def _invoke_worker(path, kind, timeout, explicit_threshold, suggestive_threshold,
+                   memory_mb=WORKER_MEMORY_MB_DEFAULT):
     env = dict(os.environ, OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1',
                MKL_NUM_THREADS='1', OPENCV_FFMPEG_CAPTURE_OPTIONS='protocol_whitelist;file')
+    env[WORKER_MEMORY_ENV] = str(clamp_worker_memory(memory_mb))
     # Classifier never needs bot tokens, provider keys or cloud credentials.
     for name in list(env):
         if any(part in name.upper() for part in ('TOKEN', 'SECRET', 'PASSWORD', 'KEY', 'CREDENTIAL')):
@@ -284,9 +305,11 @@ def worker_failure_reason(returncode, stderr):
     return f'{reason}: {tail}' if tail else reason
 
 
-def run_worker(path, kind, timeout, explicit_threshold, suggestive_threshold):
+def run_worker(path, kind, timeout, explicit_threshold, suggestive_threshold,
+               memory_mb=WORKER_MEMORY_MB_DEFAULT):
     try:
-        result = _invoke_worker(path, kind, timeout, explicit_threshold, suggestive_threshold)
+        result = _invoke_worker(path, kind, timeout, explicit_threshold,
+                                suggestive_threshold, memory_mb)
     except subprocess.TimeoutExpired:
         # subprocess.run kills and reaps the worker before returning.
         return Scan('unchecked', reason='Превышено время локальной проверки')
@@ -302,7 +325,7 @@ def run_worker(path, kind, timeout, explicit_threshold, suggestive_threshold):
                                         + (f': {tail}' if tail else ''))
 
 
-def probe(timeout=60):
+def probe(timeout=60, memory_mb=WORKER_MEMORY_MB_DEFAULT):
     """Самопроверка детектора на сгенерированной картинке.
 
     Отчёт из чата говорит только, что медиа не проверено. Чинить хостинг по
@@ -318,7 +341,7 @@ def probe(timeout=60):
         path = Path(directory) / 'probe.png'
         try:
             Image.new('RGB', (64, 64), 'slategray').save(path)
-            result = _invoke_worker(path, 'image', timeout, .80, .85)
+            result = _invoke_worker(path, 'image', timeout, .80, .85, memory_mb)
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
             return (Scan('unchecked', reason=f'{type(exc).__name__}: {exc}'), '',
                     time.monotonic() - started)
@@ -335,7 +358,7 @@ def probe(timeout=60):
 
 class MediaScanner:
     def __init__(self, timeout=25, explicit_threshold=.80, suggestive_threshold=.85,
-                 max_waiting=4):
+                 max_waiting=4, memory_mb=WORKER_MEMORY_MB_DEFAULT):
         self.timeout = max(5, min(60, timeout))
         self.explicit_threshold = max(.65, min(.99, explicit_threshold))
         self.suggestive_threshold = max(.70, min(.99, suggestive_threshold))
@@ -344,6 +367,7 @@ class MediaScanner:
         # оживлённом чате всё, что прилетало во время чужой проверки, уходило
         # непроверенным — то есть 18+ проходил ровно тогда, когда медиа много.
         self.max_waiting = max(0, min(32, max_waiting))
+        self.memory_mb = clamp_worker_memory(memory_mb)
         self._gate = None
         self._gate_loop = None
         self._in_flight = 0
@@ -418,7 +442,8 @@ class MediaScanner:
                                                                      read_timeout=15, connect_timeout=5), timeout=20)
                         task = asyncio.create_task(asyncio.to_thread(
                             run_worker, path, kind, self.timeout,
-                            self.explicit_threshold, self.suggestive_threshold))
+                            self.explicit_threshold, self.suggestive_threshold,
+                            self.memory_mb))
                         try:
                             result = await asyncio.shield(task)
                         except asyncio.CancelledError:
@@ -445,8 +470,9 @@ if __name__ == '__main__':
         import resource
     except ImportError:
         resource = None
+    memory_mb = clamp_worker_memory(os.environ.get(WORKER_MEMORY_ENV, WORKER_MEMORY_MB_DEFAULT))
     if resource is not None:
-        for limit, wanted in ((resource.RLIMIT_AS, 3 * 1024**3), (resource.RLIMIT_CPU, 50)):
+        for limit, wanted in ((resource.RLIMIT_AS, memory_mb * 1024**2), (resource.RLIMIT_CPU, 50)):
             try:
                 soft, hard = resource.getrlimit(limit)
                 # Жёсткий лимит хоста можно понизить, но не поднять: попытка
@@ -463,6 +489,18 @@ if __name__ == '__main__':
                 pass
     try:
         scan = scan_file(sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4]))
-    except Exception:
-        scan = Scan('unchecked', reason='Ошибка декодирования или локального детектора')
+    except Exception as exc:
+        # Трассировка уходит в stderr: родитель её читает, и «медиа не проверено»
+        # перестаёт быть тупиком — /mediaping показывает, чего не хватило.
+        traceback.print_exc(file=sys.stderr)
+        text = f'{type(exc).__name__}: {exc}'.lower()
+        if isinstance(exc, MemoryError) or any(
+                mark in text for mark in ('bad_alloc', 'out of memory', 'cannot allocate')):
+            # Нехватку памяти и сломанную установку чинят по-разному, а раньше
+            # обе выглядели одинаково. onnxruntime говорит про память
+            # std::bad_alloc, а не MemoryError, поэтому смотрим и на текст.
+            scan = Scan('unchecked', reason=f'Детектору не хватило памяти (лимит {memory_mb} МБ)')
+        else:
+            scan = Scan('unchecked',
+                        reason=f'Ошибка декодирования или детектора: {type(exc).__name__}')
     print(json.dumps(asdict(scan), ensure_ascii=True))

@@ -47,7 +47,8 @@ from bs4 import BeautifulSoup
 from translation import GoogleTranslator
 from safe_http import public_get
 from moderation_rules import check_text as check_moderation_text, normalize as normalize_moderation_text
-from moderation_media import MediaScanner, media_attachment, probe as media_probe
+from moderation_media import (MediaScanner, media_attachment, probe as media_probe,
+                              WORKER_MEMORY_MB_DEFAULT, WORKER_MEMORY_MB_MIN)
 from moderation_llm import ChatModelClient
 from news_deferral import NewsDeferralStore
 from publication_delivery import PublicationBot
@@ -1500,7 +1501,11 @@ _moderation_media_scanner = MediaScanner(
     # Сколько медиа могут подождать своей очереди у детектора. Ноль вернул бы
     # старое поведение: всё, что пришло во время чужой проверки, оставалось бы
     # непроверенным.
-    max_waiting=_env_int('MODERATION_MEDIA_QUEUE', 4))
+    max_waiting=_env_int('MODERATION_MEDIA_QUEUE', 4),
+    # Потолок памяти воркера. По умолчанию он ниже 2 ГБ — типичного объёма
+    # маленького хостинга: лимит, который больше всей памяти машины, не
+    # срабатывает никогда, и вместо отказа одной проверки жертву выбирает ядро.
+    memory_mb=_env_int('MODERATION_MEDIA_MEMORY_MB', WORKER_MEMORY_MB_DEFAULT))
 _moderation_action_lock = asyncio.Lock()
 _moderation_update_lock = asyncio.Lock()
 _moderation_seen_updates = {}
@@ -18018,6 +18023,17 @@ LLM_API_KEY = _env('LLM_API_KEY', '').strip()
 _preset = LLM_PRESETS.get(LLM_PROVIDER, ('', ''))
 LLM_BASE_URL = (_env('LLM_BASE_URL', '').strip() or _preset[0]).rstrip('/')
 LLM_MODEL = _env('LLM_MODEL', '').strip() or _preset[1]
+# Ручные адрес и модель молча перебивают пресет провайдера. Смена провайдера
+# тогда не работает: ключ новый, а ходит бот по старому адресу и просит модель,
+# которой у нового в каталоге нет. Симптом — «ключ вставил, а не работает»,
+# и по нему не догадаться, что виноваты переменные, оставшиеся с прошлого раза.
+# Отмечаем происхождение здесь, а разбирается /doctor.
+LLM_BASE_URL_FROM_ENV = bool(_env('LLM_BASE_URL', '').strip())
+LLM_MODEL_FROM_ENV = bool(_env('LLM_MODEL', '').strip())
+LLM_FALLBACK_OVERRIDES_FROM_ENV = tuple(
+    name for name in ('LLM_FALLBACK_BASE_URL', 'LLM_FALLBACK_MODEL')
+    if _env(name, '').strip())
+MODERATION_LLM_BASE_URL_FROM_ENV = bool(_env('MODERATION_LLM_BASE_URL', '').strip())
 # Запасной провайдер. Бесплатные роутеры кончаются без предупреждения: квота,
 # приостановка аккаунта, снятая модель. Раньше это выключало обогащение целиком
 # до перезапуска. Если запасной задан, бот один раз переключается на него и
@@ -21886,6 +21902,56 @@ def _job_line(context, name: str, human: str) -> str:
     return f"  ✅ {human}" + (f" — следующий запуск {_fmt_local(nxt)}" if nxt else "")
 
 
+def _doctor_env_conflicts() -> list[tuple[str, bool, str]]:
+    """Переменные, которые тихо отменяют друг друга.
+
+    Ошибка в наборе переменных не выглядит как ошибка: бот запускается, отвечает
+    и работает — просто не тем провайдером, не той моделью или без проверки
+    медиа. Найти это по логам нельзя, потому что жалобы нет ни у кого.
+    """
+    rows: list[tuple[str, bool, str]] = []
+    preset_url, preset_model = LLM_PRESETS.get(LLM_PROVIDER, ('', ''))
+    stale = []
+    if preset_url and LLM_BASE_URL_FROM_ENV and LLM_BASE_URL.rstrip('/') != preset_url.rstrip('/'):
+        stale.append(f'LLM_BASE_URL={LLM_BASE_URL} вместо {preset_url}')
+    if preset_model and LLM_MODEL_FROM_ENV and LLM_MODEL != preset_model:
+        stale.append(f'LLM_MODEL={LLM_MODEL} вместо {preset_model}')
+    if stale:
+        rows.append(('LLM: ручные адрес и модель', False,
+                     f'перебивают пресет {LLM_PROVIDER}: ' + '; '.join(stale)
+                     + '. Если провайдер сменился — эти переменные надо стереть.'))
+    elif LLM_PROVIDER and not preset_url and not LLM_BASE_URL:
+        rows.append(('LLM: адрес провайдера', False,
+                     f'у провайдера {LLM_PROVIDER} нет пресета, а LLM_BASE_URL не задан'))
+    else:
+        rows.append(('LLM: провайдер и адрес', True,
+                     f'{LLM_PROVIDER or "не задан"} → {LLM_BASE_URL or "нет адреса"}'))
+
+    if LLM_API_KEY and not LLM_PROVIDER and not LLM_BASE_URL_FROM_ENV:
+        rows.append(('LLM_PROVIDER', False,
+                     'ключ задан, а провайдер нет: бот не знает, куда идти'))
+    if LLM_FALLBACK_API_KEY and not LLM_FALLBACK_BASE_URL:
+        rows.append(('Запасная модель', False,
+                     'LLM_FALLBACK_API_KEY задан, а LLM_FALLBACK_PROVIDER нет: '
+                     'запасного не будет'))
+    if MODERATION_LLM_API_KEY and not MODERATION_LLM_BASE_URL:
+        rows.append(('Модель модерации', False,
+                     'MODERATION_LLM_API_KEY задан, а MODERATION_LLM_PROVIDER нет'))
+    if MODERATION_LLM_API_KEY and not MODERATION_LLM_MODEL:
+        rows.append(('Модель модерации', False,
+                     'MODERATION_LLM_API_KEY задан, а MODERATION_LLM_MODEL нет'))
+
+    requested_memory = _env_int('MODERATION_MEDIA_MEMORY_MB', WORKER_MEMORY_MB_DEFAULT)
+    if requested_memory < WORKER_MEMORY_MB_MIN:
+        rows.append(('MODERATION_MEDIA_MEMORY_MB', False,
+                     f'{requested_memory} МБ детектору не хватит; применён минимум '
+                     f'{WORKER_MEMORY_MB_MIN} МБ'))
+    if not MODERATION_MEDIA_ENABLED:
+        rows.append(('Проверка медиа', False,
+                     'MODERATION_MEDIA_ENABLED выключает проверку: 18+ бот не увидит'))
+    return rows
+
+
 def _doctor_local_checks() -> list[dict]:
     """Локальные диагностические проверки без обращения к Telegram/API."""
     checks: list[dict] = []
@@ -21916,6 +21982,12 @@ def _doctor_local_checks() -> list[dict]:
             broken_json.append(f'{path.name}: {type(e).__name__}')
     add('Runtime JSON', not broken_json,
         'все читаются' if not broken_json else '; '.join(broken_json[:8]))
+
+    for name, ok, detail in _doctor_env_conflicts():
+        # Уровень warning: бот с такими переменными работает, просто не так,
+        # как думает владелец. Ошибкой это делать нельзя — набор переменных
+        # бывает и осознанным.
+        add(name, ok, detail, level='warning')
 
     add('Pillow', Image is not None,
         'перцептивный media-dedup доступен' if Image is not None else 'только exact hash', level='warning')
@@ -23956,8 +24028,9 @@ async def mediaping_command(update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML)
         return
     msg = await update.message.reply_text('🧪 Запускаю детектор на тестовой картинке…')
-    scan, details, spent = await asyncio.to_thread(media_probe,
-                                                   _moderation_media_scanner.timeout * 2 + 20)
+    scan, details, spent = await asyncio.to_thread(
+        media_probe, _moderation_media_scanner.timeout * 2 + 20,
+        _moderation_media_scanner.memory_mb)
     ok = scan.status == 'checked'
     lines = ['🧪 <b>Локальный детектор медиа</b>', '']
     lines.append(('✅ работает' if ok else '❌ не работает') + f' · {spent:.1f} с')
@@ -23969,6 +24042,8 @@ async def mediaping_command(update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f'<pre>{html.escape(details[-500:])}</pre>')
     lines.append('')
     lines.append(f'Таймаут проверки: {_moderation_media_scanner.timeout} с')
+    lines.append(f'Память воркера: до {_moderation_media_scanner.memory_mb} МБ '
+                 f'(<code>MODERATION_MEDIA_MEMORY_MB</code>)')
     lines.append(f'Очередь: до {_moderation_media_scanner.max_waiting} ожидающих, '
                  f'сейчас {_moderation_media_scanner.queue_depth()}')
     lines.append(f'Пороги: явное {_moderation_media_scanner.explicit_threshold:.2f}, '

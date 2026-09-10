@@ -646,8 +646,9 @@ async def test_mediaping_shows_the_reason_and_punishes_nobody(monkeypatch):
     monkeypatch.setattr(bot, 'is_admin', lambda update: True)
     monkeypatch.setattr(bot, 'MODERATION_MEDIA_ENABLED', True)
     monkeypatch.setattr(bot, 'media_probe',
-                        lambda timeout: (media.Scan('unchecked', reason='Детектор убит (SIGKILL)'),
-                                         'onnxruntime: cannot allocate memory', 1.5))
+                        lambda timeout, memory_mb: (
+                            media.Scan('unchecked', reason='Детектор убит (SIGKILL)'),
+                            'onnxruntime: cannot allocate memory', 1.5))
     edit = AsyncMock()
     msg = NS(reply_text=AsyncMock(return_value=NS(edit_text=edit)))
     await bot.mediaping_command(NS(message=msg), NS(args=[], bot=telegram_bot()))

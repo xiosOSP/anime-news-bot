@@ -635,6 +635,28 @@ def _check_broken_detector_never_says_checked() -> tuple[bool, str]:
     return True, 'отказ детектора остаётся отказом во всех четырёх случаях'
 
 
+def _check_env_reference_is_complete() -> tuple[bool, str]:
+    """Справочник переменных обязан описывать всё, что читает код.
+
+    ``.env.example`` уже однажды отстал: код читал 261 переменную, описаны были
+    69. Такой файл хуже отсутствующего — по нему ищут, чего не хватает на
+    хостинге, и не находят. Пересобрать: ``python tools/env_reference.py``.
+    """
+    sys.path.insert(0, str(ROOT / 'tools'))
+    import env_reference
+
+    found = env_reference.collect()
+    if not found:
+        return False, 'сборщик не нашёл ни одной переменной — сломан разбор'
+    if not env_reference.REFERENCE.exists():
+        return False, 'docs/env-reference.md отсутствует'
+    text = env_reference.REFERENCE.read_text(encoding='utf-8')
+    missing = sorted(name for name in found if f'`{name}`' not in text)
+    if missing:
+        return False, f'в справочнике нет {len(missing)}: {missing[:5]}'
+    return True, f'все {len(found)} переменных описаны'
+
+
 def checks(bot, tree) -> list[tuple[str, bool, str]]:
     """Полный список инвариантов. Порядок стабилен: на него смотрит pytest."""
     rows: list[tuple[str, bool, str]] = []
@@ -674,6 +696,7 @@ def checks(bot, tree) -> list[tuple[str, bool, str]]:
         _check_local_topic_filter_knows_real_sources(bot))
     add('локальный отсев уступает модели',
         _check_local_topic_filter_yields_to_the_model(tree))
+    add('справочник переменных полон', _check_env_reference_is_complete())
     add('манифест описывает существующие файлы', _check_manifest_describes_reality())
     return rows
 
