@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "db721765b131b364e7f8f8b1d3b8e02f60891871",
-  "generated_at_utc": "2026-09-10T16:59:02.795378+00:00",
+  "git_commit": "b0393092308795d5993a04476e84f413d26394ed",
+  "generated_at_utc": "2026-09-10T17:01:29.778451+00:00",
   "files": {
     ".env.example": {
       "sha256": "554e1377d5ca338429e84d8c6f03faca806fadc19754bac5c3748084936c6ac7",
@@ -12,14 +12,6 @@
     ".gitattributes": {
       "sha256": "d60f352d0db1404c70afb4bb8b2ca3fd1c610572aa40720e8a0b7baa7885418c",
       "bytes": 19
-    },
-    ".github/workflows/apply-targeted-fixes-v2.yml": {
-      "sha256": "ec8a81fd84cd049d4cb0b3b07f1024c36c31582dc3697be9973b61dc6db93b6f",
-      "bytes": 7058
-    },
-    ".github/workflows/apply-targeted-fixes.yml": {
-      "sha256": "3bdb2b82c3a83bb9833923df2c5811c815b2b67ee270ae71bc29d956553e7c30",
-      "bytes": 7048
     },
     ".github/workflows/ci.yml": {
       "sha256": "8d1911e2ce5899ff601208ffaca0f4560c0bb1f748cfc39c7863d027b441002e",
