@@ -11,6 +11,7 @@ import json
 import math
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -239,7 +240,7 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
     return Scan('checked', best.category, best.reason, count, best.score)
 
 
-def run_worker(path, kind, timeout, explicit_threshold, suggestive_threshold):
+def _invoke_worker(path, kind, timeout, explicit_threshold, suggestive_threshold):
     env = dict(os.environ, OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1',
                MKL_NUM_THREADS='1', OPENCV_FFMPEG_CAPTURE_OPTIONS='protocol_whitelist;file')
     # Classifier never needs bot tokens, provider keys or cloud credentials.
@@ -247,29 +248,125 @@ def run_worker(path, kind, timeout, explicit_threshold, suggestive_threshold):
         if any(part in name.upper() for part in ('TOKEN', 'SECRET', 'PASSWORD', 'KEY', 'CREDENTIAL')):
             env.pop(name, None)
     flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+    return subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), str(path), kind,
+         str(explicit_threshold), str(suggestive_threshold)],
+        capture_output=True, text=True, encoding='utf-8', timeout=timeout,
+        env=env, creationflags=flags, check=False)
+
+
+def worker_error_tail(stderr, limit=160):
+    """Последняя содержательная строка вывода воркера."""
+    lines = [line.strip() for line in str(stderr or '').splitlines() if line.strip()]
+    return lines[-1][:limit] if lines else ''
+
+
+def worker_failure_reason(returncode, stderr):
+    """Почему воркер не отработал — словами, по которым можно чинить.
+
+    Раньше на любой сбой отчёт говорил «недоступен или завершился с ошибкой»,
+    а stderr выбрасывался. По такому тексту не отличить не установленную
+    библиотеку от нехватки памяти, и владелец чинит наугад то, что не сломано.
+    """
+    tail = worker_error_tail(stderr)
+    if returncode < 0:
+        # Убит сигналом. На маленьком хостинге это почти всегда OOM-killer:
+        # детектор поднимает onnxruntime во втором процессе.
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = f'сигнал {-returncode}'
+        # SIGKILL есть не на всякой платформе, а падать диагностика не вправе.
+        hint = (' — вероятно, не хватило памяти'
+                if -returncode == getattr(signal, 'SIGKILL', None) else '')
+        return f'Детектор убит ({name}){hint}'
+    reason = f'Детектор завершился с кодом {returncode}'
+    return f'{reason}: {tail}' if tail else reason
+
+
+def run_worker(path, kind, timeout, explicit_threshold, suggestive_threshold):
     try:
-        result = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve()), str(path), kind,
-             str(explicit_threshold), str(suggestive_threshold)],
-            capture_output=True, text=True, encoding='utf-8', timeout=timeout,
-            env=env, creationflags=flags, check=False)
-        if result.returncode:
-            return Scan('unchecked', reason='Локальный детектор недоступен или завершился с ошибкой')
-        return Scan(**json.loads(result.stdout))
+        result = _invoke_worker(path, kind, timeout, explicit_threshold, suggestive_threshold)
     except subprocess.TimeoutExpired:
         # subprocess.run kills and reaps the worker before returning.
         return Scan('unchecked', reason='Превышено время локальной проверки')
-    except (OSError, ValueError, TypeError):
-        return Scan('unchecked', reason='Ошибка запуска локального детектора')
+    except (OSError, ValueError, TypeError) as exc:
+        return Scan('unchecked', reason=f'Не удалось запустить детектор: {type(exc).__name__}')
+    if result.returncode:
+        return Scan('unchecked', reason=worker_failure_reason(result.returncode, result.stderr))
+    try:
+        return Scan(**json.loads(result.stdout))
+    except (ValueError, TypeError):
+        tail = worker_error_tail(result.stderr) or worker_error_tail(result.stdout)
+        return Scan('unchecked', reason='Детектор ответил неразборчиво'
+                                        + (f': {tail}' if tail else ''))
+
+
+def probe(timeout=60):
+    """Самопроверка детектора на сгенерированной картинке.
+
+    Отчёт из чата говорит только, что медиа не проверено. Чинить хостинг по
+    такому сообщению нельзя: непонятно, чего не хватает. Здесь проверка
+    запускается по требованию и отдаёт вывод воркера целиком.
+    """
+    started = time.monotonic()
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        return Scan('unchecked', reason=f'Нет Pillow: {exc}'), '', 0.0
+    with tempfile.TemporaryDirectory(prefix='media-probe-') as directory:
+        path = Path(directory) / 'probe.png'
+        try:
+            Image.new('RGB', (64, 64), 'slategray').save(path)
+            result = _invoke_worker(path, 'image', timeout, .80, .85)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            return (Scan('unchecked', reason=f'{type(exc).__name__}: {exc}'), '',
+                    time.monotonic() - started)
+        spent = time.monotonic() - started
+        details = (result.stderr or '').strip()[-600:]
+        if result.returncode:
+            return Scan('unchecked',
+                        reason=worker_failure_reason(result.returncode, result.stderr)), details, spent
+        try:
+            return Scan(**json.loads(result.stdout)), details, spent
+        except (ValueError, TypeError):
+            return Scan('unchecked', reason='Детектор ответил неразборчиво'), details or str(result.stdout)[:600], spent
 
 
 class MediaScanner:
-    def __init__(self, timeout=25, explicit_threshold=.80, suggestive_threshold=.85):
+    def __init__(self, timeout=25, explicit_threshold=.80, suggestive_threshold=.85,
+                 max_waiting=4):
         self.timeout = max(5, min(60, timeout))
         self.explicit_threshold = max(.65, min(.99, explicit_threshold))
         self.suggestive_threshold = max(.70, min(.99, suggestive_threshold))
-        self._busy = False
+        # Детектор в чате один, и это правильно: второй такой процесс хостинг
+        # не потянет. Но «занято» раньше означало «не проверяем вовсе», и в
+        # оживлённом чате всё, что прилетало во время чужой проверки, уходило
+        # непроверенным — то есть 18+ проходил ровно тогда, когда медиа много.
+        self.max_waiting = max(0, min(32, max_waiting))
+        self._gate = None
+        self._gate_loop = None
+        self._in_flight = 0
         self._cache = OrderedDict()
+
+    def _slot(self):
+        """Замок детектора, привязанный к текущему циклу событий.
+
+        Сканер создаётся при импорте, когда цикла ещё нет, а примитив asyncio
+        привязывается к первому же циклу, который его тронул. В прогоне тестов
+        цикл у каждого теста свой: один замок на всех давал бы падения
+        «bound to a different event loop», зависящие от порядка файлов.
+        """
+        loop = asyncio.get_running_loop()
+        if self._gate is None or self._gate_loop is not loop:
+            self._gate = asyncio.Semaphore(1)
+            self._gate_loop = loop
+            self._in_flight = 0
+        return self._gate
+
+    def queue_depth(self):
+        """Сколько проверок сейчас ждут очереди — для диагностики."""
+        return max(0, self._in_flight - 1)
 
     async def check(self, bot, message):
         attachment = media_attachment(message)
@@ -291,37 +388,54 @@ class MediaScanner:
         if cached and cached[0] > time.monotonic():
             self._cache.move_to_end(key)
             return cached[1]
-        if self._busy:
-            return Scan('unchecked', reason='Локальная проверка занята')
-        self._busy = True
+        gate = self._slot()
+        # Считаем всех, кто уже проверяется или ждёт очереди. По gate.locked()
+        # переполнение не увидеть: захват уходит в отдельную задачу и к этому
+        # моменту ещё не случился, так что второй проверяющий видел бы
+        # свободный замок и потолок не работал бы вовсе.
+        if self._in_flight > self.max_waiting:
+            # Потолок нарочный: ждущая проверка держит обработчик апдейта, и
+            # без него всплеск сообщений утащил бы бота целиком.
+            return Scan('unchecked', reason='Очередь локальной проверки переполнена')
+        self._in_flight += 1
         try:
             try:
-                file = await asyncio.wait_for(bot.get_file(item.file_id), timeout=15)
-                remote_size = getattr(file, 'file_size', None)
-                if remote_size is None or not 0 < remote_size <= MAX_BYTES:
-                    return Scan('unchecked', reason='Неизвестный или недопустимый размер файла')
-                with tempfile.TemporaryDirectory(prefix='chat-moderation-') as directory:
-                    path = Path(directory) / 'content'
-                    await asyncio.wait_for(file.download_to_drive(custom_path=path,
-                                                                 read_timeout=15, connect_timeout=5), timeout=20)
-                    task = asyncio.create_task(asyncio.to_thread(
-                        run_worker, path, kind, self.timeout,
-                        self.explicit_threshold, self.suggestive_threshold))
-                    try:
-                        result = await asyncio.shield(task)
-                    except asyncio.CancelledError:
-                        # Keep ownership of the file and slot until worker exits.
-                        await task
-                        raise
-            except Exception:
-                return Scan('unchecked', reason='Не удалось скачать или проверить медиа')
-            if key and result.status == 'checked':
-                self._cache[key] = (time.monotonic() + 86400, result)
-                while len(self._cache) > 512:
-                    self._cache.popitem(last=False)
-            return result
+                # Ожидание ограничено сверху: за это время стоящие впереди
+                # успевают отработать (скачивание плюс детектор), а если не
+                # успевают — честнее сказать человеку, чем ждать бесконечно.
+                await asyncio.wait_for(gate.acquire(), timeout=self.timeout * 2 + 20)
+            except asyncio.TimeoutError:
+                return Scan('unchecked', reason='Локальная проверка не дождалась очереди')
+            try:
+                try:
+                    file = await asyncio.wait_for(bot.get_file(item.file_id), timeout=15)
+                    remote_size = getattr(file, 'file_size', None)
+                    if remote_size is None or not 0 < remote_size <= MAX_BYTES:
+                        return Scan('unchecked', reason='Неизвестный или недопустимый размер файла')
+                    with tempfile.TemporaryDirectory(prefix='chat-moderation-') as directory:
+                        path = Path(directory) / 'content'
+                        await asyncio.wait_for(file.download_to_drive(custom_path=path,
+                                                                     read_timeout=15, connect_timeout=5), timeout=20)
+                        task = asyncio.create_task(asyncio.to_thread(
+                            run_worker, path, kind, self.timeout,
+                            self.explicit_threshold, self.suggestive_threshold))
+                        try:
+                            result = await asyncio.shield(task)
+                        except asyncio.CancelledError:
+                            # Keep ownership of the file and slot until worker exits.
+                            await task
+                            raise
+                except Exception:
+                    return Scan('unchecked', reason='Не удалось скачать или проверить медиа')
+                if key and result.status == 'checked':
+                    self._cache[key] = (time.monotonic() + 86400, result)
+                    while len(self._cache) > 512:
+                        self._cache.popitem(last=False)
+                return result
+            finally:
+                gate.release()
         finally:
-            self._busy = False
+            self._in_flight -= 1
 
 
 if __name__ == '__main__':
@@ -329,10 +443,24 @@ if __name__ == '__main__':
     # limits and the supervising timeout, but no resource module.
     try:
         import resource
-        resource.setrlimit(resource.RLIMIT_AS, (3 * 1024**3, 3 * 1024**3))
-        resource.setrlimit(resource.RLIMIT_CPU, (50, 50))
     except ImportError:
-        pass
+        resource = None
+    if resource is not None:
+        for limit, wanted in ((resource.RLIMIT_AS, 3 * 1024**3), (resource.RLIMIT_CPU, 50)):
+            try:
+                soft, hard = resource.getrlimit(limit)
+                # Жёсткий лимит хоста можно понизить, но не поднять: попытка
+                # выставить 3 ГБ там, где потолок ниже, роняет воркер прямо на
+                # старте, и каждая проверка превращается в «детектор упал».
+                # Хвост-хард оставляем как есть — сужаем только мягкий.
+                if hard != resource.RLIM_INFINITY:
+                    wanted = min(wanted, hard)
+                if soft == resource.RLIM_INFINITY or wanted < soft:
+                    resource.setrlimit(limit, (wanted, hard))
+            except (ValueError, OSError):
+                # Лимит — страховка, а не условие работы: без неё проверка
+                # всё равно ограничена таймаутом надзирающего процесса.
+                pass
     try:
         scan = scan_file(sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4]))
     except Exception:

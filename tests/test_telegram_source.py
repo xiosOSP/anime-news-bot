@@ -88,3 +88,62 @@ class TestRussianLangSkipsTranslation:
                 'published_parsed': None}
         out = anime_news_bot.format_news_short(news)
         assert 'X:' in out
+
+
+class TestPostShape:
+    """Как выглядит пост, собранный из телеграм-источника без модели.
+
+    С живой моделью текст переписывается, и кривизна исходника не видна. Но
+    ровно тогда, когда модель молчит, пост уходит копией: в канал вышел
+    заголовок «Манга.», а суть новости уехала в тело.
+    """
+
+    def test_category_line_is_not_a_headline(self):
+        post = ('Манга.\n\n'
+                'KAGURABACHI приостановлен из-за болезни автора и вернётся 27 сентября.\n'
+                'Аниме-адаптация выйдет в апреле 2027 года.')
+        title, summary = anime_news_bot._tg_title_and_summary(post, 'ch', 'TG: Ch')
+        assert title.startswith('KAGURABACHI')
+        assert 'адаптация' in summary
+
+    @pytest.mark.parametrize('label', ['Манга.', 'АНИМЕ', '🔥 Слух:', 'Новости', 'Anime'])
+    def test_labels_of_every_shape_step_aside(self, label):
+        title, _ = anime_news_bot._tg_title_and_summary(
+            f'{label}\nСтудия MAPPA объявила дату премьеры', 'ch', 'TG: Ch')
+        assert title == 'Студия MAPPA объявила дату премьеры'
+
+    def test_label_alone_is_still_published(self):
+        """Рубрика без текста — плохой заголовок, но лучше, чем пустой пост."""
+        assert anime_news_bot._tg_title_and_summary('Манга.', 'ch', 'TG: Ch') == ('Манга.', '')
+
+    def test_a_sentence_about_manga_is_not_a_label(self):
+        """Рубрика — это одно-два слова-полки, а не любое упоминание темы.
+
+        Слишком жадное правило съедало бы настоящие заголовки: «Манга
+        Kagurabachi приостановлена» начинается тем же словом.
+        """
+        for title in ('Манга Kagurabachi приостановлена',
+                      'Мангака заболел и ушёл на перерыв',
+                      'Игры по «Наруто» больше не выйдут'):
+            assert anime_news_bot._tg_title_and_summary(
+                f'{title}\nПодробности позже', 'ch', 'TG: Ch')[0] == title
+
+    def test_someone_elses_editorial_voice_is_dropped(self):
+        """«Напоминаем» — голос чужого канала: мы того поста не публиковали."""
+        post = ('Дата премьеры объявлена.\n'
+                'Напоминаем, что аниме-адаптация выйдет в апреле 2027 года.')
+        title, summary = anime_news_bot._tg_title_and_summary(post, 'ch', 'TG: Ch')
+        assert summary.startswith('Аниме-адаптация выйдет')
+        assert title == 'Дата премьеры объявлена.'
+        # И в заголовке тоже: чаще всего зачин стоит именно первой строкой.
+        headline, _ = anime_news_bot._tg_title_and_summary(
+            'Напоминаем, что премьера перенесена на осень\nПодробности позже', 'ch', 'TG: Ch')
+        assert headline == 'Премьера перенесена на осень'
+
+    def test_a_word_that_only_looks_like_a_lead_in_survives(self):
+        """Правило снимает зачин, а не любое слово, с которого он начинается."""
+        post = ('Напоминание о премьере ушло подписчикам\n'
+                'Отметим премьеру вместе в субботу.')
+        title, summary = anime_news_bot._tg_title_and_summary(post, 'ch', 'TG: Ch')
+        assert title == 'Напоминание о премьере ушло подписчикам'
+        assert summary == 'Отметим премьеру вместе в субботу.'

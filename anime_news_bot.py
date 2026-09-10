@@ -47,7 +47,7 @@ from bs4 import BeautifulSoup
 from translation import GoogleTranslator
 from safe_http import public_get
 from moderation_rules import check_text as check_moderation_text, normalize as normalize_moderation_text
-from moderation_media import MediaScanner, media_attachment
+from moderation_media import MediaScanner, media_attachment, probe as media_probe
 from moderation_llm import ChatModelClient
 from news_deferral import NewsDeferralStore
 from publication_delivery import PublicationBot
@@ -1496,7 +1496,11 @@ MODERATION_LLM_ENABLED = _env_bool('MODERATION_LLM_ENABLED', bool(
 _moderation_media_scanner = MediaScanner(
     timeout=_env_int('MODERATION_MEDIA_TIMEOUT_SEC', 25),
     explicit_threshold=_env_float('MODERATION_MEDIA_EXPLICIT_THRESHOLD', .80),
-    suggestive_threshold=_env_float('MODERATION_MEDIA_SUGGESTIVE_THRESHOLD', .85))
+    suggestive_threshold=_env_float('MODERATION_MEDIA_SUGGESTIVE_THRESHOLD', .85),
+    # Сколько медиа могут подождать своей очереди у детектора. Ноль вернул бы
+    # старое поведение: всё, что пришло во время чужой проверки, оставалось бы
+    # непроверенным.
+    max_waiting=_env_int('MODERATION_MEDIA_QUEUE', 4))
 _moderation_action_lock = asyncio.Lock()
 _moderation_update_lock = asyncio.Lock()
 _moderation_seen_updates = {}
@@ -8868,6 +8872,49 @@ def _tg_is_signature(line: str, channel: str, label: str) -> bool:
     return False
 
 
+# Рубрика вместо заголовка. Русские каналы открывают пост одним словом —
+# «Манга.», «Аниме», «Слух:», — и это не заголовок, а полка, на которую канал
+# кладёт новость. В нашем посте такая строка занимала место заголовка: читатель
+# видел «Манга.», а суть новости уезжала в тело.
+_TG_CATEGORY_WORDS = frozenset({
+    'аниме', 'манга', 'манхва', 'манхуа', 'маньхуа', 'ранобэ', 'ранобе',
+    'новость', 'новости', 'слух', 'слухи', 'анонс', 'анонсы', 'трейлер',
+    'тизер', 'релиз', 'кино', 'фильм', 'фильмы', 'сериал', 'сериалы',
+    'игра', 'игры', 'косплей', 'арт', 'арты', 'дата', 'даты', 'музыка',
+    'клип', 'обзор', 'подборка', 'объявление', 'важное', 'интересное',
+    'anime', 'manga', 'manhwa', 'news', 'rumor', 'rumour', 'trailer',
+    'teaser', 'release', 'movie', 'games', 'game',
+})
+# Редакционный голос источника. «Напоминаем, что…» — это чужой канал напоминает
+# о том, что публиковал сам; у нас той публикации не было, и фраза превращает
+# пост в чей-то чужой разговор.
+# «что» обязательно: без него правило съедало бы сказуемое — «Отметим премьеру»
+# превращалось в «Премьеру».
+_TG_EDITORIAL_LEADIN_RE = re.compile(
+    r'^(?:напоминаем|напомним|отметим|отмечу|подчеркнём|подчеркнем|добавим|'
+    r'уточним|заметим)[,]?\s+(?:о том,\s*)?что\s+',
+    re.IGNORECASE)
+
+
+def _tg_is_category_line(line: str) -> bool:
+    """Строка-рубрика: одно-два слова без содержания новости."""
+    clean = _tg_strip_decoration(line)
+    if not clean:
+        return False
+    words = clean.split()
+    # Двусловные рубрики вроде «аниме новости» тоже встречаются, но всё, что
+    # длиннее, уже несёт факт — такую строку трогать нельзя.
+    return 1 <= len(words) <= 2 and all(word in _TG_CATEGORY_WORDS for word in words)
+
+
+def _tg_drop_editorial_voice(text: str) -> str:
+    """Убирает чужой редакционный зачин, оставляя сам факт."""
+    cleaned = _TG_EDITORIAL_LEADIN_RE.sub('', str(text or '').strip(), count=1)
+    if not cleaned:
+        return str(text or '').strip()
+    return cleaned[0].upper() + cleaned[1:]
+
+
 def _tg_title_and_summary(full_text: str, channel: str, label: str) -> tuple[str, str]:
     """Делит текст телеграм-поста на заголовок и тело.
 
@@ -8875,14 +8922,20 @@ def _tg_title_and_summary(full_text: str, channel: str, label: str) -> tuple[str
     эмодзи на отдельной строке, а заканчивают подписью с собственным именем.
     Раньше эмодзи становился заголовком — в канал уходило «🔍.», — а подпись
     источника уезжала в тело поста, хотя своё имя канал у себя не публикует.
+
+    Ровно та же беда со строкой-рубрикой: в канал уходил заголовок «Манга.».
     """
     lines = [ln.strip() for ln in str(full_text or '').split('\n') if ln.strip()]
     kept = [ln for ln in lines
             if _TG_MEANINGFUL_RE.search(ln) and not _tg_is_signature(ln, channel, label)]
     if not kept:
         return '', ''
-    title = kept[0][:200]
-    summary = ' '.join(kept[1:])[:1000] if len(kept) > 1 else ''
+    # Рубрику снимаем, только пока под ней есть содержание: пост, кроме неё не
+    # состоящий ни из чего, лучше отдать как есть, чем потерять.
+    while len(kept) > 1 and _tg_is_category_line(kept[0]):
+        kept = kept[1:]
+    title = _tg_drop_editorial_voice(kept[0])[:200]
+    summary = ' '.join(_tg_drop_editorial_voice(line) for line in kept[1:])[:1000] if len(kept) > 1 else ''
     return title, summary
 
 
@@ -23430,7 +23483,8 @@ async def _mod_media_unchecked(bot: Bot, message, reason: str) -> None:
     link = getattr(message, 'link', None)
     text = (f'🛡 Медиа не проверено: {html.escape(reason)}.\n'
             f'Чат <code>{chat_id}</code>, сообщение <code>{message.message_id}</code>.\n'
-            'Нужна ручная проверка; автоматический варн/мут за медиа не выдан.')
+            'Нужна ручная проверка; автоматический варн/мут за медиа не выдан.\n'
+            'Проверить сам детектор — /mediaping')
     if link:
         text += f'\n<a href="{html.escape(link, quote=True)}">Открыть сообщение</a>'
     for admin_id in _all_admin_ids():
@@ -23884,6 +23938,46 @@ async def moderation_command(update, context: ContextTypes.DEFAULT_TYPE):
     _audit_update(update, 'moderation_chat', enabled=enabled, chat_id=chat.id)
     await message.reply_text('🛡 Модерация в этом чате ' + ('включена' if enabled else 'выключена')
                              + (f'. Режим: {chat_moderation.mode}.' if enabled else '.'))
+
+
+@admin_only
+async def mediaping_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Самопроверка локального детектора медиа: /mediaping.
+
+    Отчёт из чата говорит «медиа не проверено» — и на этом всё. По такому
+    сообщению не отличить не установленную библиотеку от нехватки памяти на
+    хостинге, а чинить наугад дорого. Здесь детектор запускается по требованию
+    на сгенерированной картинке и отдаёт настоящий вывод.
+    """
+    if not MODERATION_MEDIA_ENABLED:
+        await update.message.reply_text(
+            '🛡 Проверка медиа выключена: <code>MODERATION_MEDIA_ENABLED=false</code>.\n'
+            'Пока она выключена, 18+ в чате бот не видит вовсе.',
+            parse_mode=ParseMode.HTML)
+        return
+    msg = await update.message.reply_text('🧪 Запускаю детектор на тестовой картинке…')
+    scan, details, spent = await asyncio.to_thread(media_probe,
+                                                   _moderation_media_scanner.timeout * 2 + 20)
+    ok = scan.status == 'checked'
+    lines = ['🧪 <b>Локальный детектор медиа</b>', '']
+    lines.append(('✅ работает' if ok else '❌ не работает') + f' · {spent:.1f} с')
+    if not ok:
+        lines.append(f'<code>{html.escape(scan.reason or "причина не названа")}</code>')
+    if details:
+        lines.append('')
+        lines.append('Вывод воркера:')
+        lines.append(f'<pre>{html.escape(details[-500:])}</pre>')
+    lines.append('')
+    lines.append(f'Таймаут проверки: {_moderation_media_scanner.timeout} с')
+    lines.append(f'Очередь: до {_moderation_media_scanner.max_waiting} ожидающих, '
+                 f'сейчас {_moderation_media_scanner.queue_depth()}')
+    lines.append(f'Пороги: явное {_moderation_media_scanner.explicit_threshold:.2f}, '
+                 f'откровенное {_moderation_media_scanner.suggestive_threshold:.2f}')
+    if not ok:
+        lines.append('')
+        lines.append('Пока детектор молчит, бот не наказывает за медиа сам — '
+                     'каждое зовёт человека. Это защита, а не поломка.')
+    await msg.edit_text('\n'.join(lines), parse_mode=ParseMode.HTML)
 
 
 @admin_only
@@ -25683,6 +25777,7 @@ def main():
     app.add_handler(CommandHandler("llm", llm_command))
     app.add_handler(CommandHandler("llmmodel", llmmodel_command))
     app.add_handler(CommandHandler("llmping", llmping_command))
+    app.add_handler(CommandHandler("mediaping", mediaping_command))
     app.add_handler(CommandHandler("reliability", reliability_command))
     app.add_handler(CommandHandler("experiments", experiments_command))
     app.add_handler(CommandHandler("adaptive", adaptive_command))

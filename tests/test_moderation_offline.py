@@ -3,6 +3,8 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import gzip
 import json
+import os
+import time
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
 
@@ -487,3 +489,168 @@ def test_unconditional_threat_is_still_caught():
         verdict = check_text(text)
         assert verdict is not None and verdict.category == 'aggression', text
         assert verdict.severity == 3
+
+
+# ============== Детектор медиа: почему он молчит и кого он пропускает ==============
+# На проде отчёты выглядели так: «Локальный детектор недоступен или завершился
+# с ошибкой» и дважды «Локальная проверка занята». Первый текст не позволял
+# понять причину — stderr воркера выбрасывался; второй означал, что медиа,
+# пришедшее во время чужой проверки, не проверялось вообще.
+
+def _completed(returncode=0, stdout='', stderr=''):
+    return NS(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+class TestWorkerFailureIsExplained:
+    def test_missing_library_is_named(self, monkeypatch):
+        stderr = ('Traceback (most recent call last):\n'
+                  "  File \"moderation_media.py\", line 1\n"
+                  "ModuleNotFoundError: No module named 'nudenet'")
+        monkeypatch.setattr(media, '_invoke_worker',
+                            lambda *a, **k: _completed(1, '', stderr))
+        scan = media.run_worker('file', 'image', 5, .8, .85)
+        assert scan.status == 'unchecked'
+        assert 'nudenet' in scan.reason, scan.reason
+
+    def test_killed_worker_is_told_apart_from_a_crash(self):
+        """Смерть по SIGKILL — это память хостинга, а не сломанная установка.
+
+        Лечится это разными способами, и одинаковый текст на оба случая
+        отправлял чинить не то.
+        """
+        killed = media.worker_failure_reason(-9, '')
+        crashed = media.worker_failure_reason(2, 'ValueError: broken')
+        assert 'памят' in killed.lower()
+        assert 'памят' not in crashed.lower() and 'ValueError: broken' in crashed
+
+    def test_unparsable_answer_is_not_reported_as_success(self, monkeypatch):
+        monkeypatch.setattr(media, '_invoke_worker',
+                            lambda *a, **k: _completed(0, 'не json', ''))
+        assert media.run_worker('file', 'image', 5, .8, .85).status == 'unchecked'
+
+    def test_probe_reports_the_real_output(self, monkeypatch):
+        monkeypatch.setattr(media, '_invoke_worker',
+                            lambda *a, **k: _completed(1, '', 'onnxruntime не установлен'))
+        scan, details, spent = media.probe(timeout=5)
+        assert scan.status == 'unchecked'
+        assert 'onnxruntime не установлен' in details
+        assert spent >= 0
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='жёсткие лимиты есть только на POSIX')
+def test_worker_survives_a_host_with_lower_hard_limits(tmp_path):
+    """Хостинг с потолком ниже запрошенного не должен ронять проверку.
+
+    Воркер просил RLIMIT 3 ГБ жёстко. Там, где потолок ниже, setrlimit кидает
+    ValueError — не ImportError, который единственный ловился, — и процесс
+    падал с трейсбеком ещё до первого кадра. В отчёте это выглядело как
+    «детектор недоступен», хотя установлено было всё.
+    """
+    import resource
+    from PIL import Image
+    path = tmp_path / 'probe.png'
+    Image.new('RGB', (64, 64), 'slategray').save(path)
+
+    def lower_the_ceiling():
+        resource.setrlimit(resource.RLIMIT_CPU, (40, 40))
+
+    result = media.subprocess.run(
+        [media.sys.executable, str(media.Path(media.__file__).resolve()),
+         str(path), 'image', '0.80', '0.85'],
+        capture_output=True, text=True, timeout=120, preexec_fn=lower_the_ceiling)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)['status'] == 'checked'
+
+
+class TestQueueInsteadOfSkipping:
+    """«Занято» означало «не проверено»: 18+ проходил, когда медиа много."""
+
+    @staticmethod
+    def _telegram():
+        async def download(**kwargs):
+            kwargs['custom_path'].write_bytes(b'content')
+        return NS(get_file=AsyncMock(return_value=NS(file_size=7, download_to_drive=download)))
+
+    @staticmethod
+    def _message(unique):
+        return message('', sticker=NS(file_id=f'id-{unique}', file_unique_id=unique, file_size=7))
+
+    @pytest.mark.asyncio
+    async def test_second_media_waits_and_gets_checked(self, monkeypatch):
+        started = []
+
+        def slow_worker(*args):
+            started.append(args)
+            time.sleep(.05)
+            return media.Scan('checked', 'nsfw', 'test', 1, .9)
+
+        monkeypatch.setattr(media, 'run_worker', slow_worker)
+        scanner = media.MediaScanner()
+        telegram = self._telegram()
+        results = await asyncio.gather(scanner.check(telegram, self._message('a')),
+                                       scanner.check(telegram, self._message('b')))
+        assert [r.status for r in results] == ['checked', 'checked']
+        assert [r.category for r in results] == ['nsfw', 'nsfw']
+        assert len(started) == 2
+
+    @pytest.mark.asyncio
+    async def test_overflowing_queue_still_refuses_instead_of_hanging(self, monkeypatch):
+        """Потолок нужен: ждущая проверка держит обработчик апдейта."""
+        def slow_worker(*args):
+            time.sleep(.05)
+            return media.Scan('checked')
+
+        monkeypatch.setattr(media, 'run_worker', slow_worker)
+        scanner = media.MediaScanner(max_waiting=0)
+        telegram = self._telegram()
+        results = await asyncio.gather(scanner.check(telegram, self._message('a')),
+                                       scanner.check(telegram, self._message('b')))
+        assert sorted(r.status for r in results) == ['checked', 'unchecked']
+        refused = [r for r in results if r.status == 'unchecked'][0]
+        assert 'переполнена' in refused.reason
+
+    @pytest.mark.asyncio
+    async def test_failed_check_releases_the_slot(self, monkeypatch):
+        monkeypatch.setattr(media, 'run_worker',
+                            lambda *a: media.Scan('checked', 'nsfw', 'x', 1, .9))
+        scanner = media.MediaScanner()
+        broken = NS(get_file=AsyncMock(side_effect=OSError('сеть отвалилась')))
+        assert (await scanner.check(broken, self._message('a'))).status == 'unchecked'
+        # Слот обязан вернуться, иначе одна сетевая ошибка глушит проверку навсегда.
+        assert (await scanner.check(self._telegram(), self._message('b'))).category == 'nsfw'
+
+    def test_scanner_survives_a_new_event_loop(self, monkeypatch):
+        """Сканер живёт с импорта, а цикл событий у каждого теста свой.
+
+        Примитив asyncio привязывается к циклу в момент состязания за него, и
+        один замок на все циклы давал бы «bound to a different event loop» —
+        падение, зависящее от порядка файлов, то есть худшее из возможных.
+        Поэтому в каждом цикле здесь именно состязание, а не одиночный вызов.
+        """
+        monkeypatch.setattr(media, 'run_worker',
+                            lambda *a: media.Scan('checked', 'nsfw', 'x', 1, .9))
+        scanner = media.MediaScanner()
+        telegram = self._telegram()
+
+        async def two_at_once(mark):
+            return await asyncio.gather(scanner.check(telegram, self._message(f'{mark}1')),
+                                        scanner.check(telegram, self._message(f'{mark}2')))
+
+        for mark in ('a', 'b'):
+            results = asyncio.run(two_at_once(mark))
+            assert [r.category for r in results] == ['nsfw', 'nsfw']
+
+
+@pytest.mark.asyncio
+async def test_mediaping_shows_the_reason_and_punishes_nobody(monkeypatch):
+    monkeypatch.setattr(bot, 'is_admin', lambda update: True)
+    monkeypatch.setattr(bot, 'MODERATION_MEDIA_ENABLED', True)
+    monkeypatch.setattr(bot, 'media_probe',
+                        lambda timeout: (media.Scan('unchecked', reason='Детектор убит (SIGKILL)'),
+                                         'onnxruntime: cannot allocate memory', 1.5))
+    edit = AsyncMock()
+    msg = NS(reply_text=AsyncMock(return_value=NS(edit_text=edit)))
+    await bot.mediaping_command(NS(message=msg), NS(args=[], bot=telegram_bot()))
+    report = edit.await_args.args[0]
+    assert 'SIGKILL' in report and 'cannot allocate memory' in report
+    assert 'не наказывает' in report
