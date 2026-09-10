@@ -47,7 +47,8 @@ from bs4 import BeautifulSoup
 from translation import GoogleTranslator
 from safe_http import public_get
 from moderation_rules import check_text as check_moderation_text, normalize as normalize_moderation_text
-from moderation_media import MediaScanner, media_attachment
+from moderation_media import (MediaScanner, media_attachment, probe as media_probe,
+                              WORKER_MEMORY_MB_DEFAULT, WORKER_MEMORY_MB_MIN)
 from moderation_llm import ChatModelClient
 from news_deferral import NewsDeferralStore
 from publication_delivery import PublicationBot
@@ -1496,7 +1497,15 @@ MODERATION_LLM_ENABLED = _env_bool('MODERATION_LLM_ENABLED', bool(
 _moderation_media_scanner = MediaScanner(
     timeout=_env_int('MODERATION_MEDIA_TIMEOUT_SEC', 25),
     explicit_threshold=_env_float('MODERATION_MEDIA_EXPLICIT_THRESHOLD', .80),
-    suggestive_threshold=_env_float('MODERATION_MEDIA_SUGGESTIVE_THRESHOLD', .85))
+    suggestive_threshold=_env_float('MODERATION_MEDIA_SUGGESTIVE_THRESHOLD', .85),
+    # Сколько медиа могут подождать своей очереди у детектора. Ноль вернул бы
+    # старое поведение: всё, что пришло во время чужой проверки, оставалось бы
+    # непроверенным.
+    max_waiting=_env_int('MODERATION_MEDIA_QUEUE', 4),
+    # Потолок памяти воркера. По умолчанию он ниже 2 ГБ — типичного объёма
+    # маленького хостинга: лимит, который больше всей памяти машины, не
+    # срабатывает никогда, и вместо отказа одной проверки жертву выбирает ядро.
+    memory_mb=_env_int('MODERATION_MEDIA_MEMORY_MB', WORKER_MEMORY_MB_DEFAULT))
 _moderation_action_lock = asyncio.Lock()
 _moderation_update_lock = asyncio.Lock()
 _moderation_seen_updates = {}
@@ -8868,6 +8877,49 @@ def _tg_is_signature(line: str, channel: str, label: str) -> bool:
     return False
 
 
+# Рубрика вместо заголовка. Русские каналы открывают пост одним словом —
+# «Манга.», «Аниме», «Слух:», — и это не заголовок, а полка, на которую канал
+# кладёт новость. В нашем посте такая строка занимала место заголовка: читатель
+# видел «Манга.», а суть новости уезжала в тело.
+_TG_CATEGORY_WORDS = frozenset({
+    'аниме', 'манга', 'манхва', 'манхуа', 'маньхуа', 'ранобэ', 'ранобе',
+    'новость', 'новости', 'слух', 'слухи', 'анонс', 'анонсы', 'трейлер',
+    'тизер', 'релиз', 'кино', 'фильм', 'фильмы', 'сериал', 'сериалы',
+    'игра', 'игры', 'косплей', 'арт', 'арты', 'дата', 'даты', 'музыка',
+    'клип', 'обзор', 'подборка', 'объявление', 'важное', 'интересное',
+    'anime', 'manga', 'manhwa', 'news', 'rumor', 'rumour', 'trailer',
+    'teaser', 'release', 'movie', 'games', 'game',
+})
+# Редакционный голос источника. «Напоминаем, что…» — это чужой канал напоминает
+# о том, что публиковал сам; у нас той публикации не было, и фраза превращает
+# пост в чей-то чужой разговор.
+# «что» обязательно: без него правило съедало бы сказуемое — «Отметим премьеру»
+# превращалось в «Премьеру».
+_TG_EDITORIAL_LEADIN_RE = re.compile(
+    r'^(?:напоминаем|напомним|отметим|отмечу|подчеркнём|подчеркнем|добавим|'
+    r'уточним|заметим)[,]?\s+(?:о том,\s*)?что\s+',
+    re.IGNORECASE)
+
+
+def _tg_is_category_line(line: str) -> bool:
+    """Строка-рубрика: одно-два слова без содержания новости."""
+    clean = _tg_strip_decoration(line)
+    if not clean:
+        return False
+    words = clean.split()
+    # Двусловные рубрики вроде «аниме новости» тоже встречаются, но всё, что
+    # длиннее, уже несёт факт — такую строку трогать нельзя.
+    return 1 <= len(words) <= 2 and all(word in _TG_CATEGORY_WORDS for word in words)
+
+
+def _tg_drop_editorial_voice(text: str) -> str:
+    """Убирает чужой редакционный зачин, оставляя сам факт."""
+    cleaned = _TG_EDITORIAL_LEADIN_RE.sub('', str(text or '').strip(), count=1)
+    if not cleaned:
+        return str(text or '').strip()
+    return cleaned[0].upper() + cleaned[1:]
+
+
 def _tg_title_and_summary(full_text: str, channel: str, label: str) -> tuple[str, str]:
     """Делит текст телеграм-поста на заголовок и тело.
 
@@ -8875,14 +8927,20 @@ def _tg_title_and_summary(full_text: str, channel: str, label: str) -> tuple[str
     эмодзи на отдельной строке, а заканчивают подписью с собственным именем.
     Раньше эмодзи становился заголовком — в канал уходило «🔍.», — а подпись
     источника уезжала в тело поста, хотя своё имя канал у себя не публикует.
+
+    Ровно та же беда со строкой-рубрикой: в канал уходил заголовок «Манга.».
     """
     lines = [ln.strip() for ln in str(full_text or '').split('\n') if ln.strip()]
     kept = [ln for ln in lines
             if _TG_MEANINGFUL_RE.search(ln) and not _tg_is_signature(ln, channel, label)]
     if not kept:
         return '', ''
-    title = kept[0][:200]
-    summary = ' '.join(kept[1:])[:1000] if len(kept) > 1 else ''
+    # Рубрику снимаем, только пока под ней есть содержание: пост, кроме неё не
+    # состоящий ни из чего, лучше отдать как есть, чем потерять.
+    while len(kept) > 1 and _tg_is_category_line(kept[0]):
+        kept = kept[1:]
+    title = _tg_drop_editorial_voice(kept[0])[:200]
+    summary = ' '.join(_tg_drop_editorial_voice(line) for line in kept[1:])[:1000] if len(kept) > 1 else ''
     return title, summary
 
 
@@ -17965,6 +18023,17 @@ LLM_API_KEY = _env('LLM_API_KEY', '').strip()
 _preset = LLM_PRESETS.get(LLM_PROVIDER, ('', ''))
 LLM_BASE_URL = (_env('LLM_BASE_URL', '').strip() or _preset[0]).rstrip('/')
 LLM_MODEL = _env('LLM_MODEL', '').strip() or _preset[1]
+# Ручные адрес и модель молча перебивают пресет провайдера. Смена провайдера
+# тогда не работает: ключ новый, а ходит бот по старому адресу и просит модель,
+# которой у нового в каталоге нет. Симптом — «ключ вставил, а не работает»,
+# и по нему не догадаться, что виноваты переменные, оставшиеся с прошлого раза.
+# Отмечаем происхождение здесь, а разбирается /doctor.
+LLM_BASE_URL_FROM_ENV = bool(_env('LLM_BASE_URL', '').strip())
+LLM_MODEL_FROM_ENV = bool(_env('LLM_MODEL', '').strip())
+LLM_FALLBACK_OVERRIDES_FROM_ENV = tuple(
+    name for name in ('LLM_FALLBACK_BASE_URL', 'LLM_FALLBACK_MODEL')
+    if _env(name, '').strip())
+MODERATION_LLM_BASE_URL_FROM_ENV = bool(_env('MODERATION_LLM_BASE_URL', '').strip())
 # Запасной провайдер. Бесплатные роутеры кончаются без предупреждения: квота,
 # приостановка аккаунта, снятая модель. Раньше это выключало обогащение целиком
 # до перезапуска. Если запасной задан, бот один раз переключается на него и
@@ -21833,6 +21902,56 @@ def _job_line(context, name: str, human: str) -> str:
     return f"  ✅ {human}" + (f" — следующий запуск {_fmt_local(nxt)}" if nxt else "")
 
 
+def _doctor_env_conflicts() -> list[tuple[str, bool, str]]:
+    """Переменные, которые тихо отменяют друг друга.
+
+    Ошибка в наборе переменных не выглядит как ошибка: бот запускается, отвечает
+    и работает — просто не тем провайдером, не той моделью или без проверки
+    медиа. Найти это по логам нельзя, потому что жалобы нет ни у кого.
+    """
+    rows: list[tuple[str, bool, str]] = []
+    preset_url, preset_model = LLM_PRESETS.get(LLM_PROVIDER, ('', ''))
+    stale = []
+    if preset_url and LLM_BASE_URL_FROM_ENV and LLM_BASE_URL.rstrip('/') != preset_url.rstrip('/'):
+        stale.append(f'LLM_BASE_URL={LLM_BASE_URL} вместо {preset_url}')
+    if preset_model and LLM_MODEL_FROM_ENV and LLM_MODEL != preset_model:
+        stale.append(f'LLM_MODEL={LLM_MODEL} вместо {preset_model}')
+    if stale:
+        rows.append(('LLM: ручные адрес и модель', False,
+                     f'перебивают пресет {LLM_PROVIDER}: ' + '; '.join(stale)
+                     + '. Если провайдер сменился — эти переменные надо стереть.'))
+    elif LLM_PROVIDER and not preset_url and not LLM_BASE_URL:
+        rows.append(('LLM: адрес провайдера', False,
+                     f'у провайдера {LLM_PROVIDER} нет пресета, а LLM_BASE_URL не задан'))
+    else:
+        rows.append(('LLM: провайдер и адрес', True,
+                     f'{LLM_PROVIDER or "не задан"} → {LLM_BASE_URL or "нет адреса"}'))
+
+    if LLM_API_KEY and not LLM_PROVIDER and not LLM_BASE_URL_FROM_ENV:
+        rows.append(('LLM_PROVIDER', False,
+                     'ключ задан, а провайдер нет: бот не знает, куда идти'))
+    if LLM_FALLBACK_API_KEY and not LLM_FALLBACK_BASE_URL:
+        rows.append(('Запасная модель', False,
+                     'LLM_FALLBACK_API_KEY задан, а LLM_FALLBACK_PROVIDER нет: '
+                     'запасного не будет'))
+    if MODERATION_LLM_API_KEY and not MODERATION_LLM_BASE_URL:
+        rows.append(('Модель модерации', False,
+                     'MODERATION_LLM_API_KEY задан, а MODERATION_LLM_PROVIDER нет'))
+    if MODERATION_LLM_API_KEY and not MODERATION_LLM_MODEL:
+        rows.append(('Модель модерации', False,
+                     'MODERATION_LLM_API_KEY задан, а MODERATION_LLM_MODEL нет'))
+
+    requested_memory = _env_int('MODERATION_MEDIA_MEMORY_MB', WORKER_MEMORY_MB_DEFAULT)
+    if requested_memory < WORKER_MEMORY_MB_MIN:
+        rows.append(('MODERATION_MEDIA_MEMORY_MB', False,
+                     f'{requested_memory} МБ детектору не хватит; применён минимум '
+                     f'{WORKER_MEMORY_MB_MIN} МБ'))
+    if not MODERATION_MEDIA_ENABLED:
+        rows.append(('Проверка медиа', False,
+                     'MODERATION_MEDIA_ENABLED выключает проверку: 18+ бот не увидит'))
+    return rows
+
+
 def _doctor_local_checks() -> list[dict]:
     """Локальные диагностические проверки без обращения к Telegram/API."""
     checks: list[dict] = []
@@ -21863,6 +21982,12 @@ def _doctor_local_checks() -> list[dict]:
             broken_json.append(f'{path.name}: {type(e).__name__}')
     add('Runtime JSON', not broken_json,
         'все читаются' if not broken_json else '; '.join(broken_json[:8]))
+
+    for name, ok, detail in _doctor_env_conflicts():
+        # Уровень warning: бот с такими переменными работает, просто не так,
+        # как думает владелец. Ошибкой это делать нельзя — набор переменных
+        # бывает и осознанным.
+        add(name, ok, detail, level='warning')
 
     add('Pillow', Image is not None,
         'перцептивный media-dedup доступен' if Image is not None else 'только exact hash', level='warning')
@@ -23430,7 +23555,8 @@ async def _mod_media_unchecked(bot: Bot, message, reason: str) -> None:
     link = getattr(message, 'link', None)
     text = (f'🛡 Медиа не проверено: {html.escape(reason)}.\n'
             f'Чат <code>{chat_id}</code>, сообщение <code>{message.message_id}</code>.\n'
-            'Нужна ручная проверка; автоматический варн/мут за медиа не выдан.')
+            'Нужна ручная проверка; автоматический варн/мут за медиа не выдан.\n'
+            'Проверить сам детектор — /mediaping')
     if link:
         text += f'\n<a href="{html.escape(link, quote=True)}">Открыть сообщение</a>'
     for admin_id in _all_admin_ids():
@@ -23884,6 +24010,49 @@ async def moderation_command(update, context: ContextTypes.DEFAULT_TYPE):
     _audit_update(update, 'moderation_chat', enabled=enabled, chat_id=chat.id)
     await message.reply_text('🛡 Модерация в этом чате ' + ('включена' if enabled else 'выключена')
                              + (f'. Режим: {chat_moderation.mode}.' if enabled else '.'))
+
+
+@admin_only
+async def mediaping_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Самопроверка локального детектора медиа: /mediaping.
+
+    Отчёт из чата говорит «медиа не проверено» — и на этом всё. По такому
+    сообщению не отличить не установленную библиотеку от нехватки памяти на
+    хостинге, а чинить наугад дорого. Здесь детектор запускается по требованию
+    на сгенерированной картинке и отдаёт настоящий вывод.
+    """
+    if not MODERATION_MEDIA_ENABLED:
+        await update.message.reply_text(
+            '🛡 Проверка медиа выключена: <code>MODERATION_MEDIA_ENABLED=false</code>.\n'
+            'Пока она выключена, 18+ в чате бот не видит вовсе.',
+            parse_mode=ParseMode.HTML)
+        return
+    msg = await update.message.reply_text('🧪 Запускаю детектор на тестовой картинке…')
+    scan, details, spent = await asyncio.to_thread(
+        media_probe, _moderation_media_scanner.timeout * 2 + 20,
+        _moderation_media_scanner.memory_mb)
+    ok = scan.status == 'checked'
+    lines = ['🧪 <b>Локальный детектор медиа</b>', '']
+    lines.append(('✅ работает' if ok else '❌ не работает') + f' · {spent:.1f} с')
+    if not ok:
+        lines.append(f'<code>{html.escape(scan.reason or "причина не названа")}</code>')
+    if details:
+        lines.append('')
+        lines.append('Вывод воркера:')
+        lines.append(f'<pre>{html.escape(details[-500:])}</pre>')
+    lines.append('')
+    lines.append(f'Таймаут проверки: {_moderation_media_scanner.timeout} с')
+    lines.append(f'Память воркера: до {_moderation_media_scanner.memory_mb} МБ '
+                 f'(<code>MODERATION_MEDIA_MEMORY_MB</code>)')
+    lines.append(f'Очередь: до {_moderation_media_scanner.max_waiting} ожидающих, '
+                 f'сейчас {_moderation_media_scanner.queue_depth()}')
+    lines.append(f'Пороги: явное {_moderation_media_scanner.explicit_threshold:.2f}, '
+                 f'откровенное {_moderation_media_scanner.suggestive_threshold:.2f}')
+    if not ok:
+        lines.append('')
+        lines.append('Пока детектор молчит, бот не наказывает за медиа сам — '
+                     'каждое зовёт человека. Это защита, а не поломка.')
+    await msg.edit_text('\n'.join(lines), parse_mode=ParseMode.HTML)
 
 
 @admin_only
@@ -25683,6 +25852,7 @@ def main():
     app.add_handler(CommandHandler("llm", llm_command))
     app.add_handler(CommandHandler("llmmodel", llmmodel_command))
     app.add_handler(CommandHandler("llmping", llmping_command))
+    app.add_handler(CommandHandler("mediaping", mediaping_command))
     app.add_handler(CommandHandler("reliability", reliability_command))
     app.add_handler(CommandHandler("experiments", experiments_command))
     app.add_handler(CommandHandler("adaptive", adaptive_command))

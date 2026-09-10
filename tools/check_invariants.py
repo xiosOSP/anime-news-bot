@@ -600,6 +600,63 @@ def _check_local_topic_filter_yields_to_the_model(tree) -> tuple[bool, str]:
     return False, 'в конвейере публикации не осталось локального отсева непрофильного'
 
 
+def _check_broken_detector_never_says_checked() -> tuple[bool, str]:
+    """Сломанный детектор не имеет права выглядеть как «проверено».
+
+    Единственное, что отделяет 18+ в чате от публики, — вердикт детектора.
+    Если отказ воркера (упал, убит по памяти, ответил мусором) хоть однажды
+    превратится в status='checked', медиа пройдёт как проверенное, и человека
+    не позовут: в отличие от «unchecked», такой вердикт никого не тревожит.
+    """
+    import moderation_media as media
+
+    class _Result:
+        def __init__(self, returncode, stdout, stderr):
+            self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+    cases = {
+        'упал с кодом 1': _Result(1, '', "ModuleNotFoundError: No module named 'nudenet'"),
+        'убит сигналом': _Result(-9, '', ''),
+        'ответил мусором': _Result(0, 'not json at all', ''),
+        'соврал про статус': _Result(0, '{"status": "checked", "category": "nsfw"}', ''),
+    }
+    original = media._invoke_worker
+    try:
+        for name, result in cases.items():
+            media._invoke_worker = lambda *a, _r=result, **k: _r
+            scan = media.run_worker('file', 'image', 5, .8, .85)
+            # Последний случай — исправный ответ, он обязан пройти как есть:
+            # проверка ловит потерю отказов, а не запрещает вердикты вообще.
+            expected = 'checked' if name == 'соврал про статус' else 'unchecked'
+            if scan.status != expected:
+                return False, f'{name}: статус {scan.status!r}, ожидался {expected!r}'
+    finally:
+        media._invoke_worker = original
+    return True, 'отказ детектора остаётся отказом во всех четырёх случаях'
+
+
+def _check_env_reference_is_complete() -> tuple[bool, str]:
+    """Справочник переменных обязан описывать всё, что читает код.
+
+    ``.env.example`` уже однажды отстал: код читал 261 переменную, описаны были
+    69. Такой файл хуже отсутствующего — по нему ищут, чего не хватает на
+    хостинге, и не находят. Пересобрать: ``python tools/env_reference.py``.
+    """
+    sys.path.insert(0, str(ROOT / 'tools'))
+    import env_reference
+
+    found = env_reference.collect()
+    if not found:
+        return False, 'сборщик не нашёл ни одной переменной — сломан разбор'
+    if not env_reference.REFERENCE.exists():
+        return False, 'docs/env-reference.md отсутствует'
+    text = env_reference.REFERENCE.read_text(encoding='utf-8')
+    missing = sorted(name for name in found if f'`{name}`' not in text)
+    if missing:
+        return False, f'в справочнике нет {len(missing)}: {missing[:5]}'
+    return True, f'все {len(found)} переменных описаны'
+
+
 def checks(bot, tree) -> list[tuple[str, bool, str]]:
     """Полный список инвариантов. Порядок стабилен: на него смотрит pytest."""
     rows: list[tuple[str, bool, str]] = []
@@ -633,10 +690,13 @@ def checks(bot, tree) -> list[tuple[str, bool, str]]:
     add('у всех хранилищ есть замок', _check_every_store_has_a_lock(tree))
     add('разбор пачки не путает новости', _check_llm_batch_never_mixes_news(bot))
     add('кеш разборов модели ограничен', _check_llm_editorial_cache_is_bounded(bot))
+    add('сломанный детектор медиа не притворяется проверкой',
+        _check_broken_detector_never_says_checked())
     add('локальный отсев знает реальные источники',
         _check_local_topic_filter_knows_real_sources(bot))
     add('локальный отсев уступает модели',
         _check_local_topic_filter_yields_to_the_model(tree))
+    add('справочник переменных полон', _check_env_reference_is_complete())
     add('манифест описывает существующие файлы', _check_manifest_describes_reality())
     return rows
 
