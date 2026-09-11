@@ -655,3 +655,102 @@ async def test_mediaping_shows_the_reason_and_punishes_nobody(monkeypatch):
     report = edit.await_args.args[0]
     assert 'SIGKILL' in report and 'cannot allocate memory' in report
     assert 'не наказывает' in report
+
+
+class TestBrokenDetectorStopsPilingUp:
+    """Сломанный детектор ломается одинаково для всех.
+
+    На проде это выглядело так: сначала «очередь локальной проверки
+    переполнена», и только потом становилось видно, что детектор вообще не
+    работает. Отчёт говорил про очередь — то есть про следствие.
+    """
+
+    @staticmethod
+    def _telegram():
+        async def download(**kwargs):
+            kwargs['custom_path'].write_bytes(b'content')
+        return NS(get_file=AsyncMock(return_value=NS(file_size=7, download_to_drive=download)))
+
+    @staticmethod
+    def _message(unique):
+        return message('', sticker=NS(file_id=f'id-{unique}', file_unique_id=unique, file_size=7))
+
+    @pytest.mark.asyncio
+    async def test_pause_after_a_run_of_failures(self, monkeypatch):
+        calls = []
+
+        def broken(*args):
+            calls.append(args)
+            return media.Scan('unchecked', reason='Детектор убит (SIGABRT)')
+
+        monkeypatch.setattr(media, 'run_worker', broken)
+        scanner = media.MediaScanner()
+        telegram = self._telegram()
+        for i in range(scanner.failure_limit):
+            assert (await scanner.check(telegram, self._message(f'x{i}'))).status == 'unchecked'
+        spent = len(calls)
+        result = await scanner.check(telegram, self._message('after'))
+        assert len(calls) == spent, 'после паузы воркер запускаться не должен'
+        assert 'пауза' in result.reason and 'подряд' in result.reason
+
+    @pytest.mark.asyncio
+    async def test_a_working_check_clears_the_run(self, monkeypatch):
+        answers = [media.Scan('unchecked', reason='сбой'),
+                   media.Scan('checked'),
+                   media.Scan('unchecked', reason='сбой')]
+
+        monkeypatch.setattr(media, 'run_worker', lambda *a: answers.pop(0))
+        scanner = media.MediaScanner()
+        scanner.failure_limit = 2
+        telegram = self._telegram()
+        for unique in ('a', 'b', 'c'):
+            await scanner.check(telegram, self._message(unique))
+        # Один сбой до и один после удачной проверки — это не серия.
+        assert scanner.paused_for() == 0
+
+    @pytest.mark.asyncio
+    async def test_refusals_before_the_worker_are_not_detector_failures(self, monkeypatch):
+        """Слишком большой файл — не поломка детектора, а штатный отказ."""
+        monkeypatch.setattr(media, 'run_worker', lambda *a: media.Scan('checked'))
+        scanner = media.MediaScanner()
+        telegram = self._telegram()
+        oversize = message('', photo=[NS(file_size=media.MAX_BYTES + 1, file_unique_id='big')])
+        for _ in range(scanner.failure_limit + 2):
+            assert (await scanner.check(telegram, oversize)).status == 'unchecked'
+        assert scanner.paused_for() == 0
+
+
+def test_detector_session_is_pinned_to_one_thread_without_arena():
+    """Настройки сессии — причина, по которой детектор влезает в 2 ГБ.
+
+    nudenet поднимает onnxruntime по числу ядер и с ареной памяти: на машине с
+    четырьмя ядрами это 1.34 ГБ адресного пространства вместо 1.05 ГБ, и на
+    хостинге проверка падала с SIGABRT. Передать настройки nudenet не даёт,
+    поэтому конструктор подменяется на время вызова.
+    """
+    import onnxruntime
+    seen = {}
+    original = onnxruntime.InferenceSession
+
+    class _FakeSession:
+        def __init__(self, *args, **kwargs):
+            seen.update(kwargs)
+
+        def get_inputs(self):
+            return [NS(name='images')]
+
+    onnxruntime.InferenceSession = _FakeSession
+    try:
+        media.build_detector()
+        # Снимаем состояние ДО собственного восстановления, иначе проверка
+        # подмены проверяла бы аккуратность теста, а не кода.
+        after_call = onnxruntime.InferenceSession
+    finally:
+        onnxruntime.InferenceSession = original
+
+    options = seen.get('sess_options')
+    assert options is not None, 'сессия создана с настройками nudenet, а не нашими'
+    assert options.enable_cpu_mem_arena is False
+    assert options.intra_op_num_threads == 1
+    # Конструктор обязан вернуться на место: подмена живёт только на время вызова.
+    assert after_call is _FakeSession, 'подмена конструктора пережила вызов'

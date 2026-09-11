@@ -23,11 +23,12 @@ MAX_BYTES = 20 * 1024 * 1024
 # Потолок адресного пространства воркера. Просить больше, чем есть у хостинга,
 # бессмысленно: лимит не сработает никогда, и вместо аккуратного отказа одного
 # процесса ядро выберет жертву само — может выбрать и самого бота.
-# Замерено: детектор поднимается на 1536 МБ и не поднимается на 1024 (onnxruntime
-# резервирует адресное пространство далеко за пределами своих 120 МБ RSS).
-# Отсюда пол: значение ниже молча превращало бы каждую проверку в отказ.
-WORKER_MEMORY_MB_MIN = 1536
-WORKER_MEMORY_MB_DEFAULT = 1792
+# Замерено на настроенной сессии (один поток, без арены): пик адресного
+# пространства 1.05 ГБ, резидентная память 108 МБ. Отсюда пол 1024 МБ —
+# значение ниже молча превращало бы каждую проверку в отказ — и запас до 1536,
+# чтобы на машине с другим числом ядер не упереться в потолок.
+WORKER_MEMORY_MB_MIN = 1024
+WORKER_MEMORY_MB_DEFAULT = 1536
 WORKER_MEMORY_ENV = 'MEDIA_WORKER_MEMORY_MB'
 MAX_PIXELS = 16_000_000
 MAX_FRAMES = 16
@@ -210,8 +211,37 @@ def scan_frame(detector, frame, explicit_threshold=.80, suggestive_threshold=.85
     return best
 
 
-def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
+def build_detector():
+    """Детектор с предсказуемым аппетитом к адресному пространству.
+
+    nudenet поднимает onnxruntime со своими настройками: арена памяти включена,
+    потоков столько, сколько ядер у машины. На хостинге с четырьмя ядрами это
+    отнимало больше адресного пространства, чем разрешено процессу, и проверка
+    падала — SIGABRT, std::bad_alloc, ONNXRuntimeError: Fail, — хотя реально
+    детектору нужно около 110 МБ.
+
+    Замерено: 1.34 ГБ адресного пространства по умолчанию против 1.05 ГБ с
+    одним потоком и без арены; резидентная память в обоих случаях ~108 МБ.
+
+    Настройки сессии nudenet передать не даёт — он создаёт её сам, — поэтому
+    подменяем конструктор на время вызова и сразу возвращаем на место.
+    """
+    import onnxruntime
     from nudenet import NudeDetector
+    options = onnxruntime.SessionOptions()
+    options.enable_cpu_mem_arena = False
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    original = onnxruntime.InferenceSession
+    onnxruntime.InferenceSession = lambda *args, **kwargs: original(
+        *args, **{**kwargs, 'sess_options': options})
+    try:
+        return NudeDetector()
+    finally:
+        onnxruntime.InferenceSession = original
+
+
+def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
     from PIL import Image, UnidentifiedImageError
     if not 0 < Path(path).stat().st_size <= MAX_BYTES:
         return Scan('unchecked', reason='Размер файла вне допустимого диапазона')
@@ -231,7 +261,7 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
                     (magic[:4] == b'RIFF' and magic[8:12] == b'AVI ')):
                 return Scan('unchecked', reason='Неподдерживаемый формат файла')
             frames = _video_frames(path)
-    detector = NudeDetector()  # 320n.onnx is included in the pinned wheel.
+    detector = build_detector()  # 320n.onnx is included in the pinned wheel.
     best, count = Scan('checked'), 0
     uncertain = None
     for frame in frames:
@@ -368,6 +398,13 @@ class MediaScanner:
         # непроверенным — то есть 18+ проходил ровно тогда, когда медиа много.
         self.max_waiting = max(0, min(32, max_waiting))
         self.memory_mb = clamp_worker_memory(memory_mb)
+        # Сломанный детектор ломается одинаково для всех: очередь при этом
+        # копилась и переполнялась, а отчёт говорил про очередь, а не про
+        # поломку. После нескольких отказов подряд берём паузу и говорим прямо.
+        self.failure_limit = 3
+        self.pause_sec = 600
+        self._failures = 0
+        self._paused_until = 0.0
         self._gate = None
         self._gate_loop = None
         self._in_flight = 0
@@ -392,6 +429,24 @@ class MediaScanner:
         """Сколько проверок сейчас ждут очереди — для диагностики."""
         return max(0, self._in_flight - 1)
 
+    def paused_for(self):
+        """Сколько секунд детектор ещё на паузе после серии отказов."""
+        return max(0.0, self._paused_until - time.monotonic())
+
+    def _note_worker_result(self, result):
+        """Считает отказы подряд: только ответы самого детектора.
+
+        Отказы по размеру файла и переполнению очереди сюда не попадают —
+        это не поломка детектора, а штатный отказ до его запуска.
+        """
+        if result.status == 'checked':
+            self._failures = 0
+            self._paused_until = 0.0
+            return
+        self._failures += 1
+        if self._failures >= self.failure_limit:
+            self._paused_until = time.monotonic() + self.pause_sec
+
     async def check(self, bot, message):
         attachment = media_attachment(message)
         if attachment is None:
@@ -412,6 +467,12 @@ class MediaScanner:
         if cached and cached[0] > time.monotonic():
             self._cache.move_to_end(key)
             return cached[1]
+        paused = self.paused_for()
+        if paused > 0:
+            # Честный текст вместо «очередь переполнена»: пока детектор не
+            # работает, очередь — следствие, а не причина.
+            return Scan('unchecked', reason=f'Детектор не отвечает {self._failures} раз подряд; '
+                                            f'пауза ещё {paused / 60:.0f} мин (/mediaping)')
         gate = self._slot()
         # Считаем всех, кто уже проверяется или ждёт очереди. По gate.locked()
         # переполнение не увидеть: захват уходит в отдельную задачу и к этому
@@ -452,6 +513,7 @@ class MediaScanner:
                             raise
                 except Exception:
                     return Scan('unchecked', reason='Не удалось скачать или проверить медиа')
+                self._note_worker_result(result)
                 if key and result.status == 'checked':
                     self._cache[key] = (time.monotonic() + 86400, result)
                     while len(self._cache) > 512:
