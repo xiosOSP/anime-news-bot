@@ -255,3 +255,40 @@ class TestPresets:
         for provider in ('groq', 'mistral', 'gemini', 'openrouter', 'cerebras'):
             assert f'`{provider}`' in doc, f'{provider} не описан в справке'
             assert provider in bot.LLM_PRESETS, f'{provider} советуют, но пресета нет'
+
+
+class TestEnvIsReadOnlyAtStartup:
+    """Правка переменных без перезапуска выглядит как «бот игнорирует».
+
+    Живой случай: провайдера в панели сменили, а бот продолжал показывать
+    модель прежнего пресета. Окружение работающего процесса снаружи не
+    меняется — панель задаёт переменные следующему процессу, не этому.
+    Единственное, чем тут можно помочь, — сказать об этом на том же экране.
+    """
+
+    def test_model_screen_names_the_restart(self, monkeypatch):
+        monkeypatch.setattr(bot, 'settings', MagicMock(llm_primary_slot='', llm_model_override=''))
+        monkeypatch.setattr(bot, 'LLM_BASE_URL', 'https://primary.test/v1')
+        monkeypatch.setattr(bot, 'LLM_API_KEY', 'sk-primary')
+        monkeypatch.setattr(bot, 'LLM_MODEL', 'model-primary')
+        view = bot._llm_model_view()
+        assert 'перезапуска' in view
+        assert 'Переменные прочитаны при запуске' in view
+
+    def test_unconfigured_screen_does_not_promise_a_reload(self, monkeypatch):
+        """Когда провайдеров нет, экран другой — и обещать там нечего."""
+        monkeypatch.setattr(bot, 'LLM_API_KEY', '')
+        monkeypatch.setattr(bot, 'LLM_BASE_URL', '')
+        monkeypatch.setattr(bot, 'LLM_FALLBACK_API_KEY', '')
+        monkeypatch.setattr(bot, 'LLM_FAST_API_KEY', '')
+        assert 'LLM_PROVIDER' in bot._llm_model_view()
+
+    @pytest.mark.parametrize(('spent', 'expected'), [
+        (30, 'только что'),
+        (5 * 60, '5 мин назад'),
+        (3 * 3600 + 12 * 60, '3 ч 12 мин назад'),
+    ])
+    def test_age_is_human(self, monkeypatch, spent, expected):
+        """Возраст важнее точного времени: по нему видно, до правки или после."""
+        monkeypatch.setattr(bot, '_process_started_at', bot.time.time() - spent)
+        assert expected in bot._env_read_ago()

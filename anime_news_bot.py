@@ -20515,6 +20515,7 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
         lines.append('Fast route: не настроен (основная модель выполняет задачи новостей)')
     lines.append(html.escape(_moderation_llm_status()))
     lines.append(f'Адрес: <code>{html.escape(_llm_current()[0])}</code>')
+    lines += _llm_env_restart_note()
     lines.append('')
     lines.append('Включено: ' + ('ДА' if settings.llm_enabled else 'НЕТ'))
     lines.append('  📝 Перевод и текст: ' + ('ВКЛ' if settings.llm_rewrite else 'ВЫКЛ'))
@@ -20943,6 +20944,39 @@ def _llm_model_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _env_read_ago() -> str:
+    """Когда бот прочитал переменные окружения. Это всегда момент запуска.
+
+    У работающего процесса окружение снаружи не меняется: панель хостинга
+    задаёт переменные новому процессу, а не этому. Значит правка в панели без
+    перезапуска не значит ничего — а выглядит так, будто бот её игнорирует.
+    Показываем время, чтобы владелец сам увидел: менял он до старта или после.
+    """
+    spent = max(0, int(time.time() - _process_started_at))
+    hours, minutes = divmod(spent // 60, 60)
+    if hours:
+        ago = f'{hours} ч {minutes} мин назад'
+    elif minutes:
+        ago = f'{minutes} мин назад'
+    else:
+        ago = 'только что'
+    try:
+        started = _local_now() - timedelta(seconds=spent)
+        when = started.strftime('%d.%m в %H:%M')
+    except Exception:
+        return ago
+    return f'{ago} ({when})'
+
+
+def _llm_env_restart_note() -> list[str]:
+    """Строки про перезапуск — одинаковые в /llm и /llmmodel."""
+    return [
+        f'Переменные прочитаны при запуске, {_env_read_ago()}.',
+        'Правки в панели хостинга применяются только после перезапуска бота: '
+        'из чата окружение не перечитать, и /reloadconfig его не трогает.',
+    ]
+
+
 def _llm_model_view() -> str:
     """Текст экрана выбора модели."""
     ready = _llm_ready_slots()
@@ -20971,6 +21005,8 @@ def _llm_model_view() -> str:
     lines.append('Другая модель у того же провайдера: '
                  '<code>/llmmodel mistral-small-latest</code>')
     lines.append('Вернуть всё как в переменных: <code>/llmmodel сброс</code>')
+    lines.append('')
+    lines += _llm_env_restart_note()
     return '\n'.join(lines)
 
 
