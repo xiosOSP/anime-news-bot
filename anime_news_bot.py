@@ -18258,13 +18258,15 @@ def _scheduled_status_block(context) -> str:
 
 LLM_PRESETS = {
     'mistral':    ('https://api.mistral.ai/v1', 'mistral-small-latest'),
-    # llama-3.3-70b-versatile Groq снял с бесплатного тарифа 17.06.2026 и сам
-    # советует gpt-oss-120b. Пресет, ведущий в снятую модель, — это «ключ
-    # вставил, а не работает» на ровном месте.
+    # llama-3.3-70b-versatile у Groq не снята и работает — но в таблице лимитов
+    # бесплатного плана её нет: она на корпоративном тарифе. Бесплатному ключу
+    # достанется отказ, а выглядеть это будет как «ключ не работает». Пресет
+    # ведёт на gpt-oss-120b: он в бесплатной таблице есть.
     'groq':       ('https://api.groq.com/openai/v1', 'openai/gpt-oss-120b'),
-    # gemini-2.0-flash потерял бесплатный доступ 09.06.2026. 2.5 Flash на
-    # бесплатном тарифе остаётся; более новые Flash тоже, но 2.5 проверен
-    # временем, а пресет должен вести туда, где ключ точно примут.
+    # У Gemini бесплатными остались Flash-модели; таблицу лимитов Google
+    # публикует только в AI Studio, поэтому проверить извне нельзя. 2.5 Flash
+    # — самый долго живущий из них, и пресет ведёт туда, где меньше шансов
+    # получить отказ на ровном месте.
     'gemini':     ('https://generativelanguage.googleapis.com/v1beta/openai',
                    'gemini-2.5-flash'),
     # Бесплатные модели у роутеров снимают без предупреждения: прежний
@@ -20513,6 +20515,7 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
         lines.append('Fast route: не настроен (основная модель выполняет задачи новостей)')
     lines.append(html.escape(_moderation_llm_status()))
     lines.append(f'Адрес: <code>{html.escape(_llm_current()[0])}</code>')
+    lines += _llm_env_restart_note()
     lines.append('')
     lines.append('Включено: ' + ('ДА' if settings.llm_enabled else 'НЕТ'))
     lines.append('  📝 Перевод и текст: ' + ('ВКЛ' if settings.llm_rewrite else 'ВЫКЛ'))
@@ -20941,6 +20944,39 @@ def _llm_model_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _env_read_ago() -> str:
+    """Когда бот прочитал переменные окружения. Это всегда момент запуска.
+
+    У работающего процесса окружение снаружи не меняется: панель хостинга
+    задаёт переменные новому процессу, а не этому. Значит правка в панели без
+    перезапуска не значит ничего — а выглядит так, будто бот её игнорирует.
+    Показываем время, чтобы владелец сам увидел: менял он до старта или после.
+    """
+    spent = max(0, int(time.time() - _process_started_at))
+    hours, minutes = divmod(spent // 60, 60)
+    if hours:
+        ago = f'{hours} ч {minutes} мин назад'
+    elif minutes:
+        ago = f'{minutes} мин назад'
+    else:
+        ago = 'только что'
+    try:
+        started = _local_now() - timedelta(seconds=spent)
+        when = started.strftime('%d.%m в %H:%M')
+    except Exception:
+        return ago
+    return f'{ago} ({when})'
+
+
+def _llm_env_restart_note() -> list[str]:
+    """Строки про перезапуск — одинаковые в /llm и /llmmodel."""
+    return [
+        f'Переменные прочитаны при запуске, {_env_read_ago()}.',
+        'Правки в панели хостинга применяются только после перезапуска бота: '
+        'из чата окружение не перечитать, и /reloadconfig его не трогает.',
+    ]
+
+
 def _llm_model_view() -> str:
     """Текст экрана выбора модели."""
     ready = _llm_ready_slots()
@@ -20969,6 +21005,8 @@ def _llm_model_view() -> str:
     lines.append('Другая модель у того же провайдера: '
                  '<code>/llmmodel mistral-small-latest</code>')
     lines.append('Вернуть всё как в переменных: <code>/llmmodel сброс</code>')
+    lines.append('')
+    lines += _llm_env_restart_note()
     return '\n'.join(lines)
 
 
