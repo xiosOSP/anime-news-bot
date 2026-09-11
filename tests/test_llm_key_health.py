@@ -6,11 +6,14 @@
 перезапускает процесс каждые ~18 минут) всё начиналось сначала.
 """
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 import anime_news_bot as bot
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture
@@ -214,3 +217,37 @@ class TestWiring:
         with patch.object(llm.requests, 'post', return_value=reply):
             assert llm._llm_probe_slot('primary')['ok'] is False
         assert health.rejected('primary', 'sk-primary', ttl=3600)
+
+
+class TestPresets:
+    """Пресет — это то, куда пойдёт ключ, если руками ничего не задавать."""
+
+    # Модели, потерявшие бесплатный доступ. Дата рядом — чтобы через год было
+    # видно, когда проверяли, а не гадать.
+    RETIRED = {
+        'llama-3.3-70b-versatile': 'Groq снял с бесплатного тарифа 17.06.2026',
+        'gemini-2.0-flash': 'Google убрал из бесплатного доступа 09.06.2026',
+    }
+
+    def test_presets_do_not_lead_to_retired_models(self):
+        """Пресет в снятую модель — это «ключ вставил, а не работает».
+
+        Отличить такую поломку от негодного ключа по сообщению провайдера
+        почти нельзя: и то и другое приходит как отказ на первом же запросе.
+        """
+        for provider, (_url, model) in bot.LLM_PRESETS.items():
+            assert model not in self.RETIRED, f'{provider}: {self.RETIRED.get(model)}'
+
+    def test_every_preset_is_complete(self):
+        """Половина пресета хуже его отсутствия: запрос уйдёт в никуда."""
+        for provider, pair in bot.LLM_PRESETS.items():
+            url, model = pair
+            assert url.startswith('https://'), provider
+            assert model, provider
+
+    def test_documented_providers_exist_in_presets(self):
+        """Справка советует провайдеров именами переменных — они должны быть."""
+        doc = (ROOT / 'docs' / 'llm-providers.md').read_text(encoding='utf-8')
+        for provider in ('groq', 'mistral', 'gemini', 'openrouter', 'cerebras'):
+            assert f'`{provider}`' in doc, f'{provider} не описан в справке'
+            assert provider in bot.LLM_PRESETS, f'{provider} советуют, но пресета нет'
