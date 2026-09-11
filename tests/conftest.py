@@ -45,6 +45,16 @@ def _wipe_data_dir() -> None:
                 path.unlink()
             except OSError:
                 pass
+    # Здоровье ключей живёт не только в файле: решение «к этому слоту не
+    # ходить» кешируется в памяти хранилища. Удалить файл мало — отказ,
+    # записанный одним тестом, выключал провайдера у всех следующих, и падали
+    # чужие файлы про ротацию. Зависимость от порядка файлов — худший вид.
+    health = getattr(_bot, 'llm_key_health', None)
+    if health is not None:
+        try:
+            health.clear()
+        except Exception:
+            pass
 
 
 @pytest.fixture(autouse=True)

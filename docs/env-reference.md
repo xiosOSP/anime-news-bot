@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 261 переменных. Почти все — точная настройка со значением
+Бот читает 262 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -177,6 +177,7 @@
 | `LLM_FAST_TASKS` | `judge` | anime_news_bot.py |
 | `LLM_INLINE_RETRY_MAX_SEC` | `20.0` | anime_news_bot.py |
 | `LLM_JUDGE_MAX_TOKENS` | `180` | anime_news_bot.py |
+| `LLM_KEY_REJECTED_TTL_SEC` | — | anime_news_bot.py |
 | `LLM_MAX_TOKENS` | `700` | anime_news_bot.py |
 | `LLM_MIN_INTERVAL` | `1.2` | anime_news_bot.py |
 | `LLM_MODEL` | — | anime_news_bot.py |

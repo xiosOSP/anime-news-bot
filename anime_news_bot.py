@@ -555,6 +555,7 @@ ERROR_FINGERPRINT_WINDOW_SEC = max(60, min(24 * 3600,
 ERROR_FINGERPRINT_NOTIFY_EVERY = max(2, min(1000,
     _env_int('ERROR_FINGERPRINT_NOTIFY_EVERY', 10)))
 LLM_BUDGET_FILE = DATA_DIR / 'llm_budget.json'
+LLM_KEY_HEALTH_FILE = DATA_DIR / 'llm_key_health.json'
 # 0 = unlimited. Это сохраняет поведение существующих деплоев; лимит можно
 # включить одной env-переменной после наблюдения за фактическим расходом.
 LLM_DAILY_TOKEN_BUDGET = max(0, _env_int('LLM_DAILY_TOKEN_BUDGET', 0))
@@ -12316,6 +12317,101 @@ class ErrorFingerprintStore:
         return sorted(rows, key=lambda row: row.get('last_seen', ''), reverse=True)
 
 
+class LLMKeyHealth:
+    """Память о ключах, которые провайдер отверг.
+
+    «Выключено до рестарта» живёт в памяти процесса, а платформа
+    перезапускает бота каждые ~18 минут: мёртвый ключ снова получал запросы
+    через четверть часа — и так весь день, шестью слотами сразу. Отчёты об
+    этом уходили админу каждый раз заново.
+
+    На диске лежит только отпечаток ключа, никогда сам ключ: файл рядом с
+    остальными данными, а ключ — секрет. Отпечаток нужен, чтобы отказ не
+    пережил замену ключа: другой ключ — другая история, пробуем снова.
+
+    Отказ помнится ограниченное время. У бесплатных роутеров 401 приходит и
+    при исчерпанной квоте, то есть «ключ отклонён» не всегда значит «ключ
+    негодный»; по истечении срока слот получает ещё одну попытку сам.
+    """
+
+    MAX_SLOTS = 16
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._data: dict = {}
+        self._lock = threading.RLock()
+        self._load()
+
+    @staticmethod
+    def fingerprint(api_key: str) -> str:
+        return hashlib.sha256(str(api_key or '').encode('utf-8')).hexdigest()[:16]
+
+    def _load(self) -> None:
+        try:
+            if self.path.exists():
+                raw = json.loads(self.path.read_text(encoding='utf-8'))
+                if isinstance(raw, dict) and isinstance(raw.get('slots'), dict):
+                    for slot, row in list(raw['slots'].items())[:self.MAX_SLOTS]:
+                        if (isinstance(row, dict) and isinstance(row.get('fingerprint'), str)
+                                and type(row.get('at')) in (int, float)):
+                            self._data[str(slot)] = {
+                                'fingerprint': row['fingerprint'][:32],
+                                'at': float(row['at']),
+                                'status': _safe_nonnegative_int(row.get('status')),
+                                'model': str(row.get('model') or '')[:60],
+                            }
+        except (OSError, ValueError, TypeError) as e:
+            # Память об отказах — оптимизация, а не разрешение работать. Битый
+            # файл means просто пробуем ключи заново.
+            logger.warning(f'Здоровье ключей не загружено: {e}')
+            self._data = {}
+
+    def _save(self) -> None:
+        try:
+            _atomic_write_json(self.path, {'schema_version': 1, 'slots': self._data}, indent=2)
+        except OSError as e:
+            logger.warning(f'Здоровье ключей не сохранено: {e}')
+
+    def remember_rejected(self, slot: str, api_key: str, status: int, model: str = '') -> None:
+        with self._lock:
+            self._data[str(slot)] = {
+                'fingerprint': self.fingerprint(api_key),
+                'at': time.time(),
+                'status': _safe_nonnegative_int(status),
+                'model': str(model or '')[:60],
+            }
+            while len(self._data) > self.MAX_SLOTS:
+                self._data.pop(next(iter(self._data)))
+            self._save()
+
+    def forget(self, slot: str) -> None:
+        with self._lock:
+            if self._data.pop(str(slot), None) is not None:
+                self._save()
+
+    def rejected(self, slot: str, api_key: str, ttl: float) -> Optional[dict]:
+        """Запись об отказе, если она про ЭТОТ ключ и ещё не просрочена."""
+        with self._lock:
+            row = self._data.get(str(slot))
+            if not row or row.get('fingerprint') != self.fingerprint(api_key):
+                return None
+            age = time.time() - float(row.get('at') or 0)
+            if age < 0 or age > ttl:
+                return None
+            return {**row, 'age': age}
+
+    def clear(self) -> None:
+        """Забыть все отказы: после смены всех ключей разом и в тестах."""
+        with self._lock:
+            if self._data:
+                self._data = {}
+                self._save()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {slot: dict(row) for slot, row in self._data.items()}
+
+
 class LLMBudgetStore:
     """Crash-safe дневной бюджет приблизительных/фактических LLM tokens."""
 
@@ -12414,6 +12510,7 @@ class LLMBudgetStore:
 
 error_fingerprints: Optional['ErrorFingerprintStore'] = None
 llm_budget: Optional['LLMBudgetStore'] = None
+llm_key_health: Optional['LLMKeyHealth'] = None
 
 
 IMAGE_HASHES_FILE = DATA_DIR / 'image_hashes.json'
@@ -18204,6 +18301,10 @@ LLM_PRIMARY_RETRY_SEC = max(60, min(24 * 3600, _env_int('LLM_PRIMARY_RETRY_SEC',
 LLM_PRIMARY_RETRY_MAX_SEC = max(LLM_PRIMARY_RETRY_SEC,
                                 min(24 * 3600, _env_int('LLM_PRIMARY_RETRY_MAX_SEC', 6 * 3600)))
 LLM_TIMEOUT = max(5, min(120, _env_int('LLM_TIMEOUT', 30)))
+# Сколько помнить, что провайдер отверг ключ. Не навсегда: у бесплатных
+# роутеров 401 приходит и при исчерпанной квоте, а она восстанавливается.
+LLM_KEY_REJECTED_TTL_SEC = max(600, min(7 * 86400,
+                                        _env_int('LLM_KEY_REJECTED_TTL_SEC', 6 * 3600)))
 LLM_MIN_INTERVAL = max(0.0, min(60.0, _env_float('LLM_MIN_INTERVAL', 1.2)))
 # Потолок самообучаемой паузы. Бесплатные тарифы отличаются по темпу в разы, и
 # единая пауза для всех означает, что для одного провайдера она мала (упрёмся
@@ -18293,12 +18394,27 @@ def _llm_slot_config(slot: str) -> tuple[str, str, str]:
     return base_url, api_key, model
 
 
-def _llm_candidates() -> list[tuple[str, str]]:
-    """Все варианты по порядку: сначала модели своего провайдера, потом чужие.
+def _llm_slot_rejected(slot: str) -> Optional[dict]:
+    """Отклонён ли ключ этого слота — и как давно.
+
+    Спрашиваем перед каждым выбором, а не раз при запуске: файл переживает
+    перезапуск, а он тут случается каждые ~18 минут.
+    """
+    if llm_key_health is None:
+        return None
+    return llm_key_health.rejected(slot, _llm_slot_env(slot)[1], LLM_KEY_REJECTED_TTL_SEC)
+
+
+def _llm_all_candidates() -> list[tuple[str, str]]:
+    """Все настроенные варианты по порядку, включая отвергнутые ключи.
 
     Порядок неслучаен. Соседняя модель на том же ключе — самая дешёвая замена:
     ни нового аккаунта, ни чужих лимитов. И только когда у своего провайдера
     варианты кончились, идём к другому.
+
+    Отвергнутые слоты остаются в этом списке: их видит диагностика. Рабочий
+    путь к ним не ходит, и без прямого опроса вернуть их в строй после замены
+    ключа было бы нечем — слот просто исчез бы из бота навсегда.
     """
     chosen = _llm_primary_slot()
     out: list[tuple[str, str]] = []
@@ -18320,6 +18436,18 @@ def _llm_candidates() -> list[tuple[str, str]]:
         if pair not in out:
             out.append(pair)
     return out
+
+
+def _llm_candidates() -> list[tuple[str, str]]:
+    """Варианты, к которым имеет смысл идти сейчас.
+
+    Слот с уже отвергнутым ключом вернёт тот же 401, но сначала займёт таймаут
+    и место в серии неудач — то есть отнимет попытку у слота, который мог бы
+    ответить. Шесть настроенных слотов превращали каждый цикл в шесть
+    гарантированных отказов подряд.
+    """
+    return [(slot, model) for slot, model in _llm_all_candidates()
+            if not _llm_slot_rejected(slot)]
 
 
 def _llm_primary_config() -> tuple[str, str, str]:
@@ -18975,6 +19103,9 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
         if r.status_code in (401, 403):
             _remember_provider_error(r.status_code, r.text)
             _llm_note_failure('http', f'HTTP {r.status_code}: ключ отклонён', model=model)
+            if llm_key_health is not None:
+                # Чтобы после перезапуска бот не пошёл к этому же ключу снова.
+                llm_key_health.remember_rejected(slot, api_key, r.status_code, model)
             if _llm_try_failover('auth', 'провайдер отклонил ключ основного аккаунта. '
                                          'Проверь LLM_API_KEY: у бесплатных роутеров тот же '
                                          '401 приходит и при исчерпанной квоте, и при '
@@ -19056,6 +19187,10 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
             # Ответ пришёл: прошлая причина больше не актуальна. Иначе /llm будет
             # неделю показывать давно ушедший таймаут как текущую проблему.
             _llm_last_failure.clear()
+        if llm_key_health is not None:
+            # Ключ рабочий — старая отметка об отказе устарела. Без этого слот
+            # оставался бы вне очереди до истечения срока, хотя уже отвечает.
+            llm_key_health.forget(slot)
         return content.strip()
     finally:
         r.close()
@@ -20331,6 +20466,7 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
     lines.append('')
     lines.append('🔀 Сменить провайдера — /llmmodel')
     lines.append('📡 Спросить каждого напрямую — /llmping')
+    lines.append('🧹 Что стереть и что заменить — /llmclean')
     lines.append('')
     lines.append('LLM judge: ' + ('ВКЛ' if feature_enabled('llm_judge') else 'выкл'))
     if feature_enabled('llm_quality_routing') and _llm_fast_configured():
@@ -20355,6 +20491,12 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
     lines.append('🗞 Отсев не-новостей по заголовку: '
                  + ('ВКЛ' if settings.local_noise_filter else 'ВЫКЛ'))
     lines.append('')
+    skipped = [LLM_SLOT_HUMAN[slot].split(' (')[0] for slot in LLM_SLOTS
+               if _llm_slot_rejected(slot)]
+    if skipped:
+        # Иначе слот выглядит исчезнувшим: в очереди его нет, а почему — нигде.
+        lines.append('⛔ Пропускаю (ключ отклонён): ' + ', '.join(skipped)
+                     + '. Разбор — /llmclean')
     lines.append(f'Вызовов сегодня: {used} из {LLM_DAILY_LIMIT}')
     if _llm_disabled_runtime:
         lines.append('⚠️ Временно отключена из-за ошибок — вернётся после перезапуска')
@@ -20442,6 +20584,13 @@ def _llm_probe_slot(slot: str, timeout: float = 12.0, model: str = '') -> dict:
                 'took': time.monotonic() - started,
                 'detail': _redact_secrets(f'{type(e).__name__}: {e}')[:200]}
     took = time.monotonic() - started
+    if llm_key_health is not None:
+        # Проба — единственный способ вернуть слот в строй после замены ключа:
+        # обычный путь к отклонённому слоту больше не обращается вовсе.
+        if r.status_code == 200:
+            llm_key_health.forget(slot)
+        elif r.status_code in (401, 403):
+            llm_key_health.remember_rejected(slot, api_key, r.status_code, model)
     if r.status_code == 200:
         return {'slot': slot, 'model': model, 'ok': True, 'status': 200,
                 'took': took, 'detail': ''}
@@ -20475,6 +20624,141 @@ def _llm_shared_free_limit(results: list) -> str:
     return ''
 
 
+# Переменные каждого слота — чтобы говорить о них именами, которые владелец
+# видит в панели хостинга, а не внутренними словами «основной» и «запасной».
+LLM_SLOT_ENV_NAMES = {
+    'primary':  ('LLM_PROVIDER', 'LLM_API_KEY', 'LLM_MODEL', 'LLM_BASE_URL'),
+    'fallback': ('LLM_FALLBACK_PROVIDER', 'LLM_FALLBACK_API_KEY',
+                 'LLM_FALLBACK_MODEL', 'LLM_FALLBACK_BASE_URL'),
+    'fast':     ('LLM_FAST_PROVIDER', 'LLM_FAST_API_KEY',
+                 'LLM_FAST_MODEL', 'LLM_FAST_BASE_URL'),
+}
+
+
+def _llm_cleanup_plan(results: list[dict]) -> dict:
+    """Что оставить, что стереть, что заменить — по ответам самих провайдеров.
+
+    Разбираться в шести слотах руками невозможно: 401 у одного, 429 у другого,
+    у третьего адрес от прошлого провайдера. План строится из живых ответов, а
+    не из догадок, поэтому его можно выполнять не думая.
+    """
+    alive: dict[str, dict] = {}
+    dead: dict[str, dict] = {}
+    for row in results:
+        slot = str(row.get('slot') or '')
+        if row.get('ok'):
+            alive.setdefault(slot, row)
+            dead.pop(slot, None)
+        elif slot not in alive:
+            previous = dead.get(slot)
+            # Из нескольких отказов одного слота оставляем первый: остальные —
+            # это его же запасные модели на том же ключе.
+            if previous is None:
+                dead[slot] = row
+
+    keep: list[str] = []
+    remove: list[str] = []
+    replace: list[str] = []
+    wait: list[str] = []
+
+    for slot, row in alive.items():
+        provider, key, model, base = LLM_SLOT_ENV_NAMES.get(slot, ('', '', '', ''))
+        keep.append(f'{provider} + {key} — отвечает ({row["model"]}, {row["took"]:.1f} с)')
+
+    for slot, row in dead.items():
+        provider, key, model, base = LLM_SLOT_ENV_NAMES.get(slot, ('', '', '', ''))
+        human = LLM_SLOT_HUMAN.get(slot, slot).split(' (')[0]
+        status = int(row.get('status') or 0)
+        if status in (401, 403):
+            replace.append(f'{key} — провайдер отклонил ключ ({status}). Заменить ключ '
+                           f'или стереть слот целиком: {provider}, {key}')
+        elif status == 429 or row.get('temporary'):
+            wait.append(f'{human}: лимит или квота ({status}). Это временно, менять нечего')
+        elif status == 404 or 'model' in str(row.get('detail') or '').lower():
+            suggested = str(row.get('suggested') or '')
+            replace.append(f'{model} — провайдер не знает такой модели'
+                           + (f'. Рабочая: {suggested}' if suggested else
+                              '. Стереть переменную — вернётся модель из пресета'))
+        elif status == 0:
+            wait.append(f'{human}: не дозвонились ({row.get("detail", "")[:60]})')
+        else:
+            replace.append(f'{human}: HTTP {status} — {str(row.get("detail") or "")[:80]}')
+
+    # Ручные адрес и модель поверх пресета — самая частая причина «ключ вставил,
+    # а не работает»: ключ новый, адрес и модель остались от прошлого провайдера.
+    for name, ok, detail in _doctor_env_conflicts():
+        if not ok and name.startswith('LLM'):
+            remove.append(detail)
+    if LLM_BASE_URL_FROM_ENV and LLM_PRESETS.get(LLM_PROVIDER, ('', ''))[0]:
+        remove.append('LLM_BASE_URL — при известном провайдере адрес берётся из пресета')
+
+    return {'alive': alive, 'dead': dead, 'keep': keep,
+            'remove': remove, 'replace': replace, 'wait': wait}
+
+
+@admin_only
+async def llmclean_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Уборка настроек модели: /llmclean.
+
+    Появилась, когда в переменных накопилось шесть слотов, ни один из них не
+    работал, и понять, что из этого чинить, а что стирать, было нельзя:
+    /llmping показывает ответы, но не говорит, что с ними делать.
+    """
+    candidates = _llm_all_candidates()
+    if not candidates:
+        await update.message.reply_text(
+            '🧹 Ни один слот не настроен — убирать нечего.\n'
+            'Минимум для работы: <code>LLM_PROVIDER</code> и <code>LLM_API_KEY</code>.\n'
+            'Бот сейчас работает без модели: перевод через DeepL/Google, '
+            'локальные фильтры включены.', parse_mode=ParseMode.HTML)
+        return
+    msg = await update.message.reply_text(f'🧹 Опрашиваю варианты ({len(candidates)})…')
+    results = []
+    seen_slots: set = set()
+    for slot, model in candidates:
+        # Та же пауза, что в /llmping: три запроса подряд к одному провайдеру
+        # сами себе устраивают 429, и уборка докладывала бы о поломке, которую
+        # устроила сама.
+        if slot in seen_slots:
+            await asyncio.sleep(max(1.0, LLM_MIN_INTERVAL))
+        seen_slots.add(slot)
+        results.append(await asyncio.to_thread(_llm_probe_slot, slot, 12.0, model))
+
+    plan = _llm_cleanup_plan(results)
+    lines = ['🧹 <b>Уборка настроек модели</b>', '']
+    if plan['keep']:
+        lines.append('✅ <b>Оставить</b>')
+        lines += [f'• {html.escape(item)}' for item in plan['keep'][:6]]
+        lines.append('')
+    else:
+        lines.append('❌ Ни один слот не ответил. Бот работает без модели: перевод '
+                     'через DeepL/Google, локальные фильтры включены — канал и чат '
+                     'не останавливаются.')
+        lines.append('')
+    if plan['replace']:
+        lines.append('🔑 <b>Заменить или стереть</b>')
+        lines += [f'• {html.escape(item)}' for item in plan['replace'][:6]]
+        lines.append('')
+    if plan['remove']:
+        lines.append('🗑 <b>Стереть — перебивает пресет</b>')
+        lines += [f'• {html.escape(item)}' for item in plan['remove'][:6]]
+        lines.append('')
+    if plan['wait']:
+        lines.append('⏳ <b>Просто подождать</b>')
+        lines += [f'• {html.escape(item)}' for item in plan['wait'][:6]]
+        lines.append('')
+    rejected = [slot for slot in LLM_SLOTS if _llm_slot_rejected(slot)]
+    if rejected:
+        lines.append('Слоты с отвергнутым ключом бот сейчас пропускает: '
+                     + ', '.join(LLM_SLOT_HUMAN[s].split(' (')[0] for s in rejected)
+                     + '. Замените ключ и позовите /llmclean снова — слот вернётся сам.')
+        lines.append('')
+    lines.append('Минимум, на котором всё работает: <code>LLM_PROVIDER</code> и '
+                 '<code>LLM_API_KEY</code>. Остальное — только если дефолт не подошёл.')
+    await msg.edit_text('\n'.join(lines)[:4000], parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True)
+
+
 @admin_only
 async def llmping_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Живая проверка каждого провайдера по отдельности: /llmping.
@@ -20486,7 +20770,7 @@ async def llmping_command(update, context: ContextTypes.DEFAULT_TYPE):
     # Проверяем все варианты, а не только слоты: запасные модели на том же
     # ключе — первое, чем бот воспользуется при отказе, и знать, живы ли они,
     # нужно заранее, а не в момент поломки.
-    candidates = _llm_candidates()
+    candidates = _llm_all_candidates()
     if not candidates:
         await update.message.reply_text(
             'Ни один провайдер не настроен. Нужны <code>LLM_PROVIDER</code> и '
@@ -25811,6 +26095,9 @@ def _init_globals() -> None:
         error_fingerprints = ErrorFingerprintStore(ERROR_FINGERPRINT_FILE)
     if llm_budget is None:
         llm_budget = LLMBudgetStore(LLM_BUDGET_FILE)
+    global llm_key_health
+    if llm_key_health is None:
+        llm_key_health = LLMKeyHealth(LLM_KEY_HEALTH_FILE)
     # Статистика медиасбоев копится между процессами: при перезапусках раз в
     # ~18 минут счётчики в памяти до /health просто не доживают.
     _load_media_failures()
@@ -25983,6 +26270,7 @@ def main():
     app.add_handler(CommandHandler("llm", llm_command))
     app.add_handler(CommandHandler("llmmodel", llmmodel_command))
     app.add_handler(CommandHandler("llmping", llmping_command))
+    app.add_handler(CommandHandler("llmclean", llmclean_command))
     app.add_handler(CommandHandler("mediaping", mediaping_command))
     app.add_handler(CommandHandler("reliability", reliability_command))
     app.add_handler(CommandHandler("experiments", experiments_command))

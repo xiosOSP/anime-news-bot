@@ -688,6 +688,30 @@ def _check_noise_filter_keeps_real_news(bot) -> tuple[bool, str]:
     return True, f'{len(real)} новостей-двойников проходят, подборка отсеивается'
 
 
+def _check_rejected_key_never_outlives_its_replacement(bot, tmp_root=None) -> tuple[bool, str]:
+    """Замена ключа обязана возвращать слот в строй.
+
+    Бот перестал ходить к слотам, чьи ключи провайдер отверг, — иначе шесть
+    настроенных слотов давали шесть гарантированных отказов каждый цикл. Но
+    если эта память переживёт замену ключа, бот будет считать слот мёртвым
+    ровно после того, как его починили: владелец вставил новый ключ, а модель
+    молчит и объяснить это нечем.
+    """
+    with tempfile.TemporaryDirectory(prefix='llm-health-') as directory:
+        store = bot.LLMKeyHealth(Path(directory) / 'health.json')
+        store.remember_rejected('primary', 'sk-old', 401, 'model')
+        if not store.rejected('primary', 'sk-old', 3600):
+            return False, 'отказ не запомнился — слоты снова будут долбить мёртвый ключ'
+        if store.rejected('primary', 'sk-new', 3600):
+            return False, 'отказ пережил замену ключа: починенный слот остался бы мёртвым'
+        if store.rejected('primary', 'sk-old', 0):
+            return False, 'отказ не истекает: 401 бывает и от исчерпанной квоты'
+        raw = (Path(directory) / 'health.json').read_text(encoding='utf-8')
+        if 'sk-old' in raw:
+            return False, 'ключ попал на диск — храниться должен только отпечаток'
+    return True, 'новый ключ возвращает слот в строй, на диске только отпечаток'
+
+
 def checks(bot, tree) -> list[tuple[str, bool, str]]:
     """Полный список инвариантов. Порядок стабилен: на него смотрит pytest."""
     rows: list[tuple[str, bool, str]] = []
@@ -727,6 +751,8 @@ def checks(bot, tree) -> list[tuple[str, bool, str]]:
         _check_local_topic_filter_knows_real_sources(bot))
     add('локальный отсев уступает модели',
         _check_local_topic_filter_yields_to_the_model(tree))
+    add('отказ ключа не переживает его замену',
+        _check_rejected_key_never_outlives_its_replacement(bot))
     add('отсев не-новостей не трогает новости',
         _check_noise_filter_keeps_real_news(bot))
     add('справочник переменных полон', _check_env_reference_is_complete())
