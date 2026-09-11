@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "b9e4a3b327080af0561ce2e21ba307fe77c9cf72",
-  "generated_at_utc": "2026-09-11T12:30:52.808775+00:00",
+  "git_commit": "e5a18e4ef81c872152251d8e975e52ce350f5afa",
+  "generated_at_utc": "2026-09-11T13:03:02.881354+00:00",
   "files": {
     ".env.example": {
       "sha256": "3c73db5ac6ffe7a8c7f74c7c0b791d76c988cf6c934a838a7802ad7cb65f7c4d",
@@ -42,8 +42,8 @@
       "bytes": 18253
     },
     "docs/llm-providers.md": {
-      "sha256": "668e6b4c97de1c60ec1399903abd0e4a7e1212f91bc47aeb23a0899258c6df27",
-      "bytes": 5892
+      "sha256": "e7ed8d10e507d220364867cda0502285b2b99b373e0badd143e967d4cf6e1066",
+      "bytes": 8644
     },
     "docs/publication-recovery.md": {
       "sha256": "10beff2e7df4fd51ba610b3142d2fdf3fb0cead078af1c2058052dab0bef0094",
