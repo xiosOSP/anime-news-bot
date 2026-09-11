@@ -222,21 +222,25 @@ class TestWiring:
 class TestPresets:
     """Пресет — это то, куда пойдёт ключ, если руками ничего не задавать."""
 
-    # Модели, потерявшие бесплатный доступ. Дата рядом — чтобы через год было
-    # видно, когда проверяли, а не гадать.
-    RETIRED = {
-        'llama-3.3-70b-versatile': 'Groq снял с бесплатного тарифа 17.06.2026',
-        'gemini-2.0-flash': 'Google убрал из бесплатного доступа 09.06.2026',
+    # Модели, до которых бесплатный ключ не дотянется. Проверено 11.09.2026 по
+    # документации провайдеров; причина у каждой своя, и «снята» — не всегда
+    # верное слово.
+    UNREACHABLE_ON_FREE = {
+        'llama-3.3-70b-versatile': 'у Groq работает, но только на корпоративном '
+                                   'тарифе: в таблице бесплатного плана её нет',
+        'gemini-2.0-flash': 'по сторонним сводкам потеряла бесплатный доступ '
+                            'летом 2026; таблицу Google публикует только в AI Studio',
     }
 
-    def test_presets_do_not_lead_to_retired_models(self):
-        """Пресет в снятую модель — это «ключ вставил, а не работает».
+    def test_presets_do_not_lead_to_models_a_free_key_cannot_reach(self):
+        """Пресет в недоступную модель — это «ключ вставил, а не работает».
 
         Отличить такую поломку от негодного ключа по сообщению провайдера
         почти нельзя: и то и другое приходит как отказ на первом же запросе.
         """
         for provider, (_url, model) in bot.LLM_PRESETS.items():
-            assert model not in self.RETIRED, f'{provider}: {self.RETIRED.get(model)}'
+            assert model not in self.UNREACHABLE_ON_FREE, \
+                f'{provider}: {self.UNREACHABLE_ON_FREE.get(model)}'
 
     def test_every_preset_is_complete(self):
         """Половина пресета хуже его отсутствия: запрос уйдёт в никуда."""
