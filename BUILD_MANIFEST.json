@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "778d3a8ad62258848a1e3d31a1216e4aa53b5820",
-  "generated_at_utc": "2026-09-12T20:51:57.524602+00:00",
+  "git_commit": "33bb7b8582c38cc379b977db8398a8e59ac5c7c7",
+  "generated_at_utc": "2026-09-12T21:17:56.096560+00:00",
   "files": {
     ".env.example": {
       "sha256": "b0c6bb3483549c06af460fadee2ab43d866a9bc087ead3e88be6d10169dd9745",
@@ -34,8 +34,8 @@
       "bytes": 1432270
     },
     "docs/chat-moderation.md": {
-      "sha256": "b4cacd0213c9b7e4912c730872224dd39a2d5ec83703431b023e4cdfbd0ad78a",
-      "bytes": 21276
+      "sha256": "1ef34b95516cc71f037e027e39af68d9d8545d4d720b7700c24c9be566d1c126",
+      "bytes": 23285
     },
     "docs/env-reference.md": {
       "sha256": "3ff82e0746869a9a42f94a0d3b9bac45a4a47b11ab3f22bb1beb1a1ae9925e72",
@@ -62,8 +62,8 @@
       "bytes": 35019
     },
     "moderation_rules.py": {
-      "sha256": "8d6cde9ace938291ff3aa9296c4ffd807be7b79d8635bf023557239ff93bf088",
-      "bytes": 18379
+      "sha256": "b3b910be6d28ba05b24fdfd60d8bb53ee49f8bb8c3e59ac14d7143cd604e0e3a",
+      "bytes": 20050
     },
     "news_deferral.py": {
       "sha256": "2a4d04228fa6802df7827f3d7ffc704d403d66503807becb8594692d49258a2e",
@@ -158,8 +158,8 @@
       "bytes": 9974
     },
     "tests/test_audit_moderation_quotes.py": {
-      "sha256": "3763931dc48f950d2d3d733978b04d22879aef9570b9ee267f741e2c80ec2984",
-      "bytes": 7142
+      "sha256": "051c396b1e7abd9b5613b353bc8ff5473de87a51f1b9699f0ff59d50ea70effc",
+      "bytes": 10553
     },
     "tests/test_audit_post_quality.py": {
       "sha256": "3e0ce57733e43772b6152005abee45140548905fa9e45cba2c8e17c440285627",
@@ -550,8 +550,8 @@
       "bytes": 7322
     },
     "tools/check_invariants.py": {
-      "sha256": "c715fd024214cfe258528d05dce210390e3b126ff349e66201487a87aaadd1f0",
-      "bytes": 49441
+      "sha256": "562b4c89b07cb46f9470d64bb540751bd7b5537216e0f09475aedd1c702f5646",
+      "bytes": 51931
     },
     "tools/env_reference.py": {
       "sha256": "db2a071a06f6a27261ae29c8266f79102697c1d777053ceee4649b6d88ed31fd",
