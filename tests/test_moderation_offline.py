@@ -657,6 +657,29 @@ async def test_mediaping_shows_the_reason_and_punishes_nobody(monkeypatch):
     assert 'не наказывает' in report
 
 
+@pytest.mark.asyncio
+async def test_mediaping_names_the_number_the_machine_asked_for(monkeypatch):
+    """Замер обязан дойти до чата — иначе он остался в коде и не помог.
+
+    Владелец правит MODERATION_MEDIA_MEMORY_MB в панели хостинга, глядя на
+    ответ бота. Если число знает только воркер, подбор снова идёт наугад.
+    И подпись обязана говорить про адресное пространство: «память» отправляла
+    сравнивать потолок с объёмом ОЗУ, то есть занижать его до отказа на
+    каждой проверке.
+    """
+    monkeypatch.setattr(bot, 'is_admin', lambda update: True)
+    monkeypatch.setattr(bot, 'MODERATION_MEDIA_ENABLED', True)
+    monkeypatch.setattr(bot, 'media_probe',
+                        lambda timeout, memory_mb: (
+                            media.Scan('checked', address_space_mb=1408), '', 2.0))
+    edit = AsyncMock()
+    msg = NS(reply_text=AsyncMock(return_value=NS(edit_text=edit)))
+    await bot.mediaping_command(NS(message=msg), NS(args=[], bot=telegram_bot()))
+    report = edit.await_args.args[0]
+    assert '1408' in report, report
+    assert 'адресного пространства' in report, report
+
+
 class TestBrokenDetectorStopsPilingUp:
     """Сломанный детектор ломается одинаково для всех.
 

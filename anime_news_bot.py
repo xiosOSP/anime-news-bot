@@ -1518,9 +1518,10 @@ _moderation_media_scanner = MediaScanner(
     # старое поведение: всё, что пришло во время чужой проверки, оставалось бы
     # непроверенным.
     max_waiting=_env_int('MODERATION_MEDIA_QUEUE', 4),
-    # Потолок памяти воркера. По умолчанию он ниже 2 ГБ — типичного объёма
-    # маленького хостинга: лимит, который больше всей памяти машины, не
-    # срабатывает никогда, и вместо отказа одной проверки жертву выбирает ядро.
+    # Потолок АДРЕСНОГО ПРОСТРАНСТВА воркера, а не памяти: резидентно детектор
+    # занимает около 110 МБ, и на 2 ГБ машины он влезает с запасом. Тесный
+    # лимит здесь не экономит память, а выключает проверку целиком — сколько
+    # нужно этой машине, показывает /mediaping.
     memory_mb=_env_int('MODERATION_MEDIA_MEMORY_MB', WORKER_MEMORY_MB_DEFAULT))
 _moderation_action_lock = asyncio.Lock()
 _moderation_update_lock = asyncio.Lock()
@@ -24560,8 +24561,14 @@ async def mediaping_command(update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f'<pre>{html.escape(details[-500:])}</pre>')
     lines.append('')
     lines.append(f'Таймаут проверки: {_moderation_media_scanner.timeout} с')
-    lines.append(f'Память воркера: до {_moderation_media_scanner.memory_mb} МБ '
-                 f'(<code>MODERATION_MEDIA_MEMORY_MB</code>)')
+    # «Память» здесь — адресное пространство, а не ОЗУ: резидентно детектор
+    # занимает около 110 МБ, а просит больше гигабайта. Подпись «память»
+    # отправляла подгонять число под объём машины — то есть выключать проверку.
+    lines.append(f'Потолок адресного пространства: {_moderation_media_scanner.memory_mb} МБ '
+                 f'(<code>MODERATION_MEDIA_MEMORY_MB</code>; это не ОЗУ — '
+                 f'резидентно детектор занимает около 110 МБ)')
+    if scan.address_space_mb:
+        lines.append(f'Понадобилось на этой машине: {scan.address_space_mb} МБ')
     lines.append(f'Очередь: до {_moderation_media_scanner.max_waiting} ожидающих, '
                  f'сейчас {_moderation_media_scanner.queue_depth()}')
     lines.append(f'Пороги: явное {_moderation_media_scanner.explicit_threshold:.2f}, '

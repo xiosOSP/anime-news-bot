@@ -19,9 +19,18 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestWorkerMemoryCeiling:
-    def test_default_fits_a_small_host(self):
-        """Лимит больше памяти машины — это отсутствие лимита."""
-        assert media.WORKER_MEMORY_MB_DEFAULT < 2048
+    def test_default_clears_the_ceiling_that_failed_in_production(self):
+        """1536 МБ хватало здесь и не хватило на хостинге — значит мало.
+
+        Лимит задаётся адресному пространству, а не памяти: резидентно
+        детектор занимает около 110 МБ и на 2 ГБ машины влезает с запасом.
+        Поэтому «лимит больше памяти машины» — не ошибка, а норма, и
+        подгонять потолок под объём ОЗУ значит выключать проверку целиком:
+        отказ по лимиту случается на КАЖДОМ медиа, а от зависшего воркера
+        всё равно спасает таймаут.
+        """
+        assert media.WORKER_MEMORY_MB_DEFAULT > 1536
+        assert media.WORKER_MEMORY_MB_MIN <= media.WORKER_MEMORY_MB_DEFAULT
 
     def test_too_small_a_limit_is_raised_to_what_works(self):
         """Замерено: на 1024 МБ детектор не поднимается, на 1536 — да.
@@ -69,6 +78,97 @@ class TestWorkerMemoryCeiling:
         assert 'памяти' in json.loads(result.stdout)['reason'], result.stdout
         # Трассировка обязана дойти до stderr: /mediaping показывает именно её.
         assert 'RuntimeError' in result.stderr
+
+
+    def test_worker_env_caps_glibc_arenas_and_opencv_threads(self, monkeypatch):
+        """Арены glibc съедали лимит, не занимая памяти.
+
+        glibc заводит под каждый поток свою арену — до 8 на ядро, по 64 МБ
+        адресного пространства. На четырёх ядрах это два гигабайта, которых
+        никто не касается, но потолок адресного пространства они выбирают
+        целиком, и детектор падает, «не хватило памяти» при свободной памяти.
+        Замерено на четырёхъядерной машине: пик 642 МБ без этих двух переменных,
+        515 МБ с ними. Числа у каждой машины свои, разница — нет.
+        """
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen.update(kwargs.get('env') or {})
+            return type('R', (), {'returncode': 0, 'stdout': '{"status": "checked"}', 'stderr': ''})()
+
+        monkeypatch.setattr(media.subprocess, 'run', fake_run)
+        media.run_worker('file', 'image', 5, .8, .85, 2048)
+        assert seen['MALLOC_ARENA_MAX'] == '2'
+        assert seen['OPENCV_NUM_THREADS'] == '1'
+
+    @pytest.mark.parametrize('body, expect', [
+        ("scan = Scan('checked')", 'checked'),
+        ("raise RuntimeError('std::bad_alloc')", 'unchecked'),
+    ])
+    def test_worker_reports_how_much_room_it_took(self, body, expect, tmp_path):
+        """Число вместо подбора наугад.
+
+        Аппетит к адресному пространству зависит от машины, и без замера
+        владелец правит MODERATION_MEDIA_MEMORY_MB перезапусками вслепую.
+        Пик обязан приходить и с успешной проверки, и с отказа по памяти —
+        именно отказ и есть тот случай, когда число нужно.
+        """
+        source = (ROOT / 'moderation_media.py').read_text(encoding='utf-8')
+        probe = tmp_path / 'worker.py'
+        probe.write_text(source.replace(
+            'scan = scan_file(sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4]))',
+            body), encoding='utf-8')
+        result = media.subprocess.run(
+            [media.sys.executable, str(probe), 'file', 'image', '0.8', '0.85'],
+            capture_output=True, text=True, timeout=60)
+        answer = json.loads(result.stdout)
+        assert answer['status'] == expect, result.stderr[-400:]
+        assert answer['address_space_mb'] > 0, result.stdout
+
+
+class TestProbeMeasuresTheRealNeed:
+    """/mediaping обязан называть число, а не повторять «не хватило памяти»."""
+
+    @staticmethod
+    def _worker(monkeypatch, answers):
+        caps = []
+
+        def fake(path, kind, timeout, explicit, suggestive, memory_mb, *rest):
+            caps.append(memory_mb)
+            return type('R', (), {'returncode': 0, 'stderr': '',
+                                  'stdout': answers[min(len(caps) - 1, len(answers) - 1)]})()
+
+        monkeypatch.setattr(media, '_invoke_worker', fake)
+        return caps
+
+    def test_memory_failure_is_measured_and_turned_into_a_setting(self, monkeypatch):
+        caps = self._worker(monkeypatch, [
+            json.dumps({'status': 'unchecked',
+                        'reason': 'Детектору не хватило памяти (лимит 1536 МБ)'}),
+            json.dumps({'status': 'checked', 'address_space_mb': 1408}),
+        ])
+        scan, _details, _spent = media.probe(timeout=5, memory_mb=1536)
+        assert scan.address_space_mb == 1408
+        # Число в тексте — это то, что владелец впишет в панель: с запасом.
+        assert 'MODERATION_MEDIA_MEMORY_MB=1664' in scan.reason
+        # Замер бессмыслен под тем же потолком, который только что не вместил.
+        assert caps[1] > caps[0], caps
+
+    def test_a_working_detector_is_not_measured_twice(self, monkeypatch):
+        """Второй запуск детектора стоит секунд — зря его не тратим."""
+        caps = self._worker(monkeypatch, [json.dumps({'status': 'checked'})])
+        scan, _details, _spent = media.probe(timeout=5)
+        assert scan.status == 'checked'
+        assert len(caps) == 1, caps
+
+    def test_other_failures_are_left_alone(self, monkeypatch):
+        """Сломанной установке замер памяти не поможет и только собьёт с толку."""
+        caps = self._worker(monkeypatch, [
+            json.dumps({'status': 'unchecked',
+                        'reason': 'Ошибка декодирования или детектора: ValueError'})])
+        scan, _details, _spent = media.probe(timeout=5)
+        assert 'MODERATION_MEDIA_MEMORY_MB' not in scan.reason
+        assert len(caps) == 1, caps
 
 
 class TestEnvConflicts:
