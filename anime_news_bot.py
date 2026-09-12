@@ -104,13 +104,25 @@ except ImportError:
 # Для локального запуска на ПК создайте файл .env рядом с этим скриптом (см. .env.example).
 # Файл .env в репозиторий не попадает (он в .gitignore).
 
-def _load_dotenv(path: str | Path = Path(__file__).with_name('.env')) -> None:
+DOTENV_PATH = Path(__file__).with_name('.env')
+# Какие переменные пришли из файла, а не из панели хостинга. Разница
+# принципиальная: файл заполняет только то, чего в панели НЕТ, поэтому
+# удаление переменной из панели не убирает её из бота — оно лишь передаёт
+# ход файлу. Со стороны это выглядит так, будто бот игнорирует правку.
+ENV_FROM_DOTENV: set = set()
+
+
+def _load_dotenv(path: str | Path = DOTENV_PATH) -> set:
     """Простой загрузчик .env без внешних зависимостей.
     Читает строки вида KEY=VALUE и кладёт в окружение (не перезаписывая уже заданные).
-    Если файла нет — молча пропускает (на хостинге переменные задаются в панели)."""
+    Если файла нет — молча пропускает (на хостинге переменные задаются в панели).
+
+    Возвращает имена переменных, которые задал сам: только по ним потом можно
+    объяснить, откуда у бота значение, которого в панели уже нет."""
+    loaded: set = set()
     p = Path(path)
     if not p.exists():
-        return
+        return loaded
     try:
         for line in p.read_text(encoding='utf-8').splitlines():
             line = line.strip()
@@ -121,12 +133,15 @@ def _load_dotenv(path: str | Path = Path(__file__).with_name('.env')) -> None:
             value = value.strip().strip('"').strip("'")
             if key and key not in os.environ:
                 os.environ[key] = value
+                loaded.add(key)
     except Exception:
         pass
+    return loaded
 
 
-# Загружаем .env (для локального запуска). На хостинге файла нет — переменные из панели.
-_load_dotenv()
+# Загружаем .env (для локального запуска). На хостинге файла быть не должно —
+# переменные задаются в панели, и файл рядом с кодом их молча дополняет.
+ENV_FROM_DOTENV = _load_dotenv()
 
 
 def _env(key: str, default: str) -> str:
@@ -22433,6 +22448,16 @@ def _doctor_env_conflicts() -> list[tuple[str, bool, str]]:
     if MODERATION_LLM_API_KEY and not MODERATION_LLM_MODEL:
         rows.append(('Модель модерации', False,
                      'MODERATION_LLM_API_KEY задан, а MODERATION_LLM_MODEL нет'))
+
+    # Переменная, пришедшая из файла, переживает удаление из панели: панель её
+    # просто перестаёт задавать, и ход переходит к файлу. Найти это иначе нельзя
+    # — в окружении процесса источник уже не виден.
+    from_file = sorted(name for name in ENV_FROM_DOTENV if name.startswith('LLM'))
+    if from_file:
+        rows.append(('LLM: переменные из файла .env', False,
+                     f'{", ".join(from_file[:6])} взяты из файла {DOTENV_PATH.name} рядом с '
+                     'кодом, а не из панели хостинга. Удаление их из панели ничего не '
+                     'изменит: значение придёт из файла. Убирать надо в файле.'))
 
     requested_memory = _env_int('MODERATION_MEDIA_MEMORY_MB', WORKER_MEMORY_MB_DEFAULT)
     if requested_memory < WORKER_MEMORY_MB_MIN:

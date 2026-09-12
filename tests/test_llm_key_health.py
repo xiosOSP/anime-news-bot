@@ -320,3 +320,53 @@ class TestCleanupPlanSaysEachThingOnce:
         plan = bot._llm_cleanup_plan([
             {'slot': 'primary', 'model': 'm', 'ok': True, 'status': 200, 'took': .4}])
         assert any('LLM_BASE_URL' in item for item in plan['remove'])
+
+
+class TestWhereTheValueCameFrom:
+    """Файл .env заполняет только то, чего в панели нет.
+
+    Отсюда самый обидный случай: переменную из панели удалили, а бот
+    продолжает её видеть — значение молча пришло из файла. В окружении
+    процесса источник уже не различить, поэтому его надо запомнить при чтении.
+    """
+
+    def test_file_fills_only_what_the_panel_left_empty(self, tmp_path, monkeypatch):
+        env_file = tmp_path / '.env'
+        env_file.write_text('LLM_BASE_URL=https://from-file.test/v1\n'
+                            'LLM_PROVIDER=from-file\n', encoding='utf-8')
+        monkeypatch.setenv('LLM_PROVIDER', 'from-panel')
+        monkeypatch.delenv('LLM_BASE_URL', raising=False)
+
+        loaded = bot._load_dotenv(env_file)
+
+        # Панель сильнее файла — это правильно и так было всегда.
+        assert bot.os.environ['LLM_PROVIDER'] == 'from-panel'
+        assert 'LLM_PROVIDER' not in loaded
+        # А вот отсутствующую в панели переменную файл подставил молча.
+        assert bot.os.environ['LLM_BASE_URL'] == 'https://from-file.test/v1'
+        assert loaded == {'LLM_BASE_URL'}
+
+    def test_missing_file_is_not_an_error(self, tmp_path):
+        assert bot._load_dotenv(tmp_path / 'нет-такого.env') == set()
+
+    def test_doctor_names_the_file_as_the_source(self, monkeypatch):
+        monkeypatch.setattr(bot, 'ENV_FROM_DOTENV', {'LLM_BASE_URL', 'LLM_MODEL', 'BOT_TOKEN'})
+        rows = {name: detail for name, ok, detail in bot._doctor_env_conflicts() if not ok}
+        detail = rows.get('LLM: переменные из файла .env', '')
+        assert 'LLM_BASE_URL' in detail and 'LLM_MODEL' in detail
+        # Токен к делу не относится: речь про настройки модели.
+        assert 'BOT_TOKEN' not in detail
+        assert 'панели' in detail and 'файле' in detail
+
+    def test_cleanup_plan_carries_it_to_the_user(self, monkeypatch):
+        """Иначе объяснение осталось бы в /doctor, куда за этим не ходят."""
+        monkeypatch.setattr(bot, 'ENV_FROM_DOTENV', {'LLM_BASE_URL'})
+        monkeypatch.setattr(bot, 'LLM_BASE_URL_FROM_ENV', False)
+        plan = bot._llm_cleanup_plan([
+            {'slot': 'primary', 'model': 'm', 'ok': False, 'status': 401, 'detail': 'no'}])
+        assert any('.env' in item for item in plan['remove']), plan['remove']
+
+    def test_silence_when_there_is_no_file(self, monkeypatch):
+        monkeypatch.setattr(bot, 'ENV_FROM_DOTENV', set())
+        names = [name for name, ok, _ in bot._doctor_env_conflicts() if not ok]
+        assert 'LLM: переменные из файла .env' not in names
