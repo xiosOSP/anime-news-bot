@@ -2,12 +2,12 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "caa945b53ca00772d118598516f202cb3b88cea1",
-  "generated_at_utc": "2026-09-12T10:38:54.330894+00:00",
+  "git_commit": "9a139a9a2dfb9eab3af6a1fafbd8e259c9e42c78",
+  "generated_at_utc": "2026-09-12T17:07:26.689304+00:00",
   "files": {
     ".env.example": {
-      "sha256": "33226bd220c363d30808f58013e60118869edd733ac8f1d0cbe585f96b8b4d24",
-      "bytes": 18619
+      "sha256": "58d7f337d0e7135c318320b6f76414ab52cc74c660e7da924a802145e3215832",
+      "bytes": 19252
     },
     ".gitattributes": {
       "sha256": "d60f352d0db1404c70afb4bb8b2ca3fd1c610572aa40720e8a0b7baa7885418c",
@@ -30,8 +30,8 @@
       "bytes": 8059
     },
     "anime_news_bot.py": {
-      "sha256": "de7268c6ffe8f954d272568f10562a8fecc0635b937e291c7c49af75b384c36c",
-      "bytes": 1420003
+      "sha256": "f1f24633dd757a4b868117942ca71ffd043bc447bd58686a954ec89ab2c51ccf",
+      "bytes": 1424352
     },
     "docs/chat-moderation.md": {
       "sha256": "b4cacd0213c9b7e4912c730872224dd39a2d5ec83703431b023e4cdfbd0ad78a",
@@ -42,8 +42,8 @@
       "bytes": 18318
     },
     "docs/llm-providers.md": {
-      "sha256": "11f5418bdd42598e3057bb92de9d8346209446578b44ef08817f2f7d2ce273a6",
-      "bytes": 11341
+      "sha256": "2c193dd926e518926506c6b085adc455c26f252fbb483a209b80513d787dc5a8",
+      "bytes": 12383
     },
     "docs/publication-recovery.md": {
       "sha256": "10beff2e7df4fd51ba610b3142d2fdf3fb0cead078af1c2058052dab0bef0094",
@@ -278,8 +278,8 @@
       "bytes": 33274
     },
     "tests/test_llm_attempt_accounting.py": {
-      "sha256": "71b4499dccbbc0bc58ab32870b6fa67faec97b388d56295d8517137bc52bb760",
-      "bytes": 6771
+      "sha256": "1d817b6722da67b498fda69b9bb0751915bea4f25d43a91b41388ca4fa2c5a8d",
+      "bytes": 11474
     },
     "tests/test_llm_batching.py": {
       "sha256": "cb71fd1f36469f8bd673ef3c4a5c25845045715346dd15c75f210a9f1004bb0d",
@@ -290,8 +290,8 @@
       "bytes": 4415
     },
     "tests/test_llm_diagnostics.py": {
-      "sha256": "2f4b97ee35880d163ad5b8fe2da654aa4391a87041e77d2995a1f823e9f6cbfc",
-      "bytes": 14405
+      "sha256": "31227773bc74778ec9d97cd3e4ffb513a398b3748334bb235b318a4bd1ff861a",
+      "bytes": 17571
     },
     "tests/test_llm_extra_params.py": {
       "sha256": "d33f8cbfc8d9aed0ee31a47f38097213723ab7d952db8a11cdbaf51f4bdbbf85",
