@@ -2,7 +2,7 @@
 import ipaddress
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
@@ -63,8 +63,13 @@ _YOUR = r'(?:тво(?:я|е|ю|и|й|его|ей|ему|им|их|ими|ем)|�
 _TARGET_FAMILY = rf'(?:{_YOUR}\s+(?:вся\s+|все\s+|всю\s+)?{_FAMILY}|{_FAMILY}\s+{_YOUR})'
 _FAMILY_BRIDGE = r'(?:[\s,—–:]+(?:это|просто|еще|та|такие|все|сам\w*|настоящ\w*|кончен\w*|ебан\w*|туп\w*|полн\w*|сборищ\w*|назову|считаю)\b){0,4}[\s,—–:]+'
 _LINK = re.compile(r'https?://\S+|t\.me/\S+|discord\.gg/\S+|@[a-z0-9_]{5,}', re.IGNORECASE)
+# «Трамп» с любым хвостом — это и «трамплин», и «трампарк»: в аниме про спорт
+# трамплин встречается чаще, чем президент. Окончания перечислены закрытым
+# списком, как у оскорблений: цена ошибки здесь — вердикт «политика» за
+# разговор о прыжках с трамплина.
+_TRUMP = r'трамп(?:а|у|ом|е|ы|ов|ам|ами|ах|ист\w*)?'
 _POLITICS = re.compile(
-    r'\b(?:путин\w*|зеленск\w*|трамп\w*|байден\w*|навальн\w*|лукашенко|'
+    rf'\b(?:путин\w*|зеленск\w*|{_TRUMP}|байден\w*|навальн\w*|лукашенко|'
     r'нато|сво|слава украине|героям слава|голосуйте за|единая россия|'
     r'выборы президента|война (?:в|на|с) (?:украин\w*|росси\w*)|'
     r'putin|zelensky\w*|trump|biden|nato)\b')
@@ -81,6 +86,38 @@ _REPORT_QUOTE = re.compile(
     r'\b(?:он|она|мне|модератор|пользователь|участник)\b[^\n.!?«“"\']{0,45}'
     r'\b(?:сказал\w*|написал\w*|ответил\w*|прислал\w*|угрожал\w*)\s*:?\s*'
     r'(?:«[^»]*»|“[^”]*”|"[^"\n]*"|\'[^\'\n]*\')')
+# Фрагмент в кавычках. Границу держим короткой: незакрытая кавычка на абзац
+# иначе съела бы полтекста.
+_QUOTED = re.compile(r'«[^»]{1,200}»|“[^”]{1,200}”|"[^"\n]{1,200}"|\'[^\'\n]{1,200}\'')
+# Автор приписывает слова себе: «а я тебе: "сдохни"». Отрицание рядом («я не
+# говорил "…"») — наоборот, отказ от слов, и фрагмент снова чужой.
+_SELF_ATTRIBUTION = re.compile(r'\b(?:я|мы)\b')
+_DENIAL = re.compile(r'\bне\b')
+
+
+def _strip_foreign_quotes(text: str) -> str:
+    """Убирает из текста кавычки с чужой речью, оставляя свою.
+
+    Правило одно и без списков слов: процитированное принадлежит автору,
+    только если он сам на него претендует. Два исключения из «чужого»:
+    сообщение целиком в кавычках (это оформление своих слов, а не пересказ)
+    и фрагмент, перед которым автор назвал себя.
+    """
+    whole = text.strip()
+    out, pos, previous = [], 0, 0
+    for match in _QUOTED.finditer(text):
+        # Контекст берём от конца прошлой кавычки: «я» внутри предыдущей
+        # цитаты — это чужое «я», и присваивать по нему нельзя.
+        before = text[max(previous, match.start() - 40):match.start()]
+        mine = (match.group().strip() == whole
+                or (_SELF_ATTRIBUTION.search(before) and not _DENIAL.search(before)))
+        if not mine:
+            out.append(text[pos:match.start()])
+            out.append(' ')
+            pos = match.end()
+        previous = match.end()
+    out.append(text[pos:])
+    return ''.join(out)
 _PRIORITY = {'family': 100, 'doxxing': 100, 'scam': 100, 'raid': 100,
              'politics': 95, 'nsfw': 95, 'toxic_admin': 90,
              'aggression': 70, 'toxic': 60, 'belittling': 10}
@@ -131,19 +168,46 @@ def _private_details(text: str) -> bool:
     return False
 
 
+def _rank(verdict: Verdict) -> tuple:
+    return (_PRIORITY[verdict.category], verdict.severity)
+
+
+def _strongest(text: str, *, reply_to_user: bool, reply_to_admin: bool) -> Verdict | None:
+    strongest = None
+    for clause in _clauses(text):
+        verdict = _check_clause(clause, reply_to_user=reply_to_user,
+                               reply_to_admin=reply_to_admin)
+        if verdict is not None and (strongest is None or _rank(verdict) > _rank(strongest)):
+            strongest = verdict
+    return strongest
+
+
 def check_text(text: str, *, reply_to_user: bool = False,
                reply_to_admin: bool = False) -> Verdict | None:
     """Only clear breaches are automatic; mild banter remains possible."""
     direct = _direct_speech(normalize(text))
-    strongest = None
-    for clause in _clauses(direct):
-        verdict = _check_clause(clause, reply_to_user=reply_to_user,
-                                reply_to_admin=reply_to_admin)
-        if verdict is not None and (strongest is None or
-                (_PRIORITY[verdict.category], verdict.severity) >
-                (_PRIORITY[strongest.category], strongest.severity)):
-            strongest = verdict
-    return strongest
+    strongest = _strongest(direct, reply_to_user=reply_to_user,
+                           reply_to_admin=reply_to_admin)
+    if strongest is None:
+        return None
+    outside_text = _strip_foreign_quotes(direct)
+    if outside_text == direct:
+        return strongest
+    # Нарушение нашлось, но пропадает вместе с чужими кавычками — значит оно
+    # жило в чужой речи. Аниме-чат пересказывает сюжеты («он кричит "сдохни!"»),
+    # а модератор цитирует правило («за "заткнись" будет предупреждение») — за
+    # это выдавался мут. Список глаголов пересказа латать бесполезно: их сотни,
+    # поэтому смотрим не на глагол, а на то, претендует ли автор на слова.
+    outside = _strongest(outside_text, reply_to_user=reply_to_user,
+                         reply_to_admin=reply_to_admin)
+    # Своя речь нарушает — судим по ней, и уверенно: цитата рядом не смягчает
+    # собственное оскорбление, даже если сама была тяжелее.
+    if outside is not None:
+        return outside
+    # Своего нарушения нет. Вердикт не исчезает — кавычки не должны стать
+    # лазейкой, — но перестаёт быть уверенным: сообщение уходит на второй
+    # уровень, а не в наказание.
+    return replace(strongest, confident=False)
 
 
 def _check_clause(value: str, *, reply_to_user: bool,

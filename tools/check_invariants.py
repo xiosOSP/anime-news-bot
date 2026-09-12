@@ -657,6 +657,51 @@ def _check_env_reference_is_complete() -> tuple[bool, str]:
     return True, f'все {len(found)} переменных описаны'
 
 
+def _check_quoted_speech_is_never_punished_automatically() -> tuple[bool, str]:
+    """За процитированную чужую речь бот не наказывает сам.
+
+    Аниме-чат живёт пересказом сюжетов, а модератор — цитированием правил.
+    Наказание за них выглядит как придирка и стоит чату людей, поэтому
+    решение тут одностороннее: сомнение — на второй уровень, а не в мут.
+    Обратное направление проверяется рядом: снять кавычками собственное
+    оскорбление тоже нельзя, иначе правило стало бы инструкцией по обходу.
+    """
+    import moderation_rules as rules
+
+    quoted = (
+        'В конце он говорит "я тебя убью" и уходит',
+        'Там сцена, где он кричит "сдохни!" — мурашки',
+        'Правило 3: за "заткнись" будет предупреждение',
+        'Цитата из тайтла: «убейся об стену»',
+    )
+    punished = [text for text in quoted
+                if (v := rules.check_text(text)) is not None and v.confident]
+    if punished:
+        return False, f'наказано за чужую речь: {punished[0]!r}'
+    own = ('«Твоя мама шлюха»', 'я тебе говорю: "сдохни"')
+    escaped = [text for text in own
+               if (v := rules.check_text(text)) is None or not v.confident]
+    if escaped:
+        return False, f'кавычки стали лазейкой: {escaped[0]!r}'
+    return True, f'{len(quoted)} цитат не наказаны, {len(own)} своих — наказаны'
+
+
+def _check_headline_is_never_a_label(bot) -> tuple[bool, str]:
+    """Заголовок поста обязан нести факт, а не рубрику канала.
+
+    Эту поломку не видно в логах: пост выходит, бот считает работу сделанной,
+    а в канале стоит «Манга.» или «🔥 СРОЧНО». Замечает её только читатель, и
+    замечает как «бот сломался».
+    """
+    labels = ('Манга.', 'Аниме', '🔥 СРОЧНО', '⚡️ВАЖНО', 'BREAKING', 'Слух')
+    fact = 'Студия MAPPA анонсировала новый проект.'
+    bad = [label for label in labels
+           if bot._tg_title_and_summary(f'{label}\n{fact}', 'ch', 'Канал')[0] != fact]
+    if bad:
+        return False, f'заголовком стала рубрика: {bad[0]!r}'
+    return True, f'{len(labels)} рубрик уступили место новости'
+
+
 def _check_noise_filter_keeps_real_news(bot) -> tuple[bool, str]:
     """Отсев не-новостей не имеет права трогать новости.
 
@@ -755,6 +800,9 @@ def checks(bot, tree) -> list[tuple[str, bool, str]]:
         _check_rejected_key_never_outlives_its_replacement(bot))
     add('отсев не-новостей не трогает новости',
         _check_noise_filter_keeps_real_news(bot))
+    add('за чужую речь бот не наказывает сам',
+        _check_quoted_speech_is_never_punished_automatically())
+    add('заголовок поста — не рубрика канала', _check_headline_is_never_a_label(bot))
     add('справочник переменных полон', _check_env_reference_is_complete())
     add('манифест описывает существующие файлы', _check_manifest_describes_reality())
     return rows
