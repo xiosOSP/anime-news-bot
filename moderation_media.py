@@ -20,15 +20,18 @@ import traceback
 from datetime import timedelta
 
 MAX_BYTES = 20 * 1024 * 1024
-# Потолок адресного пространства воркера. Просить больше, чем есть у хостинга,
-# бессмысленно: лимит не сработает никогда, и вместо аккуратного отказа одного
-# процесса ядро выберет жертву само — может выбрать и самого бота.
-# Замерено на настроенной сессии (один поток, без арены): пик адресного
-# пространства 1.05 ГБ, резидентная память 108 МБ. Отсюда пол 1024 МБ —
-# значение ниже молча превращало бы каждую проверку в отказ — и запас до 1536,
-# чтобы на машине с другим числом ядер не упереться в потолок.
+# Потолок АДРЕСНОГО ПРОСТРАНСТВА воркера, а не памяти: резидентно детектор занимает
+# около 110 МБ на любой машине, а вот адресного пространства просит по-разному —
+# замерено 515 МБ на одной четырёхъядерной машине и больше 1536 МБ на другой.
+# Зависит от числа ядер, версии onnxruntime и аллокатора, поэтому единственный
+# надёжный способ узнать своё число — измерить: это делает /mediaping.
+#
+# Значение по умолчанию с запасом. Слишком тесный лимит превращает КАЖДУЮ
+# проверку в отказ — это хуже, чем страховка, которая не сработала: от
+# зависшего воркера всё равно спасает таймаут, а от выключенной проверки
+# не спасает ничто.
 WORKER_MEMORY_MB_MIN = 1024
-WORKER_MEMORY_MB_DEFAULT = 1536
+WORKER_MEMORY_MB_DEFAULT = 2048
 WORKER_MEMORY_ENV = 'MEDIA_WORKER_MEMORY_MB'
 MAX_PIXELS = 16_000_000
 MAX_FRAMES = 16
@@ -45,6 +48,22 @@ class Scan:
     reason: str = ''
     frames: int = 0
     score: float = 0.0
+    # Сколько адресного пространства понадобилось воркеру. Нужен не ради
+    # любопытства: на разных машинах аппетит разный, и подбирать лимит вслепую
+    # значит менять число наугад после каждого отказа.
+    address_space_mb: int = 0
+
+
+def _address_space_peak_mb():
+    """Пик адресного пространства процесса. Ноль — если платформа не говорит."""
+    try:
+        with open('/proc/self/status', encoding='utf-8') as status:
+            for line in status:
+                if line.startswith('VmPeak:'):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
 
 
 def classify_detections(detections, explicit_threshold=.80, suggestive_threshold=.85):
@@ -292,7 +311,16 @@ def clamp_worker_memory(memory_mb):
 def _invoke_worker(path, kind, timeout, explicit_threshold, suggestive_threshold,
                    memory_mb=WORKER_MEMORY_MB_DEFAULT):
     env = dict(os.environ, OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1',
-               MKL_NUM_THREADS='1', OPENCV_FFMPEG_CAPTURE_OPTIONS='protocol_whitelist;file')
+               MKL_NUM_THREADS='1', OPENCV_FFMPEG_CAPTURE_OPTIONS='protocol_whitelist;file',
+               # glibc заводит под каждый поток свою арену — до 8 на ядро, по 64 МБ
+               # адресного пространства каждая. На четырёх ядрах это 2 ГБ, которые
+               # никто не использует, но лимит адресного пространства съедают
+               # целиком. Реальной памяти арены не занимают: она выделяется по
+               # мере записи. Двух хватает.
+               MALLOC_ARENA_MAX='2',
+               # OpenCV поднимает пул потоков по числу ядер — и каждый поток
+               # тянет за собой свою арену.
+               OPENCV_NUM_THREADS='1')
     env[WORKER_MEMORY_ENV] = str(clamp_worker_memory(memory_mb))
     # Classifier never needs bot tokens, provider keys or cloud credentials.
     for name in list(env):
@@ -355,12 +383,35 @@ def run_worker(path, kind, timeout, explicit_threshold, suggestive_threshold,
                                         + (f': {tail}' if tail else ''))
 
 
+def _measure_address_space(directory, timeout):
+    """Сколько адресного пространства детектор берёт без тесного потолка.
+
+    Число, а не догадка: подбирать лимит перезапусками — это часы на то, что
+    машина может сказать сама.
+    """
+    path = Path(directory) / 'probe.png'
+    if not path.exists():
+        return 0
+    try:
+        result = _invoke_worker(path, 'image', timeout, .80, .85, 8192)
+        if result.returncode:
+            return 0
+        return int(Scan(**json.loads(result.stdout)).address_space_mb or 0)
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+        return 0
+
+
 def probe(timeout=60, memory_mb=WORKER_MEMORY_MB_DEFAULT):
     """Самопроверка детектора на сгенерированной картинке.
 
     Отчёт из чата говорит только, что медиа не проверено. Чинить хостинг по
     такому сообщению нельзя: непонятно, чего не хватает. Здесь проверка
     запускается по требованию и отдаёт вывод воркера целиком.
+
+    Если не хватило памяти, проба повторяется с поднятым потолком — иначе
+    владелец подбирает лимит наугад после каждого отказа. Аппетит к адресному
+    пространству у разных машин разный (число ядер, версия onnxruntime, аллокатор),
+    и единственный способ узнать нужное число — измерить его на этой машине.
     """
     started = time.monotonic()
     try:
@@ -381,9 +432,22 @@ def probe(timeout=60, memory_mb=WORKER_MEMORY_MB_DEFAULT):
             return Scan('unchecked',
                         reason=worker_failure_reason(result.returncode, result.stderr)), details, spent
         try:
-            return Scan(**json.loads(result.stdout)), details, spent
+            scan = Scan(**json.loads(result.stdout))
         except (ValueError, TypeError):
             return Scan('unchecked', reason='Детектор ответил неразборчиво'), details or str(result.stdout)[:600], spent
+        # Мерить есть смысл ровно в одном случае — когда отказ именно по
+        # памяти. Успешная проверка говорит о памяти только цену секунд, а
+        # сломанной установке число не поможет и собьёт с толку.
+        if 'памяти' not in scan.reason:
+            return scan, details, spent
+        needed = _measure_address_space(directory, timeout)
+        if needed:
+            scan = Scan(scan.status,
+                        reason=f'{scan.reason}. На этой машине детектору нужно '
+                               f'{needed} МБ: поставьте MODERATION_MEDIA_MEMORY_MB='
+                               f'{needed + 256}',
+                        address_space_mb=needed)
+        return scan, details, spent
 
 
 class MediaScanner:
@@ -551,6 +615,7 @@ if __name__ == '__main__':
                 pass
     try:
         scan = scan_file(sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4]))
+        scan = Scan(**{**asdict(scan), 'address_space_mb': _address_space_peak_mb()})
     except Exception as exc:
         # Трассировка уходит в stderr: родитель её читает, и «медиа не проверено»
         # перестаёт быть тупиком — /mediaping показывает, чего не хватило.
@@ -561,8 +626,11 @@ if __name__ == '__main__':
             # Нехватку памяти и сломанную установку чинят по-разному, а раньше
             # обе выглядели одинаково. onnxruntime говорит про память
             # std::bad_alloc, а не MemoryError, поэтому смотрим и на текст.
-            scan = Scan('unchecked', reason=f'Детектору не хватило памяти (лимит {memory_mb} МБ)')
+            scan = Scan('unchecked',
+                        reason=f'Детектору не хватило памяти (лимит {memory_mb} МБ)',
+                        address_space_mb=_address_space_peak_mb())
         else:
             scan = Scan('unchecked',
-                        reason=f'Ошибка декодирования или детектора: {type(exc).__name__}')
+                        reason=f'Ошибка декодирования или детектора: {type(exc).__name__}',
+                        address_space_mb=_address_space_peak_mb())
     print(json.dumps(asdict(scan), ensure_ascii=True))
