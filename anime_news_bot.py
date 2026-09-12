@@ -3881,6 +3881,21 @@ class BotSettings:
         self._data['llm_calls_today'] = max(0, int(value))
         self.save()
 
+    def refund_llm_call(self, day: str) -> int:
+        """Снимает вызов с дневного счётчика, если он не дошёл до модели.
+
+        Под той же блокировкой и с той же атомарной записью, что и прибавка:
+        счётчик один, и половинчатая правка означала бы потерянный день.
+        """
+        day = str(day)
+        with self._lock:
+            if self._data.get('llm_day') != day:
+                return 0
+            total = max(0, _safe_nonnegative_int(self._data.get('llm_calls_today')) - 1)
+            self._data['llm_calls_today'] = total
+        self.save()
+        return total
+
     def increment_llm_call(self, day: str) -> int:
         """Обновляет дневной LLM-счётчик одной атомарной записью на диск.
 
@@ -18962,7 +18977,7 @@ def _llm_note_primary_recovered() -> None:
 _llm_last_failure: dict = {}       # что именно не сработало в последний раз
 
 
-def _llm_note_failure(kind: str, detail: str, *, model: str = '') -> None:
+def _llm_note_failure(kind: str, detail: str, *, model: str = '', free: bool = False) -> None:
     """Запоминает причину последнего молчания модели.
 
     Записывалась только часть отказов — те, где провайдер прислал внятный код.
@@ -18978,6 +18993,8 @@ def _llm_note_failure(kind: str, detail: str, *, model: str = '') -> None:
         'detail': _redact_secrets(' '.join(str(detail or '').split()))[:300],
         'model': str(model or '')[:120],
         'at': time.time(),
+        # Дошёл ли запрос до модели. Нет — дневной лимит за него не списывается.
+        'free': bool(free),
     }
     metrics.inc('anime_bot_llm_failure_total', labels={'kind': str(kind)[:32]})
 
@@ -19117,6 +19134,32 @@ def _llm_count_call() -> None:
         pass
 
 
+# Отказы, которые не стоили провайдеру ничего: до модели запрос не дошёл,
+# токенов не потратил. Отклонённый ключ и несуществующая модель — это ошибки
+# настройки, а не работа; сеть не дошла вовсе. Списывать за них дневной лимит
+# значит тратить сутки работы на то, чтобы шесть раз получить 401: именно так
+# «Вызовов сегодня: 30 из 30» получалось при нуле вышедших постов.
+#
+# 429 сюда НЕ входит: провайдер запрос посчитал, и делать вид, что его не было,
+# значит идти на новый 429.
+_LLM_FREE_FAILURES = frozenset({'auth', 'config', 'network'})
+
+
+def _llm_refund_call() -> None:
+    """Возвращает вызов в дневной счётчик."""
+    if settings is None:
+        return
+    today = _local_now().strftime('%Y-%m-%d')
+    if isinstance(settings, BotSettings):
+        settings.refund_llm_call(today)
+        return
+    try:
+        if settings.llm_day == today:
+            settings.llm_calls_today = max(0, int(settings.llm_calls_today or 0) - 1)
+    except (TypeError, ValueError, AttributeError):
+        pass
+
+
 def _estimate_llm_tokens(messages: list, max_tokens: int) -> int:
     """Conservative token estimate used only for local budget admission."""
     chars = 0
@@ -19166,7 +19209,7 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
     except Exception as e:
         if not routed_task:
             _llm_fail_streak += 1
-        _llm_note_failure('network', f'{type(e).__name__}: {e}', model=model)
+        _llm_note_failure('network', f'{type(e).__name__}: {e}', model=model, free=True)
         logger.warning('LLM: запрос не удался (%s: %s)', type(e).__name__, _redact_secrets(str(e)))
         if not routed_task:
             _llm_try_failover('network', 'ошибка соединения с провайдером', LLM_PRIMARY_RETRY_SEC)
@@ -19229,7 +19272,8 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
             return None
         if r.status_code in (401, 403):
             _remember_provider_error(r.status_code, r.text)
-            _llm_note_failure('http', f'HTTP {r.status_code}: ключ отклонён', model=model)
+            _llm_note_failure('http', f'HTTP {r.status_code}: ключ отклонён', model=model,
+                              free=True)
             if llm_key_health is not None:
                 # Чтобы после перезапуска бот не пошёл к этому же ключу снова.
                 llm_key_health.remember_rejected(slot, api_key, r.status_code, model)
@@ -19252,7 +19296,8 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
         fatal = _llm_fatal_reason(r.status_code, r.text)
         if fatal:
             _remember_provider_error(r.status_code, r.text)
-            _llm_note_failure('http', f'HTTP {r.status_code}: {fatal["log"]}', model=model)
+            _llm_note_failure('http', f'HTTP {r.status_code}: {fatal["log"]}', model=model,
+                              free=True)
             if _llm_try_failover(fatal['reason'], fatal['admin'],
                                  float(fatal.get('retry_after_sec') or 0.0)):
                 return None          # следующий вызов пойдёт к запасному провайдеру
@@ -19433,6 +19478,12 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: s
                         f'💰 LLM budget использован на {int(100 * snap["tokens"] / max(1, LLM_DAILY_TOKEN_BUDGET))}%. '
                         f'Осталось примерно {snap["remaining"]} tokens.')
             previous = (_llm_candidate, _llm_json_mode, dict(_llm_extra_ok))
+            # Списываем ДО запроса: иначе два пути успели бы выйти за лимит,
+            # пока первый ждёт ответа. Флаг «отказ ничего не стоил» относится
+            # ровно к этой попытке, поэтому снимаем его заранее: прошлый отказ
+            # не имеет права вернуть чужой вызов.
+            if _llm_last_failure:
+                _llm_last_failure['free'] = False
             _llm_count_call()
             _llm_last_usage_tokens = None
             metrics.inc('anime_bot_llm_route_total', labels={
@@ -19452,6 +19503,13 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: s
                 if reserved_tokens and llm_budget is not None:
                     llm_budget.reconcile(reserved_tokens, _llm_last_usage_tokens)
                     metrics.set('anime_bot_llm_budget_tokens', llm_budget.snapshot()['tokens'])
+            if result is None and _llm_last_failure.get('free'):
+                # Отклонённый ключ, несуществующая модель и не дошедший запрос
+                # не стоили провайдеру ни одного токена. Оставлять их на
+                # счётчике значит тратить сутки работы на ошибку настройки.
+                _llm_refund_call()
+                metrics.inc('anime_bot_llm_refunded_calls_total',
+                            labels={'kind': str(_llm_last_failure.get('kind') or '')[:32]})
             if result is not None:
                 _llm_pace_faster(active_slot)
                 if route_config is None:
@@ -20551,9 +20609,16 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
     preset_url = (LLM_PRESETS.get(LLM_PROVIDER) or ('', ''))[0]
     actual_url = _llm_slot_env('primary')[0]
     if preset_url and actual_url and preset_url.rstrip('/') != actual_url.rstrip('/'):
+        # Чинится это стиранием LLM_BASE_URL, а не переименованием провайдера:
+        # имя выбрано осознанно, а адрес остался от прошлой настройки. Совет
+        # «приведите имя в соответствие» закреплял бы поломку вместо починки.
+        where = (f'в файле {DOTENV_PATH.name} рядом с кодом'
+                 if 'LLM_BASE_URL' in ENV_FROM_DOTENV else 'в панели хостинга')
         lines.append(f'  ⚠️ но запросы идут на <code>{html.escape(actual_url)}</code> — '
-                     f'это не {html.escape(LLM_PROVIDER)}. Имя провайдера стоит '
-                     'привести в соответствие, иначе отчёты вводят в заблуждение.')
+                     f'это не {html.escape(LLM_PROVIDER)}.')
+        lines.append(f'     Адрес задан вручную ({where}) и перебивает пресет.')
+        lines.append('     Сотрите <code>LLM_BASE_URL</code> и перезапустите бота — '
+                     f'адрес возьмётся из пресета: <code>{html.escape(preset_url)}</code>')
     _, _, current_model = _llm_current()
     lines.append(f'Модель: <code>{html.escape(current_model)}</code>')
     # Роль провайдера теперь выбирается в настройках, а не только переменными.
