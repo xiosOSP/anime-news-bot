@@ -702,6 +702,27 @@ def _check_headline_is_never_a_label(bot) -> tuple[bool, str]:
     return True, f'{len(labels)} рубрик уступили место новости'
 
 
+def _check_env_report_never_prints_a_secret(bot) -> tuple[bool, str]:
+    """Отчёт о файле .env не имеет права показать значение ключа.
+
+    Команда сделана ради поломки, где ключи и лежат, а отчёт уходит в
+    переписку. Секрет, показанный один раз, уже утёк: его нельзя «убрать
+    обратно», а ротация ключа — это ручная работа владельца.
+    """
+    secret = 'gsk_supersecretvalue1234567890'
+    leaked = [name for name in ('LLM_API_KEY', 'BOT_TOKEN', 'MODERATION_LLM_API_KEY',
+                                'DEEPL_API_KEY', 'DASHBOARD_TOKEN', 'SOME_PASSWORD',
+                                'AWS_SECRET', 'DB_CREDENTIAL')
+              if secret in bot._dotenv_shown_value(name, secret)]
+    if leaked:
+        return False, f'значение показано для {leaked[0]}'
+    # Обратная сторона: адрес — не секрет, и скрывать его значит прятать
+    # ровно ту строку, ради которой команду и зовут.
+    if 'orcarouter' not in bot._dotenv_shown_value('LLM_BASE_URL', 'https://api.orcarouter.ai/v1'):
+        return False, 'скрыт несекретный адрес — чинить будет не по чему'
+    return True, 'значения ключей скрыты, адреса видны'
+
+
 def _check_noise_filter_keeps_real_news(bot) -> tuple[bool, str]:
     """Отсев не-новостей не имеет права трогать новости.
 
@@ -803,6 +824,8 @@ def checks(bot, tree) -> list[tuple[str, bool, str]]:
     add('за чужую речь бот не наказывает сам',
         _check_quoted_speech_is_never_punished_automatically())
     add('заголовок поста — не рубрика канала', _check_headline_is_never_a_label(bot))
+    add('отчёт о .env не показывает ключи',
+        _check_env_report_never_prints_a_secret(bot))
     add('справочник переменных полон', _check_env_reference_is_complete())
     add('манифест описывает существующие файлы', _check_manifest_describes_reality())
     return rows

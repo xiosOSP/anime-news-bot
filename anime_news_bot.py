@@ -105,6 +105,9 @@ except ImportError:
 # Файл .env в репозиторий не попадает (он в .gitignore).
 
 DOTENV_PATH = Path(__file__).with_name('.env')
+# Копия файла перед правкой из чата. Имя собирается через with_name, а не
+# with_suffix: у «.env» суффикса нет вовсе, и with_suffix дал бы «.env.env.bak».
+DOTENV_BACKUP_PATH = DOTENV_PATH.with_name(DOTENV_PATH.name + '.bak')
 # Какие переменные пришли из файла, а не из панели хостинга. Разница
 # принципиальная: файл заполняет только то, чего в панели НЕТ, поэтому
 # удаление переменной из панели не убирает её из бота — оно лишь передаёт
@@ -20892,6 +20895,129 @@ def _llm_cleanup_plan(results: list[dict]) -> dict:
             'remove': remove, 'replace': replace, 'wait': wait}
 
 
+# Имена, за которыми стоит секрет. Значение такой переменной не показываем
+# никогда: отчёт уходит в переписку, а переписка — это не то место, где
+# ключ должен появиться даже один раз.
+_ENV_SECRET_NAME_RE = re.compile(r'KEY|TOKEN|SECRET|PASSWORD|PASS\b|CREDENTIAL', re.IGNORECASE)
+
+
+def _dotenv_lines() -> list[tuple[int, str, str]]:
+    """Строки файла .env как (номер, имя, значение). Комментарии пропущены."""
+    rows: list[tuple[int, str, str]] = []
+    try:
+        text = DOTENV_PATH.read_text(encoding='utf-8')
+    except OSError:
+        return rows
+    for number, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#') or '=' not in stripped:
+            continue
+        key, _, value = stripped.partition('=')
+        rows.append((number, key.strip(), value.strip().strip('"').strip("'")))
+    return rows
+
+
+def _dotenv_shown_value(name: str, value: str) -> str:
+    if _ENV_SECRET_NAME_RE.search(name):
+        return '&lt;значение скрыто&gt;' if value else '&lt;пусто&gt;'
+    return f'<code>{_escape_to_limit(value, 120)}</code>' if value else '&lt;пусто&gt;'
+
+
+def _dotenv_comment_out(name: str) -> tuple[bool, str]:
+    """Закомментировать строку в .env. Возвращает (получилось, что сказать).
+
+    Именно закомментировать, а не стереть: правка конфигурации вслепую из чата
+    должна быть обратимой. Рядом кладётся копия файла — если строка была нужна,
+    вернуть её можно без нас.
+    """
+    try:
+        original = DOTENV_PATH.read_text(encoding='utf-8')
+    except OSError as exc:
+        return False, f'файл не прочитать: {type(exc).__name__}'
+    out, touched = [], 0
+    for line in original.splitlines():
+        stripped = line.strip()
+        # Комментарий отдельно проверять не нужно: решётка приклеена к имени,
+        # и «# LLM_BASE_URL=…» с именем «LLM_BASE_URL» не совпадёт никогда.
+        # Отсюда же идемпотентность: повтор команды ничего не найдёт и ничего
+        # не перепишет — ни файл, ни его копию.
+        if stripped and '=' in stripped and stripped.partition('=')[0].strip() == name:
+            out.append(f'# убрано ботом {_local_now():%d.%m.%Y %H:%M}: {line}')
+            touched += 1
+        else:
+            out.append(line)
+    if not touched:
+        return False, 'такой строки в файле нет'
+    try:
+        DOTENV_BACKUP_PATH.write_text(original, encoding='utf-8')
+        DOTENV_PATH.write_text('\n'.join(out) + '\n', encoding='utf-8')
+    except OSError as exc:
+        return False, f'файл не записать: {type(exc).__name__}'
+    return True, f'строк закомментировано: {touched}'
+
+
+@owner_only
+async def envfile_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать и почистить файл .env рядом с кодом: /envfile [убрать ИМЯ].
+
+    Панель хостинга правит окружение следующего процесса, а файл рядом с кодом
+    заполняет только то, чего в панели НЕТ. Поэтому удаление переменной из
+    панели не убирает её из бота, а передаёт ход файлу — со стороны это
+    выглядит так, будто правку проигнорировали, и починить это через панель
+    нельзя в принципе. Доступа к диску у владельца бота может не быть вовсе,
+    а у самого бота он есть: файл лежит рядом с кодом.
+
+    Значения ключей не показываются никогда — только имена.
+    """
+    args = [str(a) for a in (context.args or [])]
+    if len(args) >= 2 and args[0].lower() in ('убрать', 'remove', 'delete'):
+        name = args[1].strip().upper()
+        ok, detail = _dotenv_comment_out(name)
+        if not ok:
+            await update.message.reply_text(
+                f'❌ <code>{html.escape(name)}</code> — {html.escape(detail)}',
+                parse_mode=ParseMode.HTML)
+            return
+        await update.message.reply_text(
+            f'🧹 <code>{html.escape(name)}</code> закомментирована в '
+            f'<code>{html.escape(DOTENV_PATH.name)}</code> ({html.escape(detail)}).\n'
+            f'Копия файла — <code>{html.escape(DOTENV_BACKUP_PATH.name)}</code>.\n\n'
+            '⚠️ Перезапустите бота: переменные читаются один раз при запуске, '
+            'у работающего процесса окружение снаружи не меняется.',
+            parse_mode=ParseMode.HTML)
+        return
+
+    rows = _dotenv_lines()
+    if not DOTENV_PATH.exists():
+        await update.message.reply_text(
+            f'📄 Файла <code>{html.escape(DOTENV_PATH.name)}</code> рядом с кодом нет.\n'
+            'Значит все переменные приходят из панели хостинга — правьте их там.',
+            parse_mode=ParseMode.HTML)
+        return
+    lines = [f'📄 <b>{html.escape(DOTENV_PATH.name)}</b> рядом с кодом', '']
+    if not rows:
+        lines.append('Файл есть, но переменных в нём нет.')
+    else:
+        # Главное различие: панель сильнее файла. Строка, перебитая панелью,
+        # ничего не делает, и стирать её незачем — а вот действующая строка и
+        # есть та причина, по которой правка в панели «не сработала».
+        lines.append('Действуют (панель их не задаёт):')
+        active = [(n, v) for _, n, v in rows if n in ENV_FROM_DOTENV]
+        for name, value in active or []:
+            lines.append(f'  • <code>{html.escape(name)}</code> = {_dotenv_shown_value(name, value)}')
+        if not active:
+            lines.append('  — ни одной: всё перебито панелью хостинга')
+        shadowed = [n for _, n, _ in rows if n not in ENV_FROM_DOTENV]
+        if shadowed:
+            lines.append('')
+            lines.append('Перебиты панелью (в файле лежат, но ни на что не влияют):')
+            lines.append('  ' + ', '.join(f'<code>{html.escape(n)}</code>' for n in shadowed[:20]))
+        lines.append('')
+        lines.append('Убрать строку: <code>/envfile убрать LLM_BASE_URL</code>')
+        lines.append('Строка не стирается, а комментируется; рядом остаётся копия файла.')
+    await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
+
+
 @admin_only
 async def llmclean_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Уборка настроек модели: /llmclean.
@@ -26568,6 +26694,7 @@ def main():
     app.add_handler(CommandHandler("llmmodel", llmmodel_command))
     app.add_handler(CommandHandler("llmping", llmping_command))
     app.add_handler(CommandHandler("llmclean", llmclean_command))
+    app.add_handler(CommandHandler("envfile", envfile_command))
     app.add_handler(CommandHandler("mediaping", mediaping_command))
     app.add_handler(CommandHandler("reliability", reliability_command))
     app.add_handler(CommandHandler("experiments", experiments_command))
