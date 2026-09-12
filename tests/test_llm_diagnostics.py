@@ -7,6 +7,8 @@
 """
 import re
 import time
+from types import SimpleNamespace as NS
+from unittest.mock import AsyncMock
 
 import pytest
 import telegram.error as bot_error
@@ -288,3 +290,52 @@ def test_no_recovery_notice_while_fallback_answers(failover_state):
     bot._llm_using_fallback = True
     bot._llm_note_primary_recovered()
     assert len(failover_state) == before
+
+
+class TestMismatchedAddressAdvisesTheFix:
+    """Совет обязан чинить поломку, а не закреплять её.
+
+    В отчёте стояло «имя провайдера стоит привести в соответствие»: то есть
+    переименовать groq в orcarouter и навсегда остаться на чужом адресе.
+    Осознанно выбрано было имя, а остался от прошлой настройки адрес.
+    """
+
+    @staticmethod
+    def _configured(monkeypatch, from_dotenv):
+        monkeypatch.setattr(bot, 'is_admin', lambda update: True)
+        # Заглушка перечисляет поля целиком: getattr-заплатка в коде спрятала бы
+        # настоящую ошибку «поля нет» за молчаливым значением по умолчанию.
+        monkeypatch.setattr(bot, 'settings', NS(
+            llm_calls_today=0, llm_day='', llm_enabled=True, llm_model_override='',
+            llm_primary_slot='primary', llm_tags=False, llm_rewrite=True,
+            llm_filter=True, llm_read_article=True, llm_dedup_subject=True,
+            llm_skip_filler=True, local_topic_filter=True, local_noise_filter=True))
+        monkeypatch.setattr(bot, 'LLM_PROVIDER', 'groq')
+        monkeypatch.setattr(bot, 'LLM_BASE_URL', 'https://api.orcarouter.ai/v1')
+        monkeypatch.setattr(bot, 'LLM_BASE_URL_FROM_ENV', True)
+        monkeypatch.setattr(bot, 'LLM_API_KEY', 'k')
+        monkeypatch.setattr(bot, 'LLM_MODEL', 'qwen/qwen3.8-27b')
+        monkeypatch.setattr(bot, 'ENV_FROM_DOTENV', from_dotenv)
+
+    @pytest.mark.asyncio
+    async def test_it_says_to_erase_the_address_not_rename_the_provider(self, monkeypatch):
+        self._configured(monkeypatch, set())
+        reply = AsyncMock()
+        await bot.llm_command(NS(message=NS(reply_text=reply)), NS(args=[]))
+        # Первый ответ — отчёт о состоянии; вторым уходит результат живой
+        # проверки связи, и он тут ни при чём.
+        report = reply.await_args_list[0].args[0]
+        assert 'LLM_BASE_URL' in report, report
+        assert bot.LLM_PRESETS['groq'][0] in report
+        assert 'привести в соответствие' not in report
+
+    @pytest.mark.asyncio
+    async def test_it_names_the_file_when_the_address_comes_from_dotenv(self, monkeypatch):
+        """Удалять из панели бесполезно, если значение лежит в файле рядом."""
+        self._configured(monkeypatch, {'LLM_BASE_URL'})
+        reply = AsyncMock()
+        await bot.llm_command(NS(message=NS(reply_text=reply)), NS(args=[]))
+        # Первый ответ — отчёт о состоянии; вторым уходит результат живой
+        # проверки связи, и он тут ни при чём.
+        report = reply.await_args_list[0].args[0]
+        assert bot.DOTENV_PATH.name in report, report
