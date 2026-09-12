@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 262 переменных. Почти все — точная настройка со значением
+Бот читает 263 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -242,6 +242,7 @@
 | `MODERATION_REPEAT_LIMIT` | `3` | anime_news_bot.py |
 | `MODERATION_REPEAT_WINDOW_SEC` | `120` | anime_news_bot.py |
 | `MODERATION_STORE_MAX_USERS` | `5000` | anime_news_bot.py |
+| `MODERATION_UNJUDGED_NOTICE_SEC` | `300` | anime_news_bot.py |
 | `MODERATION_WARN_TTL_HOURS` | — | anime_news_bot.py |
 
 ### Опрос Telegram

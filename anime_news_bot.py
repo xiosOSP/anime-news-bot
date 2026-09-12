@@ -1527,6 +1527,7 @@ _moderation_action_lock = asyncio.Lock()
 _moderation_update_lock = asyncio.Lock()
 _moderation_seen_updates = {}
 _moderation_media_reports = {}
+_moderation_unjudged_reports = {}
 _moderation_report_recent = {}
 _moderation_user_notices = {}
 
@@ -1563,6 +1564,9 @@ MODERATION_RULES = {
     'flood': {'action': 'warn', 'human': 'флуд'},
 }
 # Категории, по которым бот не действует сам ни при каких настройках.
+# Как часто звать человека на сообщение, которое судить некому. Ноль выключает
+# уведомление совсем — на случай, если чат шумит, а админ один.
+MODERATION_UNJUDGED_NOTICE_SEC = _env_int('MODERATION_UNJUDGED_NOTICE_SEC', 300)
 MODERATION_HUMAN_ONLY = frozenset(
     name for name, rule in MODERATION_RULES.items() if rule['action'] == 'escalate')
 
@@ -8963,14 +8967,22 @@ _TG_EDITORIAL_LEADIN_RE = re.compile(
 
 
 def _tg_is_category_line(line: str) -> bool:
-    """Строка-рубрика: одно-два слова без содержания новости."""
+    """Строка-рубрика или баннер: одно-два слова без содержания новости."""
     clean = _tg_strip_decoration(line)
     if not clean:
         return False
     words = clean.split()
     # Двусловные рубрики вроде «аниме новости» тоже встречаются, но всё, что
     # длиннее, уже несёт факт — такую строку трогать нельзя.
-    return 1 <= len(words) <= 2 and all(word in _TG_CATEGORY_WORDS for word in words)
+    if len(words) > 2:
+        return False
+    if all(word in _TG_CATEGORY_WORDS for word in words):
+        return True
+    # Список слов закрыт, а баннеры каналы придумывают свои: «🔥 СРОЧНО»,
+    # «⚡️ ВАЖНО», «BREAKING». Общий признак у них один — капслок: заголовок
+    # из одного-двух слов капсом содержания не несёт, он кричит о нём.
+    letters = [c for c in line if c.isalpha()]
+    return bool(letters) and all(c.isupper() for c in letters)
 
 
 def _tg_drop_editorial_voice(text: str) -> str:
@@ -8979,6 +8991,25 @@ def _tg_drop_editorial_voice(text: str) -> str:
     if not cleaned:
         return str(text or '').strip()
     return cleaned[0].upper() + cleaned[1:]
+
+
+def _tg_split_leading_sentence(line: str) -> tuple[str, str]:
+    """Делит строку на первое предложение и остаток. Остаток пуст — делить нечего.
+
+    Границу берём ту же, что и при разборе описаний: точка после сокращения
+    («12 окт.», «2022 г.») предложением не заканчивается, и заголовок по ней
+    рвать нельзя.
+    """
+    line = str(line or '').strip()
+    match = _SENTENCE_END_RE.search(line)
+    if not match:
+        return line, ''
+    head, tail = line[:match.end()].strip(), line[match.end():].strip()
+    # Заголовок в два слова — это рубрика, а не заголовок: «Слух.» с текстом
+    # под ним выглядит ровно той поломкой, от которой уходим.
+    if not tail or len(head.split()) < 3:
+        return line, ''
+    return head, tail
 
 
 def _tg_title_and_summary(full_text: str, channel: str, label: str) -> tuple[str, str]:
@@ -9000,9 +9031,16 @@ def _tg_title_and_summary(full_text: str, channel: str, label: str) -> tuple[str
     # состоящий ни из чего, лучше отдать как есть, чем потерять.
     while len(kept) > 1 and _tg_is_category_line(kept[0]):
         kept = kept[1:]
-    title = _tg_drop_editorial_voice(kept[0])[:200]
-    summary = ' '.join(_tg_drop_editorial_voice(line) for line in kept[1:])[:1000] if len(kept) > 1 else ''
-    return title, summary
+    head = _tg_drop_editorial_voice(kept[0])
+    rest = [_tg_drop_editorial_voice(line) for line in kept[1:]]
+    # Первая строка бывает целым абзацем. Заголовком тогда служил весь абзац,
+    # а тело поста оставалось пустым: читатель получал стену текста вместо
+    # заголовка и ничего под ним. Заголовок — первое предложение, остальное
+    # спускаем в тело, где ему и место.
+    head, tail = _tg_split_leading_sentence(head)
+    if tail:
+        rest.insert(0, tail)
+    return head[:200], ' '.join(rest)[:1000]
 
 
 def get_telegram_channel(channel: str, label: str) -> list[dict]:
@@ -9632,8 +9670,12 @@ _LINK_LEADIN_WORDS = (
 _LEADIN_BEFORE_RE = re.compile(
     rf'(?:\b(?:{_LINK_LEADIN_WORDS})\b[^.!?]{{0,30}}?)?'
     rf'[\s,:;—–-]*\b(?:на|в|по|у|at|on|in|to|by|from)?\s*$', re.IGNORECASE)
+# Союзы И предлоги: «Аниме про» — такой же обрывок, как «Аниме и», но предлоги
+# в списке отсутствовали, и хвост доезжал до поста.
 _TRAILING_CONNECTOR_RE = re.compile(
-    r'[\s,;:—–-]*\b(?:и|а|но|или|же|что|чтобы|как|где|когда|the|and|or|but|'
+    r'[\s,;:—–-]*\b(?:и|а|но|или|же|что|чтобы|как|где|когда|'
+    r'про|при|об|обо|о|для|из|изо|от|ото|до|без|через|под|над|перед|между|'
+    r'к|ко|с|со|у|во|во время|в|на|по|за|the|and|or|but|'
     r'with|for|of|to|in|on|at|by|from)\s*$', re.IGNORECASE)
 
 
@@ -9772,6 +9814,20 @@ def _extract_sentences(text: str, max_sentences: int = 3, max_len: int = 700) ->
     return _drop_unfinished_tail(result.strip())
 
 
+# Конец предложения и хвост-многоточие — рядом, потому что работают в паре:
+# первое ищет настоящую границу, второе отличает обрыв от точки.
+#
+# Следующее предложение обязано начинаться с заглавной: точка в «12 окт.» и
+# «2022 г.» — это сокращение, и резать по ней значит рвать фразу пополам. Тот
+# же признак уже используется при разборе описаний.
+_SENTENCE_END_RE = re.compile(
+    r'(?<!\s\d)[.!?](?=\s+[«"„“A-ZА-ЯЁ]|\s*$)|[。！？]')
+_ELLIPSIS_TAIL_RE = re.compile(r'\s*(?:…|\.{2,})\s*$')
+# Граница части предложения, после которой остаётся осмысленный кусок.
+# 80 символов — примерно строка: короче него обрывок уже ничего не сообщает.
+_CLAUSE_END_RE = re.compile(r'^(.{80,})\s*[,;:—–]\s+\S', re.DOTALL)
+
+
 def _drop_unfinished_tail(text: str) -> str:
     """Отрезает незаконченный хвост, оставляя только целые предложения.
 
@@ -9786,10 +9842,26 @@ def _drop_unfinished_tail(text: str) -> str:
     text = (text or '').strip()
     if not text:
         return ''
-    if text.endswith(('.', '!', '?', '…', '。', '！', '？')):
+    # Многоточие в конце — не конец мысли, а отметка обрыва: так обрезает
+    # описание сам источник («Сериал выйдет...») и так же обрезаем мы сами
+    # в smart_truncate. Раньше эта строка считалась законченной и уходила в
+    # пост как есть — это и есть тот «обрывистый пост», на который жалуются.
+    if _ELLIPSIS_TAIL_RE.search(text):
+        text = _ELLIPSIS_TAIL_RE.sub('', text).rstrip()
+        bounds = list(_SENTENCE_END_RE.finditer(text))
+        if bounds:
+            return text[:bounds[-1].end()].strip()
+        # Целого предложения нет вовсе — описание состоит из одной длинной
+        # фразы. Выбросить её целиком значит потерять все факты, поэтому
+        # отступаем до ближайшей границы части предложения: мысль обрывается,
+        # но на паузе, а не на полуслове. Огрызок короче строки не спасти —
+        # «Сериал выйдет» не сообщает ничего, и пост живёт заголовком.
+        clause = _CLAUSE_END_RE.search(text)
+        return clause.group(1).strip() if clause else ''
+    if text.endswith(('.', '!', '?', '。', '！', '？')):
         return text
     # Ищем последнюю настоящую границу предложения и обрезаем по ней.
-    bounds = list(re.finditer(r'(?<!\s\d)[.!?](?=\s|$)|[。！？]', text))
+    bounds = list(_SENTENCE_END_RE.finditer(text))
     if bounds:
         return text[:bounds[-1].end()].strip()
     # Целого предложения нет. Обрывок на союзе или предлоге — это мусор:
@@ -24085,6 +24157,49 @@ async def _mod_media_unchecked(bot: Bot, message, reason: str) -> None:
             logger.info('Модерация: отчёт о непроверенном медиа не доставлен')
 
 
+async def _mod_unjudged_text(bot: Bot, message, category: str, reason: str) -> None:
+    """Зовёт человека, когда сомнительное сообщение судить некому.
+
+    Второй уровень существует ровно для таких случаев: локальные правила
+    что-то заметили, но наказывать по ним нельзя — пусть посмотрит модель.
+    Когда модели нет (ключи кончились, провайдер отвечает 401), решение
+    записывалось как «не проверено» и на этом всё: никто ничего не узнавал.
+    Сейчас у бота ни одной рабочей модели, то есть молчал весь второй уровень.
+
+    Наказание тут по-прежнему не выдаётся — сомнение решается в пользу
+    человека. Но и тишины быть не должно: увидеть и решить может админ.
+    """
+    chat_id = message.chat_id
+    metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'no_judge'})
+    # Та же защита от лавины, что и у непроверенного медиа: чат может за минуту
+    # набросать десяток спорных сообщений, и десять одинаковых писем админу
+    # приведут к тому, что он выключит уведомления совсем.
+    if MODERATION_UNJUDGED_NOTICE_SEC <= 0:
+        return
+    now = time.monotonic()
+    if now - _moderation_unjudged_reports.get(chat_id, -3600) < MODERATION_UNJUDGED_NOTICE_SEC:
+        return
+    _moderation_unjudged_reports[chat_id] = now
+    while len(_moderation_unjudged_reports) > 200:
+        _moderation_unjudged_reports.pop(next(iter(_moderation_unjudged_reports)))
+    link = getattr(message, 'link', None)
+    text = (f'🛡 Сообщение не проверено: подозрение «{html.escape(category)}», '
+            'а модель недоступна.\n'
+            f'Чат <code>{chat_id}</code>, сообщение <code>{message.message_id}</code>.\n'
+            'Наказание не выдано — нужна ручная оценка.\n'
+            'Состояние моделей — /llm, проверить ключ — /llmping')
+    if reason:
+        text += f'\nПричина подозрения: {html.escape(reason)}'
+    if link:
+        text += f'\n<a href="{html.escape(link, quote=True)}">Открыть сообщение</a>'
+    for admin_id in _all_admin_ids():
+        try:
+            await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML,
+                                   disable_notification=True)
+        except TelegramError:
+            logger.info('Модерация: отчёт о непроверенном тексте не доставлен')
+
+
 async def _mod_apply(bot: Bot, message, decision: dict, category: str,
                      reason: str) -> str:
     """Apply a durable incident, recording only confirmed Telegram outcomes."""
@@ -24415,9 +24530,16 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
     if not local.get('confident'):
         verdict = await _moderation_classify(chat.id, text) if MODERATION_LLM_ENABLED else None
         if verdict is None:
+            suspicion = str(local.get('category') or '')
             chat_moderation.log_decision(chat.id, user_id, actor_name,
-                str(local.get('category') or 'подозрительно'), 'не проверено',
+                suspicion or 'подозрительно', 'не проверено',
                 'локальные правила', 'Неоднозначный текст; LLM отключена или недоступна', text)
+            # Зовём человека только на названное подозрение. Безымянное
+            # («в тексте есть похожий корень») — это половина живого чата, и
+            # письмо на каждое такое сообщение админ отключит в первый же день.
+            if suspicion:
+                await _mod_unjudged_text(context.bot, message, suspicion,
+                                         str(local.get('reason') or ''))
             return
         if verdict.get('violation') is not True:
             return
