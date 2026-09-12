@@ -292,3 +292,31 @@ class TestEnvIsReadOnlyAtStartup:
         """Возраст важнее точного времени: по нему видно, до правки или после."""
         monkeypatch.setattr(bot, '_process_started_at', bot.time.time() - spent)
         assert expected in bot._env_read_ago()
+
+
+class TestCleanupPlanSaysEachThingOnce:
+    """Две строки об одной переменной читаются как два разных дела."""
+
+    def test_base_url_is_not_listed_twice(self, monkeypatch):
+        monkeypatch.setattr(bot, 'LLM_PROVIDER', 'groq')
+        monkeypatch.setattr(bot, 'LLM_BASE_URL', 'https://api.orcarouter.ai/v1')
+        monkeypatch.setattr(bot, 'LLM_BASE_URL_FROM_ENV', True)
+        monkeypatch.setattr(bot, 'LLM_MODEL', bot.LLM_PRESETS['groq'][1])
+        monkeypatch.setattr(bot, 'LLM_MODEL_FROM_ENV', False)
+        plan = bot._llm_cleanup_plan([
+            {'slot': 'primary', 'model': 'm', 'ok': False, 'status': 401, 'detail': 'no'}])
+        mentions = [item for item in plan['remove'] if 'LLM_BASE_URL' in item]
+        assert len(mentions) == 1, plan['remove']
+        # Строка обязана остаться конкретной: с адресом, а не общим правилом.
+        assert 'orcarouter' in mentions[0]
+
+    def test_general_advice_appears_when_there_is_no_specific_one(self, monkeypatch):
+        """Адрес совпадает с пресетом — конфликта нет, но переменная лишняя."""
+        monkeypatch.setattr(bot, 'LLM_PROVIDER', 'groq')
+        monkeypatch.setattr(bot, 'LLM_BASE_URL', bot.LLM_PRESETS['groq'][0])
+        monkeypatch.setattr(bot, 'LLM_BASE_URL_FROM_ENV', True)
+        monkeypatch.setattr(bot, 'LLM_MODEL', bot.LLM_PRESETS['groq'][1])
+        monkeypatch.setattr(bot, 'LLM_MODEL_FROM_ENV', False)
+        plan = bot._llm_cleanup_plan([
+            {'slot': 'primary', 'model': 'm', 'ok': True, 'status': 200, 'took': .4}])
+        assert any('LLM_BASE_URL' in item for item in plan['remove'])

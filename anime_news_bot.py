@@ -20729,7 +20729,10 @@ def _llm_cleanup_plan(results: list[dict]) -> dict:
     for name, ok, detail in _doctor_env_conflicts():
         if not ok and name.startswith('LLM'):
             remove.append(detail)
-    if LLM_BASE_URL_FROM_ENV and LLM_PRESETS.get(LLM_PROVIDER, ('', ''))[0]:
+    # Общая строка про адрес — только если конкретной не нашлось: две строки об
+    # одной переменной в списке дел выглядят как два разных дела.
+    if (LLM_BASE_URL_FROM_ENV and LLM_PRESETS.get(LLM_PROVIDER, ('', ''))[0]
+            and not any('LLM_BASE_URL' in item for item in remove)):
         remove.append('LLM_BASE_URL — при известном провайдере адрес берётся из пресета')
 
     return {'alive': alive, 'dead': dead, 'keep': keep,
