@@ -702,6 +702,24 @@ def _check_headline_is_never_a_label(bot) -> tuple[bool, str]:
     return True, f'{len(labels)} рубрик уступили место новости'
 
 
+def _check_model_names_from_presets_are_accepted(bot) -> tuple[bool, str]:
+    """Проверка имени модели обязана пропускать все имена из пресетов.
+
+    Она стоит на пути настройки: слишком строгая — и владелец не сможет
+    выбрать модель, которую бот же ему и предлагает. Слишком слабая — и
+    случайное слово снова станет моделью, а каждый запрос уйдёт в 404.
+    """
+    names = [model for _, model in bot.LLM_PRESETS.values()]
+    refused = [name for name in names if not bot._looks_like_model_id(name)]
+    if refused:
+        return False, f'имя из пресета отвергнуто: {refused[0]!r}'
+    words = ('сброс', 'сброс.', 'привет', 'какая-то модель', '')
+    accepted = [w for w in words if bot._looks_like_model_id(w)]
+    if accepted:
+        return False, f'слово принято за модель: {accepted[0]!r}'
+    return True, f'{len(names)} имён проходят, {len(words)} слов отсеиваются'
+
+
 def _check_deleting_categories_keep_off_ordinary_speech() -> tuple[bool, str]:
     """Категории, которые УДАЛЯЮТ сообщение, не срабатывают на обычной речи.
 
@@ -862,6 +880,8 @@ def checks(bot, tree) -> list[tuple[str, bool, str]]:
         _check_env_report_never_prints_a_secret(bot))
     add('удаляющие категории не трогают обычную речь',
         _check_deleting_categories_keep_off_ordinary_speech())
+    add('имена моделей из пресетов проходят проверку',
+        _check_model_names_from_presets_are_accepted(bot))
     add('справочник переменных полон', _check_env_reference_is_complete())
     add('манифест описывает существующие файлы', _check_manifest_describes_reality())
     return rows
