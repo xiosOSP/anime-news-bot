@@ -73,6 +73,10 @@ _POLITICS = re.compile(
     r'нато|сво|слава украине|героям слава|голосуйте за|единая россия|'
     r'выборы президента|война (?:в|на|с) (?:украин\w*|росси\w*)|'
     r'putin|zelensky\w*|trump|biden|nato)\b')
+# Формы, которые одинаково читаются и как фамилия, и как обычное слово.
+# Фамилия: путина (род./вин.), путину (дат.), путине (предл.). Рыболовный
+# сезон: путина (им.), путины, путине, путину, путиной.
+_POLITICS_AMBIGUOUS = frozenset({'путина', 'путину', 'путине', 'путины', 'путиной'})
 _PHONE = re.compile(r'(?<!\d)\+?\d[\d ()\-]{8,20}\d(?!\d)')
 _IP = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
 _ADDRESS = re.compile(r'\b(?:улиц[аеуы]|ул\.|проспект|пр-т|переулок|пер\.)\s+[а-яa-z][\w -]{1,40}[, ]+(?:(?:д\.|дом)\s*)?\d{1,4}\b')
@@ -225,8 +229,14 @@ def _check_clause(value: str, *, reply_to_user: bool,
         return Verdict('family', 'Оскорбление семьи собеседника', 3)
     if re.search(r'https?://(?:www\.)?(?:pornhub\.com|xvideos\.com|xnxx\.com|xhamster\.com)(?:/|\b)', value, re.IGNORECASE):
         return Verdict('nsfw', 'Ссылка на порнографический сайт', 3)
-    if _POLITICS.search(value):
-        return Verdict('politics', 'Обсуждение реальной политики')
+    politics = list(_POLITICS.finditer(value))
+    if politics:
+        # «путина» — это и фамилия в косвенном падеже, и рыболовный сезон;
+        # различить их нельзя, регистр к этому месту уже снят. Категория
+        # удаляет сообщение, поэтому на одной лишь двусмысленной форме бот
+        # сообщение не трогает, а зовёт человека — как и всюду, где сомнение.
+        certain = any(m.group().lower() not in _POLITICS_AMBIGUOUS for m in politics)
+        return Verdict('politics', 'Обсуждение реальной политики', confident=certain)
     # Personal contact details are not doxxing without a target/disclosure cue.
     disclosure = _DOX_INTENT.search(direct)
     if (disclosure and not _negated(direct, disclosure) and _private_details(value)
@@ -234,7 +244,12 @@ def _check_clause(value: str, *, reply_to_user: bool,
         return Verdict('doxxing', 'Раскрытие чужих контактных данных', 3)
     solicitation = list(re.finditer(r'\b(?:пришли|пришлите|отправь|отправьте|введи|введите|скинь|скиньте|сообщи|сообщите|перешли|перешлите)\b', direct))
     secrets = re.search(r'\b(?:код (?:из|от|для входа в) (?:смс|sms|телеграм\w*|telegram)|пароль|seed(?:[ -]phrase)?|сид[ -]?фраз\w*|секретн\w* ключ|приватн\w* ключ)\b', direct)
-    profit = list(re.finditer(r'\b(?:удвою|удвоим|гарантированн\w* доход|без риска|получи\w* бесплатно|заработок без вложений)\b', direct))
+    # «получи\w* бесплатно» ловило «получится бесплатно» и «получилось
+    # бесплатно» — обычную фразу чата, за которую сообщение удалялось. Обещание
+    # обращено ко ВТОРОМУ лицу: скам предлагает выгоду тебе. Безличные формы
+    # ничего не предлагают, поэтому список окончаний закрыт.
+    profit = list(re.finditer(r'\b(?:удвою|удвоим|гарантированн\w* доход|без риска|'
+                              r'получи(?:те|шь)?\s+бесплатно|заработок без вложений)\b', direct))
     payment = re.search(r'\b(?:переведи|переведите|оплати|оплатите|предоплат\w*|кошелек|крипт\w*)\b', direct)
     if ((secrets and any(not _negated(direct, item) for item in solicitation)) or
             (any(not _negated(direct, item) for item in profit) and (_LINK.search(value) or payment))):

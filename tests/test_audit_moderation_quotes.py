@@ -85,6 +85,64 @@ class TestPoliticsDoesNotEatOrdinaryWords:
         assert verdict is not None and verdict.category == 'politics'
 
 
+class TestPrefixesDoNotSwallowOrdinaryWords:
+    """Основа с «любым хвостом» ловит не только то, ради чего написана.
+
+    Тот же класс, что и «трамплин»: обе категории ниже УДАЛЯЮТ сообщение и
+    зовут человека, поэтому промах стоит удалённой реплики и разбора.
+    """
+
+    @pytest.mark.parametrize('text', [
+        'Интересно, получится бесплатно посмотреть на https://example.com',
+        'У меня получилось бесплатно скачать, кидаю ссылку https://t.me/ch',
+    ])
+    def test_an_impersonal_verb_is_not_a_scam_offer(self, text):
+        """«получи\\w* бесплатно» ловило «получится» и «получилось».
+
+        Скам предлагает выгоду ТЕБЕ; безличная форма ничего не предлагает.
+        """
+        assert rules.check_text(text) is None
+
+    @pytest.mark.parametrize('text', [
+        'Получи бесплатно 5000 рублей https://scam.example',
+        'Получите бесплатно доступ, переведите 100 рублей',
+        'Получишь бесплатно крипту, переведи кошелек',
+    ])
+    def test_a_real_offer_is_still_caught(self, text):
+        verdict = rules.check_text(text)
+        assert verdict is not None and verdict.category == 'scam'
+        assert verdict.confident is True
+
+    @pytest.mark.parametrize('text', [
+        'Началась путина, отец уехал на промысел',
+        'Путина в этом году удачная',
+    ])
+    def test_an_ambiguous_form_does_not_delete_the_message(self, text):
+        """«путина» — и фамилия в косвенном падеже, и рыболовный сезон.
+
+        Регистр к этому месту уже снят, различить их нечем. Категория удаляет
+        сообщение, поэтому на одной двусмысленной форме бот его не трогает, а
+        зовёт человека. Совсем убрать вердикт нельзя: тогда косвенный падеж
+        стал бы способом обойти правило.
+        """
+        verdict = rules.check_text(text)
+        assert verdict is not None and verdict.category == 'politics'
+        assert verdict.confident is False
+
+    @pytest.mark.parametrize('text', [
+        'Путин снова выступил', 'С Путиным всё ясно', 'Зеленский и нато, обсудим?',
+    ])
+    def test_an_unambiguous_mention_is_still_removed(self, text):
+        verdict = rules.check_text(text)
+        assert verdict is not None and verdict.category == 'politics'
+        assert verdict.confident is True
+
+    def test_one_certain_mention_settles_the_whole_clause(self):
+        """Двусмысленная форма рядом с однозначной не смягчает вердикт."""
+        verdict = rules.check_text('Путина не люблю, и Зеленский тоже так себе')
+        assert verdict is not None and verdict.confident is True
+
+
 class TestNobodyToJudgeIsNotSilence:
     """Модель недоступна — человека зовут, а не пишут в журнал и молчат."""
 

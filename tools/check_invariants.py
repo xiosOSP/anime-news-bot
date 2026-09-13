@@ -702,6 +702,40 @@ def _check_headline_is_never_a_label(bot) -> tuple[bool, str]:
     return True, f'{len(labels)} рубрик уступили место новости'
 
 
+def _check_deleting_categories_keep_off_ordinary_speech() -> tuple[bool, str]:
+    """Категории, которые УДАЛЯЮТ сообщение, не срабатывают на обычной речи.
+
+    Основа с «любым хвостом» ловит не только то, ради чего написана: «трамп»
+    поймал «трамплин», «получи» — «получится». Цена промаха тут выше обычной:
+    сообщение исчезает из чата, и человек видит не разбор, а произвол.
+    Список пополняется каждым найденным случаем — он и есть память о них.
+    """
+    import moderation_rules as rules
+
+    ordinary = (
+        'На трамплине он делает сальто',
+        'Трамплин в этой серии нарисован шикарно',
+        'Интересно, получится бесплатно посмотреть на https://example.com',
+        'У меня получилось бесплатно скачать, кидаю ссылку https://t.me/ch',
+        'Началась путина, отец уехал на промысел',
+        'Твои семьдесят серий я не осилю',
+        'Ты в тупике, сюжет этого не объяснит',
+    )
+    deleting = {'politics', 'scam', 'doxxing', 'raid', 'family', 'nsfw'}
+    caught = [text for text in ordinary
+              if (v := rules.check_text(text)) is not None
+              and v.confident and v.category in deleting]
+    if caught:
+        return False, f'удаляется обычная фраза: {caught[0]!r}'
+    # Обратная сторона: правила обязаны остаться рабочими.
+    real = ('Получи бесплатно 5000 рублей https://scam.example', 'Путин снова выступил')
+    missed = [text for text in real
+              if (v := rules.check_text(text)) is None or not v.confident]
+    if missed:
+        return False, f'настоящее нарушение пропущено: {missed[0]!r}'
+    return True, f'{len(ordinary)} обычных фраз целы, {len(real)} нарушений ловятся'
+
+
 def _check_env_report_never_prints_a_secret(bot) -> tuple[bool, str]:
     """Отчёт о файле .env не имеет права показать значение ключа.
 
@@ -826,6 +860,8 @@ def checks(bot, tree) -> list[tuple[str, bool, str]]:
     add('заголовок поста — не рубрика канала', _check_headline_is_never_a_label(bot))
     add('отчёт о .env не показывает ключи',
         _check_env_report_never_prints_a_secret(bot))
+    add('удаляющие категории не трогают обычную речь',
+        _check_deleting_categories_keep_off_ordinary_speech())
     add('справочник переменных полон', _check_env_reference_is_complete())
     add('манифест описывает существующие файлы', _check_manifest_describes_reality())
     return rows
