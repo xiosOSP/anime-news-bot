@@ -18534,7 +18534,10 @@ def _llm_slot_config(slot: str) -> tuple[str, str, str]:
         # в вызывающий код и роняет обработчик — то есть неполный объект
         # настроек выключал бы модель падением, а не отказом.
         override = str(getattr(settings, 'llm_model_override', '') or '')
-        if override:
+        # Проверяем и на чтении, а не только на записи: настройка переживает
+        # перезапуск, и один раз сохранённая опечатка иначе ломала бы каждый
+        # запрос до тех пор, пока владелец не догадается её сбросить.
+        if override and _looks_like_model_id(override):
             model = override
     return base_url, api_key, model
 
@@ -21292,6 +21295,17 @@ def _llm_model_view() -> str:
     return '\n'.join(lines)
 
 
+# Имя модели у всех совместимых провайдеров выглядит одинаково: латиница,
+# цифры и разделители. Кириллица и пробелы в нём не встречаются никогда,
+# поэтому такой аргумент — это опечатка или не туда попавшее слово.
+_LLM_MODEL_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:@/-]{1,119}$')
+
+
+def _looks_like_model_id(value: str) -> bool:
+    """Похоже ли это на имя модели, а не на слово по-русски."""
+    return bool(_LLM_MODEL_ID_RE.fullmatch(str(value or '').strip()))
+
+
 @admin_only
 async def llmmodel_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Выбор основного провайдера и модели без правки переменных: /llmmodel.
@@ -21302,11 +21316,27 @@ async def llmmodel_command(update, context: ContextTypes.DEFAULT_TYPE):
     """
     arg = ' '.join(context.args or []).strip()
     if arg:
-        if arg.lower() in ('сброс', 'reset', 'default', 'по умолчанию'):
+        # Точка в конце прилипает к команде: подсказку «сбросить — /llmmodel
+        # сброс» копируют вместе со знаком препинания, и слово «сброс.» уходило
+        # в имя модели. Так у бота и появилась модель с названием «сброс.».
+        command = arg.lower().strip(' .,;:!?«»"\'()')
+        if command in ('сброс', 'сбросить', 'reset', 'default', 'по умолчанию'):
             settings.llm_primary_slot = ''
             settings.llm_model_override = ''
             _llm_reset_provider_state('сброс выбора модели')
             _audit_update(update, 'llm_model_reset')
+        elif not _looks_like_model_id(arg):
+            # Раньше принималось любое слово. Опечатка молча становилась
+            # моделью, и каждый следующий запрос уходил в 404 — при этом
+            # /llm показывал её как «выбрано вручную», будто так и задумано.
+            await update.message.reply_text(
+                f'❌ <code>{html.escape(arg)}</code> не похоже на имя модели.\n\n'
+                'Имя модели — латиница, цифры и знаки <code>. - _ / :</code>, '
+                'например <code>openai/gpt-oss-120b</code> или '
+                '<code>mistral-small-latest</code>.\n'
+                'Вернуть модель из переменных окружения — <code>/llmmodel сброс</code>',
+                parse_mode=ParseMode.HTML)
+            return
         else:
             settings.llm_model_override = arg
             _llm_reset_provider_state(f'модель вручную: {arg}')
