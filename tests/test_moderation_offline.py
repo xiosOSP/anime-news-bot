@@ -512,12 +512,14 @@ class TestWorkerFailureIsExplained:
         assert scan.status == 'unchecked'
         assert 'nudenet' in scan.reason, scan.reason
 
-    def test_killed_worker_is_told_apart_from_a_crash(self):
+    def test_killed_worker_is_told_apart_from_a_crash(self, monkeypatch):
         """Смерть по SIGKILL — это память хостинга, а не сломанная установка.
 
         Лечится это разными способами, и одинаковый текст на оба случая
         отправлял чинить не то.
         """
+        # This is a simulated POSIX worker exit; Windows has no SIGKILL constant.
+        monkeypatch.setattr(media.signal, 'SIGKILL', 9, raising=False)
         killed = media.worker_failure_reason(-9, '')
         crashed = media.worker_failure_reason(2, 'ValueError: broken')
         assert 'памят' in killed.lower()
