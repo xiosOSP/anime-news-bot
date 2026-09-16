@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "65587871bf47d5429c002e9845cef376d72746e0",
-  "generated_at_utc": "2026-09-15T16:19:11.799829+00:00",
+  "git_commit": "20b28b850c48b098b8b697c9f7201675aabd1de3",
+  "generated_at_utc": "2026-09-16T18:13:38.727790+00:00",
   "files": {
     ".env.example": {
       "sha256": "b0c6bb3483549c06af460fadee2ab43d866a9bc087ead3e88be6d10169dd9745",
@@ -30,12 +30,12 @@
       "bytes": 9936
     },
     "anime_news_bot.py": {
-      "sha256": "df4c0e16b7812f8cdbb0c3af0f5b62067b3c6ee7ca1a7db6252ab820ae75c285",
-      "bytes": 1433289
+      "sha256": "21d7dcd53ca9c612cfe9eb2cde44dd11cf8f7937e6195a2edf640747875dea10",
+      "bytes": 1437367
     },
     "docs/chat-moderation.md": {
-      "sha256": "1ef34b95516cc71f037e027e39af68d9d8545d4d720b7700c24c9be566d1c126",
-      "bytes": 23285
+      "sha256": "8dff0c1c57c7307904289972ecf7372c4e5d811ebd6aba1f6d6f943248b23dce",
+      "bytes": 26004
     },
     "docs/env-reference.md": {
       "sha256": "758adc19fb622ac1e8df200f2a517ad586847d725c299a68226dbefbbabfecf9",
@@ -66,8 +66,8 @@
       "bytes": 35019
     },
     "moderation_rules.py": {
-      "sha256": "b3b910be6d28ba05b24fdfd60d8bb53ee49f8bb8c3e59ac14d7143cd604e0e3a",
-      "bytes": 20050
+      "sha256": "dd2d32a54f2c519f9cf6733487a942c1d53cc02abad28b74f6e5bf234ecefd02",
+      "bytes": 21832
     },
     "news_deferral.py": {
       "sha256": "2a4d04228fa6802df7827f3d7ffc704d403d66503807becb8594692d49258a2e",
@@ -389,6 +389,10 @@
       "sha256": "48fa2dd0acac49b26f88e4305301abac601603a801ac151e3a43fbccd0e0bfb0",
       "bytes": 19371
     },
+    "tests/test_moderation_llm_precision.py": {
+      "sha256": "9af7c8bdc0f9d7514aa7065e3af9e007a7a7a3762ee138bc23b0ae779c71bb9f",
+      "bytes": 6731
+    },
     "tests/test_moderation_menu.py": {
       "sha256": "a2cfb83413a5784f7eae9a60e7f618ef04e737b8a6d979e1d05a21fbe2409aee",
       "bytes": 10090
@@ -401,9 +405,17 @@
       "sha256": "01db795c0463a9ac29e1efc2bf1a4f12222fd4e13dd4de28ae9b7e46f1cc3021",
       "bytes": 12614
     },
+    "tests/test_moderation_routing_precision.py": {
+      "sha256": "c67cf9f4d2b91ec4cca30f8ddc8f72ba19af84d1473d311c5373a5d2b2f94dfe",
+      "bytes": 3795
+    },
     "tests/test_moderation_rules_extended.py": {
       "sha256": "3c66337784cebcd7e4a41a072a51297e574c16a5b2c586d80626bf69ddf7be15",
       "bytes": 9262
+    },
+    "tests/test_moderation_rules_precision_audit.py": {
+      "sha256": "5f46f2ca54e065940443e6892ddab43d7ea5cd6355a308ab7be53a03e29b9c0a",
+      "bytes": 3251
     },
     "tests/test_moderation_strict_routing.py": {
       "sha256": "6bee108443631a1a1aedff222069aff2be85ac70790d7faacdaeacd10036c437",
