@@ -194,21 +194,26 @@ class TestFailedAttemptsDoNotEatTheDay:
         assert bot.settings.llm_calls_today == 1
 
     @pytest.mark.asyncio
-    async def test_an_unreadable_answer_is_still_charged(self, monkeypatch):
+    async def test_an_unreadable_answer_is_still_charged(self, monkeypatch, tmp_path):
         """Пустой или неразбираемый ответ — модель отработала и сожгла токены.
 
         Проверяется сразу после возвращённого 401: возврат не имеет права
         распространиться на следующую попытку, которая до модели дошла.
         """
+        health = bot.LLMKeyHealth(tmp_path / 'key-health.json')
+        monkeypatch.setattr(bot, 'llm_key_health', health)
         post = MagicMock(side_effect=[reply(401), reply(200, content='')])
         monkeypatch.setattr(bot.requests, 'post', post)
         await bot._llm_call([], 100)
-        bot._llm_disabled_runtime = False
-        bot._llm_disabled_reason = ''
-        bot._llm_using_fallback = False
-        bot._llm_candidate = ()
+        assert health.rejected('primary', 'test', bot.LLM_KEY_REJECTED_TTL_SEC)
+        # Simulate replacing the rejected key and resetting runtime routing.
+        # Merely toggling flags must not bypass persistent rejection memory.
+        monkeypatch.setattr(bot, 'LLM_API_KEY', 'replacement-test')
+        bot._llm_reset_provider_state('test: API key replaced')
         assert await bot._llm_call([], 100) is None
         assert bot.settings.llm_calls_today == 1
+        assert post.call_count == 2
+        assert post.call_args.kwargs['headers']['Authorization'] == 'Bearer replacement-test'
 
     def test_a_refund_never_crosses_into_another_day(self, tmp_path):
         """Возврат после полуночи не имеет права списать вызов новых суток.

@@ -57,7 +57,10 @@ def normalize(text: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 
-_INSULT = r'(?:шлюх\w*|проститут\w*|твар(?:ь|и|ей|ям|ью|ями|ях)|мраз\w*|уеб\w*|ебан\w*|долбоеб\w*|пидор\w*|сука|суки|сучк\w*|говно|хуесос\w*|дебил\w*|идиот\w*)'
+# Nouns only: «админ, идиотский вопрос» addresses an admin but describes
+# the question. A shared root does not make the adjective a personal insult.
+_MILD_INSULT = r'(?:дебил|идиот)(?:а|у|ом|е|ы|ов|ам|ами|ах|ка|ки|ке|ку|кой|кою|ок|кам|ками|ках)?'
+_INSULT = rf'(?:шлюх\w*|проститут\w*|твар(?:ь|и|ей|ям|ью|ями|ях)|мраз\w*|уеб\w*|ебан\w*|долбоеб\w*|пидор\w*|сука|суки|сучк\w*|говно|хуесос\w*|{_MILD_INSULT})'
 _FAMILY = r'(?:мать|матер[ьиьюям]+|мам[ауыое]|мамк\w*|мамаш\w*|отец|отц\w*|пап[ауыое]|бат[яюеи]|сестр\w*|брат\w*|родител\w*|семь\w*|семе[йью]+)'
 _YOUR = r'(?:тво(?:я|е|ю|и|й|его|ей|ему|им|их|ими|ем)|ваш(?:а|е|у|и|его|ей|ему|им|их|ими|ем)?)'
 _TARGET_FAMILY = rf'(?:{_YOUR}\s+(?:вся\s+|все\s+|всю\s+)?{_FAMILY}|{_FAMILY}\s+{_YOUR})'
@@ -70,7 +73,8 @@ _LINK = re.compile(r'https?://\S+|t\.me/\S+|discord\.gg/\S+|@[a-z0-9_]{5,}', re.
 _TRUMP = r'трамп(?:а|у|ом|е|ы|ов|ам|ами|ах|ист\w*)?'
 _POLITICS = re.compile(
     rf'\b(?:путин\w*|зеленск\w*|{_TRUMP}|байден\w*|навальн\w*|лукашенко|'
-    r'нато|сво|слава украине|героям слава|голосуйте за|единая россия|'
+    r'нато|сво|слава украине|героям слава|единая россия|'
+    r'голосуйте за\s+(?:\w+\s+){0,2}(?:партию|президента|депутата|мэра|губернатора)|'
     r'выборы президента|война (?:в|на|с) (?:украин\w*|росси\w*)|'
     r'putin|zelensky\w*|trump|biden|nato)\b')
 # Формы, которые одинаково читаются и как фамилия, и как обычное слово.
@@ -93,19 +97,22 @@ _REPORT_QUOTE = re.compile(
 # Фрагмент в кавычках. Границу держим короткой: незакрытая кавычка на абзац
 # иначе съела бы полтекста.
 _QUOTED = re.compile(r'«[^»]{1,200}»|“[^”]{1,200}”|"[^"\n]{1,200}"|\'[^\'\n]{1,200}\'')
-# Автор приписывает слова себе: «а я тебе: "сдохни"». Отрицание рядом («я не
-# говорил "…"») — наоборот, отказ от слов, и фрагмент снова чужой.
-_SELF_ATTRIBUTION = re.compile(r'\b(?:я|мы)\b')
-_DENIAL = re.compile(r'\bне\b')
+# Require actual ownership of the quoted words, not just a nearby «я»:
+# «я прочитал фразу…» and «я посмотрел сцену…» still quote someone else.
+_SELF_ATTRIBUTION = re.compile(
+    r'\b(?:я|мы)(?:\s*:\s*|\s+(?:тебе|вам)\s*:?\s*|\s+'
+    r'(?:(?:тебе|вам)\s+)?(?:говорю|говорим|скажу|скажем|сказал[аи]?|'
+    r'пишу|пишем|напишу|напишем|написал[аи]?|отвечаю|ответил[аи]?|'
+    r'желаю|советую|кричу)(?:\s+(?:тебе|вам))?\s*:?\s*)$')
 
 
 def _strip_foreign_quotes(text: str) -> str:
     """Убирает из текста кавычки с чужой речью, оставляя свою.
 
-    Правило одно и без списков слов: процитированное принадлежит автору,
-    только если он сам на него претендует. Два исключения из «чужого»:
+    Процитированное принадлежит автору, только если он прямо приписал
+    слова себе. Два исключения из «чужого»:
     сообщение целиком в кавычках (это оформление своих слов, а не пересказ)
-    и фрагмент, перед которым автор назвал себя.
+    и фрагмент, перед которым автор назвал себя говорящим.
     """
     whole = text.strip()
     out, pos, previous = [], 0, 0
@@ -114,7 +121,7 @@ def _strip_foreign_quotes(text: str) -> str:
         # цитаты — это чужое «я», и присваивать по нему нельзя.
         before = text[max(previous, match.start() - 40):match.start()]
         mine = (match.group().strip() == whole
-                or (_SELF_ATTRIBUTION.search(before) and not _DENIAL.search(before)))
+                or _SELF_ATTRIBUTION.search(before))
         if not mine:
             out.append(text[pos:match.start()])
             out.append(' ')
@@ -134,7 +141,10 @@ def _direct_speech(text: str) -> str:
 
 def _negated(text: str, match: re.Match) -> bool:
     prefix = text[max(0, match.start() - 40):match.start()]
-    return bool(re.search(r'\b(?:не|нельзя|никогда не|никому не|запрещено)\s*$', prefix))
+    return bool(re.search(
+        r'\b(?:не|нельзя|никогда не|никому не|запрещено)\s*'
+        r'(?:(?:писать|пиши(?:те)?|говорить|говори(?:те)?|кричать|кричи(?:те)?)\s+)?$',
+        prefix))
 
 
 def _forbidden_infinitive(text: str, match: re.Match) -> bool:
@@ -173,7 +183,7 @@ def _private_details(text: str) -> bool:
 
 
 def _rank(verdict: Verdict) -> tuple:
-    return (_PRIORITY[verdict.category], verdict.severity)
+    return (verdict.confident, _PRIORITY[verdict.category], verdict.severity)
 
 
 def _strongest(text: str, *, reply_to_user: bool, reply_to_admin: bool) -> Verdict | None:
@@ -216,7 +226,10 @@ def check_text(text: str, *, reply_to_user: bool = False,
 
 def _check_clause(value: str, *, reply_to_user: bool,
                   reply_to_admin: bool) -> Verdict | None:
-    direct = value
+    # Paths and query parameters are identifiers, not the author's speech.
+    # Keep the original value for domain and scam-destination checks.
+    direct = re.sub(_URL, ' ', value, flags=re.IGNORECASE)
+    uncertain = None
     family = re.search(rf'\b{_TARGET_FAMILY}\b{_FAMILY_BRIDGE}{_INSULT}\b|\b{_INSULT}\b{_FAMILY_BRIDGE}{_TARGET_FAMILY}\b', direct)
     sexual_family = re.search(
         r'\b(?:ебал|выебал|трахал|трахну|выебу)\s+(?:(?:твою|вашу)\s+)?(?:мать|маму|сестру)\b|'
@@ -229,17 +242,22 @@ def _check_clause(value: str, *, reply_to_user: bool,
         return Verdict('family', 'Оскорбление семьи собеседника', 3)
     if re.search(r'https?://(?:www\.)?(?:pornhub\.com|xvideos\.com|xnxx\.com|xhamster\.com)(?:/|\b)', value, re.IGNORECASE):
         return Verdict('nsfw', 'Ссылка на порнографический сайт', 3)
-    politics = list(_POLITICS.finditer(value))
+    politics = list(_POLITICS.finditer(direct))
     if politics:
         # «путина» — это и фамилия в косвенном падеже, и рыболовный сезон;
         # различить их нельзя, регистр к этому месту уже снят. Категория
         # удаляет сообщение, поэтому на одной лишь двусмысленной форме бот
         # сообщение не трогает, а зовёт человека — как и всюду, где сомнение.
-        certain = any(m.group().lower() not in _POLITICS_AMBIGUOUS for m in politics)
-        return Verdict('politics', 'Обсуждение реальной политики', confident=certain)
+        certain = any(m.group().lower() not in _POLITICS_AMBIGUOUS
+                      or re.search(r'\bголосуйте за\s*$', direct[:m.start()])
+                      for m in politics)
+        verdict = Verdict('politics', 'Обсуждение реальной политики', confident=certain)
+        if certain:
+            return verdict
+        uncertain = verdict
     # Personal contact details are not doxxing without a target/disclosure cue.
     disclosure = _DOX_INTENT.search(direct)
-    if (disclosure and not _negated(direct, disclosure) and _private_details(value)
+    if (disclosure and not _negated(direct, disclosure) and _private_details(direct)
             and not re.search(r'\b(?:не сливайте|не публикуйте|не присылайте|нельзя публиковать)\b', direct)):
         return Verdict('doxxing', 'Раскрытие чужих контактных данных', 3)
     solicitation = list(re.finditer(r'\b(?:пришли|пришлите|отправь|отправьте|введи|введите|скинь|скиньте|сообщи|сообщите|перешли|перешлите)\b', direct))
@@ -251,9 +269,19 @@ def _check_clause(value: str, *, reply_to_user: bool,
     profit = list(re.finditer(r'\b(?:удвою|удвоим|гарантированн\w* доход|без риска|'
                               r'получи(?:те|шь)?\s+бесплатно|заработок без вложений)\b', direct))
     payment = re.search(r'\b(?:переведи|переведите|оплати|оплатите|предоплат\w*|кошелек|крипт\w*)\b', direct)
-    if ((secrets and any(not _negated(direct, item) for item in solicitation)) or
-            (any(not _negated(direct, item) for item in profit) and (_LINK.search(value) or payment))):
-        return Verdict('scam', 'Запрос секретов или обещание гарантированного заработка', 3)
+    active_requests = [item for item in solicitation if not _negated(direct, item)]
+    profit_request = (any(not _negated(direct, item) for item in profit)
+                      and (_LINK.search(value) or payment))
+    if (secrets and active_requests) or profit_request:
+        # Entering a password can be ordinary login help, including a link
+        # to the service. Requesting disclosure is a different action.
+        clear_request = any(item.group() not in ('введи', 'введите')
+                            for item in active_requests)
+        verdict = Verdict('scam', 'Запрос секретов или обещание гарантированного заработка',
+                          3, confident=bool(profit_request or clear_request))
+        if verdict.confident:
+            return verdict
+        uncertain = verdict
     raids = re.finditer(r'\b(?:рейдим|рейдить|зарейдим|заспамим|заспамить|флудим|спамим|атакуем|набег|завалим спамом)\b', direct)
     destination = _LINK.search(value) or re.search(r'\b(?:чужой чат|их чат|этот чат|канал|группу)\b', direct)
     game = re.search(r'\b(?:игровой рейд|босс\w*|подземел\w*|данж\w*|гильди\w*|wow|варкрафт)\b', direct)
@@ -286,4 +314,5 @@ def _check_clause(value: str, *, reply_to_user: bool,
     if (reply_to_user or re.search(r'\bты\b', direct)) and re.search(
             r'\b(?:тебя не спрашивали|твое мнение никому не нужно|ты никто|ты ничего не понимаешь|с тобой все ясно)\b', direct):
         return Verdict('belittling', 'Повторяемое принижение собеседника', 1)
-    return None
+    # Uncertain context must not hide an independent, explicit violation.
+    return uncertain

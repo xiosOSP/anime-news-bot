@@ -9,11 +9,27 @@
 import importlib.util
 import json
 from pathlib import Path
+from unittest.mock import mock_open, patch
 
 import pytest
 
 import anime_news_bot as bot
 import moderation_media as media
+
+
+@pytest.mark.parametrize('contents, expected', [
+    ('Name:\tworker\nVmPeak:\t2097152 kB\nVmRSS:\t8192 kB\n', 2048),
+    ('VmRSS:\t8192 kB\n', 0),
+    ('VmPeak:\tunavailable\n', 0),
+])
+def test_address_space_parser_without_host_dependency(contents, expected):
+    with patch('builtins.open', mock_open(read_data=contents)):
+        assert media._address_space_peak_mb() == expected
+
+
+def test_address_space_is_unknown_when_proc_is_unavailable():
+    with patch('builtins.open', side_effect=FileNotFoundError):
+        assert media._address_space_peak_mb() == 0
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -101,6 +117,8 @@ class TestWorkerMemoryCeiling:
         assert seen['MALLOC_ARENA_MAX'] == '2'
         assert seen['OPENCV_NUM_THREADS'] == '1'
 
+    @pytest.mark.skipif(not Path('/proc/self/status').is_file(),
+                        reason='Live address-space measurement requires Linux /proc')
     @pytest.mark.parametrize('body, expect', [
         ("scan = Scan('checked')", 'checked'),
         ("raise RuntimeError('std::bad_alloc')", 'unchecked'),
