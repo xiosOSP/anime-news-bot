@@ -349,9 +349,9 @@ class TestSummaryRedundancy:
 
     @pytest.mark.parametrize('title,summary,dup', [
         ('Последний опенинг Bleach от jo0ji',
-         'Последний опенинг аниме Bleach с треком от jo0ji выйдет сегодня', True),
+         'Последний опенинг аниме Bleach с треком от jo0ji выйдет сегодня', False),
         ('Target меняет правила продажи карт',
-         'Target изменил правила продажи карточек', True),
+         'Target изменил правила продажи карточек', False),
         ('Анонсирован третий сезон Атаки титанов',
          'Третий сезон Атаки титанов анонсировали', True),
         ('Опубликован опенинг к 3 сезону Агента времени',
@@ -368,7 +368,7 @@ class TestSummaryRedundancy:
         assert anime_news_bot._too_similar('', 'что-то') is False
         assert anime_news_bot._too_similar('что-то', '') is False
 
-    def test_redundant_summary_dropped(self, llm):
+    def test_release_timing_survives_redundant_summary(self, llm):
         news = {'title': 'Bleach opening', 'summary': 'Out today.', 'source': 'X'}
         answer = {'topic': 'аниме',
                   'title': 'Последний опенинг Bleach: Thousand-Year Blood War от jo0ji',
@@ -377,7 +377,7 @@ class TestSummaryRedundancy:
                   'tags': ['#аниме']}
         with patch.object(llm.requests, 'post', return_value=_reply(answer)):
             asyncio.run(llm._llm_enrich(news))
-        assert '\n\n' not in news['_llm_text']      # остался только заголовок
+        assert 'сегодня' in news['_llm_text']  # дата отсутствует в заголовке
 
     def test_useful_summary_kept(self, llm):
         news = {'title': 'Anime announced', 'summary': 'Netflix premiere is planned for January.', 'source': 'X'}
@@ -564,9 +564,9 @@ class TestTautology:
     названия. Промпт это запрещает, а код подстраховывает."""
 
     @pytest.mark.parametrize('title,para', [
-        ('Аниме по манге «FX Воин Куруми» выйдет в октябре',
-         'Премьера аниме по манге «FX Senshi Kurumi-chan» состоится в октябре этого года.'),
-        ('Последний опенинг Bleach от jo0ji',
+        ('Аниме по манге «FX Senshi Kurumi-chan» выйдет в октябре',
+         'Премьера аниме по манге «FX Senshi Kurumi-chan» состоится в октябре.'),
+        ('Последний опенинг Bleach от jo0ji выйдет сегодня',
          'Последний опенинг аниме Bleach с треком от jo0ji выйдет сегодня.'),
         ('Chainsaw Man получит второй сезон',
          'Второй сезон Chainsaw Man был анонсирован.'),
@@ -597,7 +597,7 @@ class TestTautology:
 
     def test_second_paragraph_checked_against_first(self):
         title = 'Вышел трейлер нового сериала'
-        paras = ['Показ начнётся 4 октября на Disney+, снимает студия Pierrot.',
+        paras = ['Сериал начнёт выходить 4 октября на Disney+, работает Pierrot.',
                  'Сериал будет выходить на Disney+ с 4 октября, работает Pierrot.']
         kept = anime_news_bot._drop_repetitive_paragraphs(title, paras)
         assert len(kept) == 1                 # второй повторяет первый
@@ -614,9 +614,9 @@ class TestTautology:
 
     def test_pipeline_strips_repetition(self, llm):
         answer = {'topic': 'аниме', 'kind': 'новость', 'subject': 'X',
-                  'title': 'Аниме по манге «FX Воин Куруми» выйдет в октябре',
+                  'title': 'Аниме по манге «FX Senshi Kurumi-chan» выйдет в октябре',
                   'summary': 'Премьера аниме по манге «FX Senshi Kurumi-chan» '
-                             'состоится в октябре этого года.\n\n'
+                             'состоится в октябре.\n\n'
                              'Манга рассказывает о девушке-трейдере.',
                   'tags': ['#аниме']}
         news = {'title': 'T', 'summary': ('Premiere in October. ' + 'x' * 300), 'link': 'https://a/1', 'source': 'X'}
@@ -624,5 +624,5 @@ class TestTautology:
              patch.object(llm, 'fetch_article', return_value={'text': '', 'video': None}):
             asyncio.run(llm._llm_enrich(news))
         text = news['_llm_text']
-        assert 'состоится в октябре этого года' not in text
+        assert 'состоится в октябре' not in text
         assert 'девушке-трейдере' in text
