@@ -10006,9 +10006,8 @@ def format_news_short(news: dict) -> str:
             ru_summary = _extract_sentences(_strip_links(ru_summary),
                                             max_sentences=max_sentences, max_len=translated_max)
 
-    # Если предложение дублирует заголовок — не показываем
-    if ru_summary and ru_title.rstrip('.').lower() in ru_summary.lower():
-        ru_summary = ''
+    # Remove only the repeated sentence, keeping the facts that follow it.
+    ru_summary = _strip_title_echo(ru_title, ru_summary)
 
     # Дата СОБЫТИЯ из текста новости (не дата публикации RSS!).
     # Ищем в оригинальном английском тексте — там форматы дат предсказуемы.
@@ -10021,8 +10020,7 @@ def format_news_short(news: dict) -> str:
     if ru_summary:
         parts.append(ru_summary)
     body = '\n\n'.join(parts)
-    if date_str:
-        body += f'\n\n📅 {date_str}'
+    body = _append_release_date(body, date_str)
     body = _with_tags(body, news)
     return _apply_editorial_rules(body, news)
 
@@ -19669,14 +19667,21 @@ def _moderation_llm_budget_left() -> int:
     return max(0, client.daily_limit - snapshot['requests'])
 
 
-def _moderation_render_context(chat_id: int, target_text: str) -> str:
+def _moderation_render_context(chat_id: int, target_text: str, *, message_id=None) -> str:
     """Переписка для контекста + оцениваемое сообщение, отделённое явно.
 
     Авторы обозначаются номерами, а не именами: модель не должна оперировать
     личностями, её дело — оценить текст. Имя цели ей знать незачем, и это же
     закрывает попытку через сообщение попросить наказать кого-то другого.
     """
-    window = list(_moderation_windows.get(int(chat_id)) or [])[:-1]
+    window = list(_moderation_windows.get(int(chat_id)) or [])
+    if message_id is not None:
+        # Edits replace a row in place; later replies are not prior context.
+        index = next((i for i, row in enumerate(window)
+                      if row.get('message_id') == message_id), None)
+        window = window[:index] if index is not None else []
+    elif window and window[-1].get('text') == str(target_text or '')[:MODERATION_MAX_MESSAGE_CHARS]:
+        window = window[:-1]
     numbering: dict[int, int] = {}
     lines = []
     for item in window[-min(4, MODERATION_CONTEXT_SIZE):]:
@@ -19691,7 +19696,7 @@ def _moderation_render_context(chat_id: int, target_text: str) -> str:
             f'СООБЩЕНИЕ ДЛЯ ОЦЕНКИ:\n{json.dumps(target, ensure_ascii=False)}')
 
 
-async def _moderation_classify(chat_id: int, text: str) -> Optional[dict]:
+async def _moderation_classify(chat_id: int, text: str, *, message_id=None) -> Optional[dict]:
     """Оценка сообщения моделью. None — модель недоступна или отказала.
 
     None здесь означает «не знаю», и вызывающий код обязан трактовать это как
@@ -19702,7 +19707,7 @@ async def _moderation_classify(chat_id: int, text: str) -> Optional[dict]:
         return None
     messages = [
         {'role': 'system', 'content': MODERATION_SYSTEM_PROMPT},
-        {'role': 'user', 'content': _moderation_render_context(chat_id, text)},
+        {'role': 'user', 'content': _moderation_render_context(chat_id, text, message_id=message_id)},
     ]
     raw = await _llm_call(messages, max_tokens=200, task='moderation')
     if not raw:
@@ -19782,8 +19787,6 @@ kind — тип события; подборка — список лучших, 
 {"topic":"аниме","kind":"трейлер","subject":"Bleach","title":"Вышел трейлер Bleach","summary":"Премьера 4 октября на Disney+, анимацией снова занимается студия Pierrot.","tags":["#аниме","#трейлер"]}"""
 
 
-PARAGRAPH_ECHO_LIMIT = 0.55     # доля уже сказанного, при которой абзац — повтор
-
 # Служебные слова: их повтор неизбежен и о тавтологии не говорит.
 # Названия («фильм», «студия») сюда НЕ входят — как раз их повторы и ловим.
 # Слова-наполнители: они есть почти в каждой новости и информации не несут.
@@ -19793,7 +19796,7 @@ _ECHO_STOP = {
     'etogo', 'kotor', 'takje', 'uje', 'godu', 'goda', 'budet', 'budut', 'chto',
     'kak', 'pri', 'poka', 'tolko', 'the', 'and', 'for', 'with', 'from', 'that',
     # дежурные глаголы и обороты новостной заметки
-    'preme', 'sosto', 'viide', 'vishe', 'vishl', 'segod', 'zavtr', 'anons',
+    'preme', 'sosto', 'viide', 'vishe', 'vishl', 'anons', 'opubl', 'bil',
     'obavl', 'soobs', 'izves', 'stalo', 'stane', 'poluc', 'pokaj', 'predst',
     'treko', 'anime', 'novii', 'nova', 'novoe',
 }
@@ -19817,40 +19820,50 @@ def _content_stems(text: str) -> set:
 
 
 def _drop_repetitive_paragraphs(title: str, paragraphs: list) -> list:
-    """Убирает абзацы, которые пересказывают заголовок или предыдущий текст.
+    """Убирает явные повторы; новые значимые слова сохраняют абзац.
 
-    Промпт просит не повторяться, но не гарантирует этого: в постах попадались
-    пары вида «Аниме по манге X выйдет в октябре» и «Премьера аниме по манге X
-    состоится в октябре этого года» — второй абзац не добавляет ничего."""
-    seen = _content_stems(title)
+    Перефразирование с неизвестным названием или уточнением оставляем:
+    совпадение большинства слов само по себе не доказывает повтор."""
+    seen = title
     kept = []
     for para in paragraphs:
-        stems = _content_stems(para)
-        if not stems:
+        para = _strip_title_echo(title, para)
+        if not para.strip():
             continue
-        echo = len(stems & seen) / len(stems)
-        if echo >= PARAGRAPH_ECHO_LIMIT:
-            logger.info(f"✂️ Абзац-повтор убран ({echo:.0%} уже сказано): {para[:55]}")
+        if _too_similar(seen, para):
+            logger.info(f"✂️ Абзац-повтор убран: {para[:55]}")
             continue
         kept.append(para)
-        seen |= stems
+        seen += '\n' + para
     return kept
 
 
 def _too_similar(a: str, b: str) -> bool:
-    """Пересказывает ли summary заголовок вместо того, чтобы дополнять его.
-
-    Сравниваем по общим словам: модель любит перефразировать заголовок, и такой
-    пост выглядит как заикание — одно и то же двумя абзацами."""
-    def stems(text):
-        # Обрезаем до основы: русские окончания меняются («карт»/«карточек»),
-        # а пересказ от этого пересказом быть не перестаёт
-        return {w[:5] for w in re.findall(r'[а-яёa-z0-9]{4,}', text.lower())}
-    wa, wb = stems(a), stems(b)
+    """Only discard an echo with no new content; overlap alone loses facts."""
+    wa, wb = _content_stems(a), _content_stems(b)
     if not wa or not wb:
         return False
-    overlap = len(wa & wb) / min(len(wa), len(wb))
-    return overlap >= 0.6
+    # Short numbers and negation are invisible to the word-stem detector.
+    def details(text):
+        return set(re.findall(r'\b(?:\d+(?:[.,]\d+)?|не|нет|без|not|no)\b', text.lower()))
+    return wb.issubset(wa) and details(b).issubset(details(a))
+
+
+def _strip_title_echo(title: str, text: str) -> str:
+    """Cut a verbatim opening headline, never the rest of the description."""
+    headline = str(title or '').strip().rstrip('.!?…')
+    if not headline:
+        return str(text or '').strip()
+    return re.sub(r'^\s*' + re.escape(headline) + r'(?:[.!?…]+(?:\s+|$)|\s*$)',
+                  '', str(text or ''), count=1, flags=re.IGNORECASE).strip()
+
+
+def _append_release_date(body: str, date_str: str) -> str:
+    """Add the calendar line only if its full date is absent from the copy."""
+    normalized = re.sub(r'\s+', ' ', body).casefold()
+    if date_str and not re.search(r'(?<!\w)' + re.escape(date_str.casefold()) + r'(?!\w)', normalized):
+        return f'{body}\n\n📅 {date_str}'
+    return body
 
 
 LLM_TITLE_MAX = 200         # длиннее — это уже не заголовок
@@ -20491,11 +20504,6 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
                 and _llm_dates_supported(source_fact_text, proposed_text)):
             logger.warning(f"LLM: обнаружены новые числа/даты — переписывание отклонено: {title[:55]}")
         elif _sanity_ok(new_title, LLM_TITLE_MAX) and _sanity_ok(new_summary, LLM_SUMMARY_MAX * 2):
-            # Пересказ заголовка вместо дополнения — выбрасываем, оставляя заголовок
-            if new_summary and _too_similar(new_title, new_summary):
-                logger.info(f"LLM: текст пересказывает заголовок — оставляю только его "
-                            f"({new_title[:45]})")
-                new_summary = ''
             parts = [new_title.rstrip('.') + '.' if not new_title.endswith(('.', '!', '?'))
                      else new_title]
             if new_summary:
@@ -20508,8 +20516,7 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
 
             date_str = extract_release_date_from_text(
                 (news.get('title') or '') + ' ' + (news.get('summary') or '')[:600])
-            if date_str:
-                body += f'\n\n📅 {date_str}'
+            body = _append_release_date(body, date_str)
             news['_llm_text'] = body
         else:
             logger.info(f"LLM: ответ не влез в лимиты, беру обычный путь: {title[:50]}")
@@ -24737,6 +24744,9 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
                           counts_as_new=getattr(update, 'edited_message', None) is None,
                           message_id=getattr(message, 'message_id', None),
                           media_group_id=getattr(message, 'media_group_id', None), repeat_key=repeat_key)
+        message_id = getattr(message, 'message_id', None)
+        checked_row = next((row for row in reversed(_moderation_windows.get(int(chat.id), ()))
+                            if row.get('message_id') == message_id), None) if message_id is not None else None
 
     replied = getattr(message, 'reply_to_message', None)
     target = (getattr(getattr(replied, 'from_user', None), 'id', 0) or 0) if getattr(replied, 'sender_chat', None) is None else 0
@@ -24775,7 +24785,9 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
     if local is None:
         return
     if not local.get('confident'):
-        verdict = await _moderation_classify(chat.id, content_text) if MODERATION_LLM_ENABLED else None
+        verdict = await _moderation_classify(
+            chat.id, content_text, message_id=getattr(message, 'message_id', None)
+        ) if MODERATION_LLM_ENABLED else None
         if verdict is None:
             suspicion = str(local.get('category') or '')
             chat_moderation.log_decision(chat.id, user_id, actor_name,
@@ -24797,6 +24809,11 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
         return
     severity, reason = int(local.get('severity') or 2), str(local.get('reason') or '')
     async with _moderation_action_lock:
+        # Model/media/admin lookups await I/O. An edit can replace this exact
+        # message while we wait; its old verdict must not punish the new text.
+        if checked_row is not None and not any(
+                row is checked_row for row in _moderation_windows.get(int(chat.id), ())):
+            return
         streak = _mod_note_belittling(chat.id, user_id, target) if category == 'belittling' else 0
         decision = _mod_decide(category, severity, chat_moderation.warn_count(chat.id, user_id), streak)
         decision['severity'] = severity
