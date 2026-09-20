@@ -7,10 +7,12 @@ import asyncio
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 import gzip
+import io
 import json
 import math
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -39,11 +41,12 @@ MAX_DURATION = 180
 EXPLICIT = {'FEMALE_GENITALIA_EXPOSED', 'MALE_GENITALIA_EXPOSED',
             'ANUS_EXPOSED', 'FEMALE_BREAST_EXPOSED'}
 SUGGESTIVE = {'BUTTOCKS_EXPOSED', 'FEMALE_GENITALIA_COVERED', 'ANUS_COVERED'}
+SUGGESTIVE_STRONG_MARGIN = .07
 
 
 @dataclass(frozen=True)
 class Scan:
-    status: str  # checked, unchecked
+    status: str  # checked, partial, unchecked
     category: str = ''  # nsfw / spoiler_16 / no detected nudity
     reason: str = ''
     frames: int = 0
@@ -110,6 +113,19 @@ def media_attachment(message):
             return item, 'tgs'
         # Documents can hide media under a false name/MIME; sniff in worker.
         return item, 'unknown'
+    return None
+
+
+def media_preview(item):
+    """Best Telegram-provided preview for media too large for Bot API download.
+
+    This is intentionally only partial evidence: a thumbnail can prove that a
+    suspicious frame exists, but it can never prove the rest of the video safe.
+    """
+    for attr in ('thumbnail', 'thumb'):
+        preview = getattr(item, attr, None)
+        if preview is not None and getattr(preview, 'file_id', None):
+            return preview
     return None
 
 
