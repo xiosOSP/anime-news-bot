@@ -277,7 +277,7 @@ async def test_video_probe_uses_real_ytdlp_publication_path(monkeypatch, tmp_pat
 
 @pytest.mark.asyncio
 async def test_video_probe_reports_real_ytdlp_failure(monkeypatch):
-    async def fail_prepare(news):
+    async def fail_prepare(news, **_kwargs):
         news['_video_note'] = 'yt-dlp: Sign in to confirm you are not a bot'
         return None
 
