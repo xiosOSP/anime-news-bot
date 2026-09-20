@@ -10155,7 +10155,7 @@ def _escape_to_limit(text: str, limit: int) -> str:
     return html.escape(fit_to_limit(str(text or ''), limit))
 
 
-async def _prepare_video_file(news: dict) -> Optional[Path]:
+async def _prepare_video_file(news: dict, *, record_failures: bool = True) -> Optional[Path]:
     """Если у новости есть видео — пытается его скачать. Возвращает путь к файлу или None.
     Прямые видео (.mp4 и т.д.) возвращаются как URL-ссылка не здесь — для них Telegram сам качает.
     Здесь занимаемся только yt-dlp-хостингами."""
@@ -10166,18 +10166,21 @@ async def _prepare_video_file(news: dict) -> Optional[Path]:
     if not video_url:
         if _probably_has_video(news):
             news.setdefault('_video_note', 'новость про ролик, но ссылки на него нет')
-            _record_media_failure(news, 'article_video_not_found')
+            if record_failures:
+                _record_media_failure(news, 'article_video_not_found')
         return None
     # Прямой mp4/webm — Telegram скачает сам, нам качать не надо
     if _is_direct_video(video_url):
         return None
     if not _is_video_host(video_url):
         news['_video_note'] = f'хостинг не поддерживается: {urlparse(video_url).netloc}'
-        _record_media_failure(news, 'unsupported_host', urlparse(video_url).netloc)
+        if record_failures:
+            _record_media_failure(news, 'unsupported_host', urlparse(video_url).netloc)
         return None
     if not YT_DLP_AVAILABLE:
         news['_video_note'] = 'yt-dlp не установлен — ролик не скачать'
-        _record_media_failure(news, 'dependency_missing')
+        if record_failures:
+            _record_media_failure(news, 'dependency_missing')
         return None
     note: list = []
     path = await asyncio.to_thread(download_video, video_url, note)
@@ -10197,7 +10200,8 @@ async def _prepare_video_file(news: dict) -> Optional[Path]:
             if probe2:
                 news['_video_meta'] = probe2
     else:
-        _record_media_failure(news, 'video_download_failed', news.get('_video_note', ''))
+        if record_failures:
+            _record_media_failure(news, 'video_download_failed', news.get('_video_note', ''))
     return path
 
 
@@ -10215,7 +10219,7 @@ async def _probe_video_delivery(news: dict) -> tuple[str, str]:
         return 'warn', 'прямой URL будет передан Telegram; без отправки Bot API не проверен'
 
     probe = copy.deepcopy(news)
-    path = await _prepare_video_file(probe)
+    path = await _prepare_video_file(probe, record_failures=False)
     try:
         if path is None:
             detail = str(probe.get('_video_note') or 'yt-dlp не подготовил файл')
