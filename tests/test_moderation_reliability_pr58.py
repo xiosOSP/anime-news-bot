@@ -77,9 +77,9 @@ async def test_modllmping_uses_moderation_model_not_news_probe(monkeypatch):
     update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=1))
     context = SimpleNamespace(args=[])
 
-    # admin_only preserves __wrapped__ through functools.wraps.
-    command = getattr(bot.modllmping_command, '__wrapped__', bot.modllmping_command)
-    await command(update, context)
+    monkeypatch.setattr(bot, 'is_admin', lambda _update: True)
+    monkeypatch.setattr(bot, '_audit_update', lambda *args, **kwargs: None)
+    await bot.modllmping_command(update, context)
 
     classify.assert_awaited_once()
     rendered = message.reply_text.await_args.args[0]
