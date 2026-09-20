@@ -2,7 +2,7 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "55f28dc204cfa0ca37fb84f9bea73e78541a63fd",
+  "git_commit": "a6a5aec4cc3ea63348c1f2039415544d09a16a47",
   "generated_at_utc": "2026-09-20T18:12:00+00:00",
   "files": {
     ".env.example": {
@@ -414,8 +414,8 @@
       "bytes": 12614
     },
     "tests/test_moderation_routing_precision.py": {
-      "sha256": "6d29dbe74e9811901f79b262555cb1029ad112c589ba06e6cbbd8a2886cb7847",
-      "bytes": 4189
+      "sha256": "efe7fee958761f086143fb22427576268b2782bcc4d2f87c53dd0da34f66ff0a",
+      "bytes": 4412
     },
     "tests/test_moderation_rules_extended.py": {
       "sha256": "3c66337784cebcd7e4a41a072a51297e574c16a5b2c586d80626bf69ddf7be15",
