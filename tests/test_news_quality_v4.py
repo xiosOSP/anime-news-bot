@@ -229,3 +229,70 @@ async def test_telegram_rejecting_video_does_not_silently_publish_cover(monkeypa
         tg, news, [], True, None, 'https://cdn.example/trailer.mp4',
         'Вышел трейлер.', None, {}, -200)
     assert 'Видео не прикреплено' in tg.send_message.call_args.kwargs['text']
+
+def test_article_chooses_relevant_trailer_when_multiple_real_videos_exist():
+    markup = (
+        '<h1>Roshidere Season 2 trailer unveiled</h1>'
+        '<article>'
+        '<iframe title="Director interview" src="https://youtu.be/interview"></iframe>'
+        '<iframe title="Roshidere Season 2 Official Trailer" '
+        'src="https://youtu.be/season2"></iframe>'
+        '</article>'
+    )
+    assert bot._find_video_in_html(markup) == 'https://youtu.be/season2'
+
+
+def test_missing_video_notice_uses_found_video_even_without_keyword(monkeypatch):
+    monkeypatch.setattr(bot, 'settings', SimpleNamespace(video_enabled=True))
+    monkeypatch.setattr(bot, 'CHANNEL_ID', -100)
+    news = {
+        'title': 'Опубликованы новые материалы второго сезона',
+        'video': 'https://youtu.be/season2',
+        'link': 'https://news.example/story',
+    }
+    text = bot._video_moderation_notice('Пост', news, -200)
+    assert 'Видео не прикреплено' in text
+
+
+@pytest.mark.asyncio
+async def test_video_probe_uses_real_ytdlp_publication_path(monkeypatch, tmp_path):
+    path = tmp_path / 'trailer.mp4'
+    path.write_bytes(b'actual prepared payload')
+    prepare = AsyncMock(return_value=path)
+    resolve = AsyncMock(side_effect=AssertionError('YouTube must go through yt-dlp'))
+    monkeypatch.setattr(bot, '_prepare_video_file', prepare)
+    monkeypatch.setattr(bot, '_resolve_video', resolve)
+
+    status, detail = await bot._probe_video_delivery({
+        'title': 'Trailer',
+        'video': 'https://youtu.be/season2',
+    })
+
+    assert status == 'ok'
+    assert 'yt-dlp' in detail
+    prepare.assert_awaited_once()
+    resolve.assert_not_awaited()
+    assert not path.exists()
+
+
+@pytest.mark.asyncio
+async def test_video_probe_reports_real_ytdlp_failure(monkeypatch):
+    async def fail_prepare(news):
+        news['_video_note'] = 'yt-dlp: Sign in to confirm you are not a bot'
+        return None
+
+    monkeypatch.setattr(bot, '_prepare_video_file', fail_prepare)
+    status, detail = await bot._probe_video_delivery({
+        'title': 'Trailer',
+        'video': 'https://youtu.be/season2',
+    })
+    assert status == 'fail'
+    assert 'Sign in' in detail
+
+
+def test_doctor_warns_about_stale_prompt_version(monkeypatch):
+    monkeypatch.setattr(bot, 'LLM_PROMPT_VERSION', 'editorial-v3-2026-09-15')
+    rows = {name: (ok, detail) for name, ok, detail in bot._doctor_env_conflicts()}
+    ok, detail = rows['LLM: версия промпта']
+    assert not ok
+    assert bot.DEFAULT_LLM_PROMPT_VERSION in detail
