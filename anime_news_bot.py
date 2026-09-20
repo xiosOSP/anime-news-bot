@@ -1571,7 +1571,8 @@ MODERATION_RULES = {
 # Категории, по которым бот не действует сам ни при каких настройках.
 # Как часто звать человека на сообщение, которое судить некому. Ноль выключает
 # уведомление совсем — на случай, если чат шумит, а админ один.
-MODERATION_UNJUDGED_NOTICE_SEC = _env_int('MODERATION_UNJUDGED_NOTICE_SEC', 300)
+MODERATION_UNJUDGED_NOTICE_SEC = max(0, min(86400, _env_int('MODERATION_UNJUDGED_NOTICE_SEC', 900)))
+MODERATION_MEDIA_NOTICE_SEC = max(0, min(86400, _env_int('MODERATION_MEDIA_NOTICE_SEC', 900)))
 MODERATION_HUMAN_ONLY = frozenset(
     name for name, rule in MODERATION_RULES.items() if rule['action'] == 'escalate')
 
@@ -24594,6 +24595,7 @@ def _mod_member_permissions(member) -> dict:
 
 
 async def _mod_media_unchecked(bot: Bot, message, reason: str) -> None:
+    """Queue technical media failures for review without flooding admin DMs."""
     chat_id = message.chat_id
     if (chat_moderation is None or not feature_enabled('chat_moderation')
             or not chat_moderation.is_enabled(chat_id)):
@@ -24604,17 +24606,32 @@ async def _mod_media_unchecked(bot: Bot, message, reason: str) -> None:
                                     'media', 'не проверено', 'локальный детектор', reason,
                                     _mod_message_text(message))
     metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'media_unchecked'})
-    now = time.monotonic()
-    if now - _moderation_media_reports.get(chat_id, -3600) < 60:
+    if MODERATION_MEDIA_NOTICE_SEC <= 0:
         return
-    _moderation_media_reports[chat_id] = now
-    while len(_moderation_media_reports) > 200:
+
+    # Group equal failures, not the entire chat. A broken decoder and a 20 MB
+    # Telegram download limit are different incidents; repeated copies of the
+    # same technical failure should become one useful report, not dozens.
+    reason_key = re.sub(r'\d+', '#', str(reason or '').casefold())[:120]
+    key = (int(chat_id), reason_key)
+    now = time.monotonic()
+    state = _moderation_media_reports.get(key) or {'at': -86400.0, 'suppressed': 0}
+    if now - float(state.get('at', -86400.0)) < MODERATION_MEDIA_NOTICE_SEC:
+        state['suppressed'] = int(state.get('suppressed', 0)) + 1
+        _moderation_media_reports[key] = state
+        return
+    suppressed = int(state.get('suppressed', 0))
+    _moderation_media_reports[key] = {'at': now, 'suppressed': 0}
+    while len(_moderation_media_reports) > 400:
         _moderation_media_reports.pop(next(iter(_moderation_media_reports)))
+
     link = getattr(message, 'link', None)
-    text = (f'🛡 Медиа не проверено: {html.escape(reason)}.\n'
+    text = (f'🛡 Медиа требует ручной проверки: {html.escape(reason)}.\n'
             f'Чат <code>{chat_id}</code>, сообщение <code>{message.message_id}</code>.\n'
-            'Нужна ручная проверка; автоматический варн/мут за медиа не выдан.\n'
-            'Проверить сам детектор — /mediaping')
+            'Автоматический варн/мут за это медиа не выдан.')
+    if suppressed:
+        text += f'\nЗа время паузы скрыто похожих уведомлений: <b>{suppressed}</b>.'
+    text += '\nСостояние детектора — /mediaping'
     if link:
         text += f'\n<a href="{html.escape(link, quote=True)}">Открыть сообщение</a>'
     for admin_id in _all_admin_ids():
@@ -24625,36 +24642,35 @@ async def _mod_media_unchecked(bot: Bot, message, reason: str) -> None:
 
 
 async def _mod_unjudged_text(bot: Bot, message, category: str, reason: str) -> None:
-    """Зовёт человека, когда сомнительное сообщение судить некому.
-
-    Второй уровень существует ровно для таких случаев: локальные правила
-    что-то заметили, но наказывать по ним нельзя — пусть посмотрит модель.
-    Когда модели нет (ключи кончились, провайдер отвечает 401), решение
-    записывалось как «не проверено» и на этом всё: никто ничего не узнавал.
-    Сейчас у бота ни одной рабочей модели, то есть молчал весь второй уровень.
-
-    Наказание тут по-прежнему не выдаётся — сомнение решается в пользу
-    человека. Но и тишины быть не должно: увидеть и решить может админ.
-    """
+    """Escalate an unavailable second-level judgment without notification storms."""
     chat_id = message.chat_id
     metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'no_judge'})
-    # Та же защита от лавины, что и у непроверенного медиа: чат может за минуту
-    # набросать десяток спорных сообщений, и десять одинаковых писем админу
-    # приведут к тому, что он выключит уведомления совсем.
     if MODERATION_UNJUDGED_NOTICE_SEC <= 0:
         return
+
+    # The screenshots exposed a noisy failure mode: every harmless short link
+    # candidate produced another "spam + model unavailable" DM. Coalesce by
+    # chat+category, while preserving a count so outages remain visible.
+    key = (int(chat_id), str(category or 'unknown').casefold())
     now = time.monotonic()
-    if now - _moderation_unjudged_reports.get(chat_id, -3600) < MODERATION_UNJUDGED_NOTICE_SEC:
+    state = _moderation_unjudged_reports.get(key) or {'at': -86400.0, 'suppressed': 0}
+    if now - float(state.get('at', -86400.0)) < MODERATION_UNJUDGED_NOTICE_SEC:
+        state['suppressed'] = int(state.get('suppressed', 0)) + 1
+        _moderation_unjudged_reports[key] = state
         return
-    _moderation_unjudged_reports[chat_id] = now
-    while len(_moderation_unjudged_reports) > 200:
+    suppressed = int(state.get('suppressed', 0))
+    _moderation_unjudged_reports[key] = {'at': now, 'suppressed': 0}
+    while len(_moderation_unjudged_reports) > 400:
         _moderation_unjudged_reports.pop(next(iter(_moderation_unjudged_reports)))
+
     link = getattr(message, 'link', None)
-    text = (f'🛡 Сообщение не проверено: подозрение «{html.escape(category)}», '
-            'а модель недоступна.\n'
+    text = (f'🛡 Нужна ручная оценка: локальное подозрение «{html.escape(category)}», '
+            'но модель модерации недоступна.\n'
             f'Чат <code>{chat_id}</code>, сообщение <code>{message.message_id}</code>.\n'
-            'Наказание не выдано — нужна ручная оценка.\n'
-            'Состояние моделей — /llm, проверить ключ — /llmping')
+            'Автоматическое наказание не выдано.')
+    if suppressed:
+        text += f'\nЗа время паузы скрыто похожих уведомлений: <b>{suppressed}</b>.'
+    text += '\nСтатус модерации — /modstats, живая проверка модели — /modllmping'
     if reason:
         text += f'\nПричина подозрения: {html.escape(reason)}'
     if link:
@@ -25253,12 +25269,12 @@ async def modtest_command(update, context: ContextTypes.DEFAULT_TYPE):
                    f'({MODERATION_LLM_DAILY_LIMIT})')
         verdict = await _moderation_classify(probe_chat, text)
         if verdict is None:
-            lines.append('\n2️⃣ Модель: <b>недоступна</b> — в бою бот бы промолчал.')
+            lines.append('\n2️⃣ Модель: <b>недоступна</b> — в бою сообщение ушло бы на ручную проверку.')
             # Причину, записанную самим вызовом, показываем первой: она свежее
             # и конкретнее, чем состояние, снятое до запроса.
             fresh = _moderation_llm_status()
             lines.append(f'   Причина: {html.escape(fresh or why or "провайдер не ответил")}')
-            lines.append('   Настройки модели чата и квота — /modstats')
+            lines.append('   Настройки и квота — /modstats; живая проверка — /modllmping')
             await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
             return
         if not verdict.get('violation'):
@@ -25447,6 +25463,46 @@ def _moderation_log_text(rows: list) -> str:
 async def modstats_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Статистика решений модерации: /modstats."""
     await update.message.reply_text(_moderation_stats_text(), parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def modllmping_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Live probe of the moderation model, independent from the news LLM."""
+    if not MODERATION_LLM_ENABLED:
+        await update.message.reply_text(
+            '🛡 Модель модерации отключена. Включение: MODERATION_LLM_ENABLED=true '
+            'и отдельные MODERATION_LLM_* настройки.')
+        return
+    client = _get_moderation_llm_client()
+    if not client.configured:
+        await update.message.reply_text(
+            '❌ Модель модерации не настроена. Нужны MODERATION_LLM_PROVIDER '
+            'или BASE_URL, MODERATION_LLM_MODEL и MODERATION_LLM_API_KEY.')
+        return
+    before = client.snapshot()
+    started = time.monotonic()
+    verdict = await _moderation_classify(
+        -1000000000000,
+        'Техническая проверка доступности модели. Это обычное сообщение без нарушения.',
+    )
+    took = time.monotonic() - started
+    after = client.snapshot()
+    if verdict is None:
+        await update.message.reply_text(
+            '❌ Модель модерации не ответила.\n'
+            f'Модель: <code>{html.escape(client.model)}</code>\n'
+            f'Причина: <code>{html.escape(str(after.get("error") or "unknown"))}</code>\n'
+            f'Время: {took:.1f} с\n\n'
+            'Подробнее: /modstats',
+            parse_mode=ParseMode.HTML)
+        return
+    await update.message.reply_text(
+        '✅ Модель модерации отвечает.\n'
+        f'Модель: <code>{html.escape(client.model)}</code>\n'
+        f'Время: {took:.1f} с\n'
+        f'Запросы сегодня: {after.get("requests", 0)}/{client.daily_limit} '
+        f'(до проверки было {before.get("requests", 0)}).',
+        parse_mode=ParseMode.HTML)
 
 
 @admin_only
@@ -27018,6 +27074,7 @@ def main():
     app.add_handler(CommandHandler("modoff", modoff_command))
     app.add_handler(CommandHandler("moderation", moderation_command))
     app.add_handler(CommandHandler("modstats", modstats_command))
+    app.add_handler(CommandHandler("modllmping", modllmping_command))
     app.add_handler(CommandHandler("modtest", modtest_command))
     app.add_handler(CommandHandler("modlog", modlog_command))
     app.add_handler(CommandHandler("modmode", modmode_command))
