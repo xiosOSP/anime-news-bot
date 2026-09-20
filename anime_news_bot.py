@@ -2338,6 +2338,12 @@ class ChatModerationStore:
                 'text': str(text)[:500], 'incident_id': str(incident_id)[:24],
                 'mode': self.mode, 'feedback': '',
             }
+            stats = self._data.setdefault('stats', {})
+            quality = stats.setdefault('quality', {})
+            quality['candidates'] = int(quality.get('candidates', 0)) + 1
+            cat = stats.setdefault('by_category', {}).setdefault(
+                str(category)[:40], {'total': 0, 'overturned': 0})
+            cat['candidates'] = int(cat.get('candidates', 0)) + 1
             if not self._save():
                 self._data = before
                 return False
@@ -25569,6 +25575,7 @@ def _moderation_stats_text() -> str:
     total = sum(int(v) for v in by_action.values())
     overturned = int(data.get('overturned_total', 0))
     quality = data.get('quality') or {}
+    candidates = int(quality.get('candidates', 0))
     reviewed = int(quality.get('reviewed', 0))
     correct = int(quality.get('correct', 0))
     incorrect = int(quality.get('incorrect', 0))
@@ -25580,7 +25587,7 @@ def _moderation_stats_text() -> str:
     if not total:
         return ('🛡 Решений пока не было.\n'
                 f'Технически не проверено: {unavailable}\n'
-                f'Размечено админами: {reviewed}\n'
+                f'Карточек для оценки: {candidates}; размечено: {reviewed}\n'
                 f'Модерируемых чатов: {len(chat_moderation.enabled_chats())}\n'
                 f'Бюджет модели: {_moderation_llm_budget_left()} из '
                 f'{MODERATION_LLM_DAILY_LIMIT} на сегодня\n{engines}')
@@ -25593,8 +25600,8 @@ def _moderation_stats_text() -> str:
         f'Не отменено: <b>{max(0, accuracy):.0f}%</b> (это не оценка точности)',
         '',
         '<b>Разметка админов:</b>',
-        f'  Проверено вручную: <b>{reviewed}</b> из {total} решений'
-        + (f' ({100 * reviewed / max(1, total):.0f}%)' if total else ''),
+        f'  Проверено вручную: <b>{reviewed}</b> из {candidates} карточек'
+        + (f' ({100 * reviewed / max(1, candidates):.0f}%)' if candidates else ''),
         f'  Верных: <b>{correct}</b> · ошибок: <b>{incorrect}</b>',
         (f'  False-positive среди размеченных: <b>{100 * incorrect / reviewed:.1f}%</b>'
          if reviewed else '  False-positive: пока нет размеченных решений'),
