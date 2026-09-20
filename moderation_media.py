@@ -333,10 +333,52 @@ def build_detector():
         onnxruntime.InferenceSession = original
 
 
+def _evaluate_frames(detector, frames, explicit_threshold, suggestive_threshold):
+    """Evaluate sampled frames and require corroboration for borderline 16+.
+
+    One BUTTOCKS_EXPOSED score exactly at 0.85 used to turn a whole GIF into a
+    moderation action. Suggestive classes are inherently noisier than explicit
+    nudity, so a borderline single-frame hit now goes to manual review.
+    """
+    best, count = Scan('checked'), 0
+    uncertain = None
+    suggestive_hits = 0
+    for frame in frames:
+        detection = scan_frame(detector, frame, explicit_threshold, suggestive_threshold)
+        count += 1
+        if detection.category == 'nsfw':
+            return Scan('checked', detection.category, detection.reason, count, detection.score)
+        if detection.category == 'spoiler_16':
+            suggestive_hits += 1
+            if not best.category or detection.score > best.score:
+                best = detection
+        elif detection.category:
+            best = detection
+        if detection.status == 'unchecked':
+            uncertain = detection
+    if not count:
+        return Scan('unchecked', reason='Нет декодированных кадров')
+    if not best.category and uncertain is not None:
+        return Scan('unchecked', reason=uncertain.reason, frames=count)
+    if best.category == 'spoiler_16':
+        strong = min(.99, suggestive_threshold + SUGGESTIVE_STRONG_MARGIN)
+        if suggestive_hits < 2 and best.score < strong:
+            return Scan(
+                'unchecked',
+                reason=(f'Одиночная пограничная оценка 16+ ({best.reason}; '
+                        f'{best.score:.2f}); нужна ручная проверка'),
+                frames=count,
+                score=best.score,
+            )
+    return Scan('checked', best.category, best.reason, count, best.score)
+
+
 def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
     from PIL import Image, UnidentifiedImageError
     if not 0 < Path(path).stat().st_size <= MAX_BYTES:
         return Scan('unchecked', reason='Размер файла вне допустимого диапазона')
+
+    video_like = False
     if kind == 'tgs':
         frames = _tgs_frames(path)
     else:
@@ -352,24 +394,19 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
             if not (magic[4:8] == b'ftyp' or magic[:4] == b'\x1aE\xdf\xa3' or
                     (magic[:4] == b'RIFF' and magic[8:12] == b'AVI ')):
                 return Scan('unchecked', reason='Неподдерживаемый формат файла')
+            video_like = True
             frames = _video_frames(path)
+
     detector = build_detector()  # 320n.onnx is included in the pinned wheel.
-    best, count = Scan('checked'), 0
-    uncertain = None
-    for frame in frames:
-        detection = scan_frame(detector, frame, explicit_threshold, suggestive_threshold)
-        count += 1
-        if detection.category == 'nsfw':
-            return Scan('checked', detection.category, detection.reason, count, detection.score)
-        if detection.category:
-            best = detection
-        if detection.status == 'unchecked':
-            uncertain = detection
-    if not count:
-        return Scan('unchecked', reason='Нет декодированных кадров')
-    if not best.category and uncertain is not None:
-        return Scan('unchecked', reason=uncertain.reason, frames=count)
-    return Scan('checked', best.category, best.reason, count, best.score)
+    try:
+        return _evaluate_frames(detector, frames, explicit_threshold, suggestive_threshold)
+    except ValueError:
+        # OpenCV fails on some perfectly valid Telegram encodes/seeks. Retry
+        # the same local file through ffmpeg before declaring it unchecked.
+        if not video_like or not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
+            raise
+        return _evaluate_frames(
+            detector, _ffmpeg_video_frames(path), explicit_threshold, suggestive_threshold)
 
 
 def clamp_worker_memory(memory_mb):
