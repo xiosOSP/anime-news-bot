@@ -10268,10 +10268,10 @@ async def _probe_video_delivery(news: dict) -> tuple[str, str]:
     if _is_direct_video(url):
         resolved = await _resolve_video(url)
         if resolved is None:
-            return 'fail', 'прямой файл не скачался'
+            return 'fail', 'прямой файл не отдался'
         if isinstance(resolved, (bytes, bytearray)):
             return 'ok', f'прямой файл скачан: {len(resolved) / (1024 * 1024):.1f} МБ'
-        return 'warn', 'прямой URL будет передан Telegram; без отправки Bot API не проверен'
+        return 'warn', 'скачивание не требуется: прямой URL будет передан Telegram; прикрепится только если Bot API примет URL'
 
     probe = copy.deepcopy(news)
     path = await _prepare_video_file(probe, record_failures=False)
@@ -21895,7 +21895,7 @@ async def videocheck_command(update, context: ContextTypes.DEFAULT_TYPE):
             mark = {'ok': '✅', 'warn': '⚠️', 'fail': '❌'}.get(status, '❌')
             block.append(f'  Реальный путь публикации: {mark} {html.escape(detail)}')
             if status == 'ok':
-                block.append('  Итог: ✅ файл подготовлен тем же путём, что при публикации')
+                block.append('  Итог: ✅ видео прикрепится; файл подготовлен тем же путём, что при публикации')
             elif status == 'warn':
                 block.append('  Итог: ⚠️ окончательно подтвердит только отправка в Telegram')
             else:
