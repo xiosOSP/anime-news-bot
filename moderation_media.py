@@ -544,14 +544,18 @@ class MediaScanner:
         return max(0.0, self._paused_until - time.monotonic())
 
     def _note_worker_result(self, result):
-        """Считает отказы подряд: только ответы самого детектора.
+        """Count only technical detector failures, never moderation uncertainty.
 
-        Отказы по размеру файла и переполнению очереди сюда не попадают —
-        это не поломка детектора, а штатный отказ до его запуска.
+        A borderline frame is a valid detector answer that requires a human.
+        Treating three such answers as crashes paused NudeNet for ten minutes
+        even though the worker was healthy.
         """
         if result.status == 'checked':
             self._failures = 0
             self._paused_until = 0.0
+            return
+        reason = str(result.reason or '').casefold()
+        if 'ручн' in reason or 'пограничн' in reason:
             return
         self._failures += 1
         if self._failures >= self.failure_limit:
