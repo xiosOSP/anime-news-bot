@@ -235,6 +235,7 @@
 | `MODERATION_MEDIA_ENABLED` | `true` | anime_news_bot.py |
 | `MODERATION_MEDIA_EXPLICIT_THRESHOLD` | `0.8` | anime_news_bot.py |
 | `MODERATION_MEDIA_MEMORY_MB` | — | anime_news_bot.py |
+| `MODERATION_MEDIA_NOTICE_SEC` | `900` | anime_news_bot.py |
 | `MODERATION_MEDIA_QUEUE` | `4` | anime_news_bot.py |
 | `MODERATION_MEDIA_SUGGESTIVE_THRESHOLD` | `0.85` | anime_news_bot.py |
 | `MODERATION_MEDIA_TIMEOUT_SEC` | `25` | anime_news_bot.py |
@@ -242,7 +243,7 @@
 | `MODERATION_REPEAT_LIMIT` | `3` | anime_news_bot.py |
 | `MODERATION_REPEAT_WINDOW_SEC` | `120` | anime_news_bot.py |
 | `MODERATION_STORE_MAX_USERS` | `5000` | anime_news_bot.py |
-| `MODERATION_UNJUDGED_NOTICE_SEC` | `300` | anime_news_bot.py |
+| `MODERATION_UNJUDGED_NOTICE_SEC` | `900` | anime_news_bot.py |
 | `MODERATION_WARN_TTL_HOURS` | — | anime_news_bot.py |
 
 ### Опрос Telegram
