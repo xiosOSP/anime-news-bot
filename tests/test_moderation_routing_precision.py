@@ -91,5 +91,8 @@ async def test_repeated_media_still_counts_as_spam(state, monkeypatch):
     tg = telegram_bot()
     for number in range(1, 4):
         await handle(message('', number, sticker=NS(file_unique_id='same', emoji='🙂')), tg)
-    tg.delete_message.assert_awaited_once()
+    # Repeated media is still detected as spam, but PR #59 deliberately
+    # downgraded low-severity repetition to a warning without deletion. This
+    # avoids turning three identical stickers into destructive moderation.
+    tg.delete_message.assert_not_awaited()
     assert state.warn_count(-100, 7) == 1
