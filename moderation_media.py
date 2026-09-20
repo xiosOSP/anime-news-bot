@@ -113,6 +113,25 @@ def media_attachment(message):
     return None
 
 
+def media_preview_attachment(message):
+    """Return a small Telegram thumbnail when the original cannot be downloaded.
+
+    A clean thumbnail never proves that the whole video/document is safe, but
+    a positive detection is still useful evidence for manual review. Telegram's
+    public Bot API cannot download many originals above ~20 MB, while their
+    thumbnails remain available.
+    """
+    attachment = media_attachment(message)
+    if attachment is None:
+        return None
+    item, _kind = attachment
+    for attr in ('thumbnail', 'thumb'):
+        preview = getattr(item, attr, None)
+        if preview is not None and getattr(preview, 'file_id', None):
+            return preview, 'image'
+    return None
+
+
 def sample_indices(count, limit=MAX_FRAMES):
     count = int(count)
     if count <= 0:
@@ -184,11 +203,22 @@ def _video_frames(path):
         if count / fps > MAX_DURATION or width * height > MAX_PIXELS:
             raise ValueError('video dimensions/duration exceed limit')
         for index in sample_indices(count):
-            if not capture.set(cv2.CAP_PROP_POS_FRAMES, index):
-                raise ValueError('video seek failed')
-            success, frame = capture.read()
+            success, frame = False, None
+            # Some Telegram MP4/WebM files decode fine but report that random
+            # frame seeking is unsupported. Try timestamp seeking before
+            # declaring the whole file broken.
+            if capture.set(cv2.CAP_PROP_POS_FRAMES, index):
+                success, frame = capture.read()
             if not success:
-                raise ValueError('video frame decoding failed')
+                fallback = cv2.VideoCapture(str(path))
+                try:
+                    if fallback.isOpened():
+                        fallback.set(cv2.CAP_PROP_POS_MSEC, 1000.0 * float(index) / float(fps))
+                        success, frame = fallback.read()
+                finally:
+                    fallback.release()
+            if not success:
+                raise ValueError(f'video frame decoding failed at frame {int(index)}')
             yield Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     finally:
         capture.release()
@@ -283,17 +313,33 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
     detector = build_detector()  # 320n.onnx is included in the pinned wheel.
     best, count = Scan('checked'), 0
     uncertain = None
+    suggestive_frames = 0
     for frame in frames:
         detection = scan_frame(detector, frame, explicit_threshold, suggestive_threshold)
         count += 1
         if detection.category == 'nsfw':
             return Scan('checked', detection.category, detection.reason, count, detection.score)
-        if detection.category:
+        if detection.category == 'spoiler_16':
+            suggestive_frames += 1
+            if not best.category or detection.score > best.score:
+                best = detection
+        elif detection.category and (not best.category or detection.score > best.score):
             best = detection
         if detection.status == 'unchecked':
             uncertain = detection
     if not count:
         return Scan('unchecked', reason='Нет декодированных кадров')
+    if best.category == 'spoiler_16':
+        # A single frame exactly on the NudeNet threshold caused real false
+        # positives (e.g. BUTTOCKS_EXPOSED=0.85). Require either repeated
+        # evidence across sampled frames or one clearly stronger detection.
+        strong_score = min(.99, suggestive_threshold + .10)
+        if suggestive_frames < 2 and best.score < strong_score:
+            return Scan(
+                'unchecked',
+                reason=(f'Один пограничный кадр 16+ ({best.score:.2f}); '
+                        'нужна ручная проверка'),
+                frames=count, score=best.score)
     if not best.category and uncertain is not None:
         return Scan('unchecked', reason=uncertain.reason, frames=count)
     return Scan('checked', best.category, best.reason, count, best.score)
@@ -498,34 +544,25 @@ class MediaScanner:
         return max(0.0, self._paused_until - time.monotonic())
 
     def _note_worker_result(self, result):
-        """Считает отказы подряд: только ответы самого детектора.
+        """Count only technical detector failures, never moderation uncertainty.
 
-        Отказы по размеру файла и переполнению очереди сюда не попадают —
-        это не поломка детектора, а штатный отказ до его запуска.
+        A borderline frame is a valid detector answer that requires a human.
+        Treating three such answers as crashes paused NudeNet for ten minutes
+        even though the worker was healthy.
         """
         if result.status == 'checked':
             self._failures = 0
             self._paused_until = 0.0
             return
+        reason = str(result.reason or '').casefold()
+        if 'ручн' in reason or 'пограничн' in reason:
+            return
         self._failures += 1
         if self._failures >= self.failure_limit:
             self._paused_until = time.monotonic() + self.pause_sec
 
-    async def check(self, bot, message):
-        attachment = media_attachment(message)
-        if attachment is None:
-            return None
-        item, kind = attachment
-        size = getattr(item, 'file_size', None)
-        if size is not None and (size <= 0 or size > MAX_BYTES):
-            return Scan('unchecked', reason='Файл превышает лимит проверки 20 МБ')
-        duration = getattr(item, 'duration', 0) or 0
-        if isinstance(duration, timedelta):
-            duration = duration.total_seconds()
-        if duration > MAX_DURATION:
-            return Scan('unchecked', reason='Видео длиннее 3 минут')
-        if (getattr(item, 'width', 0) or 0) * (getattr(item, 'height', 0) or 0) > MAX_PIXELS:
-            return Scan('unchecked', reason='Слишком большое разрешение')
+    async def _check_downloadable(self, bot, item, kind):
+        """Download one bounded attachment and run the disposable detector."""
         key = str(getattr(item, 'file_unique_id', '') or '')
         cached = self._cache.get(key)
         if cached and cached[0] > time.monotonic():
@@ -533,25 +570,14 @@ class MediaScanner:
             return cached[1]
         paused = self.paused_for()
         if paused > 0:
-            # Честный текст вместо «очередь переполнена»: пока детектор не
-            # работает, очередь — следствие, а не причина.
             return Scan('unchecked', reason=f'Детектор не отвечает {self._failures} раз подряд; '
                                             f'пауза ещё {paused / 60:.0f} мин (/mediaping)')
         gate = self._slot()
-        # Считаем всех, кто уже проверяется или ждёт очереди. По gate.locked()
-        # переполнение не увидеть: захват уходит в отдельную задачу и к этому
-        # моменту ещё не случился, так что второй проверяющий видел бы
-        # свободный замок и потолок не работал бы вовсе.
         if self._in_flight > self.max_waiting:
-            # Потолок нарочный: ждущая проверка держит обработчик апдейта, и
-            # без него всплеск сообщений утащил бы бота целиком.
             return Scan('unchecked', reason='Очередь локальной проверки переполнена')
         self._in_flight += 1
         try:
             try:
-                # Ожидание ограничено сверху: за это время стоящие впереди
-                # успевают отработать (скачивание плюс детектор), а если не
-                # успевают — честнее сказать человеку, чем ждать бесконечно.
                 await asyncio.wait_for(gate.acquire(), timeout=self.timeout * 2 + 20)
             except asyncio.TimeoutError:
                 return Scan('unchecked', reason='Локальная проверка не дождалась очереди')
@@ -563,8 +589,9 @@ class MediaScanner:
                         return Scan('unchecked', reason='Неизвестный или недопустимый размер файла')
                     with tempfile.TemporaryDirectory(prefix='chat-moderation-') as directory:
                         path = Path(directory) / 'content'
-                        await asyncio.wait_for(file.download_to_drive(custom_path=path,
-                                                                     read_timeout=15, connect_timeout=5), timeout=20)
+                        await asyncio.wait_for(
+                            file.download_to_drive(custom_path=path, read_timeout=15, connect_timeout=5),
+                            timeout=20)
                         task = asyncio.create_task(asyncio.to_thread(
                             run_worker, path, kind, self.timeout,
                             self.explicit_threshold, self.suggestive_threshold,
@@ -572,7 +599,6 @@ class MediaScanner:
                         try:
                             result = await asyncio.shield(task)
                         except asyncio.CancelledError:
-                            # Keep ownership of the file and slot until worker exits.
                             await task
                             raise
                 except Exception:
@@ -588,6 +614,46 @@ class MediaScanner:
         finally:
             self._in_flight -= 1
 
+    async def check(self, bot, message):
+        attachment = media_attachment(message)
+        if attachment is None:
+            return None
+        item, kind = attachment
+        size = getattr(item, 'file_size', None)
+        if size is not None and size <= 0:
+            return Scan('unchecked', reason='Некорректный размер файла')
+        if size is not None and size > MAX_BYTES:
+            preview = media_preview_attachment(message)
+            if preview is None:
+                return Scan('unchecked', reason='Файл превышает лимит загрузки Bot API 20 МБ; превью нет')
+            preview_item, preview_kind = preview
+            preview_scan = await self._check_downloadable(bot, preview_item, preview_kind)
+            if preview_scan.status != 'checked':
+                return Scan(
+                    'unchecked',
+                    reason=('Файл превышает лимит загрузки Bot API 20 МБ; '
+                            f'превью тоже не проверено: {preview_scan.reason}'),
+                    frames=preview_scan.frames, score=preview_scan.score)
+            if preview_scan.category:
+                return Scan(
+                    'unchecked', category=preview_scan.category,
+                    reason=('Оригинал больше 20 МБ и недоступен Bot API; '
+                            f'на превью: {preview_scan.reason}'),
+                    frames=preview_scan.frames, score=preview_scan.score)
+            return Scan(
+                'unchecked',
+                reason=('Файл превышает лимит загрузки Bot API 20 МБ; '
+                        'превью чистое, но весь оригинал не проверен'),
+                frames=preview_scan.frames)
+
+        duration = getattr(item, 'duration', 0) or 0
+        if isinstance(duration, timedelta):
+            duration = duration.total_seconds()
+        if duration > MAX_DURATION:
+            return Scan('unchecked', reason='Видео длиннее 3 минут')
+        if (getattr(item, 'width', 0) or 0) * (getattr(item, 'height', 0) or 0) > MAX_PIXELS:
+            return Scan('unchecked', reason='Слишком большое разрешение')
+        return await self._check_downloadable(bot, item, kind)
 
 if __name__ == '__main__':
     # Keep decoder memory bounded on production Linux; Windows also has input
@@ -630,7 +696,10 @@ if __name__ == '__main__':
                         reason=f'Детектору не хватило памяти (лимит {memory_mb} МБ)',
                         address_space_mb=_address_space_peak_mb())
         else:
+            detail = ' '.join(str(exc).split())[:120]
+            suffix = f': {detail}' if detail else ''
             scan = Scan('unchecked',
-                        reason=f'Ошибка декодирования или детектора: {type(exc).__name__}',
+                        reason=(f'Ошибка декодирования или детектора: '
+                                f'{type(exc).__name__}{suffix}'),
                         address_space_mb=_address_space_peak_mb())
     print(json.dumps(asdict(scan), ensure_ascii=True))

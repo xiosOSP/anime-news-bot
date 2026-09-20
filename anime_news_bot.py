@@ -24591,6 +24591,11 @@ def _mod_decide(category: str, severity: int, warns: int, streak: int = 0) -> di
         # не наказываем: до порога бот только запоминает, что так было.
         return {'action': 'none', 'human': rule['human'], 'streak': streak}
     base = rule['action']
+    if category == 'spoiler_16':
+        # Suggestive media is the noisiest local detector category. A previous
+        # text warning must not turn one later 16+ detection into an hour mute.
+        # Repeated cases remain visible in the incident history for a human.
+        return {'action': 'warn', 'delete': True, 'human': rule['human']}
     if base == 'escalate':
         return {'action': 'escalate', 'delete': True, 'human': rule['human']}
     if base == 'delete':
