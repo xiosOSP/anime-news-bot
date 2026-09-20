@@ -25579,6 +25579,8 @@ def _moderation_stats_text() -> str:
                + html.escape(_moderation_llm_status()))
     if not total:
         return ('🛡 Решений пока не было.\n'
+                f'Технически не проверено: {unavailable}\n'
+                f'Размечено админами: {reviewed}\n'
                 f'Модерируемых чатов: {len(chat_moderation.enabled_chats())}\n'
                 f'Бюджет модели: {_moderation_llm_budget_left()} из '
                 f'{MODERATION_LLM_DAILY_LIMIT} на сегодня\n{engines}')
@@ -25602,7 +25604,9 @@ def _moderation_stats_text() -> str:
     ]
     for action, count in sorted(by_action.items(), key=lambda kv: -int(kv[1])):
         lines.append(f'  {html.escape(action)}: {int(count)}')
-    rows = [(name, row) for name, row in by_category.items() if int(row.get('total', 0))]
+    rows = [(name, row) for name, row in by_category.items()
+            if int(row.get('total', 0)) or int(row.get('unavailable', 0))
+            or int(row.get('reviewed', 0))]
     if rows:
         lines.append('')
         lines.append('<b>По категориям:</b>')
