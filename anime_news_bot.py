@@ -2072,6 +2072,7 @@ class ChatModerationStore:
                 'moderate_admins': raw.get('moderate_admins') if type(raw.get('moderate_admins')) is bool else MODERATION_ADMINS_DEFAULT,
                 'log': raw.get('log') if isinstance(raw.get('log'), list) else [],
                 'incidents': raw.get('incidents') if isinstance(raw.get('incidents'), dict) else {},
+                'reviews': raw.get('reviews') if isinstance(raw.get('reviews'), dict) else {},
             }
         except (OSError, ValueError, TypeError) as e:
             logger.warning(f'Модерация: состояние не загружено: {e}')
@@ -2089,6 +2090,85 @@ class ChatModerationStore:
     def incident(self, incident_id: str) -> dict:
         with self._lock:
             return copy.deepcopy(self._data.get('incidents', {}).get(incident_id, {}))
+
+    def ensure_review(self, review_id: str, chat_id: int, user_id: int,
+                      category: str, action: str, source: str, reason: str,
+                      text: str) -> bool:
+        """Persist exactly what an administrator is asked to judge.
+
+        Observe-mode reports used to have buttons that did not write anything,
+        so there was no measurable false-positive rate. Reviews are separate
+        from sanctions: marking a verdict wrong never punishes a participant.
+        """
+        if not review_id:
+            return False
+        with self._lock:
+            before = copy.deepcopy(self._data)
+            reviews = self._data.setdefault('reviews', {})
+            if review_id in reviews:
+                return True
+            while len(reviews) >= MODERATION_STORE_MAX_USERS:
+                reviews.pop(next(iter(reviews)))
+            reviews[review_id] = {
+                'at': time.time(),
+                'chat_id': int(chat_id),
+                'user_id': int(user_id),
+                'category': str(category)[:40],
+                'action': str(action)[:24],
+                'source': str(source)[:40],
+                'reason': str(reason)[:200],
+                'text': str(text)[:400],
+                'feedback': '',
+            }
+            if not self._save():
+                self._data = before
+                return False
+            return True
+
+    def review(self, review_id: str) -> dict:
+        with self._lock:
+            return copy.deepcopy(self._data.get('reviews', {}).get(review_id, {}))
+
+    def record_review_feedback(self, review_id: str, verdict: str) -> bool:
+        """Store one human label per report and aggregate quality metrics."""
+        if verdict not in ('correct', 'wrong'):
+            return False
+        with self._lock:
+            before = copy.deepcopy(self._data)
+            row = self._data.get('reviews', {}).get(review_id)
+            if not row:
+                return False
+            previous = str(row.get('feedback') or '')
+            if previous == verdict:
+                return True
+            if previous in ('correct', 'wrong'):
+                return False
+            row['feedback'] = verdict
+            row['feedback_at'] = time.time()
+
+            stats = self._data.setdefault('stats', {})
+            stats['feedback_total'] = int(stats.get('feedback_total', 0)) + 1
+            key = 'feedback_correct' if verdict == 'correct' else 'feedback_wrong'
+            stats[key] = int(stats.get(key, 0)) + 1
+
+            category = str(row.get('category') or '')[:40]
+            cat = stats.setdefault('by_category', {}).setdefault(
+                category, {'total': 0, 'overturned': 0})
+            cat['feedback_total'] = int(cat.get('feedback_total', 0)) + 1
+            cat_key = 'feedback_correct' if verdict == 'correct' else 'feedback_wrong'
+            cat[cat_key] = int(cat.get(cat_key, 0)) + 1
+
+            source = str(row.get('source') or 'unknown')[:40]
+            src = stats.setdefault('by_source', {}).setdefault(
+                source, {'total': 0, 'correct': 0, 'wrong': 0})
+            src['total'] = int(src.get('total', 0)) + 1
+            src['correct' if verdict == 'correct' else 'wrong'] = (
+                int(src.get('correct' if verdict == 'correct' else 'wrong', 0)) + 1
+            )
+            if not self._save():
+                self._data = before
+                return False
+            return True
 
     def recent_penalty(self, chat_id, user_id, seconds: int) -> bool:
         with self._lock:
@@ -2373,6 +2453,7 @@ class ChatModerationStore:
         with self._lock:
             self._data['stats'] = {}
             self._data['log'] = []
+            self._data['reviews'] = {}
         return self._save()
 
     def history(self, chat_id, user_id) -> list[dict]:
@@ -24948,15 +25029,25 @@ async def _mod_tell_user(bot: Bot, message, decision: dict, category: str,
         logger.info('Модерация: объяснение не отправлено (%s)', type(exc).__name__)
 
 
-def _mod_report_markup(chat_id: int, user_id: int, incident_id: str = '', *, allow_ban: bool = True) -> InlineKeyboardMarkup:
-    suffix = f':{incident_id}' if incident_id else ''
-    buttons = [
-        InlineKeyboardButton('✅ Верно', callback_data=f'mod:ok:{chat_id}:{user_id}{suffix}'),
-        InlineKeyboardButton('↩️ Снять', callback_data=f'mod:undo:{chat_id}:{user_id}{suffix}'),
-    ]
-    if allow_ban and user_id > 0:
-        buttons.append(InlineKeyboardButton('🚫 Забанить', callback_data=f'mod:ban:{chat_id}:{user_id}{suffix}'))
-    return InlineKeyboardMarkup([buttons])
+def _mod_report_markup(chat_id: int, user_id: int, review_id: str = '',
+                       incident_id: str = '', *, allow_ban: bool = True) -> InlineKeyboardMarkup:
+    """Feedback is always available; destructive controls require an incident."""
+    rows = []
+    if review_id:
+        suffix = f':{review_id}'
+        rows.append([
+            InlineKeyboardButton('✅ Верно', callback_data=f'mod:ok:{chat_id}:{user_id}{suffix}'),
+            InlineKeyboardButton('❌ Ошибка', callback_data=f'mod:wrong:{chat_id}:{user_id}{suffix}'),
+        ])
+    if incident_id:
+        suffix = f':{incident_id}'
+        actions = [InlineKeyboardButton(
+            '↩️ Снять', callback_data=f'mod:undo:{chat_id}:{user_id}{suffix}')]
+        if allow_ban and user_id > 0:
+            actions.append(InlineKeyboardButton(
+                '🚫 Забанить', callback_data=f'mod:ban:{chat_id}:{user_id}{suffix}'))
+        rows.append(actions)
+    return InlineKeyboardMarkup(rows)
 
 
 async def _mod_report(bot: Bot, message, category: str, decision: dict,
@@ -24987,12 +25078,28 @@ async def _mod_report(bot: Bot, message, category: str, decision: dict,
         text += f'Основание: {html.escape(reason)}\n'
     if category in MODERATION_HUMAN_ONLY:
         text += '\n⚠️ Бот сам не банит. Решение за вами.\n'
-    text += f'\n<blockquote>{_escape_to_limit(_mod_message_text(message), 400)}</blockquote>'
+    message_text = _mod_message_text(message)
+    text += f'\n<blockquote>{_escape_to_limit(message_text, 400)}</blockquote>'
+
+    incident_id = str(decision.get('incident_id') or '')
+    review_seed = (
+        f'{message.chat_id}:{getattr(message, "message_id", 0)}:{user_id}:'
+        f'{category}:{source}:{decision.get("action", "")}'
+    )
+    review_id = incident_id or hashlib.sha256(review_seed.encode()).hexdigest()[:20]
+    if chat_moderation is not None:
+        chat_moderation.ensure_review(
+            review_id, message.chat_id, user_id, category,
+            str(decision.get('action') or ''), source, reason, message_text)
+    decision['review_id'] = review_id
+
     for admin_id in _all_admin_ids():
         try:
-            await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML,
-                                   reply_markup=_mod_report_markup(message.chat_id, user_id, decision.get('incident_id', ''),
-                                        allow_ban=not decision.get('restriction_blocked')))
+            await bot.send_message(
+                admin_id, text, parse_mode=ParseMode.HTML,
+                reply_markup=_mod_report_markup(
+                    message.chat_id, user_id, review_id, incident_id,
+                    allow_ban=not decision.get('restriction_blocked')))
         except TelegramError:
             logger.debug('Модерация: отчёт админу %s не доставлен', admin_id)
 
@@ -25458,6 +25565,9 @@ def _moderation_stats_text() -> str:
     by_category = data.get('by_category') or {}
     total = sum(int(v) for v in by_action.values())
     overturned = int(data.get('overturned_total', 0))
+    feedback_total = int(data.get('feedback_total', 0))
+    feedback_correct = int(data.get('feedback_correct', 0))
+    feedback_wrong = int(data.get('feedback_wrong', 0))
     engines = ('Проверка администрации: ' + ('включена' if chat_moderation.moderate_admins else 'выключена') + '\n'
                + 'Локальные текстовые правила: включены\n'
                + f'Проверка медиа: {"включена" if MODERATION_MEDIA_ENABLED else "отключена"}\n'
@@ -25474,6 +25584,10 @@ def _moderation_stats_text() -> str:
         f'Решений всего: <b>{total}</b>',
         f'Отменено людьми: <b>{overturned}</b> ({100 - accuracy:.0f}%)',
         f'Не отменено: <b>{max(0, accuracy):.0f}%</b> (это не оценка точности)',
+        f'Размечено админами: <b>{feedback_total}</b>'
+        + (f' · верно {feedback_correct} · ошибка {feedback_wrong} · '
+           f'precision {100 * feedback_correct / max(1, feedback_total):.0f}%'
+           if feedback_total else ' · нажимайте ✅ Верно / ❌ Ошибка'),
         '',
         '<b>По действиям:</b>',
     ]
@@ -25486,8 +25600,25 @@ def _moderation_stats_text() -> str:
         for name, row in sorted(rows, key=lambda kv: -int(kv[1].get('total', 0))):
             human = MODERATION_RULES.get(name, {}).get('human', name)
             bad = int(row.get('overturned', 0))
+            labelled = int(row.get('feedback_total', 0))
+            wrong = int(row.get('feedback_wrong', 0))
             tail = f' · отменено {bad}' if bad else ''
+            if labelled:
+                tail += f' · оценки {labelled}, ошибок {wrong}'
             lines.append(f'  {html.escape(str(human))}: {int(row.get("total", 0))}{tail}')
+    by_source = data.get('by_source') or {}
+    source_rows = [(name, row) for name, row in by_source.items()
+                   if int(row.get('total', 0))]
+    if source_rows:
+        lines += ['', '<b>Качество по источникам решения:</b>']
+        for name, row in sorted(source_rows, key=lambda kv: -int(kv[1].get('total', 0))):
+            labelled = int(row.get('total', 0))
+            correct = int(row.get('correct', 0))
+            wrong = int(row.get('wrong', 0))
+            lines.append(
+                f'  {html.escape(str(name))}: {labelled} оценок · '
+                f'верно {correct} · ошибок {wrong}')
+
     lines += ['', f'Режим: <b>{chat_moderation.mode}</b>'
                   + (' — бот только докладывает' if chat_moderation.mode == 'observe' else ''),
               f'Бюджет модели: {_moderation_llm_budget_left()} из '
@@ -25626,11 +25757,25 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     except ValueError:
         await query.answer()
         return True
-    if verb == 'ok':
-        await query.answer('Принято')
+    reference_id = parts[4] if len(parts) == 5 else ''
+    if verb in ('ok', 'wrong'):
+        if not reference_id or chat_moderation is None:
+            await query.answer('У этого старого отчёта нет ID для оценки', show_alert=True)
+            return True
+        review = chat_moderation.review(reference_id)
+        if (not review or review.get('chat_id') != chat_id
+                or review.get('user_id') != user_id):
+            await query.answer('Отчёт устарел или не найден', show_alert=True)
+            return True
+        verdict = 'correct' if verb == 'ok' else 'wrong'
+        if not chat_moderation.record_review_feedback(reference_id, verdict):
+            await query.answer('Оценка уже сохранена или не записалась', show_alert=True)
+            return True
+        await query.answer('Записал: решение верное' if verdict == 'correct'
+                           else 'Записал: ложное срабатывание')
         await query.edit_message_reply_markup(reply_markup=None)
         return True
-    incident_id = parts[4] if len(parts) == 5 else ''
+    incident_id = reference_id
     async with _moderation_action_lock:
         incident = chat_moderation.incident(incident_id) if chat_moderation is not None else {}
         if not incident or incident.get('chat_id') != chat_id or incident.get('user_id') != user_id:
@@ -25669,6 +25814,9 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             if not chat_moderation.undo_incident(incident_id):
                 await query.answer('Не удалось сохранить отмену; проверьте /modlog', show_alert=True)
                 return True
+            # Undo is also a strong human label that the original decision was
+            # wrong. If feedback was already recorded, the method is idempotent.
+            chat_moderation.record_review_feedback(incident_id, 'wrong')
             _MOD_LAST_ACTION.pop(f'{chat_id}:{user_id}', None)
             await query.answer('Варн за это нарушение снят. ' + ('Мут снят.' if restored else 'Другие ограничения сохранены.'))
             await query.edit_message_reply_markup(reply_markup=None)
