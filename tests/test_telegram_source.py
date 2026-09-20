@@ -110,7 +110,8 @@ class TestPostShape:
     def test_labels_of_every_shape_step_aside(self, label):
         title, _ = anime_news_bot._tg_title_and_summary(
             f'{label}\nСтудия MAPPA объявила дату премьеры', 'ch', 'TG: Ch')
-        assert title == 'Студия MAPPA объявила дату премьеры'
+        prefix = 'Слух: ' if 'Слух' in label else ''
+        assert title == prefix + 'Студия MAPPA объявила дату премьеры'
 
     def test_label_alone_is_still_published(self):
         """Рубрика без текста — плохой заголовок, но лучше, чем пустой пост."""

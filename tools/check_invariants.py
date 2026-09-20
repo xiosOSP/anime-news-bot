@@ -696,10 +696,11 @@ def _check_headline_is_never_a_label(bot) -> tuple[bool, str]:
     labels = ('Манга.', 'Аниме', '🔥 СРОЧНО', '⚡️ВАЖНО', 'BREAKING', 'Слух')
     fact = 'Студия MAPPA анонсировала новый проект.'
     bad = [label for label in labels
-           if bot._tg_title_and_summary(f'{label}\n{fact}', 'ch', 'Канал')[0] != fact]
+           if bot._tg_title_and_summary(f'{label}\n{fact}', 'ch', 'Канал')[0]
+           != ('Слух: ' + fact if label == 'Слух' else fact)]
     if bad:
         return False, f'заголовком стала рубрика: {bad[0]!r}'
-    return True, f'{len(labels)} рубрик уступили место новости'
+    return True, f'{len(labels)} рубрик уступили место новости; статус слуха сохранён'
 
 
 def _check_model_names_from_presets_are_accepted(bot) -> tuple[bool, str]:

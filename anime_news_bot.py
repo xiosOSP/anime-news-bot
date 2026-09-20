@@ -38,7 +38,7 @@ from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import feedparser
@@ -507,7 +507,7 @@ GOLDEN_DATASET_FILE = Path(__file__).with_name('golden') / 'editorial_cases.json
 STORY_UPDATE_LOOKBACK_DAYS = max(1, min(90, _env_int('STORY_UPDATE_LOOKBACK_DAYS', 21)))
 STORY_UPDATE_SIMILARITY = max(0.60, min(0.95, _env_float('STORY_UPDATE_SIMILARITY', 0.76)))
 REPLAY_BUFFER_MAX = max(20, min(2000, _env_int('REPLAY_BUFFER_MAX', 300)))
-LLM_PROMPT_VERSION = _env('LLM_PROMPT_VERSION', 'editorial-v3-2026-09-15').strip() or 'editorial-v3-2026-09-15'
+LLM_PROMPT_VERSION = _env('LLM_PROMPT_VERSION', 'editorial-v4-2026-09-20').strip() or 'editorial-v4-2026-09-20'
 LLM_JUDGE_MAX_TOKENS = max(80, min(500, _env_int('LLM_JUDGE_MAX_TOKENS', 180)))
 
 # Verification / Telegram media framing — Stage 12
@@ -905,7 +905,7 @@ VIDEO_NORMALIZE_CRF = max(18, min(35, _env_int('VIDEO_NORMALIZE_CRF', 27)))
 VIDEO_THUMB_SEEK_SEC = max(0.0, min(30.0, _env_float('VIDEO_THUMB_SEEK_SEC', 1.0)))
 # Хосты, для которых пробуем yt-dlp
 VIDEO_HOSTS = (
-    'youtube.com', 'youtu.be', 'm.youtube.com',
+    'youtube.com', 'youtu.be', 'm.youtube.com', 'youtube-nocookie.com',
     'twitter.com', 'x.com', 'mobile.twitter.com',
     'vimeo.com', 'player.vimeo.com',
     'nicovideo.jp', 'nico.ms',
@@ -5865,7 +5865,8 @@ replay_buffer: Optional['ReplayBuffer'] = None
 
 
 def _apply_editorial_rules(text: str, news: Optional[dict] = None) -> str:
-    out = str(text or '')
+    from news_parser import clean_editorial_source
+    out = clean_editorial_source(text)
     if feature_enabled('editorial_glossary') and editorial_glossary is not None:
         out = editorial_glossary.apply(out)
     if feature_enabled('entity_memory') and entity_memory is not None:
@@ -6181,6 +6182,8 @@ def extract_release_date_from_text(text: str) -> str:
     if not text:
         return ''
 
+    from news_parser import clean_editorial_source
+    text = clean_editorial_source(text)
     year_now = datetime.now().year
     year_min, year_max = year_now - 1, year_now + 6
 
@@ -7031,7 +7034,8 @@ _ARTICLE_JUNK = re.compile(
 # Ради них стоит заглянуть в статью, если в ленте видео не оказалось.
 _VIDEO_HINT_RE = re.compile(
     r'(?:trailer|teaser|promo video|\bpv\b|opening|ending|first look|'
-    r'трейлер|тизер|промо|опенинг|эндинг|ролик|видео)', re.IGNORECASE)
+    r'трейлер|тизер|промо|опенинг|эндинг|ролик|видео|'
+    r'予告|ティザー|特報|映像|(?<![a-z])pv(?![a-z]))', re.IGNORECASE)
 
 
 def _probably_has_video(news: dict) -> bool:
@@ -7040,59 +7044,113 @@ def _probably_has_video(news: dict) -> bool:
     return bool(_VIDEO_HINT_RE.search(text))
 
 
-def _find_video_in_html(html_text: str, base_url: Optional[str] = None) -> Optional[str]:
-    """Ищет ролик на странице статьи: og:video, встроенный плеер, ссылки.
+def _is_playable_video_url(url: str) -> bool:
+    """A video page or file, not a publisher's social profile or playlist."""
+    if _is_direct_video(url):
+        return True
+    if not _is_video_host(url):
+        return False
+    parsed = urlparse(url)
+    host = (parsed.hostname or '').lower().removeprefix('www.').removeprefix('m.')
+    path = parsed.path
+    if host in ('x.com', 'twitter.com', 'mobile.twitter.com'):
+        return bool(re.fullmatch(r'/(?:[^/]+/status|i/(?:web/)?status)/[0-9]+(?:/video/[0-9]+)?/?', path))
+    if host in ('youtube.com', 'youtube-nocookie.com'):
+        return bool((path == '/watch' and parse_qs(parsed.query).get('v'))
+                    or re.fullmatch(r'/(?:embed|shorts|live)/[\w-]+/?', path))
+    if host == 'youtu.be':
+        return bool(re.fullmatch(r'/[\w-]+/?', path))
+    if host in ('vimeo.com', 'player.vimeo.com'):
+        return bool(re.fullmatch(r'/(?:video/)?[0-9]+/?', path))
+    if host.endswith('nicovideo.jp'):
+        return path.startswith('/watch/')
+    if host == 'nico.ms':
+        return bool(path.strip('/'))
+    if host.endswith('bilibili.com'):
+        return path.startswith('/video/')
+    if host.endswith('dailymotion.com'):
+        return bool(re.match(r'/(?:embed/)?video/[^/]+', path))
+    if host == 'clips.twitch.tv':
+        return bool(path.strip('/'))
+    if host.endswith('twitch.tv'):
+        return bool(re.search(r'/(?:videos|clip)/[^/]+', path))
+    return False
 
-    В RSS обычно лежит обрезанный тизер без плеера — трейлер живёт в самой
-    статье. Раньше мы туда не заглядывали, и новости про трейлеры выходили
-    без видео."""
+
+def _find_video_in_html(html_text: str, base_url: Optional[str] = None) -> Optional[str]:
+    """Find an actual clip, including lazy players and structured VideoObject."""
     try:
         soup = BeautifulSoup(html_text, 'html.parser')
     except Exception:
         return None
 
-    def absolute(raw: Optional[str]) -> Optional[str]:
+    def playable(raw):
         value = html.unescape(str(raw or '').strip())
         if not value:
             return None
-        if value.startswith('//'):
-            value = 'https:' + value
-        elif base_url and not value.startswith(('http://', 'https://')):
-            value = urljoin(base_url, value)
+        if not base_url and not value.startswith(('http://', 'https://', '//')):
+            return None
         try:
-            parsed = urlparse(value)
-        except Exception:
+            value = urljoin(base_url or 'https://localhost/', value)
+            return value if _is_playable_video_url(value) else None
+        except ValueError:
             return None
-        if parsed.scheme not in ('http', 'https') or not parsed.netloc:
-            return None
-        return value
 
-    # 1. Мета-теги: самый надёжный признак
     for prop in ('og:video:url', 'og:video:secure_url', 'og:video',
-                 'twitter:player:stream'):
+                 'twitter:player:stream', 'twitter:player'):
         meta = (soup.select_one(f'meta[property="{prop}"]')
                 or soup.select_one(f'meta[name="{prop}"]'))
-        content = absolute(meta.get('content') if meta else None)
-        if content and (_is_video_host(content) or _is_direct_video(content)):
-            return content
-
-    # 2. Встроенный плеер
-    for frame in soup.select('iframe[src], embed[src]'):
-        url = absolute(frame.get('src'))
-        if url and _is_video_host(url):
+        url = playable(meta.get('content') if meta else None)
+        if url:
             return url
 
-    # 3. Тег video
-    tag = soup.select_one('video[src]') or soup.select_one('video source[src]')
-    if tag:
-        url = absolute(tag.get('src'))
-        if url and _is_direct_video(url):
-            return url
+    # Prefer the article to navigation/footer/recommended videos.
+    body = (soup.select_one('[itemprop="articleBody"], .article-content, .entry-content, .post-content, .article-body')
+            or soup.select_one('article') or soup)
+    for node in reversed(body.select('nav, footer, aside, .related, .related-posts')):
+        node.decompose()
+    for frame in body.select('iframe, embed, video, video source'):
+        for attr in ('src', 'data-src', 'data-lazy-src', 'data-original'):
+            url = playable(frame.get(attr))
+            if url:
+                return url
+    for player in body.select('lite-youtube[videoid], [data-youtube-id]'):
+        video_id = player.get('videoid') or player.get('data-youtube-id')
+        if re.fullmatch(r'[\w-]+', str(video_id or '')):
+            return f'https://www.youtube.com/watch?v={video_id}'
 
-    # 4. Ссылка на видеохостинг в тексте статьи
-    for link in soup.select('a[href]'):
-        url = absolute(link.get('href'))
-        if url and (_is_video_host(url) or _is_direct_video(url)):
+    def video_object(value, depth=0):
+        if depth > 12:
+            return None
+        if isinstance(value, list):
+            for item in value[:100]:
+                found = video_object(item, depth + 1)
+                if found:
+                    return found
+        elif isinstance(value, dict):
+            kind = value.get('@type')
+            if kind == 'VideoObject' or (isinstance(kind, list) and 'VideoObject' in kind):
+                for key in ('contentUrl', 'embedUrl', 'url'):
+                    found = playable(value.get(key))
+                    if found:
+                        return found
+            for item in value.values():
+                if isinstance(item, (dict, list)):
+                    found = video_object(item, depth + 1)
+                    if found:
+                        return found
+        return None
+
+    for script in soup.select('script[type="application/ld+json"]')[:20]:
+        try:
+            url = video_object(json.loads(script.string or script.get_text()))
+        except (ValueError, TypeError, RecursionError):
+            continue
+        if url:
+            return url
+    for link in body.select('a[href]'):
+        url = playable(link.get('href'))
+        if url:
             return url
     return None
 
@@ -7176,8 +7234,16 @@ def fetch_article_text(url: str) -> str:
 
 async def _discover_article_video(news: dict) -> None:
     """Ищет ролик в статье независимо от доступности и настроек LLM."""
-    if (not settings.video_enabled or news.get('video')
-            or not news.get('link') or not _probably_has_video(news)):
+    if not settings.video_enabled:
+        return
+    video = news.get('video')
+    if video and _is_video_host(video) and not _is_playable_video_url(video):
+        news.pop('video', None)
+    if news.get('video') or not news.get('link') or not _probably_has_video(news):
+        return
+    # A source may itself be a specific X/YouTube video page.
+    if _is_playable_video_url(news['link']):
+        news['video'] = news['link']
         return
     article = await asyncio.to_thread(fetch_article, news['link'])
     video = article.get('video') if isinstance(article, dict) else None
@@ -7840,28 +7906,8 @@ def extract_video_url(entry, summary_html: Optional[str] = None) -> Optional[str
             if url:
                 return url
 
-    # 3. Поиск в HTML описания
-    if summary_html:
-        # iframe (YouTube/Vimeo embed)
-        iframe_match = re.search(r'<iframe[^>]+src=["\']([^"\']+)', summary_html, re.IGNORECASE)
-        if iframe_match:
-            url = absolute(iframe_match.group(1))
-            if url and _is_video_host(url):
-                return url
-
-        # <video src="...">
-        video_tag = re.search(r'<video[^>]+src=["\']([^"\']+)', summary_html, re.IGNORECASE)
-        if video_tag:
-            url = absolute(video_tag.group(1))
-            if url and (_is_direct_video(url) or _is_video_host(url)):
-                return url
-
-        # Прямая ссылка <a href="...youtube.../watch?v=...">
-        for link_match in re.finditer(r'href=["\']([^"\']+)', summary_html):
-            url = absolute(link_match.group(1))
-            if url and (_is_video_host(url) or _is_direct_video(url)):
-                return url
-    return None
+    # The same parser handles RSS and full articles (lazy embeds, source tags).
+    return _find_video_in_html(summary_html, base_url) if summary_html else None
 
 
 def _probe_video_file(path: Path) -> Optional[dict]:
@@ -9062,7 +9108,11 @@ def _tg_split_leading_sentence(line: str) -> tuple[str, str]:
     рвать нельзя.
     """
     line = str(line or '').strip()
-    match = _SENTENCE_END_RE.search(line)
+    match = next((m for m in _SENTENCE_END_RE.finditer(line)
+                  if line[:m.end()].count('«') == line[:m.end()].count('»')
+                  and line[:m.end()].count('(') == line[:m.end()].count(')')
+                  and not re.search(r'\b(?:Dr|Mr|Mrs|Ms|No|vol|д-р)\.$',
+                                    line[:m.end()], re.I)), None)
     if not match:
         return line, ''
     head, tail = line[:match.end()].strip(), line[match.end():].strip()
@@ -9091,6 +9141,9 @@ def _tg_title_and_summary(full_text: str, channel: str, label: str) -> tuple[str
     # Рубрику снимаем, только пока под ней есть содержание: пост, кроме неё не
     # состоящий ни из чего, лучше отдать как есть, чем потерять.
     while len(kept) > 1 and _tg_is_category_line(kept[0]):
+        # A rumour label carries factual uncertainty, unlike a topic banner.
+        if _tg_strip_decoration(kept[0]) in ('слух', 'слухи', 'rumor', 'rumour'):
+            kept[1] = 'Слух: ' + kept[1]
         kept = kept[1:]
     head = _tg_drop_editorial_voice(kept[0])
     rest = [_tg_drop_editorial_voice(line) for line in kept[1:]]
@@ -9101,7 +9154,8 @@ def _tg_title_and_summary(full_text: str, channel: str, label: str) -> tuple[str
     head, tail = _tg_split_leading_sentence(head)
     if tail:
         rest.insert(0, tail)
-    return head[:200], ' '.join(rest)[:1000]
+    # The source headline is evidence for the editor: never cut it mid-name.
+    return head, ' '.join(rest)[:3500]
 
 
 def get_telegram_channel(channel: str, label: str) -> list[dict]:
@@ -9140,7 +9194,8 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
         if post_id in seen_ids:
             continue                             # тот же пост встретился дважды
         seen_ids.add(post_id)
-        full_text = text_el.get_text('\n', strip=True)
+        from news_parser import message_html_text
+        full_text = message_html_text(str(text_el))
         if len(full_text) < 15:
             continue
         title, summary = _tg_title_and_summary(full_text, channel, label)
@@ -9234,6 +9289,8 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
                     images = [video_thumb] + [i for i in images if i != video_thumb]
                     thumb_only = True
             logger.info(f"TG {post_id}: видео — {video_note}")
+        if not video_url and not has_video_marker:
+            video_url = _find_video_in_html(str(text_el), f'https://t.me/{post_id}')
         news_list.append({
             'title': title,
             'link': f'https://t.me/{post_id}',
@@ -9993,7 +10050,8 @@ def format_news_short(news: dict) -> str:
         ru_title += '.'
 
     # До трёх предложений из описания (более полный текст, влезает в caption 1024)
-    summary = _strip_links(news.get('summary') or '')
+    from news_parser import clean_editorial_source
+    summary = _strip_links(clean_editorial_source(news.get('summary') or ''))
     ru_summary = ''
     if summary:
         compact = str(news.get('_format_variant') or '') == 'compact'
@@ -10012,7 +10070,7 @@ def format_news_short(news: dict) -> str:
     # Дата СОБЫТИЯ из текста новости (не дата публикации RSS!).
     # Ищем в оригинальном английском тексте — там форматы дат предсказуемы.
     # Если конкретной даты в тексте нет — строка даты не показывается вообще.
-    search_text = (news.get('title') or '') + ' ' + (news.get('summary') or '')[:600]
+    search_text = (news.get('title') or '') + '\n' + (news.get('summary') or '')[:600]
     date_str = extract_release_date_from_text(search_text)
 
     # Собираем: заголовок / предложение / дата
@@ -10115,11 +10173,27 @@ def _add_video_link_to_text(text: str, video_url: str, target=None) -> str:
     Для cdn-telegram/telesco ссылку не добавляем нигде: она гигантская,
     нечитаемая и быстро протухает.
     """
-    if _download_needed_host(video_url):
+    if not _is_playable_video_url(video_url) or _download_needed_host(video_url):
         return text
     if _is_channel_target(target):
         return text
     return f'{text}\n\n🎬 Смотреть: {video_url}'
+
+
+def _video_moderation_notice(text: str, news: dict, target=None) -> str:
+    """Make a missing trailer visible to editors without altering channel copy."""
+    if (_is_channel_target(target) or not _probably_has_video(news)
+            or not settings.video_enabled):
+        return text
+    notice = '⚠️ Видео не прикреплено. Проверьте трейлер перед публикацией.'
+    if notice not in text:
+        text += '\n\n' + notice
+    # If discovery failed, the article is still useful to the moderator.
+    source = str(news.get('link') or '')
+    if (not news.get('video') and source.startswith(('https://', 'http://'))
+            and source not in text):
+        text += '\nИсточник: ' + source
+    return text
 
 
 class DeliveryUncertain(RuntimeError):
@@ -10164,6 +10238,8 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
     )
     if video_url and not has_inline_video:
         text = _add_video_link_to_text(text, video_url, target)
+    if not has_inline_video:
+        text = _video_moderation_notice(text, news, target)
 
     # Считаем превью один раз и заранее, в потоке: ниже оно нужно в трёх
     # разных ветках отправки, а генерация — это ffprobe + ffmpeg.
@@ -13370,6 +13446,8 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     )
     if video_url and not has_inline_video:
         text = _add_video_link_to_text(text, video_url)
+    if not has_inline_video:
+        text = _video_moderation_notice(text, news, target)
 
     # Как и в _send_post: одна генерация в потоке на все ветки отправки.
     video_thumb_kw = await _video_thumbnail_kwargs_async(
@@ -13611,7 +13689,6 @@ async def _send_thread_media_then_text(bot, news, photos, has_inline_video, vide
                                        video_url, text, reply_markup, thread_kw, target) -> bool:
     """Резервный режим (текст >1024 или сбой цельной отправки): медиа отдельно,
     затем текст отдельным сообщением. Сохраняет все картинки альбомом."""
-    safe_text = _escape_to_limit(text, TG_TEXT_LIMIT)
     media_sent = False
 
     if has_inline_video:
@@ -13631,6 +13708,7 @@ async def _send_thread_media_then_text(bot, news, photos, has_inline_video, vide
             _raise_if_ambiguous_tg_error(e)
             _record_media_failure(news, 'telegram_rejected', str(e))
             logger.warning(f"Видео в ветку не отправилось ({e})")
+            text = _video_moderation_notice(text, news, target)
 
     if photos:
         resolved = await _resolve_photos_for_album(photos)
@@ -13658,6 +13736,7 @@ async def _send_thread_media_then_text(bot, news, photos, has_inline_video, vide
         return False
 
     try:
+        safe_text = _escape_to_limit(text, TG_TEXT_LIMIT)
         await _tg_call_flood_safe(lambda: bot.send_message(
             chat_id=target, text=safe_text, parse_mode=ParseMode.HTML,
             disable_web_page_preview=True, reply_markup=reply_markup, **thread_kw))
@@ -19775,6 +19854,14 @@ LLM_SYSTEM_PROMPT = r"""Ты — редактор русскоязычного T
 
 title — суть события на русском, до 200 символов, без эмодзи и кликбейта.
 summary — только дополнительные факты, до 650 символов; 1–3 коротких абзаца через \n\n. Для короткого сообщения допустим пустой summary. Никаких оценок, прогнозов, рекламы и призывов подписаться.
+Начинай с того, ЧТО произошло и с КАКИМ произведением. Не используй шутку источника («На пенсию ещё рано») вместо новости. Не разрывай предложение или название между title и summary. Переносы внутри исходной фразы не означают конец предложения.
+Выбирай детали по событию:
+- анонс/релиз: название, номер сезона, дата или окно выхода, затем студия/платформа, если названы;
+- трейлер: что показали и для какого сезона; сохрани объявленную дату премьеры. Не утверждай, что видео прикреплено, наличие вложения проверяет бот;
+- слух: прямо в title напиши «Слух:» или «По данным ...», сохрани имя источника, если оно есть. Не называй инсайд официальным анонсом;
+- каст/съёмочная группа: кто присоединился, к какому проекту и в какой роли; количество сохрани, если оно известно;
+- интервью/радиошоу: новое высказывание или событие, без длинного пересказа сюжета и ненужных спойлеров.
+Удаляй служебные даты публикации страницы, подпись автора статьи, чужие хэштеги и рекламные вводные. Не выдавай дату публикации за дату премьеры. Не добавляй «дата неизвестна» или «поступили комментарии», если источник этого не сообщает или не раскрывает содержание комментариев. Если источник не называет фильм или тайтл, честно сохрани эту неопределённость, не угадывай.
 НЕ ПОВТОРЯЙСЯ: каждый факт сообщи один раз; абзац должен добавлять сведения к заголовку. Пустые вводные и пересказ заголовка удаляй.
 Названия тайтлов, студий, компаний, сервисов и имена людей НЕ переводи. Кириллические названия заключай в кавычки-ёлочки; латиницу оставляй без кавычек.
 subject — одно название главного произведения в исходном написании; если его нет, пустая строка.
@@ -19861,6 +19948,16 @@ def _strip_title_echo(title: str, text: str) -> str:
 def _append_release_date(body: str, date_str: str) -> str:
     """Add the calendar line only if its full date is absent from the copy."""
     normalized = re.sub(r'\s+', ' ', body).casefold()
+    # «декабрь 2026» and «в декабре 2026 года» are the same release window.
+    # Match the whole adjacent month/year pair, not unrelated numbers in a post.
+    window = re.fullmatch(r'([а-яё]+)\s+(\d{4})', date_str.casefold())
+    if window:
+        month, year = window.groups()
+        for pattern in _MONTH_PATTERNS:
+            if pattern.fullmatch(month) and any(
+                    re.match(r'\s+' + year + r'\b', normalized[m.end():])
+                    for m in pattern.finditer(normalized)):
+                return body
     if date_str and not re.search(r'(?<!\w)' + re.escape(date_str.casefold()) + r'(?!\w)', normalized):
         return f'{body}\n\n📅 {date_str}'
     return body
@@ -19905,6 +20002,27 @@ def _sanity_ok(value: str, limit: int) -> bool:
     как раз то, что нужно: пост с вводными длиннее сухой новостной строки.
     Теперь ограничиваем по абсолютной длине, а достоверность держим промптом."""
     return len(value) <= limit
+
+
+_UNCERTAIN_NEWS_RE = re.compile(
+    r'\b(?:слух\w*|инсайдер\w*|предположительно|неподтвержд[её]н\w*|'
+    r'rumou?rs?|rumou?red|reportedly|allegedly|leak\w*)\b', re.I)
+_ATTRIBUTED_NEWS_RE = re.compile(
+    r'\b(?:по данным|по словам|сообщает|сообщают|может|возможно|вероятно)\b', re.I)
+
+
+def _editorial_rejection(source: str, title: str, summary: str) -> str:
+    """Cheap structural/factual checks shared by cached, batch and single replies."""
+    if _UNCERTAIN_NEWS_RE.search(source) and not (
+            _UNCERTAIN_NEWS_RE.search(title) or _ATTRIBUTED_NEWS_RE.search(title)):
+        return 'lost_uncertainty'
+    if (title.count('«') != title.count('»')
+            or title.count('(') != title.count(')')
+            or re.search(r'(?:[,;:]|\b(?:что|для|по|на|из|о|об|и))\s*[.!]?$', title, re.I)):
+        return 'fragmented_headline'
+    if re.search(r'\b(?:опубликовано|published on)\s+\d', title + '\n' + summary, re.I):
+        return 'page_metadata'
+    return ''
 
 
 def _trim_paragraphs(text: str, max_paragraphs: int = LLM_MAX_PARAGRAPHS,
@@ -20056,7 +20174,7 @@ def _llm_content_key(news: dict) -> str:
     другим правилам и переиспользовать их нельзя.
     """
     title = normalize_title(str(news.get('title') or ''))
-    body = re.sub(r'\s+', ' ', str(news.get('summary') or '')).strip().lower()[:1500]
+    body = re.sub(r'\s+', ' ', str(news.get('summary') or '')).strip().lower()[:3500]
     raw = f'{LLM_PROMPT_VERSION}\x00{title}\x00{body}'
     return hashlib.sha256(raw.encode('utf-8', errors='ignore')).hexdigest()
 
@@ -20113,7 +20231,8 @@ async def _llm_source_text(news: dict) -> str:
     Повторный вызов для той же новости почти бесплатен: ``fetch_article``
     держит собственный кеш по URL.
     """
-    summary = re.sub(r'\s+', ' ', (news.get('summary') or '')).strip()[:1500]
+    from news_parser import clean_editorial_source
+    summary = clean_editorial_source(news.get('summary') or '')[:3500]
     # В RSS обычно лежит обрезанный тизер в 8-10 слов. Из него нельзя собрать
     # пост с фактами, поэтому при бедном описании читаем саму статью.
     # Статью читаем в двух случаях: описание слишком бедное для поста, либо
@@ -20494,13 +20613,19 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
     # Otherwise a rejected rewrite or empty tags leave stale publishable text.
     for field in ('_llm_text', '_llm_tags', '_llm_judge_status', '_llm_judge_reason'):
         news.pop(field, None)
+    news.pop('_editorial_rejection', None)
     new_title = str(data.get('title') or '').strip()
     new_summary = str(data.get('summary') or '').strip()
 
     # --- Текст: только если он адекватен ---
     if settings.llm_rewrite and new_title:
         proposed_text = f'{new_title}\n{new_summary}'
-        if not (_llm_numbers_supported(source_fact_text, proposed_text)
+        rejection = _editorial_rejection(source_fact_text, new_title, new_summary)
+        if rejection:
+            news['_editorial_rejection'] = rejection
+            metrics.inc('anime_bot_editorial_rejected_total', labels={'reason': rejection})
+            logger.warning('LLM: переписывание отклонено (%s): %s', rejection, title[:55])
+        elif not (_llm_numbers_supported(source_fact_text, proposed_text)
                 and _llm_dates_supported(source_fact_text, proposed_text)):
             logger.warning(f"LLM: обнаружены новые числа/даты — переписывание отклонено: {title[:55]}")
         elif _sanity_ok(new_title, LLM_TITLE_MAX) and _sanity_ok(new_summary, LLM_SUMMARY_MAX * 2):
@@ -20515,7 +20640,7 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
             body = '\n\n'.join(p for p in parts if p)
 
             date_str = extract_release_date_from_text(
-                (news.get('title') or '') + ' ' + (news.get('summary') or '')[:600])
+                (news.get('title') or '') + '\n' + (news.get('summary') or '')[:600])
             body = _append_release_date(body, date_str)
             news['_llm_text'] = body
         else:
