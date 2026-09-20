@@ -215,6 +215,11 @@
 | Переменная | По умолчанию | Где читается |
 | --- | --- | --- |
 | `MODERATION_ACTION_COOLDOWN_SEC` | `0` | anime_news_bot.py |
+| `MODERATION_ACTIVE_CATEGORY_MIN_LABELS` | `5` | anime_news_bot.py |
+| `MODERATION_ACTIVE_CATEGORY_MIN_PRECISION` | `0.75` | anime_news_bot.py |
+| `MODERATION_ACTIVE_MIN_LABELS` | `30` | anime_news_bot.py |
+| `MODERATION_ACTIVE_MIN_PRECISION` | `0.9` | anime_news_bot.py |
+| `MODERATION_ACTIVE_MIN_WILSON` | `0.8` | anime_news_bot.py |
 | `MODERATION_ADMINS_ENABLED` | `true` | anime_news_bot.py |
 | `MODERATION_BELITTLING_STREAK` | `3` | anime_news_bot.py |
 | `MODERATION_BELITTLING_WINDOW_SEC` | — | anime_news_bot.py |
