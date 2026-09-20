@@ -1984,7 +1984,8 @@ def _mod_local_check(chat_id: int, user_id: int, text: str, *, reply_to_user=Fal
         repeat_groups = {('album', m['media_group_id']) if m.get('media_group_id') else ('message', i)
                          for i, m in enumerate(same)}
         media_marker = normalized.startswith('[') and normalized.endswith(']')
-        short_reply = (not media_marker and not _MOD_LINK_RE.search(str(text or ''))
+        short_reply = (bool(normalized) and not media_marker
+                       and not _MOD_LINK_RE.search(str(text or ''))
                        and (len(normalized) <= 6 or bool(_MOD_SHORT_ACK_RE.fullmatch(normalized))))
         repeat_limit = MODERATION_SHORT_REPEAT_LIMIT if short_reply else MODERATION_REPEAT_LIMIT
         if len(repeat_groups) >= repeat_limit:
