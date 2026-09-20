@@ -1510,6 +1510,18 @@ MODERATION_MODES = ('observe', 'active')
 MODERATION_ADMINS_DEFAULT = _env('MODERATION_ADMINS_ENABLED', 'true').lower() == 'true'
 MODERATION_DEFAULT_MODE = (
     'active' if _env('MODERATION_MODE', '').strip().lower() == 'active' else 'observe')
+# Active mode is intentionally gated by reviewed observe-mode data. The gate
+# never enables sanctions by itself; an administrator still runs /modmode active.
+MODERATION_ACTIVE_MIN_LABELS = max(
+    0, min(10000, _env_int('MODERATION_ACTIVE_MIN_LABELS', 30)))
+MODERATION_ACTIVE_MIN_PRECISION = max(
+    0.0, min(1.0, _env_float('MODERATION_ACTIVE_MIN_PRECISION', .90)))
+MODERATION_ACTIVE_MIN_WILSON = max(
+    0.0, min(1.0, _env_float('MODERATION_ACTIVE_MIN_WILSON', .80)))
+MODERATION_ACTIVE_CATEGORY_MIN_LABELS = max(
+    1, min(1000, _env_int('MODERATION_ACTIVE_CATEGORY_MIN_LABELS', 5)))
+MODERATION_ACTIVE_CATEGORY_MIN_PRECISION = max(
+    0.0, min(1.0, _env_float('MODERATION_ACTIVE_CATEGORY_MIN_PRECISION', .75)))
 # Не больше одного наказания на человека за это время. Если модель начнёт
 # ошибаться подряд, серия наказаний за минуту хуже одной ошибки.
 MODERATION_ACTION_COOLDOWN_SEC = max(0, min(3600, _env_int('MODERATION_ACTION_COOLDOWN_SEC', 0)))
@@ -25597,13 +25609,121 @@ async def modadmins_command(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('Проверка администрации ' + ('включена.' if enabled else 'выключена.'))
 
 
+def _wilson_lower_bound(correct: int, total: int, z: float = 1.96) -> float:
+    """Conservative lower confidence bound for labelled moderation precision."""
+    total = max(0, int(total))
+    correct = max(0, min(total, int(correct)))
+    if total <= 0:
+        return 0.0
+    p = correct / total
+    z2 = z * z
+    denominator = 1.0 + z2 / total
+    centre = p + z2 / (2.0 * total)
+    margin = z * math.sqrt((p * (1.0 - p) + z2 / (4.0 * total)) / total)
+    return max(0.0, min(1.0, (centre - margin) / denominator))
+
+
+def _moderation_quality_readiness(data: Optional[dict] = None) -> dict:
+    """Measure whether labelled observe-mode decisions are mature enough for active.
+
+    This is a safety gate, not automatic tuning. It uses only explicit admin
+    feedback from #62; absence of an undo or silence is never counted as correct.
+    """
+    if data is None:
+        data = chat_moderation.stats() if chat_moderation is not None else {}
+    total = int((data or {}).get('feedback_total', 0) or 0)
+    correct = int((data or {}).get('feedback_correct', 0) or 0)
+    correct = max(0, min(total, correct))
+    precision = correct / total if total else 0.0
+    lower = _wilson_lower_bound(correct, total)
+    reasons = []
+    if total < MODERATION_ACTIVE_MIN_LABELS:
+        reasons.append(
+            f'нужно минимум {MODERATION_ACTIVE_MIN_LABELS} размеченных решений; сейчас {total}')
+    if total and precision < MODERATION_ACTIVE_MIN_PRECISION:
+        reasons.append(
+            f'precision {precision:.0%} ниже требуемых {MODERATION_ACTIVE_MIN_PRECISION:.0%}')
+    if total and lower < MODERATION_ACTIVE_MIN_WILSON:
+        reasons.append(
+            f'нижняя граница уверенности {lower:.0%} ниже {MODERATION_ACTIVE_MIN_WILSON:.0%}')
+
+    weak_categories = []
+    for category, row in ((data or {}).get('by_category') or {}).items():
+        labelled = int(row.get('feedback_total', 0) or 0)
+        if labelled < MODERATION_ACTIVE_CATEGORY_MIN_LABELS:
+            continue
+        cat_correct = int(row.get('feedback_correct', 0) or 0)
+        cat_precision = max(0, min(labelled, cat_correct)) / labelled
+        if cat_precision < MODERATION_ACTIVE_CATEGORY_MIN_PRECISION:
+            weak_categories.append({
+                'category': str(category),
+                'labels': labelled,
+                'precision': cat_precision,
+            })
+    if weak_categories:
+        names = ', '.join(
+            MODERATION_RULES.get(row['category'], {}).get('human', row['category'])
+            for row in weak_categories[:4])
+        reasons.append('есть слабые категории по разметке: ' + names)
+
+    return {
+        'ready': not reasons,
+        'labels': total,
+        'correct': correct,
+        'wrong': max(0, total - correct),
+        'precision': precision,
+        'wilson_lower': lower,
+        'reasons': reasons,
+        'weak_categories': weak_categories,
+    }
+
+
+def _moderation_quality_text() -> str:
+    result = _moderation_quality_readiness()
+    mark = '✅' if result['ready'] else '🧪'
+    lines = [
+        f'{mark} <b>Готовность модерации к active</b>',
+        '',
+        f'Размечено: <b>{result["labels"]}</b> · верно {result["correct"]} · '
+        f'ошибка {result["wrong"]}',
+        f'Precision: <b>{result["precision"]:.0%}</b>',
+        f'Консервативная нижняя граница: <b>{result["wilson_lower"]:.0%}</b>',
+        '',
+        f'Требования: ≥{MODERATION_ACTIVE_MIN_LABELS} оценок, '
+        f'precision ≥{MODERATION_ACTIVE_MIN_PRECISION:.0%}, '
+        f'нижняя граница ≥{MODERATION_ACTIVE_MIN_WILSON:.0%}.',
+    ]
+    if result['weak_categories']:
+        lines += ['', '<b>Слабые категории:</b>']
+        for row in result['weak_categories'][:8]:
+            human = MODERATION_RULES.get(row['category'], {}).get('human', row['category'])
+            lines.append(
+                f'• {html.escape(str(human))}: {row["labels"]} оценок · '
+                f'precision {row["precision"]:.0%}')
+    if result['ready']:
+        lines += ['', 'Данных достаточно для осознанного перехода в active. '
+                      'Бот сам режим не переключает.']
+    else:
+        lines += ['', '<b>Пока оставайтесь в observe:</b>']
+        lines.extend('• ' + html.escape(reason) for reason in result['reasons'])
+        lines += ['', 'Экстренный ручной override: <code>/modmode active force</code>.']
+    return '\n'.join(lines)[:4000]
+
+
+@admin_only
+async def modquality_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Explain whether labelled observe data supports enabling active mode."""
+    await update.message.reply_text(_moderation_quality_text(), parse_mode=ParseMode.HTML)
+
+
 @admin_only
 async def modmode_command(update, context: ContextTypes.DEFAULT_TYPE):
-    """Переключает наблюдение и работу: /modmode observe|active."""
+    """Переключает наблюдение и работу: /modmode observe|active [force]."""
     if chat_moderation is None:
         await update.message.reply_text('Хранилище модерации не готово.')
         return
     want = (context.args[0].strip().lower() if context.args else '')
+    forced = len(context.args or []) > 1 and str(context.args[1]).strip().lower() == 'force'
     if want not in MODERATION_MODES:
         current = chat_moderation.mode
         await update.message.reply_text(
@@ -25612,17 +25732,29 @@ async def modmode_command(update, context: ContextTypes.DEFAULT_TYPE):
             'На этой ступени копится статистика ошибок.\n'
             '<b>active</b> — бот удаляет, предупреждает и выдаёт мут. '
             'Банить он не может ни в каком режиме.\n\n'
-            'Сменить: <code>/modmode active</code>\n'
-            'Перед переходом посмотрите /modstats.',
+            'Проверить готовность: <code>/modquality</code>\n'
+            'Сменить: <code>/modmode active</code>',
             parse_mode=ParseMode.HTML)
         return
+    if want == 'active' and not forced:
+        quality = _moderation_quality_readiness()
+        if not quality['ready']:
+            await update.message.reply_text(
+                '🧪 <b>Active пока заблокирован качественным гейтом.</b>\n'
+                + '\n'.join('• ' + html.escape(reason) for reason in quality['reasons'])
+                + '\n\nПодробности: /modquality\n'
+                  'Если это осознанный аварийный override: '
+                  '<code>/modmode active force</code>',
+                parse_mode=ParseMode.HTML)
+            return
     if not chat_moderation.set_mode(want):
         await update.message.reply_text('❌ Не удалось записать настройку на диск.')
         return
-    _audit_update(update, 'moderation_mode', mode=want)
+    _audit_update(update, 'moderation_mode', mode=want, forced=bool(forced and want == 'active'))
     if want == 'active':
+        prefix = '⚠️ Принудительно. ' if forced else ''
         await update.message.reply_text(
-            '🛡 Режим <b>active</b>: бот теперь удаляет, предупреждает и мутит.\n'
+            prefix + '🛡 Режим <b>active</b>: бот теперь удаляет, предупреждает и мутит.\n'
             'Банить по-прежнему не может — такие случаи приходят вам с кнопкой.\n'
             'Если пойдут ошибки, вернуть наблюдение: <code>/modmode observe</code>',
             parse_mode=ParseMode.HTML)
@@ -25701,6 +25833,10 @@ def _moderation_stats_text() -> str:
             lines.append(
                 f'  {html.escape(str(name))}: {labelled} оценок · '
                 f'верно {correct} · ошибок {wrong}')
+
+    readiness = _moderation_quality_readiness(data)
+    lines += ['', ('✅ Готовность к active: <b>да</b>' if readiness['ready']
+                  else '🧪 Готовность к active: <b>нет</b> · /modquality')]
 
     lines += ['', f'Режим: <b>{chat_moderation.mode}</b>'
                   + (' — бот только докладывает' if chat_moderation.mode == 'observe' else ''),
@@ -27365,6 +27501,7 @@ def main():
     app.add_handler(CommandHandler("modoff", modoff_command))
     app.add_handler(CommandHandler("moderation", moderation_command))
     app.add_handler(CommandHandler("modstats", modstats_command))
+    app.add_handler(CommandHandler("modquality", modquality_command))
     app.add_handler(CommandHandler("modllmping", modllmping_command))
     app.add_handler(CommandHandler("modtest", modtest_command))
     app.add_handler(CommandHandler("modlog", modlog_command))
