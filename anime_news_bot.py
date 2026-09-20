@@ -507,7 +507,9 @@ GOLDEN_DATASET_FILE = Path(__file__).with_name('golden') / 'editorial_cases.json
 STORY_UPDATE_LOOKBACK_DAYS = max(1, min(90, _env_int('STORY_UPDATE_LOOKBACK_DAYS', 21)))
 STORY_UPDATE_SIMILARITY = max(0.60, min(0.95, _env_float('STORY_UPDATE_SIMILARITY', 0.76)))
 REPLAY_BUFFER_MAX = max(20, min(2000, _env_int('REPLAY_BUFFER_MAX', 300)))
-LLM_PROMPT_VERSION = _env('LLM_PROMPT_VERSION', 'editorial-v4-2026-09-20').strip() or 'editorial-v4-2026-09-20'
+DEFAULT_LLM_PROMPT_VERSION = 'editorial-v4-2026-09-20'
+LLM_PROMPT_VERSION = (_env('LLM_PROMPT_VERSION', DEFAULT_LLM_PROMPT_VERSION).strip()
+                      or DEFAULT_LLM_PROMPT_VERSION)
 LLM_JUDGE_MAX_TOKENS = max(80, min(500, _env_int('LLM_JUDGE_MAX_TOKENS', 180)))
 
 # Verification / Telegram media framing — Stage 12
@@ -7078,7 +7080,7 @@ def _is_playable_video_url(url: str) -> bool:
 
 
 def _find_video_in_html(html_text: str, base_url: Optional[str] = None) -> Optional[str]:
-    """Find an actual clip, including lazy players and structured VideoObject."""
+    """Find the most relevant playable clip, not merely the first video URL."""
     try:
         soup = BeautifulSoup(html_text, 'html.parser')
     except Exception:
@@ -7096,63 +7098,107 @@ def _find_video_in_html(html_text: str, base_url: Optional[str] = None) -> Optio
         except ValueError:
             return None
 
+    def tokens(value: str) -> set[str]:
+        return {
+            word for word in re.findall(r'[0-9A-Za-zА-Яа-яЁё一-龯ぁ-んァ-ン]{3,}',
+                                        str(value or '').casefold())
+            if word not in {'the', 'and', 'with', 'from', 'this', 'that',
+                            'для', 'про', 'это', 'как', 'или'}
+        }
+
+    heading = soup.select_one('h1') or soup.select_one('title')
+    context = heading.get_text(' ', strip=True) if heading else ''
+    context_tokens = tokens(context)
+    candidates: dict[str, tuple[int, int]] = {}
+    order = 0
+
+    def add(raw, base_score: int, evidence: str = '') -> None:
+        nonlocal order
+        url = playable(raw)
+        if not url:
+            return
+        order += 1
+        evidence = ' '.join(str(evidence or '').split())[:600]
+        overlap = len(context_tokens & tokens(evidence)) if context_tokens else 0
+        score = base_score + min(30, overlap * 6)
+        if _VIDEO_HINT_RE.search(evidence):
+            score += 8
+        previous = candidates.get(url)
+        current = (score, -order)
+        if previous is None or current > previous:
+            candidates[url] = current
+
+    # Page-level metadata is normally authored specifically for this article.
     for prop in ('og:video:url', 'og:video:secure_url', 'og:video',
                  'twitter:player:stream', 'twitter:player'):
         meta = (soup.select_one(f'meta[property="{prop}"]')
                 or soup.select_one(f'meta[name="{prop}"]'))
-        url = playable(meta.get('content') if meta else None)
-        if url:
-            return url
+        if meta:
+            add(meta.get('content'), 110, context)
 
-    # Prefer the article to navigation/footer/recommended videos.
+    # Stay inside the actual article and discard recommendation/navigation video.
     body = (soup.select_one('[itemprop="articleBody"], .article-content, .entry-content, .post-content, .article-body')
             or soup.select_one('article') or soup)
-    for node in reversed(body.select('nav, footer, aside, .related, .related-posts')):
+    for node in reversed(body.select(
+            'nav, footer, aside, .related, .related-posts, .recommended, .recommendations')):
         node.decompose()
+
     for frame in body.select('iframe, embed, video, video source'):
+        evidence = ' '.join(filter(None, [
+            frame.get('title'), frame.get('aria-label'), frame.get('alt'),
+            frame.parent.get_text(' ', strip=True)[:300] if frame.parent else '',
+        ]))
+        base_score = 96 if frame.name in ('video', 'source') else 82
         for attr in ('src', 'data-src', 'data-lazy-src', 'data-original'):
-            url = playable(frame.get(attr))
-            if url:
-                return url
+            add(frame.get(attr), base_score, evidence)
+
     for player in body.select('lite-youtube[videoid], [data-youtube-id]'):
         video_id = player.get('videoid') or player.get('data-youtube-id')
         if re.fullmatch(r'[\w-]+', str(video_id or '')):
-            return f'https://www.youtube.com/watch?v={video_id}'
+            evidence = ' '.join(filter(None, [
+                player.get('title'), player.get('aria-label'),
+                player.parent.get_text(' ', strip=True)[:300] if player.parent else '',
+            ]))
+            add(f'https://www.youtube.com/watch?v={video_id}', 90, evidence)
 
-    def video_object(value, depth=0):
+    def video_objects(value, depth=0):
         if depth > 12:
-            return None
+            return
         if isinstance(value, list):
             for item in value[:100]:
-                found = video_object(item, depth + 1)
-                if found:
-                    return found
+                yield from video_objects(item, depth + 1)
         elif isinstance(value, dict):
             kind = value.get('@type')
             if kind == 'VideoObject' or (isinstance(kind, list) and 'VideoObject' in kind):
+                evidence = ' '.join(str(value.get(key) or '')
+                                    for key in ('name', 'headline', 'description'))
                 for key in ('contentUrl', 'embedUrl', 'url'):
-                    found = playable(value.get(key))
-                    if found:
-                        return found
+                    yield value.get(key), evidence
             for item in value.values():
                 if isinstance(item, (dict, list)):
-                    found = video_object(item, depth + 1)
-                    if found:
-                        return found
-        return None
+                    yield from video_objects(item, depth + 1)
 
     for script in soup.select('script[type="application/ld+json"]')[:20]:
         try:
-            url = video_object(json.loads(script.string or script.get_text()))
+            data = json.loads(script.string or script.get_text())
         except (ValueError, TypeError, RecursionError):
             continue
-        if url:
-            return url
+        try:
+            for raw, evidence in video_objects(data):
+                add(raw, 100, evidence)
+        except RecursionError:
+            continue
+
     for link in body.select('a[href]'):
-        url = playable(link.get('href'))
-        if url:
-            return url
-    return None
+        evidence = ' '.join(filter(None, [
+            link.get_text(' ', strip=True), link.get('title'), link.get('aria-label'),
+            link.parent.get_text(' ', strip=True)[:300] if link.parent else '',
+        ]))
+        add(link.get('href'), 60, evidence)
+
+    if not candidates:
+        return None
+    return max(candidates.items(), key=lambda item: item[1])[0]
 
 
 def _looks_thin(text: str) -> bool:
@@ -10155,6 +10201,38 @@ async def _prepare_video_file(news: dict) -> Optional[Path]:
     return path
 
 
+async def _probe_video_delivery(news: dict) -> tuple[str, str]:
+    """Use the real publication media path for /videocheck without sending."""
+    url = str(news.get('video') or '').strip()
+    if not url:
+        return 'fail', 'ссылки на ролик нет'
+    if _is_direct_video(url):
+        resolved = await _resolve_video(url)
+        if resolved is None:
+            return 'fail', 'прямой файл не скачался'
+        if isinstance(resolved, (bytes, bytearray)):
+            return 'ok', f'прямой файл скачан: {len(resolved) / (1024 * 1024):.1f} МБ'
+        return 'warn', 'прямой URL будет передан Telegram; без отправки Bot API не проверен'
+
+    probe = copy.deepcopy(news)
+    path = await _prepare_video_file(probe)
+    try:
+        if path is None:
+            detail = str(probe.get('_video_note') or 'yt-dlp не подготовил файл')
+            return 'fail', detail
+        size_mb = path.stat().st_size / (1024 * 1024)
+        meta = probe.get('_video_meta') or {}
+        duration = meta.get('duration')
+        suffix = f', {float(duration):.0f} с' if duration is not None else ''
+        return 'ok', f'реальный yt-dlp путь: {size_mb:.1f} МБ{suffix}'
+    finally:
+        if path:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def _is_channel_target(target) -> bool:
     """Пост идёт подписчикам канала, а не модераторам в ветку."""
     try:
@@ -10181,17 +10259,19 @@ def _add_video_link_to_text(text: str, video_url: str, target=None) -> str:
 
 
 def _video_moderation_notice(text: str, news: dict, target=None) -> str:
-    """Make a missing trailer visible to editors without altering channel copy."""
-    if (_is_channel_target(target) or not _probably_has_video(news)
-            or not settings.video_enabled):
+    """Make every expected-but-missing video visible to editors, never subscribers."""
+    media_failed = bool(news.get('_media_failure_codes'))
+    video_expected = bool(news.get('video') or media_failed or _probably_has_video(news))
+    if (_is_channel_target(target) or not video_expected or not settings.video_enabled):
         return text
     notice = '⚠️ Видео не прикреплено. Проверьте трейлер перед публикацией.'
     if notice not in text:
         text += '\n\n' + notice
-    # If discovery failed, the article is still useful to the moderator.
+    # A source link helps both when discovery failed and when the found clip
+    # could not be downloaded/sent.
     source = str(news.get('link') or '')
-    if (not news.get('video') and source.startswith(('https://', 'http://'))
-            and source not in text):
+    if (media_failed or not news.get('video')) and source.startswith(('https://', 'http://')) \
+            and source not in text:
         text += '\nИсточник: ' + source
     return text
 
@@ -21752,18 +21832,15 @@ async def videocheck_command(update, context: ContextTypes.DEFAULT_TYPE):
             block.append('  Итог: ❌ ролика нет — уйдёт кадр-превью')
         else:
             block.append(f'  Ссылка: <code>{html.escape(url[:60])}…</code>')
-            resolved = await _resolve_video(url)
-            if resolved is None:
-                block.append('  Скачивание: ❌ файл не отдался '
-                             '(см. строку «Медиа не скачалось» в /logs)')
-                block.append('  Итог: ❌ уйдёт кадр-превью')
-            elif isinstance(resolved, (bytes, bytearray)):
-                mb = len(resolved) / (1024 * 1024)
-                block.append(f'  Скачивание: ✅ {mb:.1f} МБ')
-                block.append('  Итог: ✅ видео прикрепится')
+            status, detail = await _probe_video_delivery(post)
+            mark = {'ok': '✅', 'warn': '⚠️', 'fail': '❌'}.get(status, '❌')
+            block.append(f'  Реальный путь публикации: {mark} {html.escape(detail)}')
+            if status == 'ok':
+                block.append('  Итог: ✅ файл подготовлен тем же путём, что при публикации')
+            elif status == 'warn':
+                block.append('  Итог: ⚠️ окончательно подтвердит только отправка в Telegram')
             else:
-                block.append('  Скачивание: не требуется (обычный хост)')
-                block.append('  Итог: ✅ видео прикрепится')
+                block.append('  Итог: ❌ видео сейчас не прикрепится')
         lines.extend(block)
 
     await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
@@ -22885,6 +22962,14 @@ def _doctor_env_conflicts() -> list[tuple[str, bool, str]]:
     else:
         rows.append(('LLM: провайдер и адрес', True,
                      f'{LLM_PROVIDER or "не задан"} → {LLM_BASE_URL or "нет адреса"}'))
+
+    if LLM_PROMPT_VERSION != DEFAULT_LLM_PROMPT_VERSION:
+        rows.append(('LLM: версия промпта', False,
+                     f'активна {LLM_PROMPT_VERSION}, код ожидает '
+                     f'{DEFAULT_LLM_PROMPT_VERSION}. Уберите старый '
+                     'LLM_PROMPT_VERSION из env/.env и перезапустите бот.'))
+    else:
+        rows.append(('LLM: версия промпта', True, LLM_PROMPT_VERSION))
 
     if LLM_API_KEY and not LLM_PROVIDER and not LLM_BASE_URL_FROM_ENV:
         rows.append(('LLM_PROVIDER', False,
