@@ -1480,10 +1480,22 @@ MODERATION_MAX_MESSAGE_CHARS = max(200, min(4000, _env_int('MODERATION_MAX_MESSA
 # Бюджет модели на модерацию — отдельный от новостного. Без него одна
 # перепалка съела бы дневной лимит, и бот перестал бы обрабатывать новости.
 MODERATION_LLM_DAILY_LIMIT = max(0, min(5000, _env_int('MODERATION_LLM_DAILY_LIMIT', 120)))
-# Флуд: столько сообщений за столько секунд от одного человека.
-MODERATION_FLOOD_MESSAGES = max(3, min(50, _env_int('MODERATION_FLOOD_MESSAGES', 6)))
-MODERATION_FLOOD_WINDOW_SEC = max(3, min(300, _env_int('MODERATION_FLOOD_WINDOW_SEC', 12)))
+# Флуд: отделяем короткий burst от устойчивого заливания чата. Старые 6/12
+# ловили обычный быстрый диалог, голосовые и несколько стикеров как нарушение.
+MODERATION_FLOOD_MESSAGES = max(5, min(50, _env_int('MODERATION_FLOOD_MESSAGES', 8)))
+MODERATION_FLOOD_WINDOW_SEC = max(3, min(60, _env_int('MODERATION_FLOOD_WINDOW_SEC', 10)))
+MODERATION_FLOOD_SUSTAINED_MESSAGES = max(
+    MODERATION_FLOOD_MESSAGES + 2,
+    min(100, _env_int('MODERATION_FLOOD_SUSTAINED_MESSAGES', 14)))
+MODERATION_FLOOD_SUSTAINED_WINDOW_SEC = max(
+    MODERATION_FLOOD_WINDOW_SEC + 5,
+    min(300, _env_int('MODERATION_FLOOD_SUSTAINED_WINDOW_SEC', 45)))
 MODERATION_REPEAT_LIMIT = max(2, min(20, _env_int('MODERATION_REPEAT_LIMIT', 3)))
+# Короткие живые ответы ("нет", "да", "ок") естественно повторяются в чате.
+# Для них нужен заметно более высокий порог, чем для рекламы или стикера.
+MODERATION_SHORT_REPEAT_LIMIT = max(
+    MODERATION_REPEAT_LIMIT + 1,
+    min(20, _env_int('MODERATION_SHORT_REPEAT_LIMIT', 6)))
 # Длительность мута по номеру предупреждения (минуты). Последнее значение
 # применяется и дальше: бот не эскалирует бесконечно, дальше решает человек.
 MODERATION_MUTE_LADDER = (60, 24 * 60)
@@ -1588,6 +1600,12 @@ _MOD_LINK_RE = re.compile(r'(https?://|t\.me/|@[A-Za-z0-9_]{5,})', re.IGNORECASE
 _MOD_INVITE_RE = re.compile(
     r'(?<![\w./])(?:https?://)?(?:t\.me/(?:joinchat/|\+)|discord\.gg/)', re.IGNORECASE)
 _MOD_TEXT_URL_RE = re.compile(r'(?:https?://|www\.|t\.me/|discord\.gg/)\S+', re.IGNORECASE)
+_MOD_PROMO_RE = re.compile(
+    r'\b(?:залетай|заходи|вступай|подписывайся|подпишись|реклама|розыгрыш|'
+    r'бесплатн\w*|заработ\w*|промокод|пиши\s+в\s+лс)\b', re.IGNORECASE)
+_MOD_SHORT_ACK_RE = re.compile(
+    r'^(?:да|нет|неа|ага|угу|ок|окей|спс|лол|кек|ахах+|хаха+|пон|ясно|ладно)$',
+    re.IGNORECASE)
 # Корни, после которых имеет смысл спросить модель. Это НЕ список для
 # наказания: по нему только выбираются сообщения на разбор, решение принимает
 # модель с учётом контекста — иначе шуточное «дурак» между своими ловилось бы
@@ -1737,7 +1755,9 @@ def _mod_note_message(chat_id: int, user_id: int, name: str, text: str,
     if same_album:
         return
     key = f'{chat_id}:{user_id}'
-    recent = _moderation_recent.setdefault(key, deque(maxlen=MODERATION_FLOOD_MESSAGES * 3))
+    recent = _moderation_recent.setdefault(
+        key, deque(maxlen=max(MODERATION_FLOOD_MESSAGES * 3,
+                              MODERATION_FLOOD_SUSTAINED_MESSAGES * 2)))
     recent.append(time.time())
     if len(_moderation_recent) > 2000:        # чат живёт, словарь расти не должен
         for stale in list(_moderation_recent)[:500]:
@@ -1926,37 +1946,72 @@ def _mod_local_check(chat_id: int, user_id: int, text: str, *, reply_to_user=Fal
     if verdict is not None and verdict.confident:
         return verdict.as_dict()
 
-    # Флуд — считается, а не оценивается: тут модель не нужна.
+    # Флуд — арифметика, но один жёсткий порог оказался слишком грубым.
+    # Быстрый разговор и устойчивое заливание чата теперь считаются отдельно.
     key = f'{chat_id}:{user_id}'
     recent = _moderation_recent.get(key) or deque()
-    edge = time.time() - MODERATION_FLOOD_WINDOW_SEC
-    if sum(1 for ts in recent if ts > edge) >= MODERATION_FLOOD_MESSAGES:
-        return {'category': 'flood', 'confident': True}
+    now = time.time()
+    burst_edge = now - MODERATION_FLOOD_WINDOW_SEC
+    sustained_edge = now - MODERATION_FLOOD_SUSTAINED_WINDOW_SEC
+    burst_count = sum(1 for ts in recent if ts > burst_edge)
+    sustained_count = sum(1 for ts in recent if ts > sustained_edge)
 
-    # Одно и то же сообщение подряд — тоже арифметика. Для медиа сравниваются
-    # подстановки вроде «[стикер]», поэтому повтор одного стикера тоже виден.
     window = _moderation_windows.get(int(chat_id)) or deque()
+    # Если между быстрыми репликами отвечают другие люди, это больше похоже
+    # на разговор. Небольшой запас не позволяет одному активному участнику
+    # получить flood только за темп нормального диалога.
+    other_speakers = {
+        int(m.get('user_id') or 0) for m in window
+        if m.get('at', 0) > burst_edge and int(m.get('user_id') or 0) != int(user_id)
+    }
+    burst_limit = MODERATION_FLOOD_MESSAGES + min(3, len(other_speakers))
+    if burst_count >= burst_limit:
+        return {'category': 'flood', 'confident': True, 'severity': 1,
+                'reason': f'быстрый поток: {burst_count} сообщений за '
+                          f'{MODERATION_FLOOD_WINDOW_SEC} с'}
+    if sustained_count >= MODERATION_FLOOD_SUSTAINED_MESSAGES:
+        return {'category': 'flood', 'confident': True, 'severity': 1,
+                'reason': f'устойчивый поток: {sustained_count} сообщений за '
+                          f'{MODERATION_FLOOD_SUSTAINED_WINDOW_SEC} с'}
+
+    # Повторы считаются отдельно от flood. Короткие ответы вроде «Нет» на
+    # скриншотах попадали в spam после трёх естественных повторов за две минуты.
     if normalized or repeat_key is not None:
         same = [m for m in window if m['user_id'] == user_id
-                and m.get('at', 0) > time.time() - MODERATION_REPEAT_WINDOW_SEC
+                and m.get('at', 0) > now - MODERATION_REPEAT_WINDOW_SEC
                 and (m.get('repeat_key') == repeat_key if repeat_key is not None
                      else _mod_normalize(m['text']) == normalized)]
         repeat_groups = {('album', m['media_group_id']) if m.get('media_group_id') else ('message', i)
                          for i, m in enumerate(same)}
-        if len(repeat_groups) >= MODERATION_REPEAT_LIMIT:
-            return {'category': 'spam', 'confident': True}
+        media_marker = normalized.startswith('[') and normalized.endswith(']')
+        short_reply = (bool(normalized) and not media_marker
+                       and not _MOD_LINK_RE.search(str(text or ''))
+                       and (len(normalized) <= 6 or bool(_MOD_SHORT_ACK_RE.fullmatch(normalized))))
+        repeat_limit = MODERATION_SHORT_REPEAT_LIMIT if short_reply else MODERATION_REPEAT_LIMIT
+        if len(repeat_groups) >= repeat_limit:
+            return {'category': 'spam', 'confident': True, 'severity': 1,
+                    'reason': f'одно и то же сообщение повторено {len(repeat_groups)} раз'}
     if verdict is not None:
         return verdict.as_dict()
     if not normalized:
         return None                      # медиа без текста: дальше судить не по чему
 
     if _MOD_INVITE_RE.search(text or ''):
-        return {'category': 'spam', 'confident': True}
+        # Сам invite не доказывает нежелательную рекламу: люди приглашают друг
+        # друга в игровые/тематические чаты. Явный рекламный призыв можно решить
+        # локально; голую ссылку должен оценить второй уровень.
+        if _MOD_PROMO_RE.search(text or ''):
+            return {'category': 'spam', 'confident': True, 'severity': 1,
+                    'reason': 'рекламный призыв со ссылкой-приглашением'}
+        return {'category': 'spam', 'confident': False,
+                'reason': 'ссылка-приглашение без явного рекламного контекста'}
 
     if _MOD_LINK_RE.search(text or '') and len(normalized) < 120:
-        # Короткое сообщение, состоящее в основном из ссылки, — кандидат на спам,
-        # но ссылкой делятся и по делу, поэтому решает модель.
-        return {'category': 'spam', 'confident': False}
+        # Короткая ссылка — кандидат, а не нарушение. Это особенно важно при
+        # недоступной LLM: раньше любая такая реплика превращалась в поток
+        # одинаковых "подозрение spam" администратору.
+        return {'category': 'spam', 'confident': False,
+                'reason': 'короткое сообщение со ссылкой; нужен контекст'}
 
     # Однозначное оскорбление группы решаем здесь же: правила чата не делают
     # для него исключений ни по адресности, ни по контексту, а ждать модель,

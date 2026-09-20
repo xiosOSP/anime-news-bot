@@ -2,12 +2,12 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "86e417c51d5a295e5c6c4054daca9439a35d905e",
-  "generated_at_utc": "2026-09-20T17:25:00+00:00",
+  "git_commit": "f8f8bd23bda9062509b634f56a30e60fcca50664",
+  "generated_at_utc": "2026-09-20T17:44:00+00:00",
   "files": {
     ".env.example": {
-      "sha256": "1d0eb8b3a89b4021f24458e4aec9e0ceb42f1368cfa206badc5232d2ee9c34fc",
-      "bytes": 19945
+      "sha256": "f3daa63f2be6dd2468cdeae4fe2b45303de0381d332c20541c1682708e0115b4",
+      "bytes": 20451
     },
     ".gitattributes": {
       "sha256": "d60f352d0db1404c70afb4bb8b2ca3fd1c610572aa40720e8a0b7baa7885418c",
@@ -30,16 +30,16 @@
       "bytes": 13351
     },
     "anime_news_bot.py": {
-      "sha256": "a12d90cdd67a3499e59acc4b32fe8fe87bca0486da79e1e015f47e72de2aab79",
-      "bytes": 1453239
+      "sha256": "139c9a23db2595cacc362a94b4b52032e3a7037d13068be335986c03bb987207",
+      "bytes": 1457499
     },
     "docs/chat-moderation.md": {
       "sha256": "8dff0c1c57c7307904289972ecf7372c4e5d811ebd6aba1f6d6f943248b23dce",
       "bytes": 26004
     },
     "docs/env-reference.md": {
-      "sha256": "a953304cf8bd76288daec3813f958c479cb2d3ee951855e2a241eb1c19658ead",
-      "bytes": 18383
+      "sha256": "4d6bea62845fee40ce5c8edcafe895710dd69f09cb1467c0053e426cd172baa2",
+      "bytes": 18585
     },
     "docs/llm-providers.md": {
       "sha256": "5a2bd606625a1318b90184942b226a0d1b94d5a86a41b6c8598af1ce05d8f04f",
@@ -414,8 +414,8 @@
       "bytes": 12614
     },
     "tests/test_moderation_routing_precision.py": {
-      "sha256": "c67cf9f4d2b91ec4cca30f8ddc8f72ba19af84d1473d311c5373a5d2b2f94dfe",
-      "bytes": 3795
+      "sha256": "6d29dbe74e9811901f79b262555cb1029ad112c589ba06e6cbbd8a2886cb7847",
+      "bytes": 4189
     },
     "tests/test_moderation_rules_extended.py": {
       "sha256": "3c66337784cebcd7e4a41a072a51297e574c16a5b2c586d80626bf69ddf7be15",
@@ -608,6 +608,10 @@
     "tests/test_moderation_reliability_pr58.py": {
       "sha256": "dcc7decc95116b680bada179f421b17a58ad14791cc2a13445974eb857b6f3df",
       "bytes": 3961
+    },
+    "tests/test_moderation_flood_spam_pr59.py": {
+      "sha256": "2222513346fdcc206e1601b0356a4c06d237398ab207c5ce6dc3c831dc61add1",
+      "bytes": 2813
     }
   }
 }

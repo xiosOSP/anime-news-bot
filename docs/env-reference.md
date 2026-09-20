@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 263 переменных. Почти все — точная настройка со значением
+Бот читает 266 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -220,8 +220,10 @@
 | `MODERATION_BELITTLING_WINDOW_SEC` | — | anime_news_bot.py |
 | `MODERATION_CHATS` | — | anime_news_bot.py |
 | `MODERATION_CONTEXT_SIZE` | `12` | anime_news_bot.py |
-| `MODERATION_FLOOD_MESSAGES` | `6` | anime_news_bot.py |
-| `MODERATION_FLOOD_WINDOW_SEC` | `12` | anime_news_bot.py |
+| `MODERATION_FLOOD_MESSAGES` | `8` | anime_news_bot.py |
+| `MODERATION_FLOOD_SUSTAINED_MESSAGES` | `14` | anime_news_bot.py |
+| `MODERATION_FLOOD_SUSTAINED_WINDOW_SEC` | `45` | anime_news_bot.py |
+| `MODERATION_FLOOD_WINDOW_SEC` | `10` | anime_news_bot.py |
 | `MODERATION_LLM_API_KEY` | — | anime_news_bot.py |
 | `MODERATION_LLM_BASE_URL` | — | anime_news_bot.py |
 | `MODERATION_LLM_DAILY_LIMIT` | `120` | anime_news_bot.py |
@@ -242,6 +244,7 @@
 | `MODERATION_MODE` | — | anime_news_bot.py |
 | `MODERATION_REPEAT_LIMIT` | `3` | anime_news_bot.py |
 | `MODERATION_REPEAT_WINDOW_SEC` | `120` | anime_news_bot.py |
+| `MODERATION_SHORT_REPEAT_LIMIT` | `6` | anime_news_bot.py |
 | `MODERATION_STORE_MAX_USERS` | `5000` | anime_news_bot.py |
 | `MODERATION_UNJUDGED_NOTICE_SEC` | `900` | anime_news_bot.py |
 | `MODERATION_WARN_TTL_HOURS` | — | anime_news_bot.py |

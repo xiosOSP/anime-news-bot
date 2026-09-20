@@ -41,9 +41,21 @@ def test_url_path_is_not_a_slur():
 
 
 @pytest.mark.parametrize('link', ['https://t.me/+abcdef', 't.me/joinchat/abcdef', 'discord.gg/abcdef'])
-def test_real_invite_is_still_detected(link):
+def test_real_invite_is_still_routed_to_spam_review(link):
     result = bot._mod_local_check(-100, 7, link)
-    assert result['category'] == 'spam' and result['confident']
+    assert result['category'] == 'spam'
+    assert result['confident'] is False
+
+
+@pytest.mark.parametrize('text', [
+    'залетай https://t.me/+abcdef',
+    'подписывайся t.me/joinchat/abcdef',
+    'розыгрыш discord.gg/abcdef',
+])
+def test_promotional_invite_is_confident_local_spam(text):
+    result = bot._mod_local_check(-100, 7, text)
+    assert result['category'] == 'spam'
+    assert result['confident'] is True
 
 
 @pytest.mark.asyncio
