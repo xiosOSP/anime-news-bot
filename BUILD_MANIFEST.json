@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "5c56ff55a1bf47c256abf5b4029c51c46044a239",
-  "generated_at_utc": "2026-09-20T17:36:00+00:00",
+  "git_commit": "f8f8bd23bda9062509b634f56a30e60fcca50664",
+  "generated_at_utc": "2026-09-20T17:44:00+00:00",
   "files": {
     ".env.example": {
       "sha256": "f3daa63f2be6dd2468cdeae4fe2b45303de0381d332c20541c1682708e0115b4",
@@ -30,8 +30,8 @@
       "bytes": 13351
     },
     "anime_news_bot.py": {
-      "sha256": "55d44825eae50beff7d36323e1ebe20397d8c11601e31466bdbb063cbea92939",
-      "bytes": 1457455
+      "sha256": "139c9a23db2595cacc362a94b4b52032e3a7037d13068be335986c03bb987207",
+      "bytes": 1457499
     },
     "docs/chat-moderation.md": {
       "sha256": "8dff0c1c57c7307904289972ecf7372c4e5d811ebd6aba1f6d6f943248b23dce",
@@ -414,8 +414,8 @@
       "bytes": 12614
     },
     "tests/test_moderation_routing_precision.py": {
-      "sha256": "c67cf9f4d2b91ec4cca30f8ddc8f72ba19af84d1473d311c5373a5d2b2f94dfe",
-      "bytes": 3795
+      "sha256": "6d29dbe74e9811901f79b262555cb1029ad112c589ba06e6cbbd8a2886cb7847",
+      "bytes": 4189
     },
     "tests/test_moderation_rules_extended.py": {
       "sha256": "3c66337784cebcd7e4a41a072a51297e574c16a5b2c586d80626bf69ddf7be15",
