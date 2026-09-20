@@ -185,6 +185,7 @@ def _tgs_frames(path):
 
 
 def _video_frames(path):
+    """Primary OpenCV decoder. scan_file may retry with ffmpeg on ValueError."""
     import cv2
     from PIL import Image
     capture = cv2.VideoCapture(str(path))
@@ -205,9 +206,65 @@ def _video_frames(path):
             success, frame = capture.read()
             if not success:
                 raise ValueError('video frame decoding failed')
-            yield Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            image.thumbnail((1280, 1280))
+            yield image
     finally:
         capture.release()
+
+
+def _ffmpeg_video_frames(path):
+    """Fallback decoder for files OpenCV cannot seek/decode reliably."""
+    ffmpeg = shutil.which('ffmpeg')
+    ffprobe = shutil.which('ffprobe')
+    if not ffmpeg or not ffprobe:
+        raise ValueError('ffmpeg fallback unavailable')
+    probe = subprocess.run(
+        (ffprobe, '-v', 'error', '-select_streams', 'v:0',
+         '-show_entries', 'stream=width,height,duration:format=duration',
+         '-of', 'json', str(path)),
+        capture_output=True, text=True, timeout=6,
+    )
+    if probe.returncode != 0:
+        raise ValueError('ffprobe failed')
+    try:
+        data = json.loads(probe.stdout or '{}')
+        stream = (data.get('streams') or [{}])[0]
+        width = float(stream.get('width') or 0)
+        height = float(stream.get('height') or 0)
+        duration = float(stream.get('duration') or
+                         (data.get('format') or {}).get('duration') or 0)
+    except (ValueError, TypeError, IndexError):
+        raise ValueError('invalid ffprobe metadata') from None
+    if not all(math.isfinite(v) and v > 0 for v in (width, height, duration)):
+        raise ValueError('invalid ffprobe metadata')
+    if duration > MAX_DURATION or width * height > MAX_PIXELS:
+        raise ValueError('video dimensions/duration exceed limit')
+
+    from PIL import Image
+    samples = min(8, MAX_FRAMES, max(2, math.ceil(duration / 15) + 1))
+    positions = sorted({max(0.0, min(duration - 0.05,
+                                    i * duration / max(1, samples - 1)))
+                        for i in range(samples)})
+    decoded = 0
+    for position in positions:
+        result = subprocess.run(
+            (ffmpeg, '-nostdin', '-v', 'error', '-ss', f'{position:.3f}',
+             '-i', str(path), '-frames:v', '1', '-an', '-sn',
+             '-vf', 'scale=1280:1280:force_original_aspect_ratio=decrease',
+             '-f', 'image2pipe', '-vcodec', 'png', 'pipe:1'),
+            capture_output=True, timeout=6,
+        )
+        if result.returncode != 0 or not result.stdout:
+            continue
+        try:
+            with Image.open(io.BytesIO(result.stdout)) as image:
+                decoded += 1
+                yield image.convert('RGB').copy()
+        except Exception:
+            continue
+    if not decoded:
+        raise ValueError('ffmpeg could not decode sampled frames')
 
 
 def detection_variants(frame):
