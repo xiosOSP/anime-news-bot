@@ -22,10 +22,11 @@ _HIDDEN = frozenset({'script', 'style', 'noscript', 'template', 'svg'})
 class _FragmentText(HTMLParser):
     """Keep inline typography, separate block boundaries, omit executable text."""
 
-    def __init__(self):
+    def __init__(self, *, paragraphs: bool = False):
         super().__init__(convert_charrefs=False)
         self.parts: list[str] = []
         self.hidden: list[str] = []
+        self.separator = '\n' if paragraphs else ' '
 
     def handle_starttag(self, tag, attrs):
         if tag in _HIDDEN:
@@ -33,7 +34,7 @@ class _FragmentText(HTMLParser):
                 self.parts.append(' ')
             self.hidden.append(tag)
         elif not self.hidden and tag in _BLOCKS:
-            self.parts.append(' ')
+            self.parts.append(self.separator)
 
     def handle_endtag(self, tag):
         if self.hidden:
@@ -42,7 +43,7 @@ class _FragmentText(HTMLParser):
                 del self.hidden[index:]
             return
         if tag in _BLOCKS:
-            self.parts.append(' ')
+            self.parts.append(self.separator)
 
     def handle_data(self, data):
         if not self.hidden:
@@ -64,6 +65,35 @@ def clean_html_fragment(value: str) -> str:
     parser.close()
     text = html.unescape(''.join(parser.parts))
     return re.sub(r'\s+', ' ', text.replace('\u200b', '')).strip()
+
+
+def message_html_text(value: str) -> str:
+    """Preserve real paragraphs, never split a sentence at inline markup."""
+    parser = _FragmentText(paragraphs=True)
+    parser.feed(value or '')
+    parser.close()
+    text = html.unescape(''.join(parser.parts)).replace('\u200b', '')
+    return '\n'.join(re.sub(r'[^\S\n]+', ' ', line).strip()
+                     for line in text.splitlines()).strip()
+
+
+_BYLINE = re.compile(
+    r'^(?:published(?:\s+on)?|posted(?:\s+on)?|updated(?:\s+on)?|'
+    r'опубликовано|обновлено)\s+(?:\d|[A-Z][a-z]+\s+\d)', re.I)
+
+
+def clean_editorial_source(value: str) -> str:
+    """Remove standalone CMS bylines, not dates or names inside news facts."""
+    lines = []
+    for line in str(value or '').splitlines():
+        line = re.sub(r'[^\S\n]+', ' ', line).strip()
+        if _BYLINE.match(line):
+            continue
+        line = re.sub(r'\s+([,.;!?])', r'\1', line)
+        line = re.sub(r'«\s+', '«', line)
+        line = re.sub(r'\s+»', '»', line)
+        lines.append(line)
+    return '\n'.join(lines).strip()
 
 
 _JUNK_SELECTORS = (
@@ -97,8 +127,9 @@ def extract_article_text(
             # A list item containing paragraphs otherwise duplicates their text.
             if paragraph.name == 'li' and paragraph.find('p') is not None:
                 continue
-            text = re.sub(r'\s+', ' ', paragraph.get_text(' ', strip=True)).strip()
-            if len(text) < 12 or _CREDIT.match(text) or junk_pattern.search(text):
+            text = clean_html_fragment(str(paragraph))
+            if (len(text) < 12 or _CREDIT.match(text) or _BYLINE.match(text)
+                    or junk_pattern.search(text)):
                 continue
             linked = sum(len(a.get_text(' ', strip=True)) for a in paragraph.find_all('a'))
             if linked > len(text) * 0.7:

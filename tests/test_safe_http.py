@@ -2,8 +2,8 @@
 import socket
 import ssl
 import threading
+from collections import namedtuple
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -46,7 +46,9 @@ def test_https_keeps_hostname_and_certificate_verification(monkeypatch):
     adapter = safe_http._pinned_adapter(((socket.AF_INET, socket.SOCK_STREAM, 6, ('8.8.8.8', 443)),))
     sock = MagicMock()
     monkeypatch.setattr(socket, 'socket', lambda *a, **kw: sock)
-    wrap = MagicMock(return_value=SimpleNamespace(socket=sock, is_verified=True))
+    # urllib3 supports both attribute access and tuple unpacking for this result.
+    wrapped = namedtuple('WrappedSocket', 'socket is_verified')
+    wrap = MagicMock(return_value=wrapped(socket=sock, is_verified=True))
     monkeypatch.setattr(urllib3.connection, '_ssl_wrap_socket_and_match_hostname', wrap)
     conn = adapter.poolmanager.connection_from_url('https://news.invalid/feed')._new_conn()
     try:

@@ -11,6 +11,8 @@ import anime_news_bot as botmod
 @pytest.mark.asyncio
 async def test_album_fallback_uses_resolved_direct_video(monkeypatch):
     """После отказа media_group fallback не должен падать с NameError video_media."""
+    # Delivery test: translating the synthetic title must not call a provider.
+    monkeypatch.setattr(botmod, 'translate_text', lambda value, **kwargs: value)
     monkeypatch.setattr(botmod, 'settings', SimpleNamespace(
         video_enabled=True, require_image=True,
     ))
