@@ -1,6 +1,4 @@
 """Regression tests for PR #59 flood/spam precision."""
-import time
-
 import anime_news_bot as bot
 
 
