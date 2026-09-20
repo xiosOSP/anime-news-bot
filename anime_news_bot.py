@@ -2072,6 +2072,7 @@ class ChatModerationStore:
                 'moderate_admins': raw.get('moderate_admins') if type(raw.get('moderate_admins')) is bool else MODERATION_ADMINS_DEFAULT,
                 'log': raw.get('log') if isinstance(raw.get('log'), list) else [],
                 'incidents': raw.get('incidents') if isinstance(raw.get('incidents'), dict) else {},
+                'reviews': raw.get('reviews') if isinstance(raw.get('reviews'), dict) else {},
             }
         except (OSError, ValueError, TypeError) as e:
             logger.warning(f'Модерация: состояние не загружено: {e}')
@@ -2315,6 +2316,83 @@ class ChatModerationStore:
             by_action[str(action)[:20]] = int(by_action.get(str(action)[:20], 0)) + 1
         self._save()
 
+    def reserve_review(self, review_id: str, *, chat_id: int, user_id: int,
+                       category: str, source: str, action: str, reason: str,
+                       text: str, incident_id: str = '') -> bool:
+        """Persist one moderation sample so observe-mode feedback survives restarts."""
+        with self._lock:
+            before = copy.deepcopy(self._data)
+            reviews = self._data.setdefault('reviews', {})
+            if review_id in reviews:
+                return True
+            edge = time.time() - 90 * 86400
+            for key, row in list(reviews.items()):
+                if float(row.get('at') or 0) < edge:
+                    reviews.pop(key, None)
+            while len(reviews) >= MODERATION_STORE_MAX_USERS:
+                reviews.pop(next(iter(reviews)))
+            reviews[review_id] = {
+                'at': time.time(), 'chat_id': int(chat_id), 'user_id': int(user_id),
+                'category': str(category)[:40], 'source': str(source)[:32],
+                'action': str(action)[:32], 'reason': str(reason)[:240],
+                'text': str(text)[:500], 'incident_id': str(incident_id)[:24],
+                'mode': self.mode, 'feedback': '',
+            }
+            if not self._save():
+                self._data = before
+                return False
+            return True
+
+    def review(self, review_id: str) -> dict:
+        with self._lock:
+            return copy.deepcopy(self._data.get('reviews', {}).get(review_id, {}))
+
+    def record_feedback(self, review_id: str, verdict: str) -> bool:
+        """Save admin ground truth once; changing a vote adjusts counters safely."""
+        if verdict not in ('correct', 'incorrect'):
+            raise ValueError('unknown moderation feedback')
+        with self._lock:
+            before = copy.deepcopy(self._data)
+            row = self._data.get('reviews', {}).get(review_id)
+            if not row:
+                return False
+            old = str(row.get('feedback') or '')
+            if old == verdict:
+                return True
+            stats = self._data.setdefault('stats', {})
+            quality = stats.setdefault('quality', {})
+            by_cat = stats.setdefault('by_category', {})
+            cat = by_cat.setdefault(str(row.get('category') or '')[:40],
+                                    {'total': 0, 'overturned': 0})
+            if old in ('correct', 'incorrect'):
+                quality[old] = max(0, int(quality.get(old, 0)) - 1)
+                cat[old] = max(0, int(cat.get(old, 0)) - 1)
+            else:
+                quality['reviewed'] = int(quality.get('reviewed', 0)) + 1
+                cat['reviewed'] = int(cat.get('reviewed', 0)) + 1
+            quality[verdict] = int(quality.get(verdict, 0)) + 1
+            cat[verdict] = int(cat.get(verdict, 0)) + 1
+            row['feedback'] = verdict
+            row['feedback_at'] = time.time()
+            if not self._save():
+                self._data = before
+                return False
+            return True
+
+    def record_unavailable(self, category: str, source: str) -> None:
+        """Count technical gaps separately from moderation verdicts."""
+        with self._lock:
+            stats = self._data.setdefault('stats', {})
+            quality = stats.setdefault('quality', {})
+            quality['unavailable'] = int(quality.get('unavailable', 0)) + 1
+            by_source = quality.setdefault('unavailable_by_source', {})
+            source = str(source or 'unknown')[:32]
+            by_source[source] = int(by_source.get(source, 0)) + 1
+            cat = stats.setdefault('by_category', {}).setdefault(
+                str(category or 'unknown')[:40], {'total': 0, 'overturned': 0})
+            cat['unavailable'] = int(cat.get('unavailable', 0)) + 1
+        self._save()
+
     def record_overturned(self, chat_id, user_id) -> None:
         """Человек отменил решение бота — значит бот ошибся."""
         with self._lock:
@@ -2373,6 +2451,7 @@ class ChatModerationStore:
         with self._lock:
             self._data['stats'] = {}
             self._data['log'] = []
+            self._data['reviews'] = {}
         return self._save()
 
     def history(self, chat_id, user_id) -> list[dict]:
@@ -24665,6 +24744,7 @@ async def _mod_media_unchecked(bot: Bot, message, reason: str) -> None:
         chat_moderation.log_decision(chat_id, user_id, name,
                                     'media', 'не проверено', 'локальный детектор', reason,
                                     _mod_message_text(message))
+        chat_moderation.record_unavailable('media', 'media')
     metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'media_unchecked'})
     if MODERATION_MEDIA_NOTICE_SEC <= 0:
         return
@@ -24705,6 +24785,8 @@ async def _mod_unjudged_text(bot: Bot, message, category: str, reason: str) -> N
     """Escalate an unavailable second-level judgment without notification storms."""
     chat_id = message.chat_id
     metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'no_judge'})
+    if chat_moderation is not None:
+        chat_moderation.record_unavailable(category or 'unknown', 'llm')
     if MODERATION_UNJUDGED_NOTICE_SEC <= 0:
         return
 
@@ -24948,7 +25030,22 @@ async def _mod_tell_user(bot: Bot, message, decision: dict, category: str,
         logger.info('Модерация: объяснение не отправлено (%s)', type(exc).__name__)
 
 
-def _mod_report_markup(chat_id: int, user_id: int, incident_id: str = '', *, allow_ban: bool = True) -> InlineKeyboardMarkup:
+def _mod_report_markup(chat_id: int, user_id: int, incident_id: str = '',
+                       *, review_id: str = '', allow_ban: bool = True) -> InlineKeyboardMarkup:
+    if review_id:
+        rows = [[
+            InlineKeyboardButton('✅ Верно', callback_data=f'modq:ok:{review_id}'),
+            InlineKeyboardButton('❌ Ошибка', callback_data=f'modq:wrong:{review_id}'),
+        ]]
+        actions = []
+        if incident_id:
+            actions.append(InlineKeyboardButton('↩️ Снять', callback_data=f'modq:undo:{review_id}'))
+        if allow_ban and incident_id and user_id > 0:
+            actions.append(InlineKeyboardButton('🚫 Забанить', callback_data=f'modq:ban:{review_id}'))
+        if actions:
+            rows.append(actions)
+        return InlineKeyboardMarkup(rows)
+    # Backward-compatible markup for reports created before the quality dataset.
     suffix = f':{incident_id}' if incident_id else ''
     buttons = [
         InlineKeyboardButton('✅ Верно', callback_data=f'mod:ok:{chat_id}:{user_id}{suffix}'),
@@ -24987,12 +25084,25 @@ async def _mod_report(bot: Bot, message, category: str, decision: dict,
         text += f'Основание: {html.escape(reason)}\n'
     if category in MODERATION_HUMAN_ONLY:
         text += '\n⚠️ Бот сам не банит. Решение за вами.\n'
-    text += f'\n<blockquote>{_escape_to_limit(_mod_message_text(message), 400)}</blockquote>'
+    sample_text = _mod_message_text(message)
+    text += f'\n<blockquote>{_escape_to_limit(sample_text, 400)}</blockquote>'
+    review_id = hashlib.sha256(
+        f'{message.chat_id}:{getattr(message, "message_id", 0)}:{user_id}:{category}:{source}'.encode()
+    ).hexdigest()[:16]
+    stored = False
+    if chat_moderation is not None:
+        stored = chat_moderation.reserve_review(
+            review_id, chat_id=message.chat_id, user_id=user_id, category=category,
+            source=source, action=str(decision.get('applied_action') or decision.get('action') or ''),
+            reason=reason, text=sample_text, incident_id=str(decision.get('incident_id') or ''))
     for admin_id in _all_admin_ids():
         try:
-            await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML,
-                                   reply_markup=_mod_report_markup(message.chat_id, user_id, decision.get('incident_id', ''),
-                                        allow_ban=not decision.get('restriction_blocked')))
+            await bot.send_message(
+                admin_id, text, parse_mode=ParseMode.HTML,
+                reply_markup=_mod_report_markup(
+                    message.chat_id, user_id, str(decision.get('incident_id') or ''),
+                    review_id=review_id if stored else '',
+                    allow_ban=not decision.get('restriction_blocked')))
         except TelegramError:
             logger.debug('Модерация: отчёт админу %s не доставлен', admin_id)
 
@@ -25458,6 +25568,11 @@ def _moderation_stats_text() -> str:
     by_category = data.get('by_category') or {}
     total = sum(int(v) for v in by_action.values())
     overturned = int(data.get('overturned_total', 0))
+    quality = data.get('quality') or {}
+    reviewed = int(quality.get('reviewed', 0))
+    correct = int(quality.get('correct', 0))
+    incorrect = int(quality.get('incorrect', 0))
+    unavailable = int(quality.get('unavailable', 0))
     engines = ('Проверка администрации: ' + ('включена' if chat_moderation.moderate_admins else 'выключена') + '\n'
                + 'Локальные текстовые правила: включены\n'
                + f'Проверка медиа: {"включена" if MODERATION_MEDIA_ENABLED else "отключена"}\n'
@@ -25475,6 +25590,14 @@ def _moderation_stats_text() -> str:
         f'Отменено людьми: <b>{overturned}</b> ({100 - accuracy:.0f}%)',
         f'Не отменено: <b>{max(0, accuracy):.0f}%</b> (это не оценка точности)',
         '',
+        '<b>Разметка админов:</b>',
+        f'  Проверено вручную: <b>{reviewed}</b> из {total} решений'
+        + (f' ({100 * reviewed / max(1, total):.0f}%)' if total else ''),
+        f'  Верных: <b>{correct}</b> · ошибок: <b>{incorrect}</b>',
+        (f'  False-positive среди размеченных: <b>{100 * incorrect / reviewed:.1f}%</b>'
+         if reviewed else '  False-positive: пока нет размеченных решений'),
+        f'  Технически не проверено: <b>{unavailable}</b>',
+        '',
         '<b>По действиям:</b>',
     ]
     for action, count in sorted(by_action.items(), key=lambda kv: -int(kv[1])):
@@ -25486,8 +25609,18 @@ def _moderation_stats_text() -> str:
         for name, row in sorted(rows, key=lambda kv: -int(kv[1].get('total', 0))):
             human = MODERATION_RULES.get(name, {}).get('human', name)
             bad = int(row.get('overturned', 0))
-            tail = f' · отменено {bad}' if bad else ''
-            lines.append(f'  {html.escape(str(human))}: {int(row.get("total", 0))}{tail}')
+            reviewed_cat = int(row.get('reviewed', 0))
+            incorrect_cat = int(row.get('incorrect', 0))
+            unavailable_cat = int(row.get('unavailable', 0))
+            parts = [f'{int(row.get("total", 0))} решений']
+            if reviewed_cat:
+                parts.append(f'размечено {reviewed_cat}')
+                parts.append(f'ошибок {incorrect_cat}')
+            if unavailable_cat:
+                parts.append(f'не проверено {unavailable_cat}')
+            if bad:
+                parts.append(f'снято {bad}')
+            lines.append(f'  {html.escape(str(human))}: ' + ' · '.join(parts))
     lines += ['', f'Режим: <b>{chat_moderation.mode}</b>'
                   + (' — бот только докладывает' if chat_moderation.mode == 'observe' else ''),
               f'Бюджет модели: {_moderation_llm_budget_left()} из '
@@ -25608,33 +25741,72 @@ async def unwarn_command(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Human actions are bound to one incident; undo never clears later warns."""
+    """Handle moderation feedback and active sanctions without conflating them."""
     query = update.callback_query
     data = str(getattr(query, 'data', '') or '')
-    if not data.startswith('mod:'):
+    if not data.startswith(('mod:', 'modq:')):
         return False
-    parts = data.split(':')
-    if len(parts) not in (4, 5):
-        await query.answer()
-        return True
     if not is_admin(update):
         await query.answer('Только для админов', show_alert=True)
         return True
-    _, verb, raw_chat, raw_user = parts[:4]
-    try:
-        chat_id, user_id = int(raw_chat), int(raw_user)
-    except ValueError:
-        await query.answer()
-        return True
-    if verb == 'ok':
-        await query.answer('Принято')
-        await query.edit_message_reply_markup(reply_markup=None)
-        return True
-    incident_id = parts[4] if len(parts) == 5 else ''
+
+    review_id = ''
+    incident_id = ''
+    if data.startswith('modq:'):
+        parts = data.split(':')
+        if len(parts) != 3:
+            await query.answer()
+            return True
+        _, verb, review_id = parts
+        review = chat_moderation.review(review_id) if chat_moderation is not None else {}
+        if not review:
+            await query.answer('Карточка оценки устарела', show_alert=True)
+            return True
+        chat_id = int(review.get('chat_id') or 0)
+        user_id = int(review.get('user_id') or 0)
+        incident_id = str(review.get('incident_id') or '')
+        if verb == 'ok':
+            if not chat_moderation.record_feedback(review_id, 'correct'):
+                await query.answer('Не удалось сохранить оценку', show_alert=True)
+                return True
+            await query.answer('Записано как верное решение')
+            await query.edit_message_reply_markup(reply_markup=None)
+            return True
+        if verb == 'wrong':
+            if not chat_moderation.record_feedback(review_id, 'incorrect'):
+                await query.answer('Не удалось сохранить оценку', show_alert=True)
+                return True
+            if incident_id:
+                await query.answer('Ошибка записана. Санкция пока не снята.')
+                await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton('↩️ Снять санкцию',
+                                         callback_data=f'modq:undo:{review_id}')
+                ]]))
+            else:
+                await query.answer('Записано как ложное срабатывание')
+                await query.edit_message_reply_markup(reply_markup=None)
+            return True
+    else:
+        parts = data.split(':')
+        if len(parts) not in (4, 5):
+            await query.answer()
+            return True
+        _, verb, raw_chat, raw_user = parts[:4]
+        try:
+            chat_id, user_id = int(raw_chat), int(raw_user)
+        except ValueError:
+            await query.answer()
+            return True
+        if verb == 'ok':
+            await query.answer('Принято')
+            await query.edit_message_reply_markup(reply_markup=None)
+            return True
+        incident_id = parts[4] if len(parts) == 5 else ''
+
     async with _moderation_action_lock:
         incident = chat_moderation.incident(incident_id) if chat_moderation is not None else {}
         if not incident or incident.get('chat_id') != chat_id or incident.get('user_id') != user_id:
-            await query.answer('Отчёт устарел или создан в режиме наблюдения. Используйте команды модерации.', show_alert=True)
+            await query.answer('Отчёт устарел или создан в режиме наблюдения.', show_alert=True)
             return True
         if incident.get('status') == 'undone':
             await query.answer('Это решение уже отменено')
@@ -25664,27 +25836,34 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                             raise BadRequest('Telegram returned false')
                         restored = not restore_until
                 except TelegramError as exc:
-                    await query.answer(f'Снятие мута не подтверждено ({type(exc).__name__}); варн сохранён', show_alert=True)
+                    await query.answer(
+                        f'Снятие мута не подтверждено ({type(exc).__name__}); варн сохранён',
+                        show_alert=True)
                     return True
             if not chat_moderation.undo_incident(incident_id):
                 await query.answer('Не удалось сохранить отмену; проверьте /modlog', show_alert=True)
                 return True
+            if review_id:
+                chat_moderation.record_feedback(review_id, 'incorrect')
             _MOD_LAST_ACTION.pop(f'{chat_id}:{user_id}', None)
-            await query.answer('Варн за это нарушение снят. ' + ('Мут снят.' if restored else 'Другие ограничения сохранены.'))
+            await query.answer('Санкция снята. Решение отмечено ошибочным.'
+                               if review_id else
+                               'Варн за это нарушение снят. ' + ('Мут снят.' if restored else ''))
             await query.edit_message_reply_markup(reply_markup=None)
             return True
         if verb == 'ban':
             if user_id <= 0:
                 await query.answer('Telegram не раскрывает автора сообщения от имени чата', show_alert=True)
                 return True
-            # The only ban call remains an explicit administrator button.
             if incident.get('ban_status') in ('pending', 'confirmed', 'unknown'):
                 await query.answer('Бан уже запрошен; проверьте участника в чате', show_alert=True)
                 return True
             try:
                 member = await context.bot.get_chat_member(chat_id, user_id)
                 if getattr(member, 'status', '') in ('creator', 'administrator'):
-                    await query.answer('Telegram не позволяет забанить администратора; сначала владелец должен снять его права', show_alert=True)
+                    await query.answer(
+                        'Telegram не позволяет забанить администратора; сначала владелец должен снять его права',
+                        show_alert=True)
                     return True
                 if not chat_moderation.update_incident(incident_id, ban_status='pending'):
                     await query.answer('Не удалось сохранить решение', show_alert=True)
@@ -25693,6 +25872,8 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 if result is False:
                     raise BadRequest('Telegram returned false')
                 chat_moderation.update_incident(incident_id, ban_status='confirmed')
+                if review_id:
+                    chat_moderation.record_feedback(review_id, 'correct')
                 _audit_update(update, 'chat_ban', chat=chat_id, user=user_id)
                 await query.answer('Участник забанен')
             except TelegramError as exc:
@@ -25704,7 +25885,6 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             return True
     await query.answer()
     return True
-
 
 # ============== SINGLE-INSTANCE GUARD ==============
 _instance_lock_handle = None
