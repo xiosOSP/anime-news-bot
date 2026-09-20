@@ -58,13 +58,14 @@ async def test_large_media_positive_thumbnail_is_only_manual_evidence(monkeypatc
     ))
     monkeypatch.setattr(scanner, '_check_downloadable', probe)
 
-    result = await scanner.check(NS(), _message(video=video))
+    telegram = NS()
+    result = await scanner.check(telegram, _message(video=video))
 
     assert result.status == 'unchecked'
     assert result.category == 'spoiler_16'
     assert result.score == .97
     assert 'Оригинал больше 20 МБ' in result.reason
-    probe.assert_awaited_once_with(NS(), thumb, 'image')
+    probe.assert_awaited_once_with(telegram, thumb, 'image')
 
 
 def test_one_borderline_suggestive_frame_requires_review(tmp_path, monkeypatch):
