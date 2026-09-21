@@ -2057,7 +2057,7 @@ class ChatModerationStore:
 
     def __init__(self, path: Path):
         self.path = path
-        self._data: dict = {'schema_version': 1, 'chats': [], 'users': {}}
+        self._data: dict = {'schema_version': 1, 'chats': [], 'users': {}, 'misses': {}}
         self._lock = threading.RLock()
         self._load()
 
@@ -2086,6 +2086,7 @@ class ChatModerationStore:
                 'log': raw.get('log') if isinstance(raw.get('log'), list) else [],
                 'incidents': raw.get('incidents') if isinstance(raw.get('incidents'), dict) else {},
                 'reviews': raw.get('reviews') if isinstance(raw.get('reviews'), dict) else {},
+                'misses': raw.get('misses') if isinstance(raw.get('misses'), dict) else {},
             }
         except (OSError, ValueError, TypeError) as e:
             logger.warning(f'Модерация: состояние не загружено: {e}')
@@ -2178,6 +2179,37 @@ class ChatModerationStore:
             src['correct' if verdict == 'correct' else 'wrong'] = (
                 int(src.get('correct' if verdict == 'correct' else 'wrong', 0)) + 1
             )
+            if not self._save():
+                self._data = before
+                return False
+            return True
+
+    def record_missed_violation(self, miss_id: str, chat_id: int, user_id: int,
+                                category: str, text: str, note: str = '') -> bool:
+        """Persist an admin-confirmed false negative without punishing the user."""
+        category = str(category or '').strip().lower()
+        if not miss_id or category not in MODERATION_RULES:
+            return False
+        with self._lock:
+            before = copy.deepcopy(self._data)
+            misses = self._data.setdefault('misses', {})
+            if miss_id in misses:
+                return True
+            while len(misses) >= MODERATION_STORE_MAX_USERS:
+                misses.pop(next(iter(misses)))
+            misses[miss_id] = {
+                'at': time.time(),
+                'chat_id': int(chat_id),
+                'user_id': int(user_id),
+                'category': category,
+                'text': str(text or '')[:400],
+                'note': str(note or '')[:200],
+            }
+            stats = self._data.setdefault('stats', {})
+            stats['missed_total'] = int(stats.get('missed_total', 0)) + 1
+            cat = stats.setdefault('by_category', {}).setdefault(
+                category, {'total': 0, 'overturned': 0})
+            cat['missed_total'] = int(cat.get('missed_total', 0)) + 1
             if not self._save():
                 self._data = before
                 return False
@@ -2467,6 +2499,7 @@ class ChatModerationStore:
             self._data['stats'] = {}
             self._data['log'] = []
             self._data['reviews'] = {}
+            self._data['misses'] = {}
         return self._save()
 
     def history(self, chat_id, user_id) -> list[dict]:
@@ -25700,6 +25733,14 @@ def _moderation_quality_text() -> str:
             lines.append(
                 f'• {html.escape(str(human))}: {row["labels"]} оценок · '
                 f'precision {row["precision"]:.0%}')
+    missed = int((chat_moderation.stats() if chat_moderation is not None else {}).get('missed_total', 0) or 0)
+    if missed:
+        lines += ['', f'Пропуски, вручную отмеченные админами: <b>{missed}</b>. '
+                      'Это не полный recall: считаются только явно отмеченные случаи.']
+    else:
+        lines += ['', 'Пропуски пока не отмечались. Если бот ничего не сделал там, '
+                      'где должен был, ответьте на сообщение командой '
+                      '<code>/modmiss категория</code>.']
     if result['ready']:
         lines += ['', 'Данных достаточно для осознанного перехода в active. '
                       'Бот сам режим не переключает.']
@@ -25714,6 +25755,44 @@ def _moderation_quality_text() -> str:
 async def modquality_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Explain whether labelled observe data supports enabling active mode."""
     await update.message.reply_text(_moderation_quality_text(), parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def modmiss_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Mark a violation that the bot completely missed. No sanction is applied."""
+    if chat_moderation is None:
+        await update.message.reply_text('Хранилище модерации не готово.')
+        return
+    reply = getattr(update.message, 'reply_to_message', None)
+    chat = getattr(update, 'effective_chat', None)
+    if reply is None or chat is None:
+        await update.message.reply_text(
+            'Ответьте командой на пропущенное сообщение: '
+            '<code>/modmiss spam</code>\n'
+            'Категории: <code>' + ', '.join(sorted(MODERATION_RULES)) + '</code>',
+            parse_mode=ParseMode.HTML)
+        return
+    category = (str(context.args[0]).strip().lower() if context.args else '')
+    if category not in MODERATION_RULES:
+        await update.message.reply_text(
+            'Неизвестная категория. Доступны: <code>'
+            + ', '.join(sorted(MODERATION_RULES)) + '</code>',
+            parse_mode=ParseMode.HTML)
+        return
+    note = ' '.join(context.args[1:]).strip() if len(context.args or []) > 1 else ''
+    user_id, _ = _mod_actor(reply)
+    message_id = int(getattr(reply, 'message_id', 0) or 0)
+    miss_id = hashlib.sha256(
+        f'{chat.id}:{message_id}:{category}'.encode()).hexdigest()[:20]
+    if not chat_moderation.record_missed_violation(
+            miss_id, chat.id, user_id, category, _mod_message_text(reply), note):
+        await update.message.reply_text('❌ Не удалось сохранить пропуск.')
+        return
+    human = MODERATION_RULES.get(category, {}).get('human', category)
+    await update.message.reply_text(
+        f'✅ Пропуск записан: <b>{html.escape(str(human))}</b>.\n'
+        'Никакая санкция пользователю не применена. Статистика: /modquality',
+        parse_mode=ParseMode.HTML)
 
 
 @admin_only
@@ -25783,6 +25862,7 @@ def _moderation_stats_text() -> str:
     feedback_total = int(data.get('feedback_total', 0))
     feedback_correct = int(data.get('feedback_correct', 0))
     feedback_wrong = int(data.get('feedback_wrong', 0))
+    missed_total = int(data.get('missed_total', 0))
     engines = ('Проверка администрации: ' + ('включена' if chat_moderation.moderate_admins else 'выключена') + '\n'
                + 'Локальные текстовые правила: включены\n'
                + f'Проверка медиа: {"включена" if MODERATION_MEDIA_ENABLED else "отключена"}\n'
@@ -25803,6 +25883,7 @@ def _moderation_stats_text() -> str:
         + (f' · верно {feedback_correct} · ошибка {feedback_wrong} · '
            f'precision {100 * feedback_correct / max(1, feedback_total):.0f}%'
            if feedback_total else ' · нажимайте ✅ Верно / ❌ Ошибка'),
+        f'Пропущенных нарушений отмечено вручную: <b>{missed_total}</b>',
         '',
         '<b>По действиям:</b>',
     ]
@@ -25817,9 +25898,12 @@ def _moderation_stats_text() -> str:
             bad = int(row.get('overturned', 0))
             labelled = int(row.get('feedback_total', 0))
             wrong = int(row.get('feedback_wrong', 0))
+            missed = int(row.get('missed_total', 0))
             tail = f' · отменено {bad}' if bad else ''
             if labelled:
                 tail += f' · оценки {labelled}, ошибок {wrong}'
+            if missed:
+                tail += f' · пропущено {missed}'
             lines.append(f'  {html.escape(str(human))}: {int(row.get("total", 0))}{tail}')
     by_source = data.get('by_source') or {}
     source_rows = [(name, row) for name, row in by_source.items()
@@ -27502,6 +27586,7 @@ def main():
     app.add_handler(CommandHandler("moderation", moderation_command))
     app.add_handler(CommandHandler("modstats", modstats_command))
     app.add_handler(CommandHandler("modquality", modquality_command))
+    app.add_handler(CommandHandler("modmiss", modmiss_command))
     app.add_handler(CommandHandler("modllmping", modllmping_command))
     app.add_handler(CommandHandler("modtest", modtest_command))
     app.add_handler(CommandHandler("modlog", modlog_command))
