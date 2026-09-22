@@ -270,6 +270,23 @@ class TestEnvReference:
         assert set(found) == {'PLAIN_NAME', 'NUMERIC_NAME', 'BARE_NAME'}
         assert found['NUMERIC_NAME']['default'] == 42
 
+    def test_a_default_held_in_a_named_constant_is_resolved(self, tmp_path):
+        """Дефолт, вынесенный в константу, не должен пропадать из справочника.
+
+        Так уже было: DEFAULT_LLM_PROMPT_VERSION вынесли в константу, и в
+        справочнике вместо значения появился прочерк — документация беднела
+        молча, при каждом таком рефакторинге.
+        """
+        module = self._module()
+        (tmp_path / 'sample.py').write_text(
+            "DEFAULT_VERSION = 'editorial-v4'\n"
+            "x = _env('PROMPT_VERSION', DEFAULT_VERSION)\n"
+            "y = _env('UNKNOWN_DEFAULT', imported_elsewhere)\n", encoding='utf-8')
+        found = module.collect(tmp_path)
+        assert found['PROMPT_VERSION']['default'] == 'editorial-v4'
+        # Неизвестное имя — честный прочерк, а не выдуманное значение.
+        assert found['UNKNOWN_DEFAULT']['default'] is None
+
     def test_committed_reference_matches_the_code(self):
         module = self._module()
         found = module.collect()

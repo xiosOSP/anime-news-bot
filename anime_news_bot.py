@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - Windows fallback: polling сам ко�
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from functools import lru_cache
+from functools import lru_cache, wraps
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
@@ -1536,6 +1536,9 @@ MODERATION_BELITTLING_WINDOW_SEC = max(
 # Сколько последних решений храним для разбора. Тексты чужих сообщений на
 # диске — вещь чувствительная, поэтому список короткий и обрезанный.
 MODERATION_LOG_MAX = max(0, min(500, _env_int('MODERATION_LOG_MAX', 50)))
+# Как часто журнал решений модерации уходит на диск, если настоящих записей
+# не было. Ноль — писать каждое решение сразу, как раньше.
+MODERATION_LOG_FLUSH_SEC = max(0, min(3600, _env_int('MODERATION_LOG_FLUSH_SEC', 30)))
 MODERATION_REPEAT_WINDOW_SEC = max(10, min(3600, _env_int('MODERATION_REPEAT_WINDOW_SEC', 120)))
 MODERATION_MEDIA_ENABLED = _env('MODERATION_MEDIA_ENABLED', 'true').lower() == 'true'
 MODERATION_LLM_ENABLED = _env_bool('MODERATION_LLM_ENABLED', bool(
@@ -1906,6 +1909,19 @@ def _mod_hard_slur(text: str) -> str:
     return 'hate'
 
 
+# Слова, которыми оскорбляют группу целиком. Сами по себе ничего не решают —
+# только рядом с упоминанием группы или подозрительной основой. Список узкий:
+# ошибка здесь стоит не наказания, а письма админу, но письмо, которое
+# приходит на каждое «тупой сюжет», админ выключит в первый же день.
+_MOD_GROUP_DEROGATORY_RE = re.compile(
+    r'(?<![а-яё])(?:туп(?:ые|ой|ая|ое|ых|ым|ыми|орыл\w*)|вонюч\w*|грязн(?:ые|ых|ым|ыми)|'
+    r'животн(?:ые|ых|ым|ыми)|скоты|скотов|обезьян\w*|мраз\w*|твар(?:и|ей|ь)|'
+    r'ебан\w*|уеб\w*|убирайтесь)(?![а-яё])', re.IGNORECASE)
+# Этнические основы, которых нет ни среди жёстких оскорблений групп, ни среди
+# нейтральных упоминаний: сами по себе в чате встречаются как шутка и
+# самоирония, поэтому решают здесь только в паре с оскорбительным словом.
+_MOD_GROUP_EXTRA_RE = re.compile(r'(?<![а-яё])(?:хохл\w*|хохол|москал\w*|русн[яиюе]|ватник\w*)',
+                                 re.IGNORECASE)
 _MOD_IDENTITY_RE = re.compile(
     r'\b(?:'
     r'евре|мусульман|ислам|христиан|православн|католик|буддист|иуде|'
@@ -2036,14 +2052,36 @@ def _mod_local_check(chat_id: int, user_id: int, text: str, *, reply_to_user=Fal
     # Подмену букв ищем и в развёрнутых вариантах: «пид0р» и «п и д о р»
     # раньше проходили насквозь мимо всего списка.
     lexical = _mod_lexical_variants(text)
+    # Группа или подозрительная основа РЯДОМ с оскорбительным словом — это уже
+    # не упоминание, а подозрение на оскорбление группы. Безымянным оно
+    # проходило мимо человека: при недоступной модели такое сообщение только
+    # писалось в журнал, и «все негры тупые» не видел никто. Имя даём, но
+    # уверенности нет: «почему "негры тупые" — это расизм» тоже содержит оба
+    # слова, поэтому решает модель или человек, а не бот.
+    #
+    # Группа определяется своими словарями, а не общим списком подозрений:
+    # в нём и мат, и личные оскорбления, и «тупой сюжет» оказывался бы сразу
+    # и группой, и оскорблением.
+    #
+    # Ищем в вариантах ДО снятия неоднозначности: оттуда вырезаны «чурка» и
+    # «жид», к которым никто не обращается, — чтобы «чурка деревянная» не
+    # срабатывала. Но рядом с оскорбительным словом неоднозначности уже нет:
+    # «чурка ебаная» — не о полене.
+    undisambiguated = _mod_variants(_MOD_TEXT_URL_RE.sub(' ', str(text or '')))
+    group = any(_MOD_HARD_SLUR_RE.search(variant) or _MOD_IDENTITY_RE.search(variant)
+                or _MOD_GROUP_EXTRA_RE.search(variant) for variant in undisambiguated)
+    derogatory = any(_MOD_GROUP_DEROGATORY_RE.search(variant) for variant in lexical)
+    suspicion = ({'category': 'hate', 'confident': False,
+                  'reason': 'группа и оскорбительное слово рядом; нужна оценка'}
+                 if group and derogatory else {'category': '', 'confident': False})
     if any(_MOD_SUSPECT_RE.search(variant) or _MOD_HARD_SLUR_RE.search(variant)
            for variant in lexical):
-        return {'category': '', 'confident': False}
+        return suspicion
     if any(_MOD_IDENTITY_RE.search(variant) for variant in lexical):
-        # Только показать модели. Решать за неё нельзя: обсуждать религию,
-        # страну и культуру в чате можно, и запрет на упоминание был бы хуже
-        # самой проблемы.
-        return {'category': '', 'confident': False}
+        # Одно лишь упоминание — только показать модели. Решать за неё нельзя:
+        # обсуждать религию, страну и культуру в чате можно, и запрет на
+        # упоминание был бы хуже самой проблемы.
+        return suspicion
     return None
 
 
@@ -2059,6 +2097,9 @@ class ChatModerationStore:
         self.path = path
         self._data: dict = {'schema_version': 1, 'chats': [], 'users': {}, 'misses': {}}
         self._lock = threading.RLock()
+        # Журнал и счётчики — справочные записи, см. _save_soon.
+        self._dirty = False
+        self._last_save = 0.0
         self._load()
 
     def _load(self) -> None:
@@ -2096,10 +2137,41 @@ class ChatModerationStore:
             snapshot = copy.deepcopy(self._data)
             try:
                 _atomic_write_json(self.path, snapshot, indent=2)
-                return True
             except OSError as e:
                 logger.error(f'Модерация: состояние не сохранено: {e}')
                 return False
+            # Снимок целый: отложенные строки журнала ушли на диск вместе с ним.
+            self._dirty = False
+            self._last_save = time.monotonic()
+            return True
+
+    def _save_soon(self) -> None:
+        """Справочная запись: журнал решений и счётчики статистики.
+
+        Хранилище пишется целиком — копия, JSON и fsync — прямо в цикле событий.
+        Заполненное до лимитов, оно весит около 8 МБ, и одна запись стоит около
+        300 мс, в которые бот не отвечает никому. Журнал же пишется на КАЖДОЕ
+        решение, включая «не проверено»: при недоступной модели это каждое
+        сообщение с матом, а на одно предупреждение приходилось пять полных
+        записей.
+
+        Предупреждения, инциденты и разборы по-прежнему пишутся сразу: потеря
+        наказания при падении означала бы повторное или забытое наказание.
+        Журнал может подождать: он уходит на диск со следующей настоящей
+        записью, раз в MODERATION_LOG_FLUSH_SEC или при штатной остановке.
+        """
+        with self._lock:
+            self._dirty = True
+            if time.monotonic() - self._last_save < MODERATION_LOG_FLUSH_SEC:
+                return
+        self._save()
+
+    def flush(self) -> None:
+        """Сбросить отложенные строки журнала — перед остановкой процесса."""
+        with self._lock:
+            dirty = self._dirty
+        if dirty:
+            self._save()
 
     def incident(self, incident_id: str) -> dict:
         with self._lock:
@@ -2438,7 +2510,7 @@ class ChatModerationStore:
             row['total'] = int(row.get('total', 0)) + 1
             by_action = stats_row.setdefault('by_action', {})
             by_action[str(action)[:20]] = int(by_action.get(str(action)[:20], 0)) + 1
-        self._save()
+        self._save_soon()
 
     def record_overturned(self, chat_id, user_id) -> None:
         """Человек отменил решение бота — значит бот ошибся."""
@@ -2476,7 +2548,7 @@ class ChatModerationStore:
             })
             if len(log) > MODERATION_LOG_MAX:
                 self._data['log'] = log[-MODERATION_LOG_MAX:] if MODERATION_LOG_MAX else []
-        self._save()
+        self._save_soon()
 
     def recent_log(self, limit: int = 10) -> list[dict]:
         with self._lock:
@@ -17126,18 +17198,25 @@ async def reply_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ============== КОМАНДЫ ==============
 def admin_only(handler):
-    """Декоратор: пускаем в команду только owner/admin, сохраняя старую модель доступа."""
+    """Декоратор: пускаем в команду только owner/admin, сохраняя старую модель доступа.
+
+    wraps, а не ручное копирование __name__: тесты проверяют тело команды через
+    __wrapped__, минуя проверку прав. Без него они молча звали обёртку — и
+    падали на проверке прав, а не на том, что проверяли; main стоял красным.
+    """
+    @wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(update):
             await deny_access(update)
             return
         _audit_update(update, f'command:{handler.__name__}')
         return await handler(update, context)
-    wrapper.__name__ = handler.__name__
     return wrapper
 
 
 def owner_only(handler):
+    """Декоратор: команда только владельцу бота. Обёртка — как у admin_only."""
+    @wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = getattr(update, 'effective_user', None)
         if not is_owner(user):
@@ -17145,7 +17224,6 @@ def owner_only(handler):
             return
         _audit_update(update, f'command:{handler.__name__}', role='owner')
         return await handler(update, context)
-    wrapper.__name__ = handler.__name__
     return wrapper
 
 def _await_ctx(mode: str, key: str, message) -> dict:
@@ -20462,6 +20540,37 @@ def _llm_wanted() -> bool:
     return bool(_llm_configured() and settings is not None and settings.llm_enabled)
 
 
+def _llm_outage_is_temporary() -> bool:
+    """Пройдёт ли молчание модели само — есть ли смысл ради неё ждать.
+
+    Отсрочка поста задумана для отказов бесплатных тарифов: они длятся
+    минуты, а сырой пост остаётся в канале навсегда. Но молчание бывает и
+    долгим, и тогда ожидание — это просто задержка каждой новости на срок
+    отсрочки (по умолчанию до 15 минут), после которой пост уходит тем же
+    обычным путём. Так канал целиком отставал на четверть часа, пока ключ
+    был отклонён.
+
+    Ждать бессмысленно, если:
+    - ключ отклонён или провайдер отказал по настройке — до перезапуска;
+    - дневной лимит вызовов исчерпан — до завтра;
+    - дневной бюджет токенов исчерпан — тоже до завтра.
+    Пауза после серии 429 и сетевых ошибок (circuit) закрывается сама —
+    её подождать стоит.
+    """
+    if _llm_disabled_runtime and _llm_disabled_reason != 'circuit':
+        return False
+    if _llm_quota_left() <= 0:
+        return False
+    # Не can_charge(0): он отвечает «можно», пока израсходовано ровно столько,
+    # сколько разрешено, хотя места нет ни на один настоящий вызов. Мерка —
+    # самый дешёвый вызов: один только зарезервированный ответ.
+    if (feature_enabled('llm_budget') and LLM_DAILY_TOKEN_BUDGET > 0
+            and llm_budget is not None
+            and not llm_budget.can_charge(_estimate_llm_tokens([], LLM_MAX_TOKENS))):
+        return False
+    return True
+
+
 def _llm_defer_news(news: dict) -> bool:
     """Wait at most a bounded number of attempts/minutes, across restarts."""
     global _llm_deferral_store
@@ -20891,7 +21000,8 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
         # Модель не настроена — работаем без неё, так и задумано. Настроена, но
         # молчит — это временно, и лучше подождать: отказ бесплатных тарифов
         # длится минуты, а сырой пост остаётся в канале навсегда.
-        if _llm_wanted() and await asyncio.to_thread(_llm_defer_news, news):
+        if (_llm_wanted() and _llm_outage_is_temporary()
+                and await asyncio.to_thread(_llm_defer_news, news)):
             return 'defer'
         return 'off'
     title = (news.get('title') or '').strip()
@@ -20916,7 +21026,8 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
         if not data:
             if raw:
                 logger.info(f"LLM: ответ не разобрался, беру обычный путь — {raw[:80]}")
-            if _llm_wanted() and await asyncio.to_thread(_llm_defer_news, news):
+            if (_llm_wanted() and _llm_outage_is_temporary()
+                    and await asyncio.to_thread(_llm_defer_news, news)):
                 return 'defer'
             return 'off'
         # Тот же пост готовится повторно после ошибки отправки, из очереди и по
@@ -27288,6 +27399,8 @@ async def _post_shutdown(app: Application) -> None:
             settings.save()
         if experiments is not None:
             experiments.flush()
+        if chat_moderation is not None:
+            chat_moderation.flush()
         for store in (post_queue, scheduled_posts, pending_posts, sent_links):
             saver = getattr(store, '_save', None)
             if callable(saver):
