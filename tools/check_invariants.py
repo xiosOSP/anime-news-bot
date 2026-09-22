@@ -755,6 +755,37 @@ def _check_deleting_categories_keep_off_ordinary_speech() -> tuple[bool, str]:
     return True, f'{len(ordinary)} обычных фраз целы, {len(real)} нарушений ловятся'
 
 
+def _check_every_secret_is_redacted(tree) -> tuple[bool, str]:
+    """Каждый ключ и токен бота обязан быть в списке вычистки секретов.
+
+    Список в _redact_secrets ручной: ключ, попавший в текст ошибки провайдера
+    («Incorrect API key provided: sk-…»), уходит в лог и в сообщение админу,
+    если его в списке нет. Ключи добавляются вместе с провайдерами, и
+    забыть про список легко — поэтому проверяем разбором кода, а не глазами.
+    """
+    import re as _re
+
+    secret_name = _re.compile(r'^[A-Z][A-Z0-9_]*(?:_API_KEY|_TOKEN)$|^TOKEN$')
+    declared = {
+        target.id
+        for node in tree.body if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name) and secret_name.match(target.id)
+    }
+    redacted: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == '_redact_secrets':
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.For) and isinstance(inner.iter, ast.Tuple):
+                    redacted |= {e.id for e in inner.iter.elts if isinstance(e, ast.Name)}
+    if not redacted:
+        return False, 'в _redact_secrets не найден список секретов'
+    missing = sorted(declared - redacted)
+    if missing:
+        return False, f'не вычищаются из логов: {", ".join(missing)}'
+    return True, f'все {len(declared)} ключей и токенов вычищаются'
+
+
 def _check_env_report_never_prints_a_secret(bot) -> tuple[bool, str]:
     """Отчёт о файле .env не имеет права показать значение ключа.
 
@@ -879,6 +910,7 @@ def checks(bot, tree) -> list[tuple[str, bool, str]]:
     add('заголовок поста — не рубрика канала', _check_headline_is_never_a_label(bot))
     add('отчёт о .env не показывает ключи',
         _check_env_report_never_prints_a_secret(bot))
+    add('каждый ключ вычищается из логов', _check_every_secret_is_redacted(tree))
     add('удаляющие категории не трогают обычную речь',
         _check_deleting_categories_keep_off_ordinary_speech())
     add('имена моделей из пресетов проходят проверку',

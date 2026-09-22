@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "b6e2c09319f9671c8ee6e5efa45232f3e4f0bdde",
-  "generated_at_utc": "2026-09-22T18:32:10.745727+00:00",
+  "git_commit": "5fb8ea0972f5dabc5c8af2960dd893e3fc9c512d",
+  "generated_at_utc": "2026-09-22T18:44:17.832598+00:00",
   "files": {
     ".env.example": {
       "sha256": "94da878ff7f7bf4aadd828292682444aa5b464da1ce4369fee23f735b3e41096",
@@ -30,12 +30,12 @@
       "bytes": 13351
     },
     "anime_news_bot.py": {
-      "sha256": "bfd634b1c0d4966524e5dbaed436ba749b0f7e3a6d19d7d6c5219cf3f538267c",
-      "bytes": 1486287
+      "sha256": "57df241b796c7ba5f776766a746bcb7540e003169080b74b6d723070838c94af",
+      "bytes": 1489924
     },
     "docs/chat-moderation.md": {
-      "sha256": "cdadfe7988dcc0a21568713092ad3bc684c0e4cec017fe1ca3905f911e063ae0",
-      "bytes": 37377
+      "sha256": "cd0b63760702101d260fe313081e2b37944b984f72d08a55963c7721d46b00c2",
+      "bytes": 39012
     },
     "docs/env-reference.md": {
       "sha256": "6190368ca8b37a682d1f3aea2092030117722186018bcbde22fe2caa368b540d",
@@ -160,6 +160,10 @@
     "tests/test_article_fetch.py": {
       "sha256": "fc560f7ab6768f2ea18d9138b507f6b25e03f8aa1788688355def3ef03579cf2",
       "bytes": 4077
+    },
+    "tests/test_audit2_group_insult.py": {
+      "sha256": "04023dfcdf644b53c6b448c078f25a29355a3d4dfbcb2c9dc764b7e0adbe5d81",
+      "bytes": 6430
     },
     "tests/test_audit_findings.py": {
       "sha256": "bec45e7f784624fb2983d9bb4db8aa6782a3eff42f68b49aa2d8eeca7ad50cb9",
@@ -626,8 +630,8 @@
       "bytes": 7322
     },
     "tools/check_invariants.py": {
-      "sha256": "17011cbda701eaf3240effcff1dbe7570589d7a651afe9ecf88f2de8dd7d3c0a",
-      "bytes": 53384
+      "sha256": "7feb44fc157abd8c2b676515b13fb9917f8cdf8f4e6ff77812b76522452c40fb",
+      "bytes": 55212
     },
     "tools/env_reference.py": {
       "sha256": "e37b051bf68db3b5fbbb9359a618d386dc9ca91d7d159014abfd0b6fc90d6508",
