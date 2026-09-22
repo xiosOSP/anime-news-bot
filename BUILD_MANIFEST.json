@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "ad20ae68089dfea2c686bd47194bb4d6cc2dfb6f",
-  "generated_at_utc": "2026-09-22T19:34:12.796782+00:00",
+  "git_commit": "2445b9847dc6cf99f6b7df8a174f70b36a3ea995",
+  "generated_at_utc": "2026-09-22T19:41:57.188834+00:00",
   "files": {
     ".env.example": {
       "sha256": "42eb1e0bfc0d66c187647e427f1cbd0fbfd1ea5477079ddef3e642e3c61c23c2",
@@ -110,8 +110,8 @@
       "bytes": 2319
     },
     "tests/conftest.py": {
-      "sha256": "69a685e545c4aa2335b5a8456faca0b2a7f35fa7c4f789c2b6d5acd55406df11",
-      "bytes": 7264
+      "sha256": "c6dea02e5455b50abdf1e7642657de90d6b62649aa82a833529aba771c0b7133",
+      "bytes": 7832
     },
     "tests/e2e/test_cli_contract.py": {
       "sha256": "8a8e84a04e2f8f2342da5973d5d0266cebc8c728cb91ca8d1ac39f5910ed7730",
