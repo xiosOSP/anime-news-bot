@@ -16,6 +16,7 @@
 import pytest
 
 import anime_news_bot as bot
+import news_stories
 
 
 def _row(title, markers=None):
@@ -101,8 +102,8 @@ class TestWordForms:
                                       ('ends', 'end'), ('premieres', 'premiere'),
                                       ('stories', 'story')])
     def test_forms_share_a_stem(self, a, b):
-        assert bot._story_anchor_stem(a) == bot._story_anchor_stem(b)
+        assert news_stories._story_anchor_stem(a) == news_stories._story_anchor_stem(b)
 
     @pytest.mark.parametrize('word', ['boss', 'ваншот', 'mha', 'одна'])
     def test_short_double_s_and_cyrillic_words_are_untouched(self, word):
-        assert bot._story_anchor_stem(word) == word
+        assert news_stories._story_anchor_stem(word) == word

@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import anime_news_bot as bot
+import news_stories
 
 
 @pytest.fixture(autouse=True)
@@ -244,6 +245,6 @@ class TestDedupWorksWithoutTheModel:
 
     def test_inflected_generic_words_do_not_count_as_evidence(self):
         """«сезона» и «сезону» — одно служебное слово, а не общий якорь."""
-        assert bot._is_generic_anchor('сезона')
-        assert bot._is_generic_anchor('сезону')
-        assert not bot._is_generic_anchor('шкатулки')
+        assert news_stories._is_generic_anchor('сезона')
+        assert news_stories._is_generic_anchor('сезону')
+        assert not news_stories._is_generic_anchor('шкатулки')

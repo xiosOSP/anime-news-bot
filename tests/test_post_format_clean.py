@@ -6,6 +6,7 @@
 import pytest
 
 import anime_news_bot as bot
+import post_text
 
 
 # ---------- ссылок в тексте поста нет ----------
@@ -60,18 +61,18 @@ def test_dates_are_not_mistaken_for_domains():
 
 def test_unfinished_tail_is_cut_to_the_last_whole_sentence():
     """RSS обрывается на полуслове, и в пост уходил обрывок."""
-    out = bot._drop_unfinished_tail('Первое предложение целое. Второе оборвалось на союзе и')
+    out = post_text._drop_unfinished_tail('Первое предложение целое. Второе оборвалось на союзе и')
     assert out == 'Первое предложение целое.'
 
 
 def test_fragment_without_any_whole_sentence_is_dropped():
     """Лучше короче, но целиком: заголовок самодостаточен."""
-    assert bot._drop_unfinished_tail('Совсем нет границы и текст обрывается на союзе и') == ''
+    assert post_text._drop_unfinished_tail('Совсем нет границы и текст обрывается на союзе и') == ''
 
 
 def test_finished_text_is_left_alone():
     text = 'Всё хорошо, предложение закончено.'
-    assert bot._drop_unfinished_tail(text) == text
+    assert post_text._drop_unfinished_tail(text) == text
 
 
 def test_post_has_no_dangling_tail(monkeypatch):
