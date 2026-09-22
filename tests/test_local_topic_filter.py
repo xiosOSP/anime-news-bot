@@ -107,6 +107,10 @@ class TestPipeline:
         monkeypatch.setattr(bot, '_optimize_news_media', AsyncMock(return_value=None))
         monkeypatch.setattr(bot, '_assign_format_variant', lambda news: None)
         monkeypatch.setattr(bot, 'stats', MagicMock(record_skipped=AsyncMock()))
+        # Переводчика в тестах нет, и английский заголовок остаётся английским:
+        # защита от непереведённых постов отложила бы любую новость. Здесь
+        # проверяется отсев по теме — защиту проверяют её собственные тесты.
+        monkeypatch.setattr(bot, '_left_untranslated', lambda news: False)
         return bot
 
     def _prepare(self, env, news):

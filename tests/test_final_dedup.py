@@ -160,6 +160,10 @@ class TestFinalDedupInPipeline:
                 return text
 
         monkeypatch.setattr(anime_news_bot, 'translator', _Identity())
+        # Тождественный переводчик оставляет английский текст английским, и
+        # защита от непереведённых постов откладывала бы первую новость. Здесь
+        # проверяется дедуп, а не перевод: защиту проверяют её собственные тесты.
+        monkeypatch.setattr(anime_news_bot, '_left_untranslated', lambda news: False)
         monkeypatch.setattr(anime_news_bot, 'anilist', MagicMock(lookup=lambda q: None))
         monkeypatch.setattr(anime_news_bot, 'DEEPL_API_KEY', '')
         monkeypatch.setattr(anime_news_bot, '_translation_cache', {})

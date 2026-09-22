@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "035650622f353895932d2f20d238b71f3cfedd6f",
-  "generated_at_utc": "2026-09-22T20:34:00.390704+00:00",
+  "git_commit": "5b65981fba053598394d682b0d08b117b486d218",
+  "generated_at_utc": "2026-09-22T21:10:11.682444+00:00",
   "files": {
     ".env.example": {
       "sha256": "42eb1e0bfc0d66c187647e427f1cbd0fbfd1ea5477079ddef3e642e3c61c23c2",
@@ -26,12 +26,12 @@
       "bytes": 33
     },
     "README.md": {
-      "sha256": "f8b8cbee47f5a3d601e46d10132756c7c53951faba2e6e8e74cf0dfdeebb7a33",
-      "bytes": 14517
+      "sha256": "006352acc15f54c8de49f45af65c2f9aa4d0da6f35c3ba9cf3a91dcdc019ab82",
+      "bytes": 15295
     },
     "anime_news_bot.py": {
-      "sha256": "56d0972640374f63672e0c91390046d28320815aa52d2a2a865cbe6191853c69",
-      "bytes": 1442716
+      "sha256": "05eff21ded1ecfe19f3c81853f6a9a6c403d12ede17698521db7eb2ed37154c1",
+      "bytes": 1451727
     },
     "docs/chat-moderation.md": {
       "sha256": "cd0b63760702101d260fe313081e2b37944b984f72d08a55963c7721d46b00c2",
@@ -82,16 +82,16 @@
       "bytes": 3134
     },
     "news_parser.py": {
-      "sha256": "a2e3c33447c36f6cb5c8ddedf71b7d82af965715c61bf8555de5efd2dec3a924",
-      "bytes": 10313
+      "sha256": "e46b20b0b6eb030bda4517df5ec9c04096ae70353c1ce00249b41ed408330fef",
+      "bytes": 14550
     },
     "news_stories.py": {
       "sha256": "df8517fdbe4dc6aa7591e77a11e81ae5a9224d94c8ceb86d6d61861c4c1641c7",
       "bytes": 17899
     },
     "post_text.py": {
-      "sha256": "333d1dc3396c919ed120d478d8a732ce2d806978fd0720fb712a41b4d217712b",
-      "bytes": 22396
+      "sha256": "069ef97e936c58734658eccd31acdde675cace9d5800511508dee5f7c65d985d",
+      "bytes": 24631
     },
     "publication_delivery.py": {
       "sha256": "b800acc2cf4735e3f81c1009684056c00e905a64372e2b3011968763f6c90538",
@@ -230,8 +230,8 @@
       "bytes": 18576
     },
     "tests/test_cycle2_source_expansion.py": {
-      "sha256": "6684f5bf11be3fcc725e56c50d5cbb4a351cf8f3c48046e4ac7f4550ca80ae80",
-      "bytes": 5533
+      "sha256": "d24817d7fd0b299183b822912d9d10762755890694a9f50a8a31f7d0130f990b",
+      "bytes": 5847
     },
     "tests/test_dedup.py": {
       "sha256": "e0bdee5e7d1ed15783af60436029e7be80ba901440b123981e75ef39aeae84e0",
@@ -298,8 +298,8 @@
       "bytes": 2719
     },
     "tests/test_final_dedup.py": {
-      "sha256": "fd774782f01690514a8085f0d0cd2a0d5b491492f6a7e3a655d28ae8bbf7d781",
-      "bytes": 12384
+      "sha256": "4763fd758b566663bd4d2d174291b370770ad168a96a4b0175aa4a41933e6c3b",
+      "bytes": 12883
     },
     "tests/test_health_dedup_backup.py": {
       "sha256": "2f5c52fa424ce02a56d57114c091729ae147811dd2ad283da15c863994b3c470",
@@ -316,6 +316,10 @@
     "tests/test_japanese_and_fixes.py": {
       "sha256": "ccd5487daa239a4a66ee9b293c7228862b722206daab958bc30240516daabc5d",
       "bytes": 5242
+    },
+    "tests/test_live_feed_defects.py": {
+      "sha256": "882966fe0608d7b13a2b8c2cc35b420a175827b44cbb8bb5f7a92b631afb3fd8",
+      "bytes": 18118
     },
     "tests/test_llm.py": {
       "sha256": "8f5bc25d0d31dd5c7d6903bb6eca724abfe859ebc07356a6a05bc7ddaa0a7cb7",
@@ -394,8 +398,8 @@
       "bytes": 5250
     },
     "tests/test_local_topic_filter.py": {
-      "sha256": "a413b18b54d8015245f37ad731565afb4ce38a98873ba9d8faf0f2ee3258a5ba",
-      "bytes": 10962
+      "sha256": "eed9bbad51ddf52255e7bdf94474e60605a94f5f7f5032bf2d1ec981a0264528",
+      "bytes": 11440
     },
     "tests/test_log_timezone.py": {
       "sha256": "aedd9f18e3a0abe6104971ebd0a2f4f6e8e08a5a1313a8ac691b6336fb903fd1",
@@ -502,8 +506,8 @@
       "bytes": 4922
     },
     "tests/test_news_noise_filter.py": {
-      "sha256": "9c286b97af323cb9ec0091fa62e5c370c99be18a744d4eee4831e1c0b2db59ea",
-      "bytes": 7725
+      "sha256": "cb4ebbc02b285c3998f2045e5d8db7e522eacaada1f8105469c907ddcedaeabf",
+      "bytes": 11292
     },
     "tests/test_news_parser_quality.py": {
       "sha256": "2116878d9cb12a8d931fb88c9cc63c3cb94f6879b150266e2421f477de2aba61",

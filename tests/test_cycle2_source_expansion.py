@@ -80,6 +80,9 @@ def test_fetch_listing_source_closes_response(monkeypatch):
     r = Resp()
     monkeypatch.setattr(bot, 'http_get_with_retry', lambda *a, **k: r)
     monkeypatch.setattr(bot, '_read_limited_text', lambda response: response.text)
+    # Тест про закрытие ответа, а не про возраст: дата в адресе карточки
+    # фиксированная и со временем устаревает для фильтра свежести.
+    monkeypatch.setattr(bot, '_is_too_old', lambda *_a, **_k: False)
     rows = bot._fetch_listing_source(
         'https://gkids.com/author/gkids/', 'GKIDS',
         base_url='https://gkids.com/',
