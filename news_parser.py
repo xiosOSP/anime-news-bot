@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import re
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Callable
 from urllib.parse import urljoin, urlparse
@@ -16,7 +17,11 @@ _BLOCKS = frozenset({
     'header', 'hr', 'li', 'main', 'ol', 'p', 'pre', 'section', 'table', 'td',
     'th', 'tr', 'ul',
 })
-_HIDDEN = frozenset({'script', 'style', 'noscript', 'template', 'svg'})
+# Подпись под картинкой — не текст новости. WordPress кладёт её прямо в
+# описание RSS первой строкой, и в пост уезжало «Courtesy of Netflix
+# Cyberpunk: Edgerunners is coming back…»: кредит фото склеивался с первой
+# фразой новости, и отделить его потом было уже нечем.
+_HIDDEN = frozenset({'script', 'style', 'noscript', 'template', 'svg', 'figcaption'})
 
 
 class _FragmentText(HTMLParser):
@@ -82,12 +87,24 @@ _BYLINE = re.compile(
     r'опубликовано|обновлено)\s+(?:\d|[A-Z][a-z]+\s+\d)', re.I)
 
 
+# Кнопки-призывы пресс-релизов, склеенные с текстом: у GKIDS описание
+# начиналось с «VIEW TRAILER HERETICKETS ON SALE NOW». Ищем только капслоком:
+# «билеты уже в продаже» строчными — это факт новости, а капслоком — кнопка.
+_CALL_TO_ACTION = re.compile(
+    r'\b(?:VIEW|WATCH|SEE)\s+(?:THE\s+)?(?:NEW\s+)?TRAILER\s+HERE'
+    r'|(?:GET\s+)?TICKETS\s+(?:ARE\s+)?(?:ON\s+SALE\s+NOW|HERE)\b'
+    r'|\b(?:CLICK|READ\s+MORE|LEARN\s+MORE)\s+HERE\b')
+
+
 def clean_editorial_source(value: str) -> str:
     """Remove standalone CMS bylines, not dates or names inside news facts."""
     lines = []
     for line in str(value or '').splitlines():
         line = re.sub(r'[^\S\n]+', ' ', line).strip()
         if _BYLINE.match(line):
+            continue
+        line = re.sub(r'\s{2,}', ' ', _CALL_TO_ACTION.sub(' ', line)).strip()
+        if not line:
             continue
         line = re.sub(r'\s+([,.;!?])', r'\1', line)
         line = re.sub(r'«\s+', '«', line)
@@ -170,6 +187,57 @@ def extract_article_text(
     return best[:max_chars].strip()
 
 
+_MONTHS = {name: number for number, names in enumerate((
+    ('jan', 'january'), ('feb', 'february'), ('mar', 'march'), ('apr', 'april'),
+    ('may',), ('jun', 'june'), ('jul', 'july'), ('aug', 'august'),
+    ('sep', 'sept', 'september'), ('oct', 'october'), ('nov', 'november'),
+    ('dec', 'december')), start=1) for name in names}
+_BYLINE_DATE = re.compile(
+    r'^(?:published|posted|updated)(?:\s+on)?\s+([A-Za-z]+)\.?\s+(\d{1,2}),?\s+(20\d\d)\b', re.I)
+_URL_DATE = re.compile(r'/(20\d\d)/(\d\d)/(\d\d)/')
+
+
+def _struct_or_none(year: int, month: int, day: int, hour: int = 0, minute: int = 0):
+    try:
+        return datetime(year, month, day, hour, minute).timetuple()
+    except (TypeError, ValueError):
+        return None
+
+
+def listing_published(card, link: str):
+    """Дата карточки на странице-списке, как её отдают RSS (struct_time, UTC).
+
+    У страниц-списков нет поля даты, и все карточки считались свежими: фильтр
+    возраста их пропускал, и в канал могла уйти апрельская новость, если её
+    ссылка выпала из истории отправленного. Дату ищем в трёх местах по
+    убыванию точности: тег <time>, подпись «Posted Aug 24, 2026», дата в
+    адресе /2026/09/19/. Не нашли — None, как и раньше: лучше пропустить
+    старую новость, чем потерять свежую из-за разметки.
+    """
+    if card is not None:
+        stamp = card.select_one('time[datetime]')
+        if stamp is not None:
+            raw = str(stamp.get('datetime') or '').strip()
+            try:
+                moment = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+            except ValueError:
+                moment = None
+            if moment is not None:
+                if moment.tzinfo is not None:
+                    moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
+                return moment.timetuple()
+        for paragraph in card.select('p, span, div'):
+            text = re.sub(r'\s+', ' ', paragraph.get_text(' ', strip=True))
+            match = _BYLINE_DATE.match(text)
+            if match and match.group(1).casefold() in _MONTHS:
+                return _struct_or_none(int(match.group(3)), _MONTHS[match.group(1).casefold()],
+                                       int(match.group(2)))
+    match = _URL_DATE.search(str(link or ''))
+    if match:
+        return _struct_or_none(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    return None
+
+
 def _host(parsed) -> str:
     return (parsed.hostname or '').casefold().removeprefix('www.')
 
@@ -243,9 +311,13 @@ def parse_listing_html(
             continue
         summary, images = '', []
         if card is not None:
-            paragraph = card.select_one('p')
-            if paragraph is not None:
-                summary = re.sub(r'\s+', ' ', paragraph.get_text(' ', strip=True)).strip()[:900]
+            # Первый абзац карточки часто служебный: у Yen Press это «Posted
+            # Aug 24, 2026 by …», и описанием новости становилась подпись.
+            for paragraph in card.select('p'):
+                text = re.sub(r'\s+', ' ', paragraph.get_text(' ', strip=True)).strip()
+                if text and not _BYLINE.match(text):
+                    summary = text[:900]
+                    break
             picture = card.select_one('img[src], img[data-src], img[data-lazy-src]')
             if picture is not None:
                 # src often contains a transparent placeholder; prefer lazy source.
@@ -260,7 +332,8 @@ def parse_listing_html(
         output.append({
             'title': title[:250], 'link': link, 'summary': summary,
             'source': source_name, 'image': images[0] if images else None,
-            'images': images, 'video': None, 'published_parsed': None,
+            'images': images, 'video': None,
+            'published_parsed': listing_published(card, link),
             **({'lang': lang} if lang else {}),
         })
         if len(output) >= limit:

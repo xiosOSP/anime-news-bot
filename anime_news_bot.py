@@ -53,6 +53,7 @@ from post_text import (
     _extract_sentences,
     _strip_links,
     _tg_title_and_summary,
+    tg_source_hashtags,
     fit_to_limit,
     smart_truncate,
 )
@@ -8733,7 +8734,7 @@ def _fetch_listing_source(
         if page_text is None:
             logger.warning('%s: HTML слишком большой', source_name)
             return SourceFetchFailure('HTML превышает лимит размера')
-        return _parse_listing_html(
+        rows = _parse_listing_html(
             page_text,
             source_name=source_name,
             base_url=base_url,
@@ -8741,6 +8742,9 @@ def _fetch_listing_source(
             lang=lang,
             title_keywords=title_keywords,
         )
+        # Страница-список держит и прошлогодние карточки. RSS-источники
+        # старое отсекают по дате записи; теперь дата есть и у карточки.
+        return [row for row in rows if not _is_too_old(row.get('published_parsed'))]
     except Exception as e:
         logger.error('%s error: %s', source_name, e)
         return SourceFetchFailure(f'HTML {type(e).__name__}: {e}')
@@ -9307,6 +9311,10 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
         logger.warning(f"TG {channel}: HTML слишком большой")
         return []
     soup = BeautifulSoup(page_text, 'html.parser')
+    # Отображаемое имя канала: им канал подписывает посты («📰 Гиковский
+    # Вестник» у @QewbsNews), а не адресом и не нашей меткой источника.
+    header = soup.select_one('.tgme_channel_info_header_title, .tgme_widget_message_owner_name')
+    display_name = header.get_text(' ', strip=True) if header is not None else ''
     news_list: list[dict] = []
     seen_ids: set[str] = set()
     embed_budget = TG_EMBED_LOOKUPS_PER_RUN   # не тормозим цикл лишними запросами
@@ -9315,6 +9323,11 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
     # равно отбрасывались срезом NEWS_PER_SOURCE.
     for msg in reversed(soup.select('div.tgme_widget_message')):
         post_id = msg.get('data-post')          # вида 'channel/123'
+        if 'service_message' in (msg.get('class') or []):
+            # «Канал pinned a photo», смена аватарки и прочие служебные
+            # события: у них тоже есть блок текста, и в канал уходил пост
+            # «Vanitas: News 🌀 pinned a photo.».
+            continue
         text_el = _msg_own_one(msg, 'div.tgme_widget_message_text')
         if not post_id or not text_el:
             continue                             # пост без текста — пропускаем
@@ -9325,7 +9338,7 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
         full_text = message_html_text(str(text_el))
         if len(full_text) < 15:
             continue
-        title, summary = _tg_title_and_summary(full_text, channel, label)
+        title, summary = _tg_title_and_summary(full_text, channel, label, display_name)
         if not title:
             continue                     # остались одни украшения и подпись
         # Дата поста
@@ -9429,6 +9442,9 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
             # Язык определяем по тексту: TG-каналы бывают не только русские
             # (напр. итальянский @VanitasNews) — их надо переводить.
             'lang': _detect_lang(full_text),
+            # Рубрики канала из хвоста поста: по ним видно фан-арт и календарь
+            # именинников, которые заголовком себя не выдают.
+            '_source_tags': tg_source_hashtags(full_text),
             # True — единственная картинка это мыльный кадр-превью видео,
             # перед отправкой попробуем найти вариант получше
             '_thumb_only': thumb_only,
@@ -9470,7 +9486,17 @@ def get_animatetimes() -> list[dict]:
     soup = BeautifulSoup(page_text, 'html.parser')
     news_list: list[dict] = []
     seen: set[str] = set()
-    for a in soup.select('a[href*="/news/details.php?id="]'):
+    anchors = soup.select('a[href*="/news/details.php?id="]')
+    # Лента новостей на главной — ссылки с id="top_news". Выше неё витрина
+    # «PICK UP» (подборки и обзоры, бывает и полугодовой давности), ниже —
+    # рейтинг просмотров с материалами 2024 года. Первые пять ссылок страницы
+    # приходились на витрину, и до самих новостей сбор не доходил. Если
+    # разметку поменяют и ленты не станет — берём как раньше, без витрин.
+    news_anchors = [a for a in anchors if a.get('id') == 'top_news']
+    if not news_anchors:
+        news_anchors = [a for a in anchors
+                        if not str(a.get('id') or '').startswith(('top_pickup', 'times_'))]
+    for a in news_anchors:
         href = a.get('href', '')
         m = re.search(r'/news/details\.php\?id=(\d+)', href)
         if not m:
@@ -9478,7 +9504,10 @@ def get_animatetimes() -> list[dict]:
         link = f'https://www.animatetimes.com/news/details.php?id={m.group(1)}'
         if link in seen:
             continue
-        title = a.get_text(' ', strip=True)
+        # Заголовок — из своего блока: текст ссылки целиком включает ярлыки
+        # вроде «PICK UP», и они приклеивались к началу заголовка.
+        heading = a.select_one('.c-item-ttl__heading')
+        title = (heading or a).get_text(' ', strip=True)
         if not title or len(title) < 10:
             continue
         # В разметке заголовок часто задвоен (alt картинки + текст): «X X» → «X»
@@ -9686,6 +9715,8 @@ DIGEST_SKIP_PATTERNS = [
     re.compile(r'our panels?,? events?,? and booth', re.IGNORECASE),
     re.compile(r'(anime expo|comic-?con|ax) \d{4}\s+(news|coverage|guide|preview)', re.IGNORECASE),
     re.compile(r'all (of )?our .{0,30}(news|coverage|reviews)', re.IGNORECASE),
+    # «Anime NYC 2026 Wrap Up!» — итоги выставки: пересказ уже вышедших анонсов.
+    re.compile(r'\b20\d\d\s+wrap[\s-]?up\b', re.IGNORECASE),
 ]
 
 
@@ -9709,6 +9740,11 @@ NOISE_TITLE_RULES = (
         r',?\s+ranked\s*$',
         r'^\s*(?:лучшие|худшие)\s',
         r'\bподборк[аиуе]\b',
+        # «…アニソン特集！» в конце заголовка — тематическая подборка («特集上映»
+        # в середине — спецпоказ, это новость), «5つの理由» — «5 причин»,
+        # «まとめ一覧» и «キャラクター一覧» — сводные списки. Просто «まとめ»
+        # не берём: «まとめて配信» значит «выложат все серии разом».
+        r'特集[!！]?\s*$|\d+\s*つの理由|まとめ一覧|(?:キャラクター|登場人物)（?[^）]*）?一覧',
     )),
     ('тест или опрос', (
         r'^\s*(?:quiz|poll|survey)\b',
@@ -9725,6 +9761,8 @@ NOISE_TITLE_RULES = (
         r'^\s*(?:opinion|editorial|column)\s*[:\-–—]',
         r'\bfirst impressions\b',
         r'^\s*(?:обзор|рецензия|мнение|колонка)[:\s]',
+        # Японские ленты: «…第1話レビュー», «【レビュー】», «Column Vol.2».
+        r'レビュー|コラム|\bcolumn\s+vol',
     )),
     ('объяснялка, а не новость', (
         r'\beverything (?:we know|you need to know)\b',
@@ -9744,6 +9782,12 @@ NOISE_TITLE_RULES = (
         r'\bthrowback\b',
         r'\b\d{1,2}\s+лет спустя\b',
         r'\bвспоминаем\b',
+        # Календарь именинников: «🎉22 сентября - день рождения Шикамару»,
+        # «КАЛЕНДАРЬ НА 22 СЕНТЯБРЯ». Только в начале заголовка: «В день
+        # рождения Оды анонсировали фильм» — уже новость.
+        r'^\W*(?:\d{1,2}\s+[а-яё]+\s*[-–—:]\s*)?день рождения\b',
+        r'^\W*(?:с\s+)?днём рождения\b|^\W*с\s+днем рождения\b',
+        r'^\W*календарь\s+на\b',
     )),
     ('скидки и распродажа', (
         r'\b\d{1,3}\s*%\s*off\b',
@@ -9751,6 +9795,17 @@ NOISE_TITLE_RULES = (
         r'\bon sale (?:now|at)\b',
         r'\b(?:black friday|prime day)\b',
         r'\bскидк|\bраспродаж|\bпо промокоду\b',
+    )),
+    # Crunchyroll шлёт в ленту каждую серию каждого дубляжа: «TRIGUN STAMPEDE
+    # (Thai Dub) - Episode 1» двухлетней давности приходил как новость «серия
+    # выходит уже сегодня». Дубляжи с подписью в DUB_MARKERS бот оформляет
+    # осознанно; серия на любом другом языке — не новость для этого канала.
+    # Список языков берём из DUB_MARKERS, чтобы новый дубляж, добавленный
+    # туда, не отсеивался здесь молча.
+    ('серия чужого дубляжа', (
+        r'\((?!(?:' + '|'.join(re.search(r'\\\((\w+) Dub', pattern.pattern).group(1)
+                              for pattern, _ in DUB_MARKERS)
+        + r')\s+dub\))[^()]{2,30}\s+dub\)',
     )),
     ('фан-контент', (
         r'\bfan\s?art\b',
@@ -9766,6 +9821,18 @@ _NOISE_TITLE_RE = tuple(
     (reason, re.compile('|'.join(patterns), re.IGNORECASE))
     for reason, patterns in NOISE_TITLE_RULES)
 
+# Рубрики, которыми телеграм-канал сам помечает не-новость. Фан-арт с
+# заголовком «В ночь с Женькой и Маомао» и список именинников жанр заголовком
+# не объявляют — зато канал ставит под ними «#арт» и «#календарь». Список
+# закрытый: «#новость» или «#аниме» ничего не говорят о жанре.
+NOISE_SOURCE_TAGS = {
+    'фан-контент': frozenset({'арт', 'арты', 'art', 'fanart', 'фанарт',
+                              'косплей', 'cosplay', 'мем', 'мемы', 'meme', 'memes'}),
+    'годовщина и ностальгия': frozenset({'календарь', 'деньрождения', 'birthday'}),
+    'тест или опрос': frozenset({'опрос', 'poll', 'квиз', 'quiz', 'тест'}),
+    'реклама': frozenset({'реклама', 'промо', 'ad', 'ads', 'sponsored'}),
+}
+
 
 def noise_reason(news: dict) -> str:
     """Чем заголовок выдаёт себя как не-новость. Пусто — новость.
@@ -9773,6 +9840,10 @@ def noise_reason(news: dict) -> str:
     Возвращает причину, а не флаг: она уходит в лог и в метрику, иначе отсев
     невозможно ни проверить, ни обжаловать — пост просто исчезает.
     """
+    tags = {str(tag).casefold() for tag in news.get('_source_tags') or ()}
+    for reason, rubric in NOISE_SOURCE_TAGS.items():
+        if tags & rubric:
+            return reason
     title = str(news.get('title') or '')
     if not title:
         return ''
@@ -9810,11 +9881,15 @@ def matches_keywords(news: dict) -> bool:
 
 
 # ============== ЛОКАЛЬНЫЙ ОТСЕВ НЕПРОФИЛЬНОГО ==============
-# Шесть лент ниже — общей тематики: аниме лежит в них вперемешку с кино,
+# Ленты ниже — общей тематики: аниме лежит в них вперемешку с кино,
 # сериалами и играми, и по одному имени источника новость не отличить.
 # Остальные источники профильные, там отсеивать нечего.
 GENERAL_TOPIC_SOURCES = frozenset({
     'Collider', '/Film', 'Variety', 'Polygon', 'ComingSoon', 'Filmix',
+    # «Гиковский Вестник» пишет про кино и сериалы вообще: на живой ленте из
+    # пяти постов подряд — Sony, Гослинг, «Сорвиголова», Соник и Торонто.
+    # Без модели он шёл в канал целиком, в отличие от Variety с теми же темами.
+    'TG: QewbsNews',
 })
 
 # Маркеры аниме-новости. Латиница проверяется словом целиком: подстрокой
@@ -9888,7 +9963,7 @@ def off_topic_without_llm(news: dict) -> bool:
     """Непрофильная новость из ленты общей тематики.
 
     Нужна там, где вердикта модели нет: она и была единственным, что отличало
-    аниме от всего остального в этих шести лентах, и без неё в канал уходили
+    аниме от всего остального в этих лентах, и без неё в канал уходили
     Zelda, Том Круз и «Ходячие мертвецы». Профильные источники не трогаем
     вовсе: там отсутствие слова «аниме» в заголовке ничего не значит.
     """
@@ -10026,6 +10101,29 @@ def format_news_short(news: dict) -> str:
     body = _append_release_date(body, date_str)
     body = _with_tags(body, news)
     return _apply_editorial_rules(body, news)
+
+
+# Доля кириллицы среди букв поста, ниже которой пост считается непереведённым.
+# На реальных лентах: у непереведённого английского или японского поста она
+# около нуля (кириллица там только в строке даты), у русских постов с обилием
+# латинских названий — от 0.45. Порог посередине с запасом в обе стороны.
+UNTRANSLATED_CYRILLIC_SHARE = 0.2
+
+
+def _left_untranslated(news: dict) -> bool:
+    """Уйдёт ли пост в канал на чужом языке.
+
+    Касается только текста, собранного машинным переводом: пересказ модели
+    уже прошёл её проверки, правку админа трогать нельзя, а русские каналы
+    не переводятся вовсе.
+    """
+    if news.get('_edited_text') or news.get('_llm_text') or news.get('lang') == 'ru':
+        return False
+    letters = [char for char in format_news_short(news) if char.isalpha()]
+    if not letters:
+        return False
+    cyrillic = sum(1 for char in letters if 'а' <= char.lower() <= 'я' or char in 'ёЁ')
+    return cyrillic / len(letters) < UNTRANSLATED_CYRILLIC_SHARE
 
 
 def format_news_text_long(news: dict) -> str:
@@ -10590,6 +10688,16 @@ async def _prepare_news_for_send(news: dict, source: str,
         # ссылка осталась бы занятой и второго шанса не получила.
         logger.info('⏸ Пост отложен до живой модели: %s', str(news.get('title', ''))[:60])
         metrics.inc('anime_bot_llm_deferred_total')
+        return 'deferred'
+
+    if await asyncio.to_thread(_left_untranslated, news):
+        # Модели нет, и переводчик не ответил: translate_text в этом случае
+        # возвращает исходник, и в русский канал уходил английский пост целиком.
+        # Google отвечает серверным адресам 429 часами, так что это не редкость.
+        # Откладываем так же, как при недоступной модели: новость вернётся в
+        # следующем цикле, а устаревшую отсеет фильтр возраста.
+        logger.info('⏸ Пост отложен: перевод не удался — %s', str(news.get('title', ''))[:60])
+        metrics.inc('anime_bot_untranslated_deferred_total')
         return 'deferred'
 
     if not apply_dedup:

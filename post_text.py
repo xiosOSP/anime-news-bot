@@ -42,8 +42,13 @@ def _tg_strip_decoration(value: str) -> str:
     return re.sub(r'[^A-Za-zА-Яа-яЁё0-9]+', ' ', str(value or '')).strip().lower()
 
 
-def _tg_is_signature(line: str, channel: str, label: str) -> bool:
-    """Похожа ли строка на подпись канала, а не на текст новости."""
+def _tg_is_signature(line: str, channel: str, label: str, display_name: str = '') -> bool:
+    """Похожа ли строка на подпись канала, а не на текст новости.
+
+    Имя из адреса и наша метка источника совпадают с подписью не всегда:
+    @QewbsNews подписывает посты «📰 Гиковский Вестник» — так канал называется
+    на своей странице. Поэтому сверяем ещё и с отображаемым именем.
+    """
     if len(line) > 60:
         return False                     # длинная строка — это уже содержание
     if _TG_SIGNATURE_RE.search(line):
@@ -51,7 +56,7 @@ def _tg_is_signature(line: str, channel: str, label: str) -> bool:
     clean = _tg_strip_decoration(line)
     if not clean:
         return False
-    for name in (channel, label):
+    for name in (channel, label, display_name):
         other = _tg_strip_decoration(name)
         # Название канала целиком внутри короткой строки — это подпись.
         if other and len(other) >= 4 and (clean == other or other in clean or clean in other):
@@ -135,7 +140,39 @@ def _tg_split_leading_sentence(line: str) -> tuple[str, str]:
     return head, tail
 
 
-def _tg_title_and_summary(full_text: str, channel: str, label: str) -> tuple[str, str]:
+# Хэштеги-рубрики в конце поста: «#новость», «#арт | #kusuriya». Это полки
+# чужого канала, у нас им не место — свои теги к посту дописывает модель.
+# Тег обязан начинаться с буквы: «эпизод #12» — номер, а не рубрика. И стоять
+# он должен отдельно — на своей строке или после конца фразы: в «Трейлер
+# сезона #OnePiece» тег служит названием, и срезать его значит сломать фразу.
+_TG_HASHTAG = r'#[^\W\d_][\w]*'
+_TG_TRAILING_TAGS_RE = re.compile(
+    rf'(?:^|(?<=[.!?…»")]))(?P<gap>[^\w#]*)'
+    rf'(?P<tags>(?:[\s|,·•/]*{_TG_HASHTAG})+)[\s|,·•/]*$')
+
+
+def tg_source_hashtags(full_text: str) -> list[str]:
+    """Рубрики, которыми канал сам пометил пост, — в нижнем регистре, без «#».
+
+    Берём только теги из хвостов строк: там канал объявляет жанр поста
+    («#арт», «#календарь»). Тег посреди фразы — часть текста.
+    """
+    tags: list[str] = []
+    for line in str(full_text or '').split('\n'):
+        tail = _TG_TRAILING_TAGS_RE.search(line.strip())
+        if tail:
+            tags += [tag[1:].casefold() for tag in re.findall(_TG_HASHTAG, tail.group('tags'))]
+    return list(dict.fromkeys(tags))
+
+
+def _tg_strip_trailing_tags(line: str) -> str:
+    line = line.strip()
+    tail = _TG_TRAILING_TAGS_RE.search(line)
+    return line[:tail.start('tags')].rstrip() if tail else line
+
+
+def _tg_title_and_summary(full_text: str, channel: str, label: str,
+                          display_name: str = '') -> tuple[str, str]:
     """Делит текст телеграм-поста на заголовок и тело.
 
     Первая строка не всегда заголовок. Каналы начинают пост декоративным
@@ -145,9 +182,10 @@ def _tg_title_and_summary(full_text: str, channel: str, label: str) -> tuple[str
 
     Ровно та же беда со строкой-рубрикой: в канал уходил заголовок «Манга.».
     """
-    lines = [ln.strip() for ln in str(full_text or '').split('\n') if ln.strip()]
+    lines = [_tg_strip_trailing_tags(ln) for ln in str(full_text or '').split('\n')]
     kept = [ln for ln in lines
-            if _TG_MEANINGFUL_RE.search(ln) and not _tg_is_signature(ln, channel, label)]
+            if _TG_MEANINGFUL_RE.search(ln)
+            and not _tg_is_signature(ln, channel, label, display_name)]
     if not kept:
         return '', ''
     # Рубрику снимаем, только пока под ней есть содержание: пост, кроме неё не
