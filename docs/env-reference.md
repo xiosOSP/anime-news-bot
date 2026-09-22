@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 266 переменных. Почти все — точная настройка со значением
+Бот читает 280 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -233,6 +233,14 @@
 | `MODERATION_LLM_BASE_URL` | — | anime_news_bot.py |
 | `MODERATION_LLM_DAILY_LIMIT` | `120` | anime_news_bot.py |
 | `MODERATION_LLM_ENABLED` | — | anime_news_bot.py |
+| `MODERATION_LLM_FALLBACK_API_KEY` | — | anime_news_bot.py |
+| `MODERATION_LLM_FALLBACK_BASE_URL` | — | anime_news_bot.py |
+| `MODERATION_LLM_FALLBACK_DAILY_LIMIT` | `120` | anime_news_bot.py |
+| `MODERATION_LLM_FALLBACK_MIN_INTERVAL` | `30.0` | anime_news_bot.py |
+| `MODERATION_LLM_FALLBACK_MODEL` | — | anime_news_bot.py |
+| `MODERATION_LLM_FALLBACK_PROVIDER` | — | anime_news_bot.py |
+| `MODERATION_LLM_FALLBACK_TIMEOUT` | `12` | anime_news_bot.py |
+| `MODERATION_LLM_FALLBACK_TOKEN_BUDGET` | `50000` | anime_news_bot.py |
 | `MODERATION_LLM_MODEL` | — | anime_news_bot.py |
 | `MODERATION_LLM_PROVIDER` | — | anime_news_bot.py |
 | `MODERATION_LLM_TIMEOUT` | `12` | anime_news_bot.py |
