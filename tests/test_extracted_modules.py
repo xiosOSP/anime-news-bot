@@ -20,6 +20,8 @@ MODULES = {
                      ('_story_similarity', '_story_events_conflict', 'normalize_title')),
     'post_text': ("assert s._extract_sentences('Сериал выйдет... Подробности позже') == ''",
                   ('_extract_sentences', 'smart_truncate', '_tg_title_and_summary')),
+    'llm_protocol': ("assert s._llm_parse_json('ответ: {\"a\": 1}') == {'a': 1}",
+                     ('_llm_parse_json', '_editorial_rejection', 'LLM_PRESETS')),
 }
 
 

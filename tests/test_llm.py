@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import anime_news_bot
+import llm_protocol
 
 
 def _reply(payload, status=200):
@@ -321,7 +322,7 @@ class TestTopicOverRelevantFlag:
             assert asyncio.run(llm._llm_enrich(news)) == 'ok'
         assert news['_llm_topic'] == 'игры'
 
-    @pytest.mark.parametrize('topic', list(anime_news_bot.LLM_TOPICS_OK))
+    @pytest.mark.parametrize('topic', list(llm_protocol.LLM_TOPICS_OK))
     def test_every_allowed_topic_passes(self, llm, topic):
         news = {'title': 'T', 'summary': '', 'source': 'X'}
         answer = {'relevant': False, 'topic': topic, 'title': 'Заголовок', 'summary': ''}
@@ -470,7 +471,7 @@ class TestPromptQuality:
         assert '{"topic"' in anime_news_bot.LLM_SYSTEM_PROMPT
 
     def test_topics_consistent(self):
-        for t in anime_news_bot.LLM_TOPICS_OK:
+        for t in llm_protocol.LLM_TOPICS_OK:
             assert t in anime_news_bot.LLM_SYSTEM_PROMPT
         assert 'прочее' in anime_news_bot.LLM_TOPIC_ANY
 
