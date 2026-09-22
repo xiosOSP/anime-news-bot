@@ -18910,6 +18910,11 @@ MODERATION_LLM_FALLBACK_TOKEN_BUDGET = max(0,
     _env_int('MODERATION_LLM_FALLBACK_TOKEN_BUDGET', 50000))
 MODERATION_LLM_FALLBACK_TIMEOUT = max(3, min(60,
     _env_int('MODERATION_LLM_FALLBACK_TIMEOUT', 12)))
+# Пауза только для запасного и быстрого слотов новостей. Общий
+# LLM_MIN_INTERVAL тормозит все слоты сразу, а у запасного провайдера лимит
+# бывает намного строже основного.
+LLM_FALLBACK_MIN_INTERVAL = max(0.0, min(120.0, _env_float('LLM_FALLBACK_MIN_INTERVAL', 0.0)))
+LLM_FAST_MIN_INTERVAL = max(0.0, min(120.0, _env_float('LLM_FAST_MIN_INTERVAL', 0.0)))
 MODERATION_LLM_FALLBACK_MIN_INTERVAL = max(0.0, min(60.0,
     _env_float('MODERATION_LLM_FALLBACK_MIN_INTERVAL', 30.0)))
 _moderation_llm_fallback_client = None
@@ -19211,6 +19216,16 @@ def _llm_extra_params(slot: str = '') -> dict:
 # означала, что предел провайдера бот узнаёт единственным способом — упираясь
 # в него: разогнался до отказа, получил 429, потерял вызов, и по кругу.
 _llm_pace: dict = {}
+# Выученный темп переживает перезапуск. Раньше после каждого перезапуска бот
+# заново нащупывал предел: для Mistral это около шести отказов 429 подряд,
+# каждый из которых списывается с дневного лимита — провайдер запрос посчитал.
+# Цифры лимитов в код не вшиты намеренно: бесплатные тарифы меняют их молча,
+# а темп, выученный на настоящих отказах, всегда актуален.
+LLM_PACE_FILE = DATA_DIR / 'llm_pace.json'
+# Сколько помнить выученный темп. Лимиты у провайдеров суточные и минутные;
+# сутки спустя старый темп скорее мешает, чем помогает.
+LLM_PACE_REMEMBER_SEC = 86400
+_llm_pace_restored = False
 # Сколько провайдер просил подождать в последний раз. Нужно, чтобы решить,
 # стоит ли переждать на месте, когда уходить больше некуда.
 _llm_wait_hint_sec = 0.0
@@ -19219,9 +19234,69 @@ _llm_wait_hint_sec = 0.0
 LLM_INLINE_RETRY_MAX_SEC = max(0.0, min(120.0, _env_float('LLM_INLINE_RETRY_MAX_SEC', 20.0)))
 
 
+def _llm_slot_min_interval(slot: str) -> float:
+    """Нижняя граница паузы, заданная владельцем для конкретного слота.
+
+    LLM_MIN_INTERVAL общий на все слоты: поставить 30 с ради запасного
+    Mistral значило замедлить и основной Groq. Отдельная настройка слота
+    поднимает паузу только ему.
+    """
+    if slot == 'fallback':
+        return LLM_FALLBACK_MIN_INTERVAL
+    if slot == 'fast':
+        return LLM_FAST_MIN_INTERVAL
+    return 0.0
+
+
+def _llm_pace_restore() -> None:
+    """Один раз за процесс поднимает с диска выученный темп.
+
+    Запись к другому адресу отбрасывается: слоту поменяли провайдера, и
+    темп прежнего к новому не относится. Устаревшая — тоже.
+    """
+    global _llm_pace_restored
+    if _llm_pace_restored:
+        return
+    _llm_pace_restored = True
+    try:
+        raw = json.loads(LLM_PACE_FILE.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return
+    if not isinstance(raw, dict):
+        return
+    now = time.time()
+    for slot, row in raw.items():
+        if slot not in LLM_SLOTS or not isinstance(row, dict) or slot in _llm_pace:
+            continue
+        try:
+            pace, saved_at = float(row.get('pace')), float(row.get('at'))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(pace) or not 0 < pace <= LLM_PACE_MAX_SEC:
+            continue
+        if now - saved_at > LLM_PACE_REMEMBER_SEC:
+            continue
+        if str(row.get('url') or '') != _llm_slot_env(slot)[0]:
+            continue
+        _llm_pace[slot] = pace
+
+
+def _llm_pace_save() -> None:
+    """Записать выученный темп. Неудача не мешает работе — только памяти."""
+    now = time.time()
+    data = {slot: {'pace': round(pace, 2), 'url': _llm_slot_env(slot)[0], 'at': now}
+            for slot, pace in _llm_pace.items() if slot in LLM_SLOTS}
+    try:
+        _atomic_write_json(LLM_PACE_FILE, data)
+    except OSError as e:
+        logger.debug(f'LLM: темп не сохранён: {e}')
+
+
 def _llm_pace_for(slot: str) -> float:
     """Сколько ждать перед следующим запросом к этому провайдеру."""
-    return max(LLM_MIN_INTERVAL, float(_llm_pace.get(slot, LLM_MIN_INTERVAL)))
+    _llm_pace_restore()
+    return max(LLM_MIN_INTERVAL, _llm_slot_min_interval(slot),
+               float(_llm_pace.get(slot, LLM_MIN_INTERVAL)))
 
 
 def _llm_pace_slower(slot: str, retry_after: float = 0.0) -> float:
@@ -19234,6 +19309,7 @@ def _llm_pace_slower(slot: str, retry_after: float = 0.0) -> float:
     current = _llm_pace_for(slot)
     pace = min(LLM_PACE_MAX_SEC, max(current * 2, float(retry_after or 0)))
     _llm_pace[slot] = pace
+    _llm_pace_save()
     metrics.set('anime_bot_llm_pace_seconds', pace)
     logger.info('LLM: сбавляю темп для %s до %.1f с между запросами', slot, pace)
     return pace
@@ -19245,6 +19321,7 @@ def _llm_pace_faster(slot: str) -> None:
     Шаг вниз мельче шага вверх намеренно: разогнаться обратно можно долго,
     а вот упереться в лимит — один раз и сразу.
     """
+    _llm_pace_restore()
     current = _llm_pace.get(slot)
     if current is None or current <= LLM_MIN_INTERVAL:
         return
@@ -19254,6 +19331,7 @@ def _llm_pace_faster(slot: str) -> None:
         pace = LLM_MIN_INTERVAL
     else:
         _llm_pace[slot] = pace
+    _llm_pace_save()
     metrics.set('anime_bot_llm_pace_seconds', pace)
 
 
