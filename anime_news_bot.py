@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - Windows fallback: polling сам ко�
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from functools import lru_cache
+from functools import lru_cache, wraps
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
@@ -17126,18 +17126,25 @@ async def reply_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ============== КОМАНДЫ ==============
 def admin_only(handler):
-    """Декоратор: пускаем в команду только owner/admin, сохраняя старую модель доступа."""
+    """Декоратор: пускаем в команду только owner/admin, сохраняя старую модель доступа.
+
+    wraps, а не ручное копирование __name__: тесты проверяют тело команды через
+    __wrapped__, минуя проверку прав. Без него они молча звали обёртку — и
+    падали на проверке прав, а не на том, что проверяли; main стоял красным.
+    """
+    @wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(update):
             await deny_access(update)
             return
         _audit_update(update, f'command:{handler.__name__}')
         return await handler(update, context)
-    wrapper.__name__ = handler.__name__
     return wrapper
 
 
 def owner_only(handler):
+    """Декоратор: команда только владельцу бота. Обёртка — как у admin_only."""
+    @wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = getattr(update, 'effective_user', None)
         if not is_owner(user):
@@ -17145,7 +17152,6 @@ def owner_only(handler):
             return
         _audit_update(update, f'command:{handler.__name__}', role='owner')
         return await handler(update, context)
-    wrapper.__name__ = handler.__name__
     return wrapper
 
 def _await_ctx(mode: str, key: str, message) -> dict:

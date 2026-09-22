@@ -77,7 +77,11 @@ async def test_delayed_verdict_cannot_punish_replaced_message(state, monkeypatch
             bot._moderation_windows[chat_id].clear()
         elif change == 'other_message':
             bot._mod_note_message(chat_id, 8, 'Other', 'новое сообщение', message_id=12)
-        return {'violation': True, 'category': 'toxic', 'severity': 2, 'reason': 'оскорбление'}
+        # Уверенность выше порога: с PR #63 вердикт модели без неё уходит в
+        # ручной разбор и ничего не удаляет. Тест проверяет устаревание
+        # вердикта, а не порог, поэтому вердикт здесь заведомо годный.
+        return {'violation': True, 'category': 'toxic', 'severity': 2,
+                'confidence': .99, 'reason': 'оскорбление'}
     model = AsyncMock(side_effect=classify)
     monkeypatch.setattr(bot, '_moderation_classify', model)
     tg = telegram_bot()

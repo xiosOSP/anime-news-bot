@@ -73,6 +73,20 @@ def collect(root: Path = ROOT) -> dict[str, dict]:
 
     for path in sorted(root.glob('*.py')):
         tree = ast.parse(path.read_text(encoding='utf-8'))
+        # Значение по умолчанию часто выносят в именованную константу
+        # (DEFAULT_LLM_PROMPT_VERSION = '…'). Без её разрешения справочник
+        # молча терял дефолт при каждом таком рефакторинге.
+        constants = {
+            target.id: _literal(node.value)
+            for node in tree.body if isinstance(node, ast.Assign)
+            for target in node.targets if isinstance(target, ast.Name)
+        }
+
+        def default_of(arg):
+            if isinstance(arg, ast.Name):
+                return constants.get(arg.id)
+            return _literal(arg)
+
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not node.args:
                 continue
@@ -80,10 +94,10 @@ def collect(root: Path = ROOT) -> dict[str, dict]:
             name = getattr(func, 'id', None) or getattr(func, 'attr', None)
             if name in READERS:
                 key = _literal(node.args[0])
-                default = _literal(node.args[1]) if len(node.args) > 1 else None
+                default = default_of(node.args[1]) if len(node.args) > 1 else None
             elif name in ('getenv', 'get') or isinstance(func, ast.Attribute) and func.attr == 'environ':
                 key = _literal(node.args[0])
-                default = _literal(node.args[1]) if len(node.args) > 1 else None
+                default = default_of(node.args[1]) if len(node.args) > 1 else None
                 if not isinstance(key, str) or not key.isupper():
                     continue
             else:
