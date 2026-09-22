@@ -5737,6 +5737,38 @@ def _is_generic_anchor(word: str) -> bool:
                for base in _STORY_UPDATE_GENERIC if len(base) >= 4)
 
 
+def _story_anchor_stem(word: str) -> str:
+    """Грубая основа английского слова: confirms = confirmed, weeks = week.
+
+    Ядра сравниваются на точное равенство — намеренно, чтобы Solo Leveling и
+    Solo Leveling Ragnarok не слились. Но тогда одна буква разводила один
+    сюжет на два: «Manga Ends» и «Manga to End», «Takes Three-Week Break» и
+    «Goes on Break for Three Weeks». Срезаются только латинские окончания, так
+    что кириллица не меняется сама собой: русская морфология так не лечится.
+    """
+    w = str(word or '')
+    if len(w) <= 3:
+        return w
+    if w.endswith('ies') and len(w) > 4:
+        return w[:-3] + 'y'
+    if w.endswith('ed') and len(w) > 5:
+        return w[:-2]
+    if w.endswith('s') and not w.endswith('ss'):
+        return w[:-1]
+    return w
+
+
+# Глаголы-связки английских заголовков. Суть новости в них нет: «Goes on
+# Break» и «Takes a Break» — один перерыв. Хранятся уже в виде основ.
+_STORY_IDENTITY_FILLER = {
+    _story_anchor_stem(w) for w in (
+        'go', 'goes', 'take', 'takes', 'get', 'gets', 'set', 'confirm', 'confirms',
+        'confirmed', 'announce', 'announces', 'announced', 'reveal', 'reveals', 'revealed',
+        'this', 'until', 'will', 'its', 'now', 'officially',
+    )
+}
+
+
 def _story_identity_anchors(value) -> set[str]:
     """Консервативное ядро названия для delivery-дедупа."""
     title = value.get('title', '') if isinstance(value, dict) else str(value or '')
@@ -5757,12 +5789,21 @@ def _story_identity_anchors(value) -> set[str]:
         return match.group(0)
 
     title = re.sub(r'\([^()]{1,80}\)', strip_alias, title)
-    return {
-        anchor for anchor in _story_update_anchor({'title': title})
-        if not _is_generic_anchor(anchor)
-        and _ordinal_word_value(anchor) is None
-        and anchor not in _STORY_IDENTITY_NOISE
-    }
+    anchors = set()
+    for anchor in _story_update_anchor({'title': title}):
+        if (_is_generic_anchor(anchor) or _ordinal_word_value(anchor) is not None
+                or anchor in _STORY_IDENTITY_NOISE):
+            continue
+        # Слово-событие — не часть названия: тип события сравнивается
+        # маркерами отдельно, а в ядре «delayed» против «postponed» разводили
+        # один перенос на две новости.
+        if _STORY_MARKER_CANON.get(anchor, anchor) in _STORY_EVENT_MARKERS:
+            continue
+        stem = _story_anchor_stem(anchor)
+        if stem in _STORY_IDENTITY_FILLER or stem in _STORY_EVENT_MARKERS:
+            continue
+        anchors.add(stem)
+    return anchors
 
 
 def _anchor_identity_match(news: dict, old_title: str,
@@ -5836,8 +5877,12 @@ class StoryRegistry:
         if new_numbers and old_numbers and new_numbers != old_numbers:
             return False
         new_markers = _story_event_markers(news)
-        old_markers = set(str(x) for x in (row.get('delivered_markers') or []))
+        # Сохранённые до правки маркеры могли быть в другом написании.
+        old_markers = _story_canonical_markers(row.get('delivered_markers') or [])
         if new_markers and old_markers and new_markers != old_markers:
+            return False
+        new_media, old_media = _story_media(news), _story_media(old_title)
+        if new_media and old_media and not (new_media & old_media):
             return False
         new_identity = _story_identity_anchors(news)
         old_identity = _story_identity_anchors(old_title)
@@ -14280,11 +14325,63 @@ _STORY_EVENT_MARKERS = {
 }
 
 
+# Одно событие разными словами. «Delayed» было маркером переноса, а
+# «postponed» — нет, «premiere» было, а «premieres» — нет: у двух заголовков об
+# одном переносе типы событий не совпадали, и повтор уходил в канал. Film и
+# movie — тоже одно и то же.
+_STORY_MARKER_CANON = {
+    'delayed': 'delay', 'delays': 'delay', 'postponed': 'delay', 'postpone': 'delay',
+    'postpones': 'delay', 'cancelled': 'canceled', 'cancels': 'canceled', 'cancel': 'canceled',
+    'premieres': 'premiere', 'premiered': 'premiere', 'trailers': 'trailer',
+    'teasers': 'teaser', 'visuals': 'visual', 'posters': 'poster', 'seasons': 'season',
+    'episodes': 'episode', 'movies': 'movie', 'film': 'movie', 'films': 'movie',
+    'games': 'game', 'novels': 'novel', 'adaptations': 'adaptation',
+    'отложен': 'перенос', 'отложена': 'перенос', 'перенесли': 'перенос',
+    'отменён': 'отменен', 'отменили': 'отменен',
+}
+
+
+def _story_canonical_markers(markers) -> set[str]:
+    """Маркеры к одному написанию — в том числе сохранённые до этой правки."""
+    return {_STORY_MARKER_CANON.get(str(m), str(m)) for m in markers} & _STORY_EVENT_MARKERS
+
+
 def _story_event_markers(news_or_title) -> set[str]:
     title = (news_or_title.get('title', '')
              if isinstance(news_or_title, dict) else str(news_or_title or ''))
     words = set(re.findall(r'[A-Za-zА-Яа-яЁё]+', title.casefold()))
-    return words & _STORY_EVENT_MARKERS
+    return _story_canonical_markers(words)
+
+
+# Носитель новости. «Аниме» и «манга» выброшены из токенов как стоп-слова —
+# иначе «X Anime Gets Season 2» и «X Season 2» не совпадали бы. Цена этого:
+# «перерыв у манги One Piece» и «перерыв у аниме One Piece» получали сходство
+# 1.00, и вторая, самостоятельная новость тихо терялась.
+_STORY_MEDIUM_RE = (
+    ('anime', re.compile(r'(?<![a-zа-яё])(?:anime|аниме)(?![a-zа-яё])', re.IGNORECASE)),
+    ('manga', re.compile(r'(?<![a-zа-яё])(?:manga|манг[аиуеойю]\w*)(?![a-zа-яё])', re.IGNORECASE)),
+)
+
+
+def _story_media(news_or_title) -> set[str]:
+    title = (news_or_title.get('title', '')
+             if isinstance(news_or_title, dict) else str(news_or_title or ''))
+    return {name for name, pattern in _STORY_MEDIUM_RE if pattern.search(title)}
+
+
+def _story_events_conflict(a, b) -> bool:
+    """Заведомо разные события, как бы похоже ни звучали заголовки.
+
+    Тип события названы оба, и он разный: трейлер и ключевой визуал одного
+    сезона — две новости. Носитель назван у обоих и разный: аниме и манга.
+    Если у одного заголовка тип не назван, конфликта нет — «X Season 2» и
+    «X Season 2 Trailer» решает сходство.
+    """
+    ma, mb = _story_event_markers(a), _story_event_markers(b)
+    if ma and mb and ma != mb:
+        return True
+    da, db = _story_media(a), _story_media(b)
+    return bool(da and db and not (da & db))
 
 
 _OFFICIAL_HOST_HINTS = (
@@ -15053,6 +15150,10 @@ def _cluster_news(items: list[dict], *, persist_intelligence: bool = True) -> li
         # Не сравниваем со всей бесконечной историей: clustering работает в одном batch.
         for idx, cluster in enumerate(clusters[-STORY_CLUSTER_MAX_COMPARE:]):
             rep = cluster[0]
+            # Доставка это проверяла, а пачка — нет: трейлер и ключевой визуал
+            # одного сезона склеивались в один пост при сходстве 0.91.
+            if _story_events_conflict(item, rep):
+                continue
             sim = _story_similarity(item, rep)
             if sim >= best_score:
                 best_score = sim
