@@ -5,9 +5,6 @@
 сообщает о НАЗВАННЫХ подозрениях, иначе письмо приходило бы на каждое
 упоминание страны или религии. В итоге оскорбление группы не видел никто.
 """
-from types import SimpleNamespace as NS
-from unittest.mock import AsyncMock
-
 import pytest
 
 import anime_news_bot as bot
