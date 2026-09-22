@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 281 переменных. Почти все — точная настройка со значением
+Бот читает 283 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -168,10 +168,12 @@
 | `LLM_EXTRA_PARAMS` | — | anime_news_bot.py |
 | `LLM_FALLBACK_API_KEY` | — | anime_news_bot.py |
 | `LLM_FALLBACK_BASE_URL` | — | anime_news_bot.py |
+| `LLM_FALLBACK_MIN_INTERVAL` | `0.0` | anime_news_bot.py |
 | `LLM_FALLBACK_MODEL` | — | anime_news_bot.py |
 | `LLM_FALLBACK_PROVIDER` | — | anime_news_bot.py |
 | `LLM_FAST_API_KEY` | — | anime_news_bot.py |
 | `LLM_FAST_BASE_URL` | — | anime_news_bot.py |
+| `LLM_FAST_MIN_INTERVAL` | `0.0` | anime_news_bot.py |
 | `LLM_FAST_MODEL` | — | anime_news_bot.py |
 | `LLM_FAST_PROVIDER` | — | anime_news_bot.py |
 | `LLM_FAST_TASKS` | `judge` | anime_news_bot.py |

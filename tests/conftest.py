@@ -55,6 +55,12 @@ def _wipe_data_dir() -> None:
             health.clear()
         except Exception:
             pass
+    # Реестр историй — та же история: файл стёрт, а источники, накопленные
+    # кластеризацией одного теста, оставались в памяти, и соседний тест видел
+    # кластер из четырёх новостей вместо двух. Падал только полный прогон.
+    registry = getattr(_bot, 'story_registry', None)
+    if registry is not None and isinstance(getattr(registry, '_items', None), list):
+        registry._items = []
 
 
 @pytest.fixture(autouse=True)
