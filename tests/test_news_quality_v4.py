@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 import anime_news_bot as bot
+import post_text
 from news_parser import clean_editorial_source, message_html_text
 
 
@@ -47,11 +48,11 @@ def test_long_source_headline_is_not_cut_before_editor_sees_it():
 
 
 def test_quoted_and_abbreviated_names_are_not_sentence_boundaries():
-    head, tail = bot._tg_split_leading_sentence(
+    head, tail = post_text._tg_split_leading_sentence(
         'Новый сезон Dr. Stone получил трейлер. Премьера осенью.')
     assert head == 'Новый сезон Dr. Stone получил трейлер.'
     assert tail == 'Премьера осенью.'
-    head, _ = bot._tg_split_leading_sentence('Вышел трейлер «Кто я? Новый мир». Премьера осенью.')
+    head, _ = post_text._tg_split_leading_sentence('Вышел трейлер «Кто я? Новый мир». Премьера осенью.')
     assert head == 'Вышел трейлер «Кто я? Новый мир».'
 
 

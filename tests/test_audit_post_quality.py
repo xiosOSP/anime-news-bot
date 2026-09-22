@@ -7,6 +7,7 @@
 import pytest
 
 import anime_news_bot as bot
+import post_text
 
 
 class TestBannerIsNotAHeadline:
@@ -103,8 +104,8 @@ class TestFragmentOnAPreposition:
     @pytest.mark.parametrize('text', ['Аниме про', 'Сериал о', 'Манга для', 'Фильм без'])
     def test_a_dangling_preposition_is_rubbish(self, text):
         """Союзы список знал, предлоги — нет, и хвост доезжал до поста."""
-        assert bot._drop_unfinished_tail(text) == ''
+        assert post_text._drop_unfinished_tail(text) == ''
 
     def test_a_finished_sentence_is_untouched(self):
-        assert bot._drop_unfinished_tail('Сериал выйдет в январе.') \
+        assert post_text._drop_unfinished_tail('Сериал выйдет в январе.') \
             == 'Сериал выйдет в январе.'
