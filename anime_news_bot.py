@@ -20540,6 +20540,37 @@ def _llm_wanted() -> bool:
     return bool(_llm_configured() and settings is not None and settings.llm_enabled)
 
 
+def _llm_outage_is_temporary() -> bool:
+    """Пройдёт ли молчание модели само — есть ли смысл ради неё ждать.
+
+    Отсрочка поста задумана для отказов бесплатных тарифов: они длятся
+    минуты, а сырой пост остаётся в канале навсегда. Но молчание бывает и
+    долгим, и тогда ожидание — это просто задержка каждой новости на срок
+    отсрочки (по умолчанию до 15 минут), после которой пост уходит тем же
+    обычным путём. Так канал целиком отставал на четверть часа, пока ключ
+    был отклонён.
+
+    Ждать бессмысленно, если:
+    - ключ отклонён или провайдер отказал по настройке — до перезапуска;
+    - дневной лимит вызовов исчерпан — до завтра;
+    - дневной бюджет токенов исчерпан — тоже до завтра.
+    Пауза после серии 429 и сетевых ошибок (circuit) закрывается сама —
+    её подождать стоит.
+    """
+    if _llm_disabled_runtime and _llm_disabled_reason != 'circuit':
+        return False
+    if _llm_quota_left() <= 0:
+        return False
+    # Не can_charge(0): он отвечает «можно», пока израсходовано ровно столько,
+    # сколько разрешено, хотя места нет ни на один настоящий вызов. Мерка —
+    # самый дешёвый вызов: один только зарезервированный ответ.
+    if (feature_enabled('llm_budget') and LLM_DAILY_TOKEN_BUDGET > 0
+            and llm_budget is not None
+            and not llm_budget.can_charge(_estimate_llm_tokens([], LLM_MAX_TOKENS))):
+        return False
+    return True
+
+
 def _llm_defer_news(news: dict) -> bool:
     """Wait at most a bounded number of attempts/minutes, across restarts."""
     global _llm_deferral_store
@@ -20969,7 +21000,8 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
         # Модель не настроена — работаем без неё, так и задумано. Настроена, но
         # молчит — это временно, и лучше подождать: отказ бесплатных тарифов
         # длится минуты, а сырой пост остаётся в канале навсегда.
-        if _llm_wanted() and await asyncio.to_thread(_llm_defer_news, news):
+        if (_llm_wanted() and _llm_outage_is_temporary()
+                and await asyncio.to_thread(_llm_defer_news, news)):
             return 'defer'
         return 'off'
     title = (news.get('title') or '').strip()
@@ -20994,7 +21026,8 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
         if not data:
             if raw:
                 logger.info(f"LLM: ответ не разобрался, беру обычный путь — {raw[:80]}")
-            if _llm_wanted() and await asyncio.to_thread(_llm_defer_news, news):
+            if (_llm_wanted() and _llm_outage_is_temporary()
+                    and await asyncio.to_thread(_llm_defer_news, news)):
                 return 'defer'
             return 'off'
         # Тот же пост готовится повторно после ошибки отправки, из очереди и по

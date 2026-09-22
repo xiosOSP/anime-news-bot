@@ -178,7 +178,10 @@ class TestQuota:
         llm.settings.llm_day = llm._local_now().strftime('%Y-%m-%d')
         llm.settings.llm_calls_today = 2
         with patch.object(llm.requests, 'post', side_effect=AssertionError('не вызывать')):
-            assert asyncio.run(llm._llm_enrich(dict(NEWS))) == 'defer'
+            # 'off', а не 'defer': лимит вернётся только завтра, и ожидание
+            # лишь задержало бы пост на срок отсрочки, после которого он всё
+            # равно ушёл бы обычным путём.
+            assert asyncio.run(llm._llm_enrich(dict(NEWS))) == 'off'
 
     def test_counter_increments(self, llm):
         """Две разные новости — два вызова: счётчик считает именно обращения."""
