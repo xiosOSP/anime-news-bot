@@ -1536,6 +1536,9 @@ MODERATION_BELITTLING_WINDOW_SEC = max(
 # Сколько последних решений храним для разбора. Тексты чужих сообщений на
 # диске — вещь чувствительная, поэтому список короткий и обрезанный.
 MODERATION_LOG_MAX = max(0, min(500, _env_int('MODERATION_LOG_MAX', 50)))
+# Как часто журнал решений модерации уходит на диск, если настоящих записей
+# не было. Ноль — писать каждое решение сразу, как раньше.
+MODERATION_LOG_FLUSH_SEC = max(0, min(3600, _env_int('MODERATION_LOG_FLUSH_SEC', 30)))
 MODERATION_REPEAT_WINDOW_SEC = max(10, min(3600, _env_int('MODERATION_REPEAT_WINDOW_SEC', 120)))
 MODERATION_MEDIA_ENABLED = _env('MODERATION_MEDIA_ENABLED', 'true').lower() == 'true'
 MODERATION_LLM_ENABLED = _env_bool('MODERATION_LLM_ENABLED', bool(
@@ -2094,6 +2097,9 @@ class ChatModerationStore:
         self.path = path
         self._data: dict = {'schema_version': 1, 'chats': [], 'users': {}, 'misses': {}}
         self._lock = threading.RLock()
+        # Журнал и счётчики — справочные записи, см. _save_soon.
+        self._dirty = False
+        self._last_save = 0.0
         self._load()
 
     def _load(self) -> None:
@@ -2131,10 +2137,41 @@ class ChatModerationStore:
             snapshot = copy.deepcopy(self._data)
             try:
                 _atomic_write_json(self.path, snapshot, indent=2)
-                return True
             except OSError as e:
                 logger.error(f'Модерация: состояние не сохранено: {e}')
                 return False
+            # Снимок целый: отложенные строки журнала ушли на диск вместе с ним.
+            self._dirty = False
+            self._last_save = time.monotonic()
+            return True
+
+    def _save_soon(self) -> None:
+        """Справочная запись: журнал решений и счётчики статистики.
+
+        Хранилище пишется целиком — копия, JSON и fsync — прямо в цикле событий.
+        Заполненное до лимитов, оно весит около 8 МБ, и одна запись стоит около
+        300 мс, в которые бот не отвечает никому. Журнал же пишется на КАЖДОЕ
+        решение, включая «не проверено»: при недоступной модели это каждое
+        сообщение с матом, а на одно предупреждение приходилось пять полных
+        записей.
+
+        Предупреждения, инциденты и разборы по-прежнему пишутся сразу: потеря
+        наказания при падении означала бы повторное или забытое наказание.
+        Журнал может подождать: он уходит на диск со следующей настоящей
+        записью, раз в MODERATION_LOG_FLUSH_SEC или при штатной остановке.
+        """
+        with self._lock:
+            self._dirty = True
+            if time.monotonic() - self._last_save < MODERATION_LOG_FLUSH_SEC:
+                return
+        self._save()
+
+    def flush(self) -> None:
+        """Сбросить отложенные строки журнала — перед остановкой процесса."""
+        with self._lock:
+            dirty = self._dirty
+        if dirty:
+            self._save()
 
     def incident(self, incident_id: str) -> dict:
         with self._lock:
@@ -2473,7 +2510,7 @@ class ChatModerationStore:
             row['total'] = int(row.get('total', 0)) + 1
             by_action = stats_row.setdefault('by_action', {})
             by_action[str(action)[:20]] = int(by_action.get(str(action)[:20], 0)) + 1
-        self._save()
+        self._save_soon()
 
     def record_overturned(self, chat_id, user_id) -> None:
         """Человек отменил решение бота — значит бот ошибся."""
@@ -2511,7 +2548,7 @@ class ChatModerationStore:
             })
             if len(log) > MODERATION_LOG_MAX:
                 self._data['log'] = log[-MODERATION_LOG_MAX:] if MODERATION_LOG_MAX else []
-        self._save()
+        self._save_soon()
 
     def recent_log(self, limit: int = 10) -> list[dict]:
         with self._lock:
@@ -27329,6 +27366,8 @@ async def _post_shutdown(app: Application) -> None:
             settings.save()
         if experiments is not None:
             experiments.flush()
+        if chat_moderation is not None:
+            chat_moderation.flush()
         for store in (post_queue, scheduled_posts, pending_posts, sent_links):
             saver = getattr(store, '_save', None)
             if callable(saver):
