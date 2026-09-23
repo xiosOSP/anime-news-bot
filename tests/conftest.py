@@ -19,6 +19,11 @@ os.environ['DATA_DIR'] = _TEST_DATA_DIR
 
 import anime_news_bot as _bot
 
+# Сверка тайтлов ходит в Shikimori. Тесты сбора не должны зависеть от сети,
+# поэтому в прогоне она выключена; тесты самой сверки включают её сами и
+# подменяют ответ сервера.
+_bot.FEATURE_FLAGS['work_identity'] = False
+
 
 @pytest.fixture
 def tmp_json(tmp_path):

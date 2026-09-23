@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 283 переменных. Почти все — точная настройка со значением
+Бот читает 286 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -126,6 +126,7 @@
 | `FEATURE_VIDEO_NORMALIZE` | `False` | anime_news_bot.py |
 | `FEATURE_VIDEO_PROBE` | `True` | anime_news_bot.py |
 | `FEATURE_VIDEO_THUMBNAILS` | `True` | anime_news_bot.py |
+| `FEATURE_WORK_IDENTITY` | `True` | anime_news_bot.py |
 
 ### Health-порт и метрики
 
@@ -386,3 +387,5 @@
 | `STARTUP_REPORT_MAX_IN_WINDOW` | `3` | anime_news_bot.py |
 | `STARTUP_REPORT_WINDOW_SEC` | `1800` | anime_news_bot.py |
 | `TELEGRAM_BOT_TOKEN` | — | anime_news_bot.py |
+| `WORK_LOOKUP_PER_CYCLE` | `40` | anime_news_bot.py |
+| `WORK_LOOKUP_URL` | `https://shikimori.io/api/graphql` | anime_news_bot.py |
