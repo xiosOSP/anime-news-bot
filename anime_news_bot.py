@@ -1669,9 +1669,71 @@ _MOD_LINK_RE = re.compile(r'(https?://|t\.me/|@[A-Za-z0-9_]{5,})', re.IGNORECASE
 _MOD_INVITE_RE = re.compile(
     r'(?<![\w./])(?:https?://)?(?:t\.me/(?:joinchat/|\+)|discord\.gg/)', re.IGNORECASE)
 _MOD_TEXT_URL_RE = re.compile(r'(?:https?://|www\.|t\.me/|discord\.gg/)\S+', re.IGNORECASE)
+# Призыв и на «ты», и на «вы»: «подписывайтесь на мой канал» — такая же
+# реклама, как «подпишись», а ловилась только вторая форма.
 _MOD_PROMO_RE = re.compile(
-    r'\b(?:залетай|заходи|вступай|подписывайся|подпишись|реклама|розыгрыш|'
-    r'бесплатн\w*|заработ\w*|промокод|пиши\s+в\s+лс)\b', re.IGNORECASE)
+    r'\b(?:залетай(?:те)?|заходи(?:те)?|вступай(?:те)?|подписывайся|подписывайтесь|'
+    r'подпишись|подпишитесь|реклама|розыгрыш|бесплатн\w*|заработ\w*|промокод|'
+    r'пиши(?:те)?\s+в\s+лс|(?:мой|наш)\s+(?:канал|стрим))\b', re.IGNORECASE)
+# Сайты, ссылка на которые в аниме-чате — часть разговора, а не реклама:
+# клип, опенинг, карточка тайтла или персонажа, пост художника. Замер на
+# живых комментариях аниме-чатов (Telegram и Shikimori, 9,7 тыс. реплик):
+# из 90 писем «короткое сообщение со ссылкой» 83 были обычным разговором —
+# ссылками на эти сайты и упоминаниями участников. Оставшиеся семь вели на
+# незнакомые сайты и хостинги — они под подозрением и остаются. А каждое
+# письмо — вызов модели из дневного лимита или, когда модели нет,
+# уведомление админу.
+#
+# Файлообменников, картинок и видео без модерации (tumblr, imgur, boosty)
+# здесь нет намеренно: за ними бывает 18+ и то, что прячут от чата.
+MODERATION_CONTENT_HOSTS = frozenset({
+    'youtube.com', 'youtu.be', 'shikimori.one', 'shikimori.io', 'shikimori.net',
+    'shikimori.me', 'myanimelist.net', 'anilist.co', 'anidb.net',
+    'animenewsnetwork.com', 'crunchyroll.com', 'netflix.com',
+    'twitter.com', 'x.com', 'reddit.com', 'coub.com', 'vkvideo.ru', 'rutube.ru',
+    'wikipedia.org', 'fandom.com', 'wikitropes.ru', 'kinopoisk.ru', 'kinorium.com',
+    'imdb.com', 'pixiv.net', 'spotify.com', 'soundcloud.com',
+})
+# Упоминание: «@ник работай» — обращение к участнику, а не ссылка.
+_MOD_MENTION_RE = re.compile(r'(?<![\w.])@([A-Za-z0-9_]{5,32})\b')
+
+
+def _mod_content_link(url: str) -> bool:
+    """Ведёт ли ссылка на сайт из MODERATION_CONTENT_HOSTS.
+
+    Хост сравнивается целиком или как поддомен: «youtube.com.example.ru» —
+    чужой сайт, притворяющийся YouTube. У ВКонтакте своими считаем только
+    видео и клипы: остальное там — те же группы, куда зазывает спам.
+    """
+    candidate = url if re.match(r'https?://', url, re.IGNORECASE) else 'https://' + url
+    try:
+        parts = urlparse(candidate)
+        host = (parts.hostname or '').lower()
+    except ValueError:
+        return False
+    host = host[4:] if host.startswith('www.') else host
+    if host in ('vk.com', 'm.vk.com'):
+        return parts.path.startswith(('/video', '/clip'))
+    return any(host == known or host.endswith('.' + known) for known in MODERATION_CONTENT_HOSTS)
+
+
+def _mod_link_needs_review(text: str) -> bool:
+    """Есть ли ссылка или упоминание, которые стоит показать второму уровню.
+
+    Ссылка на сайт из MODERATION_CONTENT_HOSTS и упоминание участника в
+    подозрение не записываются. Остаётся всё прочее: незнакомые сайты, t.me,
+    упоминания ботов — и любая ссылка рядом с рекламным призывом:
+    «подписывайтесь на мой канал» с адресом YouTube — всё ещё реклама.
+    """
+    raw = str(text or '')
+    promo = bool(_MOD_PROMO_RE.search(raw))
+    if any(promo or not _mod_content_link(match.group(0))
+           for match in _MOD_TEXT_URL_RE.finditer(raw)):
+        return True
+    return any(promo or name.lower().endswith('bot')
+               for name in _MOD_MENTION_RE.findall(raw))
+
+
 _MOD_SHORT_ACK_RE = re.compile(
     r'^(?:да|нет|неа|ага|угу|ок|окей|спс|лол|кек|ахах+|хаха+|пон|ясно|ладно)$',
     re.IGNORECASE)
@@ -1901,7 +1963,9 @@ _MOD_HARD_SLUR_RE = re.compile(
 
 # Ambiguous forms need an actual address or derogatory predicate. A typo or
 # a piece of firewood is insufficient evidence for an automatic hate mute.
-_MOD_AMBIGUOUS_SLUR_RE = re.compile(r'\b(?:жид(?:а|у|ом|е)?|чурк(?:а|и|у|ой|е))\b')
+# «Хачу» — шуточное «хочу» («хачу второй сезон!»): для слова целиком оно
+# совпадало с оскорблением в дательном падеже и стоило бы мута сразу.
+_MOD_AMBIGUOUS_SLUR_RE = re.compile(r'\b(?:жид(?:а|у|ом|е)?|чурк(?:а|и|у|ой|е)|хачу|хачю)\b')
 _MOD_SLUR_ADDRESS_BEFORE = re.compile(
     r'(?:\b(?:ты|вы|он|она|они)|@[a-z0-9_]{2,32})\s+'
     r'(?:(?:просто|настоящий|такая|такой|все|грязн\w*|жалк\w*|мерзк\w*|сран\w*|поган\w*|кончен\w*)\s+){0,2}[—–-]?\s*$|'
@@ -1941,6 +2005,14 @@ _MOD_SUSPECT_RE = re.compile(r'(?<!\w)(?:' + '|'.join(
 ) + r')', re.IGNORECASE)
 
 
+# «Я» и до двух слов-определений перед оскорблением: «я пидор», «я тот ещё
+# …», «я многонациональный …». Глаголы и местоимения между ними не пускаем:
+# в «я думаю, он …» слово уже о другом человеке.
+_MOD_SELF_SLUR_BEFORE = re.compile(
+    r'(?:^|[^\w])я\s+(?:(?:тот|такой|самый|просто|же|еще|вообще|конечно|реально|'
+    r'\w+(?:ый|ий|ой))\s+){0,2}$')
+
+
 def _mod_hard_slur(text: str) -> str:
     """Однозначное оскорбление группы, если оно есть. Иначе пусто.
 
@@ -1954,10 +2026,19 @@ def _mod_hard_slur(text: str) -> str:
     """
     # Словом целиком во всех вариантах: разбитое по буквам слово к этому
     # моменту уже собрано обратно, и границы у него настоящие.
-    if not any(_MOD_HARD_SLUR_RE.search(v) for v in _mod_lexical_variants(text)):
+    hits = [(variant, match) for variant in _mod_lexical_variants(text)
+            for match in _MOD_HARD_SLUR_RE.finditer(variant)]
+    if not hits:
         return ''
     raw = str(text or '')
     if _MOD_QUOTING_RE.search(raw) or _MOD_ABOUT_THE_WORD_RE.search(raw):
+        return ''
+    # Человек о себе: «я многонациональный пидорас» — самоирония, её свод
+    # правил чата прямо разрешает («я гей» — не нарушение). На живых
+    # комментариях такая реплика стоила мута сразу. Слово никуда не девается:
+    # сообщение уходит на второй уровень, как любое сомнительное.
+    if all(_MOD_SELF_SLUR_BEFORE.search(variant[max(0, match.start() - 60):match.start()])
+           for variant, match in hits):
         return ''
     return 'hate'
 
@@ -2088,7 +2169,7 @@ def _mod_local_check(chat_id: int, user_id: int, text: str, *, reply_to_user=Fal
         return {'category': 'spam', 'confident': False,
                 'reason': 'ссылка-приглашение без явного рекламного контекста'}
 
-    if _MOD_LINK_RE.search(text or '') and len(normalized) < 120:
+    if len(normalized) < 120 and _mod_link_needs_review(text):
         # Короткая ссылка — кандидат, а не нарушение. Это особенно важно при
         # недоступной LLM: раньше любая такая реплика превращалась в поток
         # одинаковых "подозрение spam" администратору.

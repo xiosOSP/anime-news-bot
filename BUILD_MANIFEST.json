@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "5b65981fba053598394d682b0d08b117b486d218",
-  "generated_at_utc": "2026-09-22T21:10:11.682444+00:00",
+  "git_commit": "6e3695af0f593f1d7045cadf3ad1849ffafe370e",
+  "generated_at_utc": "2026-09-23T06:29:06.132717+00:00",
   "files": {
     ".env.example": {
       "sha256": "42eb1e0bfc0d66c187647e427f1cbd0fbfd1ea5477079ddef3e642e3c61c23c2",
@@ -30,12 +30,12 @@
       "bytes": 15295
     },
     "anime_news_bot.py": {
-      "sha256": "05eff21ded1ecfe19f3c81853f6a9a6c403d12ede17698521db7eb2ed37154c1",
-      "bytes": 1451727
+      "sha256": "b232c24e006d9143b3042626aab27fde5f2809cf07abb7d1a4cd7bb4fbd06276",
+      "bytes": 1457440
     },
     "docs/chat-moderation.md": {
-      "sha256": "cd0b63760702101d260fe313081e2b37944b984f72d08a55963c7721d46b00c2",
-      "bytes": 39012
+      "sha256": "c326152f839a81441c1cb9ba9e0f5adc7bac1ebed8ad00441744d128f9f32c12",
+      "bytes": 44023
     },
     "docs/env-reference.md": {
       "sha256": "3f8547cd9022c19689c64379c0f60a62dae9efab0e0bb0ad13387939eb080077",
@@ -74,8 +74,8 @@
       "bytes": 37712
     },
     "moderation_rules.py": {
-      "sha256": "dd2d32a54f2c519f9cf6733487a942c1d53cc02abad28b74f6e5bf234ecefd02",
-      "bytes": 21832
+      "sha256": "ab5429c4a5c5735d0d6ba8ffb12cd16753a8b777b2cd771605b0e90d71eb82f4",
+      "bytes": 25172
     },
     "news_deferral.py": {
       "sha256": "2a4d04228fa6802df7827f3d7ffc704d403d66503807becb8594692d49258a2e",
@@ -449,6 +449,10 @@
       "sha256": "2222513346fdcc206e1601b0356a4c06d237398ab207c5ce6dc3c831dc61add1",
       "bytes": 2813
     },
+    "tests/test_moderation_live_chat.py": {
+      "sha256": "b17ab1c8dd55108e43b3fddf8829ab5352f25a1b23e1d40a66d676aba31e98e0",
+      "bytes": 9652
+    },
     "tests/test_moderation_llm_client.py": {
       "sha256": "48fa2dd0acac49b26f88e4305301abac601603a801ac151e3a43fbccd0e0bfb0",
       "bytes": 19371
@@ -666,8 +670,8 @@
       "bytes": 7322
     },
     "tools/check_invariants.py": {
-      "sha256": "7feb44fc157abd8c2b676515b13fb9917f8cdf8f4e6ff77812b76522452c40fb",
-      "bytes": 55212
+      "sha256": "3756f07760e12a76e2df17b51f5efe52e98a8aea376f9ec8d1da796d7468bfec",
+      "bytes": 55760
     },
     "tools/env_reference.py": {
       "sha256": "e37b051bf68db3b5fbbb9359a618d386dc9ca91d7d159014abfd0b6fc90d6508",

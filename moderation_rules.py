@@ -71,11 +71,17 @@ _LINK = re.compile(r'https?://\S+|t\.me/\S+|discord\.gg/\S+|@[a-z0-9_]{5,}', re.
 # списком, как у оскорблений: цена ошибки здесь — вердикт «политика» за
 # разговор о прыжках с трамплина.
 _TRUMP = r'трамп(?:а|у|ом|е|ы|ов|ам|ами|ах|ист\w*)?'
+# Президент школьного совета — сюжет половины школьных аниме: арка «Госпожи
+# Кагуи» целиком о выборах президента студсовета. Правила чата прямо говорят,
+# что политика в сюжете — не политика, а без этой оговорки сообщение о ней
+# удалялось с вызовом админа.
+_PRESIDENT = (r'президента(?!\s+(?:(?:школьн|студенческ|ученическ)\w*\s+совет\w*|'
+              r'студсовет\w*|клуба|класса))')
 _POLITICS = re.compile(
     rf'\b(?:путин\w*|зеленск\w*|{_TRUMP}|байден\w*|навальн\w*|лукашенко|'
     r'нато|сво|слава украине|героям слава|единая россия|'
-    r'голосуйте за\s+(?:\w+\s+){0,2}(?:партию|президента|депутата|мэра|губернатора)|'
-    r'выборы президента|война (?:в|на|с) (?:украин\w*|росси\w*)|'
+    rf'голосуйте за\s+(?:\w+\s+){{0,2}}(?:партию|{_PRESIDENT}|депутата|мэра|губернатора)|'
+    rf'выборы {_PRESIDENT}|война (?:в|на|с) (?:украин\w*|росси\w*)|'
     r'putin|zelensky\w*|trump|biden|nato)\b')
 # Формы, которые одинаково читаются и как фамилия, и как обычное слово.
 # Фамилия: путина (род./вин.), путину (дат.), путине (предл.). Рыболовный
@@ -132,6 +138,27 @@ def _strip_foreign_quotes(text: str) -> str:
 _PRIORITY = {'family': 100, 'doxxing': 100, 'scam': 100, 'raid': 100,
              'politics': 95, 'nsfw': 95, 'toxic_admin': 90,
              'aggression': 70, 'toxic': 60, 'belittling': 10}
+
+
+# Спам-боту отвечают так, как он заслужил: «шлюхобот пошел нахуй». Это
+# реакция на спам, а не агрессия к участнику — человек, которого разозлил
+# бот, предупреждения не заслужил. Встретилось на живых комментариях.
+_BOT_ADDRESSEE = r'(?:шлюхобот\w*|спамбот\w*|спам-бот\w*|порнобот\w*|бот(?:ы|яра)?|спамер\w*)'
+# «Заткнись и возьми мои деньги» — мем-восторг, а не приказ собеседнику.
+_SHUT_UP_MEME = re.compile(r'\s+и\s+(?:возьми|бери|забери|забирай)\s+(?:мои|моих)\s+деньг')
+
+
+def _harmless_dismissal(text: str, match: re.Match) -> bool:
+    """Грубость, обращённая не к человеку: к спам-боту или в меме."""
+    if match.group().startswith('заткнись') and _SHUT_UP_MEME.match(text[match.end():]):
+        return True
+    # «Ты бот, пошел нахуй» обзывает ботом человека — это уже ему.
+    if re.search(r'\b(?:ты|вы)\b', text):
+        return False
+    before = text[max(0, match.start() - 30):match.start()]
+    after = text[match.end():match.end() + 30]
+    return bool(re.search(rf'\b{_BOT_ADDRESSEE}[\s,!.]*$', before)
+                or re.match(rf'[\s,!.]*{_BOT_ADDRESSEE}\b', after))
 
 
 def _direct_speech(text: str) -> str:
@@ -231,8 +258,12 @@ def _check_clause(value: str, *, reply_to_user: bool,
     direct = re.sub(_URL, ' ', value, flags=re.IGNORECASE)
     uncertain = None
     family = re.search(rf'\b{_TARGET_FAMILY}\b{_FAMILY_BRIDGE}{_INSULT}\b|\b{_INSULT}\b{_FAMILY_BRIDGE}{_TARGET_FAMILY}\b', direct)
+    # Чья мать — решает всё: «ебал твою мать» оскорбляет собеседника, а «он
+    # трахал сестру всю мангу» пересказывает сюжет. Без «твою/вашу» фраза
+    # о чужой семье, и правила чата сюжет не запрещают.
     sexual_family = re.search(
-        r'\b(?:ебал|выебал|трахал|трахну|выебу)\s+(?:(?:твою|вашу)\s+)?(?:мать|маму|сестру)\b|'
+        r'\b(?:ебал|выебал|трахал|трахну|выебу)\s+(?:(?:твою|вашу)\s+(?:мать|маму|сестру)|'
+        r'(?:мать|маму|сестру)\s+(?:твою|вашу))\b|'
         r'\b(?:сын|дочь)\s+(?:шлюхи|проститутки)\b', direct)
     if family and re.search(r'\b(?:не|неправда)\b', family.group()):
         family = None
@@ -284,10 +315,17 @@ def _check_clause(value: str, *, reply_to_user: bool,
         uncertain = verdict
     raids = re.finditer(r'\b(?:рейдим|рейдить|зарейдим|заспамим|заспамить|флудим|спамим|атакуем|набег|завалим спамом)\b', direct)
     destination = _LINK.search(value) or re.search(r'\b(?:чужой чат|их чат|этот чат|канал|группу)\b', direct)
+    # «Атакуем» и «набег» — обычные слова сюжета: «атакуем группу разведчиков»
+    # — это «Атака титанов», а не рейд. Им нужна цель, которая точно чат:
+    # ссылка или «их/этот/чужой» чат, канал, группа.
+    chat_target = _LINK.search(value) or re.search(
+        r'\b(?:(?:чужой|их|этот|тот|вражеский)\s+чат|'
+        r'(?:их|этот|тот|чужой|чужую|эту|ту|вражеск\w*)\s+(?:канал|группу))\b', direct)
     game = re.search(r'\b(?:игровой рейд|босс\w*|подземел\w*|данж\w*|гильди\w*|wow|варкрафт)\b', direct)
     explicit_spam = re.search(r'\b(?:заспам\w*|флудим|спамим|завалим спамом)\b', direct)
     if destination and (not game or explicit_spam) and any(
             not _negated(direct, item) and not _forbidden_infinitive(direct, item)
+            and (chat_target or item.group() not in ('атакуем', 'набег'))
             for item in raids):
         return Verdict('raid', 'Призыв к атаке на чат или канал', 3)
     if any(not _negated(direct, threat) and not _conditional_game_joke(direct, threat)
@@ -309,7 +347,8 @@ def _check_clause(value: str, *, reply_to_user: bool,
         return Verdict('toxic', 'Грубое личное оскорбление')
     # One mild insult can be a joke; repeated personal put-downs are tracked.
     dismissals = re.finditer(r'\b(?:заткнись|завали (?:рот|ебало)|пошел на хуй|пошел нахуй)\b', direct)
-    if any(not _negated(direct, item) for item in dismissals):
+    if any(not _negated(direct, item) and not _harmless_dismissal(direct, item)
+           for item in dismissals):
         return Verdict('aggression', 'Агрессивное обращение к собеседнику')
     if (reply_to_user or re.search(r'\bты\b', direct)) and re.search(
             r'\b(?:тебя не спрашивали|твое мнение никому не нужно|ты никто|ты ничего не понимаешь|с тобой все ясно)\b', direct):
