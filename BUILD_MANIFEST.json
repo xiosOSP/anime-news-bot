@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "046796c08de4ef06caa55822991a872d148478f0",
-  "generated_at_utc": "2026-09-23T17:52:48.556166+00:00",
+  "git_commit": "0d2a34b8f4f04be7445e65a8f69eae4e1e92d1d9",
+  "generated_at_utc": "2026-09-23T19:56:11.614051+00:00",
   "files": {
     ".env.example": {
       "sha256": "2869adad4bedcbcb0a08988ace60f91ffddaa7d27c7b9dfd59620eddc4d131b2",
@@ -26,16 +26,16 @@
       "bytes": 33
     },
     "README.md": {
-      "sha256": "6ac5640cc5b3d81bebc2368518849812e8fb6539a17af11816d11abb2069403e",
-      "bytes": 16173
+      "sha256": "d9e832334238d48cd9070aa769be85c1c65c315400b2bcd1a320636f2be17b95",
+      "bytes": 16512
     },
     "anime_news_bot.py": {
-      "sha256": "c6e2c684b391eb3c880d10d69389d42a9a042c58f4af68392614dfa34eeb7b71",
-      "bytes": 1468509
+      "sha256": "0be1c9e3d16958ef3f9ef049f7048a1a2dd4159c49a0f0c3a39efc6e3fd807c9",
+      "bytes": 1475461
     },
     "docs/chat-moderation.md": {
-      "sha256": "c326152f839a81441c1cb9ba9e0f5adc7bac1ebed8ad00441744d128f9f32c12",
-      "bytes": 44023
+      "sha256": "4b3f5e99f66eeb3c128cab5390ba2d3afdcddb3a94198ff0fe855fa86b21c983",
+      "bytes": 45891
     },
     "docs/env-reference.md": {
       "sha256": "fb4a1f4171f64a0ac997755e6093b2f73371ff6f0e3a3f696c93740aa6a0f184",
@@ -70,8 +70,8 @@
       "bytes": 10699
     },
     "moderation_media.py": {
-      "sha256": "4b0729bd288d08319d754b82d95b79463bcb0ecdd8a39a67ee4fb7c3038ff188",
-      "bytes": 37712
+      "sha256": "a54fba3d3c7426ff561245bbdd55c5a4d573aa88aa262176c3ca3ea540f9e451",
+      "bytes": 39391
     },
     "moderation_rules.py": {
       "sha256": "ab5429c4a5c5735d0d6ba8ffb12cd16753a8b777b2cd771605b0e90d71eb82f4",
@@ -228,6 +228,10 @@
     "tests/test_cohesive_posts.py": {
       "sha256": "7b3b63f0f6312033bd09d794f3088bf94c4cdca7b8e6082c0cb3347c37fb76fe",
       "bytes": 18576
+    },
+    "tests/test_crunchyroll_news.py": {
+      "sha256": "1b991b9b7b9976399fa9166ca45768ac4fd0892b8c1016b42c5807d35f660c2d",
+      "bytes": 3522
     },
     "tests/test_cycle2_source_expansion.py": {
       "sha256": "d24817d7fd0b299183b822912d9d10762755890694a9f50a8a31f7d0130f990b",
@@ -450,8 +454,8 @@
       "bytes": 2813
     },
     "tests/test_moderation_live_chat.py": {
-      "sha256": "b17ab1c8dd55108e43b3fddf8829ab5352f25a1b23e1d40a66d676aba31e98e0",
-      "bytes": 9652
+      "sha256": "cbf001a06e22777aff1afd28d6c6de0d14f41935522436ead7d81ef069dfe238",
+      "bytes": 9807
     },
     "tests/test_moderation_llm_client.py": {
       "sha256": "48fa2dd0acac49b26f88e4305301abac601603a801ac151e3a43fbccd0e0bfb0",
@@ -485,6 +489,10 @@
       "sha256": "7e13b21d804b2ca11b8fb1f4af4d2c4e5585882675630ced18179ce2d1404a2d",
       "bytes": 8258
     },
+    "tests/test_moderation_quiet_notices.py": {
+      "sha256": "10a3dde08914385b5fa8047a3c5187bf896933439fdd42997c75e91b728cd4ff",
+      "bytes": 8248
+    },
     "tests/test_moderation_reliability_pr58.py": {
       "sha256": "dcc7decc95116b680bada179f421b17a58ad14791cc2a13445974eb857b6f3df",
       "bytes": 3961
@@ -510,8 +518,8 @@
       "bytes": 4922
     },
     "tests/test_news_noise_filter.py": {
-      "sha256": "bae4add4d49b2d0d2f2949d217be40e02a7b9179c699b5467cd4bbc77ffe17ae",
-      "bytes": 11418
+      "sha256": "a8906b56f34dbdadb6b55ea15e30807cd2598540f5e63ddf226eeeae53fbf929",
+      "bytes": 11724
     },
     "tests/test_news_parser_quality.py": {
       "sha256": "2116878d9cb12a8d931fb88c9cc63c3cb94f6879b150266e2421f477de2aba61",
@@ -556,6 +564,10 @@
     "tests/test_post_text.py": {
       "sha256": "3670e109204aa34db33d82d04d6589645e01df5db100e3bd61d748539de2701e",
       "bytes": 3759
+    },
+    "tests/test_posts_export.py": {
+      "sha256": "75e7cd28fe5584a37e9148d634931620bd0dd879e916cf6552c38c3abe987c7c",
+      "bytes": 2869
     },
     "tests/test_protection.py": {
       "sha256": "57813f89491164f38576a7702cc1be93050ae26af6867cf557545b89207d1d2f",

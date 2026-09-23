@@ -52,6 +52,10 @@ class Scan:
     # любопытства: на разных машинах аппетит разный, и подбирать лимит вслепую
     # значит менять число наугад после каждого отказа.
     address_space_mb: int = 0
+    # Звать ли человека. Чистое превью длинного или тяжёлого видео — «не
+    # проверено целиком», но смотреть его руками админу не на что: письмо
+    # приходило на каждый такой ролик в чате. Запись в журнал остаётся.
+    review: bool = True
 
 
 def _address_space_peak_mb():
@@ -614,6 +618,30 @@ class MediaScanner:
         finally:
             self._in_flight -= 1
 
+    async def _check_preview_only(self, bot, message, limit: str, found_prefix: str):
+        """Проверка по превью для файла, который целиком не проверить.
+
+        Чистое превью не доказывает, что чист весь ролик, — но и открывать
+        каждый такой ролик руками админ не станет: письмо приходило на любое
+        видео больше 20 МБ, а это половина роликов в живом чате. Поэтому
+        чистое превью — запись в журнал без письма; находка на превью или
+        превью, которое не удалось проверить, — письмо, как и раньше.
+        """
+        preview = media_preview_attachment(message)
+        if preview is None:
+            return Scan('unchecked', reason=f'{limit}; превью нет')
+        preview_item, preview_kind = preview
+        preview_scan = await self._check_downloadable(bot, preview_item, preview_kind)
+        if preview_scan.status != 'checked':
+            return Scan('unchecked', reason=f'{limit}; превью тоже не проверено: {preview_scan.reason}',
+                        frames=preview_scan.frames, score=preview_scan.score)
+        if preview_scan.category:
+            return Scan('unchecked', category=preview_scan.category,
+                        reason=f'{found_prefix}; на превью: {preview_scan.reason}',
+                        frames=preview_scan.frames, score=preview_scan.score)
+        return Scan('unchecked', reason=f'{limit}; превью чистое, весь файл не проверен',
+                    frames=preview_scan.frames, review=False)
+
     async def check(self, bot, message):
         attachment = media_attachment(message)
         if attachment is None:
@@ -622,37 +650,21 @@ class MediaScanner:
         size = getattr(item, 'file_size', None)
         if size is not None and size <= 0:
             return Scan('unchecked', reason='Некорректный размер файла')
+        # Файл, который целиком не проверить: Bot API не отдаёт больше 20 МБ,
+        # а длинное или огромное видео детектор не переварит. Смотрим превью —
+        # маленькую картинку, которую Telegram почти всегда прикладывает.
         if size is not None and size > MAX_BYTES:
-            preview = media_preview_attachment(message)
-            if preview is None:
-                return Scan('unchecked', reason='Файл превышает лимит загрузки Bot API 20 МБ; превью нет')
-            preview_item, preview_kind = preview
-            preview_scan = await self._check_downloadable(bot, preview_item, preview_kind)
-            if preview_scan.status != 'checked':
-                return Scan(
-                    'unchecked',
-                    reason=('Файл превышает лимит загрузки Bot API 20 МБ; '
-                            f'превью тоже не проверено: {preview_scan.reason}'),
-                    frames=preview_scan.frames, score=preview_scan.score)
-            if preview_scan.category:
-                return Scan(
-                    'unchecked', category=preview_scan.category,
-                    reason=('Оригинал больше 20 МБ и недоступен Bot API; '
-                            f'на превью: {preview_scan.reason}'),
-                    frames=preview_scan.frames, score=preview_scan.score)
-            return Scan(
-                'unchecked',
-                reason=('Файл превышает лимит загрузки Bot API 20 МБ; '
-                        'превью чистое, но весь оригинал не проверен'),
-                frames=preview_scan.frames)
-
+            return await self._check_preview_only(bot, message, 'Файл превышает лимит загрузки Bot API 20 МБ',
+                                                  'Оригинал больше 20 МБ и недоступен Bot API')
         duration = getattr(item, 'duration', 0) or 0
         if isinstance(duration, timedelta):
             duration = duration.total_seconds()
         if duration > MAX_DURATION:
-            return Scan('unchecked', reason='Видео длиннее 3 минут')
+            return await self._check_preview_only(bot, message, 'Видео длиннее 3 минут',
+                                                  'Видео длиннее 3 минут')
         if (getattr(item, 'width', 0) or 0) * (getattr(item, 'height', 0) or 0) > MAX_PIXELS:
-            return Scan('unchecked', reason='Слишком большое разрешение')
+            return await self._check_preview_only(bot, message, 'Слишком большое разрешение',
+                                                  'Слишком большое разрешение')
         return await self._check_downloadable(bot, item, kind)
 
 if __name__ == '__main__':

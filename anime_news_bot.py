@@ -2186,10 +2186,12 @@ def _mod_local_check(chat_id: int, user_id: int, text: str, *, reply_to_user=Fal
                 'reason': 'ссылка-приглашение без явного рекламного контекста'}
 
     if len(normalized) < 120 and _mod_link_needs_review(text):
-        # Короткая ссылка — кандидат, а не нарушение. Это особенно важно при
-        # недоступной LLM: раньше любая такая реплика превращалась в поток
-        # одинаковых "подозрение spam" администратору.
-        return {'category': 'spam', 'confident': False,
+        # Короткая ссылка — кандидат, а не нарушение. Модель, если она есть,
+        # посмотрит её с контекстом. Если модели нет, человека не зовём
+        # (quiet): письмо «нужна ручная оценка» приходило на каждую ссылку в
+        # чате, а спам, который стоит внимания, — приглашение с призывом,
+        # повтор, флуд — ловится и так, уверенно.
+        return {'category': 'spam', 'confident': False, 'quiet': True,
                 'reason': 'короткое сообщение со ссылкой; нужен контекст'}
 
     # Однозначное оскорбление группы решаем здесь же: правила чата не делают
@@ -6227,6 +6229,11 @@ class PublishedStoryStore:
             self._items = self._items[-self.MAX_ITEMS:]
             self._save()
 
+    def recent(self, limit: int = 30) -> list[dict]:
+        """Последние опубликованные истории, новые первыми."""
+        with self._lock:
+            return [dict(row) for row in reversed(self._items[-max(0, int(limit)):])]
+
     def classify_update(self, news: dict) -> Optional[dict]:
         if not feature_enabled('story_updates'):
             return None
@@ -8849,8 +8856,77 @@ def get_ann_newsroom():
     )
 
 
+# Новости Crunchyroll — их собственный API, тот же, из которого собирается
+# crunchyroll.com/news. Прежняя лента /rss/news давно отдаёт не новости, а
+# выход серий в дубляжах: на живой проверке все 50 записей были тайским и
+# польским дубляжом «Тригана» и «Атаки титанов», и в канал уходило «серия 1
+# уже сегодня» про сериал двухлетней давности.
+CRUNCHYROLL_NEWS_API = ('https://cr-news-api-service.prd.crunchyrollsvc.com/v1/en-US/stories/search'
+                        '?category=Latest%20News&page_size=20&page=1')
+
+
+def _crunchyroll_story(story: dict) -> Optional[dict]:
+    """Одна история API → news-словарь. Без заголовка или адреса — None."""
+    if not isinstance(story, dict):
+        return None
+    content = story.get('content') if isinstance(story.get('content'), dict) else {}
+    title = re.sub(r'\s+', ' ', str(content.get('headline') or '')).strip()
+    slug = str(story.get('slug') or '').strip().strip('/')
+    if not title or not slug or not re.fullmatch(r'[\w\-/]+', slug):
+        return None
+    published = None
+    stamp = str(content.get('created_at') or '').strip()
+    try:
+        moment = datetime.fromisoformat(stamp.replace('Z', '+00:00'))
+        published = moment.astimezone(timezone.utc).replace(tzinfo=None).timetuple()
+    except ValueError:
+        pass
+    thumbnail = content.get('thumbnail') if isinstance(content.get('thumbnail'), dict) else {}
+    image = _normalize_image_url(str(thumbnail.get('filename') or ''))
+    return {
+        'title': title[:250],
+        'link': f'https://www.crunchyroll.com/news/{slug}',
+        'summary': re.sub(r'\s+', ' ', str(content.get('lead') or '')).strip()[:900],
+        'image': image, 'images': [image] if image else [], 'video': None,
+        'published_parsed': published,
+        'source': 'Crunchyroll',
+    }
+
+
 def get_crunchyroll_news():
-    return _parse_rss_with_fallback('https://www.crunchyroll.com/rss/news', 'Crunchyroll')
+    response = None
+    try:
+        response = http_get_with_retry(
+            CRUNCHYROLL_NEWS_API,
+            headers={'User-Agent': USER_AGENT, 'Accept': 'application/json'},
+            timeout=HTTP_TIMEOUT, stream=True)
+        if not response or response.status_code != 200:
+            status = response.status_code if response is not None else 'нет ответа'
+            logger.warning('Crunchyroll: HTTP %s', status)
+            return SourceFetchFailure(f'API HTTP {status}')
+        raw = _read_limited_text(response)
+        if raw is None:
+            return SourceFetchFailure('API: ответ превышает лимит размера')
+        stories = json.loads(raw).get('stories')
+        if not isinstance(stories, list):
+            return SourceFetchFailure('API: в ответе нет списка историй')
+    except (ValueError, AttributeError) as e:
+        return SourceFetchFailure(f'API: ответ не разобрался: {type(e).__name__}')
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+    news_list = []
+    for story in stories:
+        news = _crunchyroll_story(story)
+        if news is None or _is_too_old(news['published_parsed']):
+            continue
+        news_list.append(news)
+        if len(news_list) >= NEWS_PER_SOURCE:
+            break
+    return news_list
 
 
 def get_honeys_anime():
@@ -10061,16 +10137,13 @@ NOISE_TITLE_RULES = (
         r'\b(?:black friday|prime day)\b',
         r'\bскидк|\bраспродаж|\bпо промокоду\b',
     )),
-    # Crunchyroll шлёт в ленту каждую серию каждого дубляжа: «TRIGUN STAMPEDE
-    # (Thai Dub) - Episode 1» двухлетней давности приходил как новость «серия
-    # выходит уже сегодня». Дубляжи с подписью в DUB_MARKERS бот оформляет
-    # осознанно; серия на любом другом языке — не новость для этого канала.
-    # Список языков берём из DUB_MARKERS, чтобы новый дубляж, добавленный
-    # туда, не отсеивался здесь молча.
-    ('серия чужого дубляжа', (
-        r'\((?!(?:' + '|'.join(re.search(r'\\\((\w+) Dub', pattern.pattern).group(1)
-                              for pattern, _ in DUB_MARKERS)
-        + r')\s+dub\))[^()]{2,30}\s+dub\)',
+    # Выход серии в дубляже — «TRIGUN STAMPEDE (Thai Dub) - Episode 1» — не
+    # новость для русского канала: так выглядела вся старая лента Crunchyroll,
+    # и в канал уходило «серия 1 уже сегодня» про сериал двухлетней давности.
+    # Сначала отсекались только языки, которых нет в DUB_MARKERS; по решению
+    # владельца канала серии в дубляже не публикуются вовсе.
+    ('серия в дубляже', (
+        r'\([^()]{2,30}\s+dub\)\s*[-–—:]?\s*(?:episode|ep\.?)\s*\d+',
     )),
     ('фан-контент', (
         r'\bfan\s?art\b',
@@ -21865,6 +21938,60 @@ async def videocheck_command(update, context: ContextTypes.DEFAULT_TYPE):
             'компромиссом.')
 
 
+POSTS_EXPORT_DEFAULT = 30
+POSTS_EXPORT_MAX = 200
+
+
+def _posts_export_text(rows: list[dict]) -> str:
+    """Опубликованные посты для разбора: откуда взят и что ушло в канал.
+
+    Нужен, чтобы оценивать качество постов по тому, что реально вышло, а не
+    по прогону на стенде: ветка с постами закрытая, и снаружи её не прочесть.
+    Данных участников чата здесь нет — только новости.
+    """
+    lines = [f'Последние опубликованные посты: {len(rows)}. Новые первыми.', '']
+    for number, row in enumerate(rows, 1):
+        try:
+            when = _fmt_local(datetime.fromisoformat(str(row.get('at') or '')))
+        except ValueError:
+            when = '?'
+        model = 'модель' if row.get('prompt_version') else 'без модели'
+        lines += [
+            f'#{number} · {when} · {row.get("source") or "?"} · {model}',
+            f'Источник: {row.get("title") or ""}',
+        ]
+        if row.get('link'):
+            lines.append(str(row['link']))
+        lines += ['— пост —', str(row.get('rendered') or '(текст не сохранён)').strip(), '', '']
+    return '\n'.join(lines).rstrip() + '\n'
+
+
+@admin_only
+async def posts_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Последние опубликованные посты файлом: /posts [сколько]."""
+    try:
+        limit = int(context.args[0]) if context.args else POSTS_EXPORT_DEFAULT
+    except ValueError:
+        limit = POSTS_EXPORT_DEFAULT
+    limit = max(1, min(POSTS_EXPORT_MAX, limit))
+    if story_history is None:
+        await update.message.reply_text('Журнал публикаций ещё не готов — попробуйте через минуту.')
+        return
+    rows = await asyncio.to_thread(story_history.recent, limit)
+    if not rows:
+        await update.message.reply_text('Опубликованных постов в журнале пока нет.')
+        return
+    data = _posts_export_text(rows).encode('utf-8')
+    target = update.effective_chat.id if update.effective_chat else update.effective_user.id
+    try:
+        await context.bot.send_document(
+            chat_id=target, document=data,
+            filename=f'posts-{_local_now():%Y%m%d-%H%M}.txt',
+            caption=f'Последние {len(rows)} постов: откуда взяты и что ушло в канал')
+    except TelegramError as e:
+        await update.message.reply_text(f'❌ Не удалось отправить файл: {e}')
+
+
 @admin_only
 async def logs_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Присылает последние строки лога. С аргументом — только строки с этим словом.
@@ -24639,8 +24766,12 @@ def _mod_member_permissions(member) -> dict:
             for name in ChatPermissions.no_permissions().to_dict()}
 
 
-async def _mod_media_unchecked(bot: Bot, message, reason: str) -> None:
-    """Queue technical media failures for review without flooding admin DMs."""
+async def _mod_media_unchecked(bot: Bot, message, reason: str, *, notify: bool = True) -> None:
+    """Queue technical media failures for review without flooding admin DMs.
+
+    ``notify=False`` — только журнал: чистое превью длинного или тяжёлого
+    ролика смотреть руками не на что, а письмо приходило на каждый такой.
+    """
     chat_id = message.chat_id
     if (chat_moderation is None or not feature_enabled('chat_moderation')
             or not chat_moderation.is_enabled(chat_id)):
@@ -24651,7 +24782,7 @@ async def _mod_media_unchecked(bot: Bot, message, reason: str) -> None:
                                     'media', 'не проверено', 'локальный детектор', reason,
                                     _mod_message_text(message))
     metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'media_unchecked'})
-    if MODERATION_MEDIA_NOTICE_SEC <= 0:
+    if not notify or MODERATION_MEDIA_NOTICE_SEC <= 0:
         return
 
     # Group equal failures, not the entire chat. A broken decoder and a 20 MB
@@ -25080,7 +25211,8 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
             media = await _moderation_media_scanner.check(context.bot, message)
         if media is None or media.status == 'unchecked':
             await _mod_media_unchecked(context.bot, message,
-                media.reason if media else 'Локальный детектор отключён')
+                media.reason if media else 'Локальный детектор отключён',
+                notify=media is None or getattr(media, 'review', True))
         elif media.category and not (media.category == 'spoiler_16' and
                                     getattr(message, 'has_media_spoiler', False)):
             # Ban-level text takes priority over media; both require deletion.
@@ -25103,7 +25235,7 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
             # Зовём человека только на названное подозрение. Безымянное
             # («в тексте есть похожий корень») — это половина живого чата, и
             # письмо на каждое такое сообщение админ отключит в первый же день.
-            if suspicion:
+            if suspicion and not local.get('quiet'):
                 await _mod_unjudged_text(context.bot, message, suspicion,
                                          str(local.get('reason') or ''))
             return
@@ -27393,6 +27525,7 @@ def main():
     app.add_handler(CommandHandler("addadmin", addadmin_command))
     app.add_handler(CommandHandler("deladmin", deladmin_command))
     app.add_handler(CommandHandler("logs", logs_command))
+    app.add_handler(CommandHandler("posts", posts_command))
     app.add_handler(CommandHandler("blacklist", blacklist_command))
     app.add_handler(CommandHandler("feedback", feedback_command))
     app.add_handler(CommandHandler("rules", rules_command))
