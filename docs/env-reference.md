@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 288 переменных. Почти все — точная настройка со значением
+Бот читает 289 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -386,6 +386,7 @@
 | `RESTART_STORM_WINDOW_SEC` | `900` | anime_news_bot.py |
 | `SENT_LINKS_MAX` | `5000` | anime_news_bot.py |
 | `SENT_LINKS_TRIM_TO` | — | anime_news_bot.py |
+| `SHIKIMORI_NEWS_URL` | `https://shikimori.io/api/topics?forum=news&limit=30` | anime_news_bot.py |
 | `STARTUP_REPORT_MAX_IN_WINDOW` | `3` | anime_news_bot.py |
 | `STARTUP_REPORT_WINDOW_SEC` | `1800` | anime_news_bot.py |
 | `TELEGRAM_BOT_TOKEN` | — | anime_news_bot.py |

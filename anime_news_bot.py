@@ -52,6 +52,7 @@ from moderation_rules import check_text as check_moderation_text, normalize as n
 from post_text import (
     _extract_sentences,
     _strip_links,
+    _tg_split_leading_sentence,
     _tg_title_and_summary,
     tg_source_hashtags,
     fit_to_limit,
@@ -579,6 +580,9 @@ WORK_LOOKUP_WALL_SEC = 25
 EPISODES_CALENDAR_URL = _env('EPISODES_CALENDAR_URL', 'https://shikimori.io/api/calendar?censored=true').strip()
 EPISODES_DIGEST_TIME = _env('EPISODES_DIGEST_TIME', '10:00').strip()
 EPISODES_DIGEST_FILE = DATA_DIR / 'episodes_digest.json'
+# Раздел «Новости» Shikimori: русские новости только про аниме и мангу, с
+# трейлерами и картинками. Бесплатный API без ключа, один запрос за цикл.
+SHIKIMORI_NEWS_URL = _env('SHIKIMORI_NEWS_URL', 'https://shikimori.io/api/topics?forum=news&limit=30').strip()
 EPISODES_DIGEST_MAX = 25
 REPLAY_BUFFER_FILE = DATA_DIR / 'replay_buffer.json'
 GOLDEN_DATASET_FILE = Path(__file__).with_name('golden') / 'editorial_cases.json'
@@ -6203,8 +6207,11 @@ def _annotate_work_keys(items: list[dict], *, budget: int = WORK_LOOKUP_PER_CYCL
                     failures += 1       # сеть не ответила: три раза — и хватит на цикл
             if key:
                 item['_work_key'] = key
-                item['_work_name'] = name
-                item['_work_russian'] = work_titles.russian(name)
+                # Источник мог назвать тайтл по-русски сам (Shikimori пишет
+                # «Grand Blue» (Необъятный океан)) — его пару не перетираем.
+                if not item.get('_work_russian'):
+                    item['_work_name'] = name
+                    item['_work_russian'] = work_titles.russian(name)
                 marked += 1
                 break
     work_titles.flush()
@@ -8973,6 +8980,158 @@ def get_crunchyroll_news():
     return news_list
 
 
+# Пара «оригинал» (русское) в тексте новости: так Shikimori называет тайтл.
+_SHIKI_NAME_PAIR = re.compile(r'«([^«»]{2,120})»\s*\(([^()]{2,120})\)')
+# Заголовок короче этого и без названия в кавычках — рубрика, а не заголовок:
+# «Hinode Japan 2026», «Постер, трейлер и дата премьеры».
+SHIKI_TITLE_MIN_WORDS = 6
+
+
+def _shikimori_text(html_body: str) -> str:
+    """Текст новости из html_body: только то, что читатель должен увидеть.
+
+    Спойлеры не публикуем никогда. Картинки, ролики и блок ответов — не
+    текст. Ссылку на тайтл Shikimori рисует двумя именами подряд, английским
+    и русским; без правки выходило «Nijusseiki Denki MokurokuИстория
+    электричества…», поэтому оставляем русское.
+    """
+    soup = BeautifulSoup(html_body or '', 'html.parser')
+    for el in soup.find_all(class_=re.compile(r'spoiler|b-video|b-image|b-replies|b-poster')):
+        if not el.decomposed:
+            el.decompose()
+    for el in soup.find_all(['img', 'script', 'style']):
+        el.decompose()
+    for name_en in soup.select('.name-en'):
+        if name_en.find_next_sibling(class_='name-ru'):
+            name_en.decompose()
+    for br in soup.find_all('br'):
+        br.replace_with('\n')
+    for block in soup.find_all(['div', 'p', 'li', 'blockquote']):
+        block.insert_before('\n')
+        block.insert_after('\n')
+    lines = (re.sub(r'\s+', ' ', line).strip() for line in soup.get_text().split('\n'))
+    return '\n'.join(line for line in lines if line)
+
+
+def _shikimori_media(site: str, *fragments: str) -> tuple[list[str], Optional[str], Optional[str]]:
+    """Картинки в полном размере, первый ролик и его кадр — из шапки и тела новости."""
+    images: list[str] = []
+    video = thumb = None
+    for fragment in fragments:
+        soup = BeautifulSoup(fragment or '', 'html.parser')
+        for link in soup.select('a.b-image[href]'):
+            url = _normalize_image_url(str(link.get('href') or ''), site)
+            if url and url not in images:
+                images.append(url)
+        link = soup.select_one('a.video-link[href]')
+        if video is None and link is not None:
+            # Адрес ролика проверяем тем же разбором, что и адрес картинки:
+            # абсолютный http(s) с хостом, остальное — мимо.
+            video = _normalize_image_url(str(link.get('href') or ''), site)
+            preview = link.find('img')
+            thumb = _normalize_image_url(str(preview.get('src') or ''), site) if preview else None
+    return images[:4], video, thumb
+
+
+def _shikimori_sentences(text: str) -> str:
+    """Строки текста — в одну: перенос строки у Shikimori заменяет точку.
+
+    «…«Grand Blue» (Необъятный океан)» и «Дату выхода сообщат позже» стоят
+    на разных строках без точки между ними; склейка через пробел давала одно
+    предложение «…(Необъятный океан) Дату выхода…».
+    """
+    lines = [line for line in text.split('\n') if line]
+    return ' '.join(line if re.search(r'[.!?…:;][»")]*$', line) else line + '.'
+                    for line in lines)
+
+
+def _shikimori_topic(topic: dict, site: str) -> Optional[dict]:
+    """Новость Shikimori → news-словарь. Без заголовка и текста — None."""
+    if not isinstance(topic, dict):
+        return None
+    try:
+        topic_id = int(topic.get('id'))
+    except (TypeError, ValueError):
+        return None
+    text = _shikimori_text(str(topic.get('html_body') or ''))
+    title = re.sub(r'\s+', ' ', str(topic.get('topic_title') or '')).strip()
+    # Заголовок-рубрика без названия ничего не сообщает — первое предложение
+    # текста в таком случае и есть настоящий заголовок.
+    if text and '«' not in title and len(title.split()) < SHIKI_TITLE_MIN_WORDS:
+        head, _rest = _tg_split_leading_sentence(text.split('\n', 1)[0])
+        if len(head) <= 200:
+            title = head
+    if not title:
+        return None
+    published = None
+    try:
+        moment = datetime.fromisoformat(str(topic.get('created_at') or ''))
+        published = moment.astimezone(timezone.utc).replace(tzinfo=None).timetuple()
+    except ValueError:
+        pass
+    images, video, thumb = _shikimori_media(site, str(topic.get('html_footer') or ''),
+                                            str(topic.get('html_body') or ''))
+    news = {
+        'title': title[:250],
+        'link': f'{site}/forum/news/{topic_id}',
+        'summary': _shikimori_sentences(text)[:3500],
+        'image': images[0] if images else None, 'images': images, 'video': video,
+        'published_parsed': published,
+        'source': 'Shikimori', 'lang': 'ru',
+        # Новость-трейлер бывает без картинок: если ролик не скачается, в пост
+        # пойдёт его кадр, а не пустое место.
+        '_video_thumb': thumb if video and not images else None,
+    }
+    # Shikimori сам даёт русское название тайтла: «Grand Blue» (Необъятный
+    # океан). Пара автора новости точнее поиска по базе — там у тайтла с
+    # сезонами русское имя часто с номером («Необъятный океан 3»).
+    for match in _SHIKI_NAME_PAIR.finditer(text):
+        original, russian = match.group(1).strip(), match.group(2).strip().rstrip('.')
+        if (original.casefold() in title.casefold() and not re.search(r'[А-Яа-яЁё]', original)
+                and re.search(r'[А-Яа-яЁё]', russian)):
+            news['_work_name'], news['_work_russian'] = original, russian
+            break
+    return news
+
+
+def get_shikimori_news():
+    response = None
+    try:
+        response = http_get_with_retry(
+            SHIKIMORI_NEWS_URL,
+            headers={'User-Agent': 'anime-news-bot (Telegram)', 'Accept': 'application/json'},
+            timeout=HTTP_TIMEOUT, stream=True)
+        if not response or response.status_code != 200:
+            status = response.status_code if response is not None else 'нет ответа'
+            logger.warning('Shikimori: HTTP %s', status)
+            return SourceFetchFailure(f'API HTTP {status}')
+        raw = _read_limited_text(response)
+        if raw is None:
+            return SourceFetchFailure('API: ответ превышает лимит размера')
+        topics = json.loads(raw)
+        if not isinstance(topics, list):
+            return SourceFetchFailure('API: в ответе нет списка новостей')
+    except (ValueError, AttributeError) as e:
+        return SourceFetchFailure(f'API: ответ не разобрался: {type(e).__name__}')
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+    parsed = urlparse(SHIKIMORI_NEWS_URL)
+    site = f'{parsed.scheme}://{parsed.netloc}'
+    news_list = []
+    for topic in topics:
+        news = _shikimori_topic(topic, site)
+        if news is None or _is_too_old(news['published_parsed']):
+            continue
+        news_list.append(news)
+        if len(news_list) >= NEWS_PER_SOURCE:
+            break
+    return news_list
+
+
 def get_honeys_anime():
     return _parse_rss_with_fallback('https://honeysanime.com/feed/', "Honey's Anime")
 
@@ -10018,6 +10177,7 @@ SOURCES = [
     ('ComicBook Anime', get_comicbook_anime),
     ('CBR Anime', get_cbr_anime),
     ('MyAnimeList', get_myanimelist),
+    ('Shikimori', get_shikimori_news),
     # 🟡 С force_og — обещают давать картинки через og:image
     ('AnimeNewsNetwork', get_animenewsnetwork),
     # 🆕 Second-cycle replacements for the sources that are disabled in production.
@@ -22265,6 +22425,12 @@ async def deepl_command(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
 
 
+# /sources показывает только добавленные вручную источники. Живы ли встроенные
+# на этом сервере, видно в /health: их туда и отправляем, иначе ответ на вопрос
+# «какие источники мертвы» ищут не в той команде.
+SOURCES_HEALTH_HINT = 'Какие встроенные источники молчат на этом сервере и почему: /health'
+
+
 @admin_only
 async def sources_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Список динамических источников (добавленных через /addsource)."""
@@ -22276,6 +22442,7 @@ async def sources_command(update, context: ContextTypes.DEFAULT_TYPE):
             "/addsource https://site.com/feed/ Название\n"
             "/addsource @канал — Telegram-канал\n\n"
             "Встроенные источники включаются/выключаются в /settings → Источники.\n"
+            f"{SOURCES_HEALTH_HINT}\n"
             "Найденные кандидаты: /discover"
         )
         return
@@ -22285,6 +22452,7 @@ async def sources_command(update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• {it['label']} [{kind}] — {it['value']}")
     lines.append('')
     lines.append('Удалить: /delsource Название')
+    lines.append(SOURCES_HEALTH_HINT)
     if feature_enabled('source_discovery'):
         lines.append('Кандидаты из shadow-проверок: /discover')
     await update.message.reply_text('\n'.join(lines))
