@@ -739,6 +739,10 @@ def _check_deleting_categories_keep_off_ordinary_speech() -> tuple[bool, str]:
         'Началась путина, отец уехал на промысел',
         'Твои семьдесят серий я не осилю',
         'Ты в тупике, сюжет этого не объяснит',
+        # Сверка правил со сводом чата: политика, рейд и семья в сюжете.
+        'В Кагуе лучшая арка — выборы президента студсовета',
+        'Атакуем группу разведчиков — сильнейшая сцена сезона',
+        'Он трахал сестру всю мангу, ну и сюжет',
     )
     deleting = {'politics', 'scam', 'doxxing', 'raid', 'family', 'nsfw'}
     caught = [text for text in ordinary
@@ -747,7 +751,8 @@ def _check_deleting_categories_keep_off_ordinary_speech() -> tuple[bool, str]:
     if caught:
         return False, f'удаляется обычная фраза: {caught[0]!r}'
     # Обратная сторона: правила обязаны остаться рабочими.
-    real = ('Получи бесплатно 5000 рублей https://scam.example', 'Путин снова выступил')
+    real = ('Получи бесплатно 5000 рублей https://scam.example', 'Путин снова выступил',
+            'Выборы президента России', 'Атакуем их канал', 'Я ебал твою мать')
     missed = [text for text in real
               if (v := rules.check_text(text)) is None or not v.confident]
     if missed:
