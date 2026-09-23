@@ -68,8 +68,9 @@ def test_member_mention_is_not_a_link(text):
     'заходите на мой стрим https://youtu.be/abc',
 ])
 def test_other_links_still_reach_the_second_level(text):
+    # quiet: модель, если она есть, посмотрит ссылку; без модели письма админу нет.
     verdict = _local(text)
-    assert verdict == {'category': 'spam', 'confident': False,
+    assert verdict == {'category': 'spam', 'confident': False, 'quiet': True,
                        'reason': 'короткое сообщение со ссылкой; нужен контекст'}
 
 

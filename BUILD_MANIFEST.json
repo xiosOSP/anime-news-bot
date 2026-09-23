@@ -2,12 +2,12 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "046796c08de4ef06caa55822991a872d148478f0",
-  "generated_at_utc": "2026-09-23T17:52:48.556166+00:00",
+  "git_commit": "c1c7ff9e0c330e9ddc3207936e42d23be8d65f56",
+  "generated_at_utc": "2026-09-23T20:43:24.034811+00:00",
   "files": {
     ".env.example": {
-      "sha256": "2869adad4bedcbcb0a08988ace60f91ffddaa7d27c7b9dfd59620eddc4d131b2",
-      "bytes": 23597
+      "sha256": "1d45114ec32deffad57d13ba2928bab66cf9fc248bb0e9bcb2f959028479257a",
+      "bytes": 23880
     },
     ".gitattributes": {
       "sha256": "d60f352d0db1404c70afb4bb8b2ca3fd1c610572aa40720e8a0b7baa7885418c",
@@ -26,20 +26,20 @@
       "bytes": 33
     },
     "README.md": {
-      "sha256": "6ac5640cc5b3d81bebc2368518849812e8fb6539a17af11816d11abb2069403e",
-      "bytes": 16173
+      "sha256": "0982c4262f7a354455b1d988c424b4669499d7d7860109df2712977f9f0c2a23",
+      "bytes": 18874
     },
     "anime_news_bot.py": {
-      "sha256": "c6e2c684b391eb3c880d10d69389d42a9a042c58f4af68392614dfa34eeb7b71",
-      "bytes": 1468509
+      "sha256": "0736d3034d78eea16618439bc7def8c5e314f5ba1541f429c460cedd6a77afeb",
+      "bytes": 1502447
     },
     "docs/chat-moderation.md": {
-      "sha256": "c326152f839a81441c1cb9ba9e0f5adc7bac1ebed8ad00441744d128f9f32c12",
-      "bytes": 44023
+      "sha256": "4b3f5e99f66eeb3c128cab5390ba2d3afdcddb3a94198ff0fe855fa86b21c983",
+      "bytes": 45891
     },
     "docs/env-reference.md": {
-      "sha256": "fb4a1f4171f64a0ac997755e6093b2f73371ff6f0e3a3f696c93740aa6a0f184",
-      "bytes": 19823
+      "sha256": "1208151ca9b8debdcaea04c30a5cd794eb9015158f6e5d0927ca7afcc2606e80",
+      "bytes": 20081
     },
     "docs/llm-providers.md": {
       "sha256": "7c213406ffcb83385b71f07a2b34296df4cc8d1ba78215fd55f92d9532923c95",
@@ -62,16 +62,16 @@
       "bytes": 1999
     },
     "llm_protocol.py": {
-      "sha256": "c5b0d4a8f718e6b780ebd4acec3a74261a9438a2c9cbf4b5c9edefa9e987eba6",
-      "bytes": 25637
+      "sha256": "94b50eb8375a325168862ecfdb2156d1c1868e8d53b591c4af87dd503ff2f138",
+      "bytes": 25990
     },
     "moderation_llm.py": {
       "sha256": "73a9cb2066a1da2dddabb51fd29bde1d188672d71e0ec64db4557b57ea316f50",
       "bytes": 10699
     },
     "moderation_media.py": {
-      "sha256": "4b0729bd288d08319d754b82d95b79463bcb0ecdd8a39a67ee4fb7c3038ff188",
-      "bytes": 37712
+      "sha256": "a54fba3d3c7426ff561245bbdd55c5a4d573aa88aa262176c3ca3ea540f9e451",
+      "bytes": 39391
     },
     "moderation_rules.py": {
       "sha256": "ab5429c4a5c5735d0d6ba8ffb12cd16753a8b777b2cd771605b0e90d71eb82f4",
@@ -229,6 +229,10 @@
       "sha256": "7b3b63f0f6312033bd09d794f3088bf94c4cdca7b8e6082c0cb3347c37fb76fe",
       "bytes": 18576
     },
+    "tests/test_crunchyroll_news.py": {
+      "sha256": "1b991b9b7b9976399fa9166ca45768ac4fd0892b8c1016b42c5807d35f660c2d",
+      "bytes": 3522
+    },
     "tests/test_cycle2_source_expansion.py": {
       "sha256": "d24817d7fd0b299183b822912d9d10762755890694a9f50a8a31f7d0130f990b",
       "bytes": 5847
@@ -284,6 +288,10 @@
     "tests/test_episode_parser.py": {
       "sha256": "e832ffc833166e4bc49b1ecf0011d9d8d22e3f8270d94bde256545eea30c172b",
       "bytes": 1603
+    },
+    "tests/test_episodes_digest.py": {
+      "sha256": "da8cbedb365f5d3b7a0846a652f09ddae337ff1c4a0d9429120a36587b9f1372",
+      "bytes": 12919
     },
     "tests/test_event_loop_blocking.py": {
       "sha256": "94ad72d3f844698dc1872e131f1175db8605bb8cae19f608aaf6896acc7e8ead",
@@ -450,8 +458,8 @@
       "bytes": 2813
     },
     "tests/test_moderation_live_chat.py": {
-      "sha256": "b17ab1c8dd55108e43b3fddf8829ab5352f25a1b23e1d40a66d676aba31e98e0",
-      "bytes": 9652
+      "sha256": "cbf001a06e22777aff1afd28d6c6de0d14f41935522436ead7d81ef069dfe238",
+      "bytes": 9807
     },
     "tests/test_moderation_llm_client.py": {
       "sha256": "48fa2dd0acac49b26f88e4305301abac601603a801ac151e3a43fbccd0e0bfb0",
@@ -485,6 +493,10 @@
       "sha256": "7e13b21d804b2ca11b8fb1f4af4d2c4e5585882675630ced18179ce2d1404a2d",
       "bytes": 8258
     },
+    "tests/test_moderation_quiet_notices.py": {
+      "sha256": "10a3dde08914385b5fa8047a3c5187bf896933439fdd42997c75e91b728cd4ff",
+      "bytes": 8248
+    },
     "tests/test_moderation_reliability_pr58.py": {
       "sha256": "dcc7decc95116b680bada179f421b17a58ad14791cc2a13445974eb857b6f3df",
       "bytes": 3961
@@ -510,8 +522,8 @@
       "bytes": 4922
     },
     "tests/test_news_noise_filter.py": {
-      "sha256": "bae4add4d49b2d0d2f2949d217be40e02a7b9179c699b5467cd4bbc77ffe17ae",
-      "bytes": 11418
+      "sha256": "a8906b56f34dbdadb6b55ea15e30807cd2598540f5e63ddf226eeeae53fbf929",
+      "bytes": 11724
     },
     "tests/test_news_parser_quality.py": {
       "sha256": "2116878d9cb12a8d931fb88c9cc63c3cb94f6879b150266e2421f477de2aba61",
@@ -557,6 +569,10 @@
       "sha256": "3670e109204aa34db33d82d04d6589645e01df5db100e3bd61d748539de2701e",
       "bytes": 3759
     },
+    "tests/test_posts_export.py": {
+      "sha256": "75e7cd28fe5584a37e9148d634931620bd0dd879e916cf6552c38c3abe987c7c",
+      "bytes": 2869
+    },
     "tests/test_protection.py": {
       "sha256": "57813f89491164f38576a7702cc1be93050ae26af6867cf557545b89207d1d2f",
       "bytes": 4194
@@ -597,6 +613,10 @@
       "sha256": "2106c9419aa42802e9b1e72dbe914b6134052ac77042d2c6f48bfe9f70ceb876",
       "bytes": 6426
     },
+    "tests/test_russian_titles.py": {
+      "sha256": "917fa6fe9b480397c9d981ee00c1a8712272d063b3a2af5e1a553c62a2b6a800",
+      "bytes": 9560
+    },
     "tests/test_safe_http.py": {
       "sha256": "1f9fdb1a6259d3ee007c007e490182237606da306e634b139ab567f207e1ba8c",
       "bytes": 4493
@@ -604,6 +624,10 @@
     "tests/test_scheduling_edit.py": {
       "sha256": "1ba719a97a7618a01995dce839948493648a9edf108e347b0f1a6d51c17c1010",
       "bytes": 52380
+    },
+    "tests/test_shikimori_news.py": {
+      "sha256": "bf92b3a03577bf1fea7f4ac8e3d9dfdbb8672875c066ccb9b28a6b16dd0353f3",
+      "bytes": 14025
     },
     "tests/test_short_format.py": {
       "sha256": "f44e04e09b053c49faaffee1851d17c0dc0a5ef67f7d291f3b6496ba45d3fe2a",

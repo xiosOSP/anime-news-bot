@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 286 переменных. Почти все — точная настройка со значением
+Бот читает 289 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -188,7 +188,7 @@
 | `LLM_PACE_MAX_SEC` | `60.0` | anime_news_bot.py |
 | `LLM_PRIMARY_RETRY_MAX_SEC` | — | anime_news_bot.py |
 | `LLM_PRIMARY_RETRY_SEC` | `1800` | anime_news_bot.py |
-| `LLM_PROMPT_VERSION` | `editorial-v4-2026-09-20` | anime_news_bot.py |
+| `LLM_PROMPT_VERSION` | `editorial-v5-2026-09-23` | anime_news_bot.py |
 | `LLM_PROVIDER` | — | anime_news_bot.py |
 | `LLM_TIMEOUT` | `30` | anime_news_bot.py |
 
@@ -364,6 +364,8 @@
 | `DISCUSSION_THREAD_ID` | — | anime_news_bot.py |
 | `DOCTOR_MIN_FREE_MB` | `256` | anime_news_bot.py |
 | `EDITORIAL_LEARNING_MIN_SAMPLES` | `5` | anime_news_bot.py |
+| `EPISODES_CALENDAR_URL` | `https://shikimori.io/api/calendar?censored=true` | anime_news_bot.py |
+| `EPISODES_DIGEST_TIME` | `10:00` | anime_news_bot.py |
 | `ERROR_FINGERPRINT_NOTIFY_EVERY` | `10` | anime_news_bot.py |
 | `ERROR_FINGERPRINT_WINDOW_SEC` | `1800` | anime_news_bot.py |
 | `EXPERIMENT_SALT` | `anime-news-bot-v1` | anime_news_bot.py |
@@ -384,6 +386,7 @@
 | `RESTART_STORM_WINDOW_SEC` | `900` | anime_news_bot.py |
 | `SENT_LINKS_MAX` | `5000` | anime_news_bot.py |
 | `SENT_LINKS_TRIM_TO` | — | anime_news_bot.py |
+| `SHIKIMORI_NEWS_URL` | `https://shikimori.io/api/topics?forum=news&limit=30` | anime_news_bot.py |
 | `STARTUP_REPORT_MAX_IN_WINDOW` | `3` | anime_news_bot.py |
 | `STARTUP_REPORT_WINDOW_SEC` | `1800` | anime_news_bot.py |
 | `TELEGRAM_BOT_TOKEN` | — | anime_news_bot.py |

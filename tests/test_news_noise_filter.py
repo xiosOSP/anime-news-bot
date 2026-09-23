@@ -39,10 +39,13 @@ NOISE = [
     ('This cosplay of Frieren nails the details', 'фан-контент'),
     ('Косплей дня: Макима', 'фан-контент'),
     # Живые ленты 22 сентября 2026: всё ниже бот собирал как новость.
-    ("TRIGUN STAMPEDE (Thai Dub) - Episode 1 - NOMAN'S LAND", 'серия чужого дубляжа'),
+    ("TRIGUN STAMPEDE (Thai Dub) - Episode 1 - NOMAN'S LAND", 'серия в дубляже'),
     ('Attack on Titan Final Season (Polish Dub) - Episode 85 - Traitor',
-     'серия чужого дубляжа'),
-    ('Dan Da Dan (Latin American Spanish Dub) - Episode 2', 'серия чужого дубляжа'),
+     'серия в дубляже'),
+    ('Dan Da Dan (Latin American Spanish Dub) - Episode 2', 'серия в дубляже'),
+    # По решению владельца канала — и английский, и русский дубляж тоже.
+    ('Frieren (English Dub) - Episode 3', 'серия в дубляже'),
+    ('Frieren (Russian Dub) - Episode 1', 'серия в дубляже'),
     ('🎉22 сентября - день рождения Шикамару из аниме «Наруто»', 'годовщина и ностальгия'),
     ('🎁 КАЛЕНДАРЬ НА 22 СЕНТЯБРЯ.', 'годовщина и ностальгия'),
     ('С днём рождения, Гоку!', 'годовщина и ностальгия'),
@@ -75,9 +78,8 @@ REAL_NEWS = [
     'Обзорные продажи тома выросли вдвое',
     # Двойники новых правил: дубляжи, которые бот оформляет, день рождения
     # не в начале заголовка, японские «спецпоказ» и «выложат все серии разом».
-    'Frieren (English Dub) - Episode 3',
-    'Frieren (Russian Dub) - Episode 1',
     'Dub cast for Frieren season 2 announced',
+    'Frieren (English Dub) cast revealed',          # дубляж без серии — это состав, а не выход серии
     'В день рождения Оды анонсировали новый фильм One Piece',
     'Календарь релизов Crunchyroll пополнился пятью тайтлами',
     'Happy Birthday to You! anime gets a sequel',
