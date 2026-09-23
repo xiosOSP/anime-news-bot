@@ -88,6 +88,9 @@ from llm_protocol import (
 )
 # Повторы новостей вынесены в news_stories.py; здесь — то, чем пользуется бот.
 from news_stories import (
+    _clean_work_name,
+    same_work_event,
+    story_work_names,
     _STORY_STOPWORDS,
     _anchor_identity_match,
     _story_canonical_markers,
@@ -531,6 +534,10 @@ FEATURE_FLAGS = {
     'source_discovery': _env_bool('FEATURE_SOURCE_DISCOVERY', True),
     'source_yield': _env_bool('FEATURE_SOURCE_YIELD', True),
     'story_registry': _env_bool('FEATURE_STORY_REGISTRY', True),
+    # Один тайтл на разных языках: «Необъятный океан», «Grand Blue» и
+    # «ぐらんぶる» сверяются с базой Shikimori, и одна новость из семи
+    # источников перестаёт уходить в канал семь раз. Нужна сеть до Shikimori.
+    'work_identity': _env_bool('FEATURE_WORK_IDENTITY', True),
     'value_moderation_queue': _env_bool('FEATURE_VALUE_MODERATION_QUEUE', True),
     'llm_quality_routing': _env_bool('FEATURE_LLM_QUALITY_ROUTING', True),
     # Пакетная обработка новостей одним запросом к модели. Бесплатные пулы
@@ -556,6 +563,15 @@ STORY_REGISTRY_FILE = DATA_DIR / 'story_registry.json'
 SOURCE_YIELD_FILE = DATA_DIR / 'source_yield.json'
 STORY_REGISTRY_MAX = max(200, min(10000, _env_int('STORY_REGISTRY_MAX', 2500)))
 STORY_REGISTRY_TTL_DAYS = max(1, min(90, _env_int('STORY_REGISTRY_TTL_DAYS', 14)))
+WORK_TITLES_FILE = DATA_DIR / 'work_titles.json'
+# База названий тайтлов. Shikimori отдаёт русское, английское и японское имя
+# бесплатно и без ключа; адрес вынесен в переменную, потому что домен у них
+# уже менялся (shikimori.one → shikimori.io).
+WORK_LOOKUP_URL = _env('WORK_LOOKUP_URL', 'https://shikimori.io/api/graphql').strip()
+# Новых названий за цикл сбора. Известные берутся из кеша на диске; предел
+# держит цикл быстрым и укладывается в лимит API (90 запросов в минуту).
+WORK_LOOKUP_PER_CYCLE = max(0, min(200, _env_int('WORK_LOOKUP_PER_CYCLE', 40)))
+WORK_LOOKUP_WALL_SEC = 25
 REPLAY_BUFFER_FILE = DATA_DIR / 'replay_buffer.json'
 GOLDEN_DATASET_FILE = Path(__file__).with_name('golden') / 'editorial_cases.json'
 STORY_UPDATE_LOOKBACK_DAYS = max(1, min(90, _env_int('STORY_UPDATE_LOOKBACK_DAYS', 21)))
@@ -5874,6 +5890,8 @@ class StoryRegistry:
     @staticmethod
     def _match(news:dict,row:dict)->float:
         sim=_story_similarity(news,{'title':row.get('title','')})
+        if same_work_event(news, {'_work_key': row.get('work_key'), 'title': row.get('title', '')}):
+            sim=max(sim,0.94)
         subject=EntityMemory._key(news.get('_llm_subject') or ''); old=EntityMemory._key(row.get('subject') or '')
         if subject and old and subject==old: sim=max(sim,0.94)
         a=_story_update_anchor(news); b=set(row.get('anchors') or [])
@@ -5891,6 +5909,10 @@ class StoryRegistry:
         old_title = str(row.get('delivered_title') or '')
         if not old_title:
             return False
+        # Тайтл опознан у обоих: сравнение по ключу, номерам и типу события.
+        # Оно раньше проверки маркеров — «постер» и «visual» для неё разные слова.
+        if same_work_event(news, {'_work_key': row.get('delivered_work_key'), 'title': old_title}):
+            return True
         new_numbers = _story_numbers(news)
         old_numbers = set(str(x) for x in (row.get('delivered_numbers') or []))
         if new_numbers and old_numbers and new_numbers != old_numbers:
@@ -5941,12 +5963,14 @@ class StoryRegistry:
             if best is None or score<min(STORY_CLUSTER_SIMILARITY,0.86):
                 best={'registry_id':hashlib.sha1(f"{news.get('title','')}|{now}".encode()).hexdigest()[:16],
                       'title':str(news.get('title') or '')[:300], 'subject':str(news.get('_llm_subject') or '')[:160],
-                      'anchors':sorted(_story_update_anchor(news))[:40], 'sources':[], 'links':[], 'first_seen':now}
+                      'anchors':sorted(_story_update_anchor(news))[:40], 'sources':[], 'links':[], 'first_seen':now,
+                      'work_key':str(news.get('_work_key') or '')}
                 self._items.append(best)
             before=set(best.get('sources') or []); merged=list(dict.fromkeys([*best.get('sources',[]),*sources]))
             best.update({'title':str(news.get('title') or best.get('title') or '')[:300],
                          'subject':str(news.get('_llm_subject') or best.get('subject') or '')[:160],
                          'anchors':sorted(set(best.get('anchors') or [])|_story_update_anchor(news))[:40],
+                         'work_key':str(news.get('_work_key') or best.get('work_key') or ''),
                          'sources':merged, 'links':list(dict.fromkeys([*best.get('links',[]),*links]))[-30:],
                          'last_seen':now, 'observations':_safe_nonnegative_int(best.get('observations'))+1})
             self._items=self._items[-STORY_REGISTRY_MAX:]; self._save()
@@ -5977,8 +6001,168 @@ class StoryRegistry:
             row['delivered_subject'] = str(news.get('_llm_subject') or row.get('subject') or '')[:160]
             row['delivered_markers'] = sorted(_story_event_markers(news))[:20]
             row['delivered_numbers'] = sorted(_story_numbers(news))[:20]
+            row['delivered_work_key'] = str(news.get('_work_key') or '')
             self._save()
             return True
+
+
+class WorkTitleResolver:
+    """Какой тайтл назван в новости — по базе Shikimori, с кешем на диске.
+
+    Одна новость приходит на русском, английском, итальянском и японском, и
+    сравнение заголовков её не склеит: в «Необъятном океане» и «Grand Blue»
+    нет общих букв. У Shikimori же у тайтла есть все эти имена, и ответ
+    «оба — запись 37105» склеивает новость без модели.
+
+    Поиск Shikimori нечёткий и всегда что-нибудь находит, поэтому найденное
+    принимается, только если одно из имён записи действительно похоже на
+    запрос: «CrosSing» не станет «Fumikiri Jikan». Сомнение — это промах,
+    а промах лишь оставляет всё как было, без склейки.
+    """
+    MAX_ITEMS = 5000
+    HIT_DAYS = 60
+    MISS_DAYS = 7
+    MIN_INTERVAL = 0.7          # 90 запросов в минуту — с запасом
+    ACCEPT = 0.85
+    QUERY = ('query($s:String){animes(search:$s,limit:3)'
+             '{id name russian english japanese synonyms}}')
+
+    def __init__(self, path: Path, *, url: str = WORK_LOOKUP_URL):
+        self.path = path
+        self.url = url
+        self._items: dict[str, dict] = {}
+        self._lock = threading.RLock()
+        self._last_request = 0.0
+        self._dirty = False
+        self._load()
+
+    @staticmethod
+    def _norm(value: str) -> str:
+        return re.sub(r'[^0-9a-zа-я\u3040-\u30ff\u4e00-\u9fff]+', '',
+                      str(value or '').casefold().replace('ё', 'е'))
+
+    def _load(self) -> None:
+        try:
+            if self.path.exists():
+                raw = json.loads(self.path.read_text(encoding='utf-8'))
+                items = raw.get('titles') if isinstance(raw, dict) else None
+                if isinstance(items, dict):
+                    self._items = {str(k): v for k, v in items.items() if isinstance(v, dict)}
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning(f'кеш тайтлов не загружен: {e}')
+
+    def flush(self) -> None:
+        with self._lock:
+            if not self._dirty:
+                return
+            if len(self._items) > self.MAX_ITEMS:
+                keep = sorted(self._items.items(), key=lambda kv: str(kv[1].get('at') or ''))
+                self._items = dict(keep[-self.MAX_ITEMS:])
+            try:
+                _atomic_write_json(self.path, {'schema_version': 1, 'titles': self._items})
+                self._dirty = False
+            except OSError as e:
+                logger.warning(f'кеш тайтлов не сохранён: {e}')
+
+    def cached(self, name: str) -> Optional[str]:
+        """Ключ тайтла из кеша: строка (пустая — «не нашли»), None — не спрашивали."""
+        key = self._norm(name)
+        with self._lock:
+            row = self._items.get(key)
+        if not row:
+            return None
+        try:
+            age = datetime.now(timezone.utc) - datetime.fromisoformat(str(row.get('at')))
+        except (TypeError, ValueError):
+            return None
+        days = self.HIT_DAYS if row.get('key') else self.MISS_DAYS
+        return str(row.get('key') or '') if age <= timedelta(days=days) else None
+
+    def _accept(self, query: str, candidates: list) -> Optional[dict]:
+        wanted = self._norm(query)
+        for row in candidates or []:
+            if not isinstance(row, dict) or not row.get('id'):
+                continue
+            names = [row.get('name'), row.get('russian'), row.get('english'), row.get('japanese'),
+                     *(row.get('synonyms') or [])]
+            for name in names:
+                have = self._norm(_clean_work_name(str(name or '')))
+                if not have:
+                    continue
+                # Короткое имя сходится только целиком: у «Spin» с любым
+                # коротким словом сходство высокое, а тайтл это другой.
+                if min(len(have), len(wanted)) <= 5:
+                    if have == wanted:
+                        return row
+                elif difflib.SequenceMatcher(None, wanted, have).ratio() >= self.ACCEPT:
+                    return row
+        return None
+
+    def lookup(self, name: str) -> Optional[str]:
+        """Спросить Shikimori. None — сеть не ответила: в кеш это не пишем."""
+        wait = self.MIN_INTERVAL - (time.monotonic() - self._last_request)
+        if wait > 0:
+            time.sleep(wait)
+        self._last_request = time.monotonic()
+        try:
+            response = requests.post(
+                self.url, json={'query': self.QUERY, 'variables': {'s': name}},
+                headers={'User-Agent': 'anime-news-bot (Telegram)',
+                         'Content-Type': 'application/json'},
+                timeout=min(HTTP_TIMEOUT, 8), allow_redirects=False)
+            if response.status_code != 200:
+                return None
+            data = response.json()
+            candidates = (data.get('data') or {}).get('animes')
+        except (requests.RequestException, ValueError, AttributeError):
+            return None
+        if not isinstance(candidates, list):
+            return None
+        found = self._accept(name, candidates)
+        key = f"shiki:{found['id']}" if found else ''
+        with self._lock:
+            self._items[self._norm(name)] = {
+                'key': key, 'name': str((found or {}).get('name') or '')[:120],
+                'at': datetime.now(timezone.utc).isoformat()}
+            self._dirty = True
+        return key
+
+
+work_titles: Optional[WorkTitleResolver] = None
+
+
+def _annotate_work_keys(items: list[dict], *, budget: int = WORK_LOOKUP_PER_CYCLE) -> int:
+    """Проставляет новостям ``_work_key`` — какой тайтл в них назван.
+
+    Уже отправленные ссылки не проверяем: на них тратился бы лимит запросов.
+    Сеть не отвечает — ключа просто нет, и новость склеивается по-старому,
+    по словам заголовка. Возвращает число новостей с ключом.
+    """
+    if not feature_enabled('work_identity') or work_titles is None:
+        return 0
+    marked = 0
+    failures = 0
+    # Пока кеш пуст, сорок запросов с паузой — это полминуты сбора. Что не
+    # успели сейчас, опознается в следующем цикле: новости никуда не денутся.
+    deadline = time.monotonic() + WORK_LOOKUP_WALL_SEC
+    for item in items:
+        if item.get('_work_key') or (sent_links is not None and item.get('link') in sent_links):
+            continue
+        for name in story_work_names(item):
+            key = work_titles.cached(name)
+            if (key is None and budget > 0 and failures < 3
+                    and time.monotonic() < deadline):
+                budget -= 1
+                key = work_titles.lookup(name)
+                if key is None:
+                    failures += 1       # сеть не ответила: три раза — и хватит на цикл
+            if key:
+                item['_work_key'] = key
+                item['_work_name'] = name
+                marked += 1
+                break
+    work_titles.flush()
+    return marked
 
 
 source_yield: Optional['SourceYieldStore'] = None
@@ -9908,7 +10092,8 @@ _NOISE_TITLE_RE = tuple(
 # закрытый: «#новость» или «#аниме» ничего не говорят о жанре.
 NOISE_SOURCE_TAGS = {
     'фан-контент': frozenset({'арт', 'арты', 'art', 'fanart', 'фанарт',
-                              'косплей', 'cosplay', 'мем', 'мемы', 'meme', 'memes'}),
+                              'косплей', 'cosplay', 'мем', 'мемы', 'meme', 'memes',
+                              'сравнение'}),
     'годовщина и ностальгия': frozenset({'календарь', 'деньрождения', 'birthday'}),
     'тест или опрос': frozenset({'опрос', 'poll', 'квиз', 'quiz', 'тест'}),
     'реклама': frozenset({'реклама', 'промо', 'ad', 'ads', 'sponsored'}),
@@ -14735,11 +14920,17 @@ def _cluster_news(items: list[dict], *, persist_intelligence: bool = True) -> li
         # Не сравниваем со всей бесконечной историей: clustering работает в одном batch.
         for idx, cluster in enumerate(clusters[-STORY_CLUSTER_MAX_COMPARE:]):
             rep = cluster[0]
+            # Тот же тайтл, номер и тип события — одна новость, на каком бы
+            # языке её ни написали. Проверка раньше конфликта маркеров: у
+            # «постера к 4 сезону» и «Season 4 Announced» слова событий разные.
+            if same_work_event(item, rep):
+                sim = 1.0
             # Доставка это проверяла, а пачка — нет: трейлер и ключевой визуал
             # одного сезона склеивались в один пост при сходстве 0.91.
-            if _story_events_conflict(item, rep):
+            elif _story_events_conflict(item, rep):
                 continue
-            sim = _story_similarity(item, rep)
+            else:
+                sim = _story_similarity(item, rep)
             if sim >= best_score:
                 best_score = sim
                 best_idx = len(clusters) - min(len(clusters), STORY_CLUSTER_MAX_COMPARE) + idx
@@ -15308,6 +15499,14 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
         # Discovery is advisory and must never break the production collection loop.
         logger.warning('Source discovery cycle failed: %s: %s', type(e).__name__, e)
         metrics.inc('anime_bot_source_discovery_errors_total')
+    try:
+        # Тайтлы — до склейки: по ним одна новость на разных языках становится
+        # одной историей. Сверка советующая: сбой не должен ломать сбор.
+        marked = await asyncio.to_thread(_annotate_work_keys, all_news)
+        if marked:
+            logger.info('Тайтл опознан у %d новостей', marked)
+    except Exception as e:
+        logger.warning('Сверка тайтлов не удалась: %s: %s', type(e).__name__, e)
     all_news = _cluster_news(all_news, persist_intelligence=False)
     if feature_enabled('source_intelligence') and source_intelligence is not None:
         await asyncio.to_thread(source_intelligence.flush)
@@ -26964,7 +27163,7 @@ def _init_globals() -> None:
     позволяет тестам создавать свои инстансы с временными файлами,
     не затрагивая реальные данные пользователя."""
     global sent_links, translator, post_queue, settings, stats, anilist, pending_posts, moderation_feedback
-    global editorial_rules, editorial_glossary, entity_memory, story_history, replay_buffer, story_registry, source_yield
+    global editorial_rules, editorial_glossary, entity_memory, story_history, replay_buffer, story_registry, source_yield, work_titles
     global error_fingerprints, llm_budget, admin_audit, experiments, adaptive_publishing, analytics_store
     if sent_links is None:
         sent_links = SentLinksStore(SENT_LINKS_FILE)
@@ -27045,6 +27244,8 @@ def _init_globals() -> None:
         story_history = PublishedStoryStore(PUBLISHED_STORIES_FILE)
     if story_registry is None:
         story_registry = StoryRegistry(STORY_REGISTRY_FILE)
+    if work_titles is None:
+        work_titles = WorkTitleResolver(WORK_TITLES_FILE)
     if source_yield is None:
         source_yield = SourceYieldStore(SOURCE_YIELD_FILE)
     if replay_buffer is None:
