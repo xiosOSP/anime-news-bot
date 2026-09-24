@@ -87,7 +87,10 @@ async def test_delayed_verdict_cannot_punish_replaced_message(state, monkeypatch
     tg = telegram_bot()
     await handle(message('ты дурак что ли', number=11), tg)
     model.assert_awaited_once()
-    if change in ('edit', 'eviction'):
+    # Вытеснение из окна — не правка: в живом чате за время проверки набегает
+    # больше 12 реплик, и найденное нарушение оставалось без удаления. Вердикт
+    # отменяет только новая версия того же сообщения.
+    if change == 'edit':
         tg.delete_message.assert_not_awaited()
         tg.restrict_chat_member.assert_not_awaited()
         tg.send_message.assert_not_awaited()

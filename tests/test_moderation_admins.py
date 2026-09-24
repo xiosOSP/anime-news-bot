@@ -151,7 +151,10 @@ async def test_unknown_membership_never_attempts_mute(state):
     await handle(tg, message())
     tg.restrict_chat_member.assert_not_awaited()
     assert state.warn_count(-100, 7) == 0
-    assert state.recent_log(1)[0]['action'] == 'unknown'
+    # Удаление от статуса участника не зависит: раньше при сбое запроса
+    # статуса нарушение оставалось висеть в чате. Мут и варн — по-прежнему нет.
+    tg.delete_message.assert_awaited_once()
+    assert state.recent_log(1)[0]['action'] == 'delete'
 
 
 @pytest.mark.asyncio
