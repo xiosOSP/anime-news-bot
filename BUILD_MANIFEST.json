@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "493f3446bc423a41e5fd169ca1fab804b2e6b851",
-  "generated_at_utc": "2026-09-25T12:12:27.764821+00:00",
+  "git_commit": "bf0918495682d8c0a2ed739cfdeabc375d493ef0",
+  "generated_at_utc": "2026-09-25T12:26:40.546167+00:00",
   "files": {
     ".env.example": {
       "sha256": "1d45114ec32deffad57d13ba2928bab66cf9fc248bb0e9bcb2f959028479257a",
@@ -30,8 +30,8 @@
       "bytes": 18874
     },
     "anime_news_bot.py": {
-      "sha256": "25df1c95a705b994ad38f8f5349cdbb8d59dd232da99a1d519a54a66c45c6fc3",
-      "bytes": 1539242
+      "sha256": "a67d2ce6848ec405de16a4db3dcfbebd68799b41a71340f7d162adf123724caf",
+      "bytes": 1556522
     },
     "docs/chat-moderation.md": {
       "sha256": "73bb7daef18afe0b31744e5900cc30fbdc1ca32075b1a7ae3e0171d65c42263a",
@@ -90,8 +90,8 @@
       "bytes": 31760
     },
     "post_text.py": {
-      "sha256": "069ef97e936c58734658eccd31acdde675cace9d5800511508dee5f7c65d985d",
-      "bytes": 24631
+      "sha256": "1c75bee4da0741372c540604e31d263b1ce452d464333b67649fe7c5b424fec0",
+      "bytes": 26268
     },
     "publication_delivery.py": {
       "sha256": "b800acc2cf4735e3f81c1009684056c00e905a64372e2b3011968763f6c90538",
@@ -114,8 +114,8 @@
       "bytes": 12
     },
     "safe_http.py": {
-      "sha256": "41bf8871c77f8d1327bc496c0c2ac7fbaa7b479ea5c087f88325ba217c0a4590",
-      "bytes": 4053
+      "sha256": "6a5ebd1793899db0185b81cf830bb020bba3ac7535ced48efddaf30c532c452b",
+      "bytes": 6290
     },
     "test_invariants.py": {
       "sha256": "95cd31dec11c7478c2b51d11ef17d49eb3853e2965160e61b0f6efccad9b92f7",
@@ -632,6 +632,10 @@
     "tests/test_scheduling_edit.py": {
       "sha256": "1ba719a97a7618a01995dce839948493648a9edf108e347b0f1a6d51c17c1010",
       "bytes": 52380
+    },
+    "tests/test_security_audit.py": {
+      "sha256": "087315121cccfe746e84dd69b4b59cda84a2b6b9c8e0e2e975b9d66e2c6b5308",
+      "bytes": 28208
     },
     "tests/test_shikimori_news.py": {
       "sha256": "bf92b3a03577bf1fea7f4ac8e3d9dfdbb8672875c066ccb9b28a6b16dd0353f3",

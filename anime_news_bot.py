@@ -356,6 +356,12 @@ CHANNEL_ID = int(_channel_raw) if re.fullmatch(r'-?\d+', _channel_raw) \
 _admin_env = (os.getenv('ADMIN_ID') or '').strip()
 ADMIN_FROM_ENV = bool(re.fullmatch(r'-?\d+', _admin_env))
 ADMIN_ID = int(_admin_env) if ADMIN_FROM_ENV else 5056873937
+# Служебные «отправители» Telegram: у них один id на все чаты мира. От
+# GroupAnonymousBot приходит любое сообщение анонимного админа любой группы,
+# от Channel_Bot — любое сообщение от имени любого канала, от 777000 —
+# автопересылки из каналов. Права для такого id достались бы каждому анониму
+# в любой группе, поэтому админом они не бывают никогда.
+TELEGRAM_SERVICE_USER_IDS = frozenset({1087968824, 136817688, 777000})
 
 # Группа обсуждения и ветка (тема форума) для режима "слать всё в ветку".
 # Узнать ID можно командой /chatinfo внутри нужной ветки.
@@ -4221,7 +4227,10 @@ class BotSettings:
                 uid = int(value)
             except (TypeError, ValueError):
                 continue
-            if uid > 0 and uid != ADMIN_ID and uid not in admins:
+            # Служебный id мог попасть в список до запрета — вычищаем при
+            # загрузке, иначе дыра осталась бы открытой на уже живых ботах.
+            if (uid > 0 and uid != ADMIN_ID and uid not in admins
+                    and uid not in TELEGRAM_SERVICE_USER_IDS):
                 admins.append(uid)
         self._data['extra_admins'] = admins
         raw_disabled = self._data.get('disabled_sources', [])
@@ -4720,12 +4729,17 @@ class BotSettings:
     def extra_admins(self) -> list[int]:
         return [x for x in self._data.get('extra_admins', []) if isinstance(x, int) and x > 0]
 
-    def add_admin(self, user_id: int) -> bool:
+    def add_admin(self, user_id: int, *, is_bot: bool = False) -> bool:
+        uid = int(user_id)
+        # Последний рубеж, даже если вызывающий код не проверил: бот, чат/канал
+        # (id ≤ 0) или служебный id Telegram админом стать не могут.
+        if is_bot or uid <= 0 or uid in TELEGRAM_SERVICE_USER_IDS:
+            return False
         with self._lock:
             ids = self._data.setdefault('extra_admins', [])
-            if int(user_id) in ids or int(user_id) == ADMIN_ID:
+            if uid in ids or uid == ADMIN_ID:
                 return False
-            ids.append(int(user_id))
+            ids.append(uid)
         self.save()
         return True
 
@@ -7805,6 +7819,16 @@ ARTICLE_MIN_WORDS = 25          # ниже этого RSS-описание сч�
 ARTICLE_MAX_CHARS = 3500        # столько текста статьи отдаём модели
 _article_cache: dict[str, dict] = {}
 _article_text_cache: dict[str, str] = {}
+# Страница статьи — недоверенный ввод. Раньше поиск ролика брал текст родителя
+# целиком на КАЖДУЮ ссылку: 16 тысяч ссылок в одном <div> разбирались около
+# двух минут, и всё это время поток был занят, а цикл новостей ждал. Потолки
+# держат работу линейной и короткой при любой разметке.
+VIDEO_SCAN_MAX_HTML_CHARS = 512 * 1024   # столько HTML отдаём BeautifulSoup
+VIDEO_SCAN_MAX_NODES = 300               # столько ссылок/плееров смотрим
+VIDEO_SCAN_CONTEXT_CHARS = 300           # столько текста вокруг берём в улики
+# Общий потолок на чтение статьи: запросы с повторами и редиректами, чтение
+# тела и разбор. Дольше ждать нельзя — за статьёй стоит вся пачка новостей.
+ARTICLE_FETCH_TIMEOUT_SEC = 60
 
 # Мусор, который на новостных сайтах лежит вперемешку с текстом
 _ARTICLE_JUNK = re.compile(
@@ -7860,10 +7884,30 @@ def _is_playable_video_url(url: str) -> bool:
     return False
 
 
+def _text_prefix(node, limit: int = VIDEO_SCAN_CONTEXT_CHARS) -> str:
+    """Начало текста узла — то же, что get_text(' ', strip=True)[:limit].
+
+    Строки берём по одной и останавливаемся на лимите: get_text собирал бы
+    весь текст родителя, а у родителя тысяч ссылок это вся страница — на
+    каждую ссылку заново, то есть квадратичная работа."""
+    if node is None:
+        return ''
+    parts: list[str] = []
+    size = 0
+    for piece in node.stripped_strings:
+        parts.append(piece)
+        size += len(piece) + 1
+        if size > limit:
+            break
+    return ' '.join(parts)[:limit]
+
+
 def _find_video_in_html(html_text: str, base_url: Optional[str] = None) -> Optional[str]:
     """Find the most relevant playable clip, not merely the first video URL."""
     try:
-        soup = BeautifulSoup(html_text, 'html.parser')
+        # Метатеги og:video и плеер статьи стоят в начале страницы; хвост
+        # огромного документа ролика не добавит, а разбор его стоит дорого.
+        soup = BeautifulSoup(str(html_text or '')[:VIDEO_SCAN_MAX_HTML_CHARS], 'html.parser')
     except Exception:
         return None
 
@@ -7924,21 +7968,21 @@ def _find_video_in_html(html_text: str, base_url: Optional[str] = None) -> Optio
             'nav, footer, aside, .related, .related-posts, .recommended, .recommendations')):
         node.decompose()
 
-    for frame in body.select('iframe, embed, video, video source'):
+    for frame in body.select('iframe, embed, video, video source', limit=VIDEO_SCAN_MAX_NODES):
         evidence = ' '.join(filter(None, [
             frame.get('title'), frame.get('aria-label'), frame.get('alt'),
-            frame.parent.get_text(' ', strip=True)[:300] if frame.parent else '',
+            _text_prefix(frame.parent),
         ]))
         base_score = 96 if frame.name in ('video', 'source') else 82
         for attr in ('src', 'data-src', 'data-lazy-src', 'data-original'):
             add(frame.get(attr), base_score, evidence)
 
-    for player in body.select('lite-youtube[videoid], [data-youtube-id]'):
+    for player in body.select('lite-youtube[videoid], [data-youtube-id]', limit=VIDEO_SCAN_MAX_NODES):
         video_id = player.get('videoid') or player.get('data-youtube-id')
         if re.fullmatch(r'[\w-]+', str(video_id or '')):
             evidence = ' '.join(filter(None, [
                 player.get('title'), player.get('aria-label'),
-                player.parent.get_text(' ', strip=True)[:300] if player.parent else '',
+                _text_prefix(player.parent),
             ]))
             add(f'https://www.youtube.com/watch?v={video_id}', 90, evidence)
 
@@ -7970,10 +8014,10 @@ def _find_video_in_html(html_text: str, base_url: Optional[str] = None) -> Optio
         except RecursionError:
             continue
 
-    for link in body.select('a[href]'):
+    for link in body.select('a[href]', limit=VIDEO_SCAN_MAX_NODES):
         evidence = ' '.join(filter(None, [
-            link.get_text(' ', strip=True), link.get('title'), link.get('aria-label'),
-            link.parent.get_text(' ', strip=True)[:300] if link.parent else '',
+            _text_prefix(link), link.get('title'), link.get('aria-label'),
+            _text_prefix(link.parent),
         ]))
         add(link.get('href'), 60, evidence)
 
@@ -8059,6 +8103,20 @@ def fetch_article_text(url: str) -> str:
     return fetch_article(url).get('text', '')
 
 
+async def _fetch_article_bounded(url: str) -> dict:
+    """fetch_article в потоке, но с общим потолком по времени.
+
+    Таймауты requests — на каждое чтение, а не на весь ответ: медленный сайт
+    может отдавать тело по байту бесконечно. Поток мы не убьём, но пачка
+    новостей дальше его ждать не будет."""
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(fetch_article, url),
+                                      timeout=ARTICLE_FETCH_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        logger.info(f"Статья читалась дольше {ARTICLE_FETCH_TIMEOUT_SEC} с — пропускаем: {str(url)[:70]}")
+        return {'text': '', 'video': None}
+
+
 async def _discover_article_video(news: dict) -> None:
     """Ищет ролик в статье независимо от доступности и настроек LLM."""
     if not settings.video_enabled:
@@ -8072,7 +8130,7 @@ async def _discover_article_video(news: dict) -> None:
     if _is_playable_video_url(news['link']):
         news['video'] = news['link']
         return
-    article = await asyncio.to_thread(fetch_article, news['link'])
+    article = await _fetch_article_bounded(news['link'])
     video = article.get('video') if isinstance(article, dict) else None
     if video:
         news['video'] = video
@@ -16153,10 +16211,38 @@ def _all_admin_ids() -> set[int]:
     return {ADMIN_ID, *extra}
 
 
+def _is_service_or_bot_user(user) -> bool:
+    """Служебный id Telegram или бот — такой «отправитель» не человек.
+
+    `is True`, а не просто истинность: в PTB поле строго bool, а автосозданный
+    атрибут мока не должен выдавать себя за бота."""
+    uid = getattr(user, 'id', None)
+    return uid in TELEGRAM_SERVICE_USER_IDS or getattr(user, 'is_bot', False) is True
+
+
+def _sent_as_chat(message) -> bool:
+    """Сообщение отправлено от имени чата (анонимный админ, канал, автопересылка).
+
+    Настоящий автор тогда скрыт, а в from_user стоит общий для всех служебный
+    id — такому сообщению нельзя доверять как сообщению конкретного человека.
+    Проверяем именно числовой id: у настоящего Chat он всегда int."""
+    sender = getattr(message, 'sender_chat', None)
+    return isinstance(getattr(sender, 'id', None), int)
+
+
 def is_admin(update: Update) -> bool:
     """Проверяет, что отправитель — админ (главный или дополнительный)."""
     user = update.effective_user
     if not user:
+        return False
+    # Служебные id и боты — никогда: иначе анонимный админ ЛЮБОЙ группы
+    # получил бы права, если такой id когда-то попал в список админов.
+    if _is_service_or_bot_user(user):
+        return False
+    # У кнопки effective_message — сообщение самого бота, и sender_chat там
+    # ничего не говорит о нажавшем: нажимает всегда настоящий пользователь.
+    if (getattr(update, 'callback_query', None) is None
+            and _sent_as_chat(getattr(update, 'effective_message', None))):
         return False
     return user.id in _all_admin_ids()
 
@@ -16175,16 +16261,67 @@ def _audit_update(update: Update, action: str, **details) -> None:
     admin_audit.record(action, actor, **details)
 
 
+def _in_group_chat(update) -> bool:
+    """Сообщение пришло из группы или канала, а не из лички с ботом.
+
+    У сообщения Telegram тип чата всегда один из четырёх: private, group,
+    supergroup, channel — так что явный список общих чатов покрывает всё,
+    кроме лички."""
+    chat = getattr(update, 'effective_chat', None)
+    return getattr(chat, 'type', None) in ('group', 'supergroup', 'channel')
+
+
 async def deny_access(update: Update) -> None:
     """Сообщает не-админу, что доступа нет."""
     try:
         if update.callback_query:
             await update.callback_query.answer("Эта кнопка только для админа.", show_alert=True)
-        elif update.message:
+        elif update.message and not _in_group_chat(update):
             await update.message.reply_text("⛔ Этот бот только для администратора.")
+        # В группе молчим: иначе любой участник, набирая /команды, заставлял
+        # бота писать отказ в общий чат — это шум для всех и расход лимита
+        # сообщений группы, который нужен модерации и постам.
     except Exception as e:
         # Отказ в доступе не должен ронять обработчик ни при каких условиях
         logger.debug(f"deny_access: {type(e).__name__}: {e}")
+
+
+# Команды, которые по смыслу работают в самой группе: включают и выключают там
+# модерацию, смотрят и снимают предупреждения участника, показывают id чата и
+# ветки. Остальные выдают данные бота (логи, посты, настройки, бэкап, ключи),
+# и в группе их ответ увидели бы все участники.
+_GROUP_COMMANDS = frozenset({
+    'chatinfo_command', 'modhere_command', 'modoff_command', 'modmiss_command',
+    'warns_command', 'unwarn_command',
+})
+
+_PRIVATE_ONLY_HINT = ('🔒 Эта команда показывает данные бота — в группе их увидели бы '
+                      'все участники. Повтори её в личке со мной.')
+
+
+async def _require_private_chat(update, bot=None) -> bool:
+    """True — можно отвечать здесь. В группе вместо ответа — подсказка админу.
+
+    Подсказку сначала шлём в личку: в группе не остаётся ни слова. Если
+    личка закрыта (админ ещё не нажимал /start), оставляем в группе одну
+    короткую строку без данных — иначе команда молча «не работала бы».
+    """
+    if not _in_group_chat(update):
+        return True
+    user = getattr(update, 'effective_user', None)
+    if bot is not None and user is not None:
+        try:
+            await bot.send_message(chat_id=user.id, text=_PRIVATE_ONLY_HINT)
+            return False
+        except Exception as e:
+            logger.debug(f"подсказка в личку не ушла: {type(e).__name__}: {e}")
+    message = getattr(update, 'effective_message', None)
+    if message is not None:
+        try:
+            await message.reply_text(_PRIVATE_ONLY_HINT)
+        except Exception as e:
+            logger.debug(f"подсказка в группу не ушла: {type(e).__name__}: {e}")
+    return False
 
 
 # ============== INLINE-МЕНЮ "НАСТРОЙКИ" ==============
@@ -16942,8 +17079,12 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.to_thread(experiments.record, str(hidden.get('_format_variant') or 'standard'), 'hidden')
             if hidden and not actor_is_admin:
                 title = re.sub(r'\s+', ' ', hidden.get('title', ''))[:80]
+                # Письмо админу уходит с HTML-разметкой, а имя выбирает сам
+                # гость: без экранирования он вставил бы в письмо от бота свою
+                # ссылку или разметку. Заголовок из чужой ленты — тоже чужой ввод.
                 await notify_admin(context.bot,
-                                   f'👥 {actor_name} скрыл пост в ветке:\n{title}')
+                                   f'👥 {html.escape(actor_name)} скрыл пост в ветке:\n'
+                                   f'{html.escape(title)}')
             return
 
         news = pending_posts.get(key) if pending_posts is not None else None
@@ -17045,9 +17186,10 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     show_alert=True)
             await _mark_post_done(query, '\n\n✅ Опубликовано в канал')
             if not actor_is_admin:
+                # Имя гостя — его собственный ввод, а письмо размечено HTML.
                 await notify_admin(
                     context.bot,
-                    f'👥 {actor_name} опубликовал в канал пост из ветки:\n\n'
+                    f'👥 {html.escape(actor_name)} опубликовал в канал пост из ветки:\n\n'
                     f'{_post_card(news, {})}')
         else:
             if delivery.started:
@@ -17704,6 +17846,9 @@ async def reply_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not is_admin(update):
         await deny_access(update)
         return
+    # Тот же текст можно набрать руками в группе — статус и настройки туда не шлём.
+    if not await _require_private_chat(update, getattr(context, 'bot', None)):
+        return
 
     text = (update.message.text or "").strip()
 
@@ -17738,6 +17883,10 @@ def admin_only(handler):
         if not is_admin(update):
             await deny_access(update)
             return
+        # Ответ с данными бота уходит только в личку: в группе его прочли бы все.
+        if (handler.__name__ not in _GROUP_COMMANDS
+                and not await _require_private_chat(update, getattr(context, 'bot', None))):
+            return
         _audit_update(update, f'command:{handler.__name__}')
         return await handler(update, context)
     return wrapper
@@ -17750,6 +17899,9 @@ def owner_only(handler):
         user = getattr(update, 'effective_user', None)
         if not is_owner(user):
             await deny_access(update)
+            return
+        # Команды владельца показывают ключи и настройки — только в личке.
+        if not await _require_private_chat(update, getattr(context, 'bot', None)):
             return
         _audit_update(update, f'command:{handler.__name__}', role='owner')
         return await handler(update, context)
@@ -17910,9 +18062,11 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
         logger.info(f"📅 Отложен пост «{news.get('title', '')[:60]}» на {_fmt_local(when)} "
                     f"(отложил: {(by or {}).get('name', '?')})")
         if user and user.id not in _all_admin_ids():
+            # Имя гостя — его собственный ввод, а письмо размечено HTML.
             await notify_admin(
                 context.bot,
-                f'👥 {(by or {}).get("name", "?")} отложил пост на {_fmt_local(when)}:\n\n'
+                f'👥 {html.escape(str((by or {}).get("name", "?")))} отложил пост на '
+                f'{_fmt_local(when)}:\n\n'
                 f'{_post_card(news, {"by": by, "at": when})}')
         reply = (
             f'📅 Опубликую {_fmt_local(when)} — через {_human_delta(when)}.\n'
@@ -17942,9 +18096,16 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
         editor = update.effective_user
         if editor and editor.id not in _all_admin_ids():
             ed_name = editor.full_name or editor.username or str(editor.id)
+            # Письмо админу размечено HTML и приходит от имени бота. Сырой текст
+            # гостя превратился бы в ссылку «подтвердите права» прямо в личке
+            # админа — поэтому экранируем и вычищаем ссылки, а об их удалении
+            # честно пишем: правку всё равно стоит посмотреть в ветке.
+            shown = _strip_links(text)
+            note = '\n\n🔗 Ссылки из текста в этом письме убраны.' if shown != text else ''
             await notify_admin(
                 context.bot,
-                f'👥 {ed_name} изменил текст поста в ветке:\n\n{fit_to_limit(text, 500)}')
+                f'👥 {html.escape(ed_name)} изменил текст поста в ветке:\n\n'
+                f'{html.escape(fit_to_limit(shown, 500))}{note}')
         updated = await _update_preview_text(context.bot, key, text)
         msg = '✏️ Текст обновлён — в канал уйдёт именно он.'
         if not updated:
@@ -17991,7 +18152,9 @@ async def cancel_command(update, context: ContextTypes.DEFAULT_TYPE):
     Доступна всем: гость отменяет только своё собственное состояние."""
     if context.user_data and context.user_data.pop('await_input', None):
         await update.message.reply_text('Отменил. Пост остался в ветке с кнопками.')
-    else:
+    elif not _in_group_chat(update):
+        # В группе молчим: иначе любой участник заставлял бы бота отвечать
+        # «Нечего отменять» в общий чат на каждый /cancel.
         await update.message.reply_text('Нечего отменять.')
 
 
@@ -18672,8 +18835,9 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
             for idx, item in enumerate(top, 1):
                 conf = float(item.get('_confidence_score', 0.5))
                 cluster = _safe_nonnegative_int(item.get('_story_cluster_size'), 1)
+                # Заголовок из чужой ленты, а письмо размечено HTML.
                 lines.append(
-                    f'{idx}. {str(item.get("title") or "")[:120]} '
+                    f'{idx}. {html.escape(str(item.get("title") or "")[:120])} '
                     f'· score {float(item.get("_priority_score", 0)):.1f} '
                     f'· conf {conf:.2f} · источников {cluster}'
                 )
@@ -21114,7 +21278,7 @@ async def _llm_source_text(news: dict) -> str:
     need_video = not news.get('video') and _probably_has_video(news)
     read_article = settings is not None and settings.llm_read_article
     if read_article and news.get('link') and (need_text or need_video):
-        article = await asyncio.to_thread(fetch_article, news['link'])
+        article = await _fetch_article_bounded(news['link'])
         text = article.get('text') or ''
         if text and len(text.split()) > len(summary.split()):
             summary = text
@@ -21851,6 +22015,23 @@ def _llm_cleanup_plan(results: list[dict]) -> dict:
 # никогда: отчёт уходит в переписку, а переписка — это не то место, где
 # ключ должен появиться даже один раз.
 _ENV_SECRET_NAME_RE = re.compile(r'KEY|TOKEN|SECRET|PASSWORD|PASS\b|CREDENTIAL', re.IGNORECASE)
+# Имена, за которыми обычно адрес или строка подключения. Сам адрес показывать
+# полезно — по нему видно, куда ходит бот, — но логин и пароль в нём
+# (HTTPS_PROXY=http://user:pass@proxy:3128) — тот же секрет, что и ключ.
+_ENV_URLISH_NAME_RE = re.compile(r'PROXY|URL|DSN|AUTH|COOKIE', re.IGNORECASE)
+# Логин с паролем в URL — прячем у переменной с любым именем.
+_URL_PASSWORD_RE = re.compile(r'://[^/@\s]+:[^/@\s]+@')
+# Вся userinfo-часть адреса, включая одиночный токен (https://token@host) и
+# пароль с «@» внутри: жадно до последней «@» перед путём.
+_URL_USERINFO_RE = re.compile(r'://[^/\s?#]*@')
+# Прокси часто пишут без схемы: user:pass@host:3128.
+_BARE_USERINFO_RE = re.compile(r'^[^/\s:@]+:[^/\s]*@')
+
+
+def _mask_url_credentials(value: str) -> str:
+    """scheme://user:pass@host → scheme://***@host; host и путь остаются видны."""
+    value = _URL_USERINFO_RE.sub('://***@', value)
+    return _BARE_USERINFO_RE.sub('***@', value)
 
 
 def _dotenv_lines() -> list[tuple[int, str, str]]:
@@ -21872,6 +22053,10 @@ def _dotenv_lines() -> list[tuple[int, str, str]]:
 def _dotenv_shown_value(name: str, value: str) -> str:
     if _ENV_SECRET_NAME_RE.search(name):
         return '&lt;значение скрыто&gt;' if value else '&lt;пусто&gt;'
+    if value and (_URL_PASSWORD_RE.search(value) or (
+            _ENV_URLISH_NAME_RE.search(name)
+            and (_URL_USERINFO_RE.search(value) or _BARE_USERINFO_RE.search(value)))):
+        value = _mask_url_credentials(value)
     return f'<code>{_escape_to_limit(value, 120)}</code>' if value else '&lt;пусто&gt;'
 
 
@@ -23056,6 +23241,13 @@ class UserDirectory:
         if self._by_id.get(uid) == entry:
             return                       # ничего не изменилось — не пишем на диск
         self._by_id[uid] = entry
+        if entry['username']:
+            # @ник в каждый момент принадлежит одному человеку, но его меняют
+            # и отдают. У прежнего владельца этот ник уже чужой: оставь его —
+            # и /addadmin @ник выдал бы права не тому человеку.
+            for other_id, other in self._by_id.items():
+                if other_id != uid and other.get('username') == entry['username']:
+                    other['username'] = ''
         if len(self._by_id) > USER_DIRECTORY_MAX:
             oldest = sorted(self._by_id, key=lambda k: self._by_id[k].get('seen', ''))
             for key in oldest[:len(self._by_id) - USER_DIRECTORY_MAX]:
@@ -23074,13 +23266,21 @@ class UserDirectory:
         key = (username or '').strip().lstrip('@').lower()
         if not key:
             return None
+        # Если ник всё же числится за несколькими (старый файл, записи до
+        # чистки в remember) — верим самой свежей: ник сейчас у того, кого
+        # видели с ним последним, а не у первого попавшегося по порядку.
+        best: Optional[tuple[str, dict]] = None
         for uid, entry in self._by_id.items():
-            if entry.get('username') == key:
-                try:
-                    return int(uid), entry.get('name') or f'@{key}'
-                except ValueError:
-                    return None
-        return None
+            if entry.get('username') != key:
+                continue
+            if best is None or str(entry.get('seen', '')) > str(best[1].get('seen', '')):
+                best = (uid, entry)
+        if best is None:
+            return None
+        try:
+            return int(best[0]), best[1].get('name') or f'@{key}'
+        except ValueError:
+            return None
 
     def describe(self, user_id: int) -> str:
         """Человекочитаемое имя по id: «Вася Пупкин (@vasya)»."""
@@ -23113,6 +23313,15 @@ async def remember_user_handler(update: Update, context: ContextTypes.DEFAULT_TY
         logger.debug(f"пользователь не запомнился: {e}")
 
 
+_ANON_SENDER_REFUSAL = (
+    '⛔ Это сообщение отправлено не человеком, а анонимно: от имени группы '
+    '(анонимный админ), от имени канала, автопересылкой или ботом.\n\n'
+    'У таких сообщений Telegram подставляет общий служебный id — один и тот же '
+    'для всех групп и каналов. Права на него получил бы любой анонимный админ '
+    'любой чужой группы, поэтому так выдать админку нельзя.\n\n'
+    'Попроси человека написать от своего имени и ответь на это сообщение.')
+
+
 async def _resolve_user(update, context) -> tuple[Optional[int], str, str]:
     """Кому адресована команда: (id, имя, пояснение при неудаче).
 
@@ -23124,6 +23333,11 @@ async def _resolve_user(update, context) -> tuple[Optional[int], str, str]:
     reply = getattr(message, 'reply_to_message', None)
     if reply is not None and getattr(reply, 'from_user', None):
         user = reply.from_user
+        # Автор такого сообщения скрыт: в from_user стоит общий служебный id
+        # (GroupAnonymousBot, Channel_Bot, 777000) или бот. Выдать права ему —
+        # значит выдать их каждому анониму и каналу в любой группе.
+        if _sent_as_chat(reply) or _is_service_or_bot_user(user):
+            return None, '', _ANON_SENDER_REFUSAL
         if user_directory is not None:
             user_directory.remember(user)
         display = user.full_name or (f'@{user.username}' if user.username else str(user.id))
@@ -23167,6 +23381,9 @@ async def admins_command(update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await deny_access(update)
         return
+    # Список админов с именами и никами — не для глаз всей группы.
+    if not await _require_private_chat(update, getattr(context, 'bot', None)):
+        return
     who = user_directory.describe if user_directory else str
     lines = ['👥 <b>Администраторы</b>', '',
              f'👑 {html.escape(who(ADMIN_ID))} — главный']
@@ -23199,13 +23416,24 @@ async def addadmin_command(update, context: ContextTypes.DEFAULT_TYPE):
     if uid == ADMIN_ID:
         await update.message.reply_text('Это ты и есть — главный админ.')
         return
+    # По числовому id тоже нельзя: служебный id Telegram общий для всех
+    # анонимов, а id ≤ 0 — это группа или канал, а не человек.
+    if uid <= 0 or uid in TELEGRAM_SERVICE_USER_IDS:
+        await update.message.reply_text(
+            f'⛔ {uid} — не человек: это служебный id Telegram (общий для '
+            'анонимных админов, каналов и автопересылок во всех группах) или id '
+            'группы/канала. Права на него получил бы любой аноним в любой чужой '
+            'группе, поэтому выдать их нельзя.')
+        return
     label = html.escape(name or str(uid))
     if settings.add_admin(uid):
         if user_directory is not None:
             user_directory.flush()
         logger.info(f"👥 Выдана админка: {name} ({uid})")
+        # id в ответе — чтобы владелец видел, КОМУ именно ушли права: одно
+        # и то же имя или бывший @ник могут принадлежать разным людям.
         await update.message.reply_text(
-            f'✅ <b>{label}</b> теперь админ.\n\n'
+            f'✅ <b>{label}</b> (id <code>{uid}</code>) теперь админ.\n\n'
             f'Доступны команды бота и кнопки модерации в ветке.\n'
             f'Чтобы получать уведомления, ему нужно открыть бота и нажать /start.',
             parse_mode=ParseMode.HTML)
@@ -27059,6 +27287,9 @@ def _redact_secrets(text: str) -> str:
             out = out.replace(str(secret), '<скрыто>')
     # Затем всё, что выглядит как токен бота, включая чужие и старые.
     out = _SECRET_TOKEN_RE.sub(lambda m: f'{m.group(0).split(":")[0]}:<скрыто>', out)
+    # Логин и пароль в адресе: requests и urllib3 пишут URL прокси целиком
+    # в текст ошибки, и пароль уезжал бы в лог и админу вместе с ним.
+    out = _URL_USERINFO_RE.sub('://***@', out)
     return out
 
 
