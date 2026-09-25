@@ -63,8 +63,13 @@ class TestContains:
 class TestPersistence:
     async def test_persists_to_disk(self, tmp_json):
         store1 = SentLinksStore(tmp_json)
+        # Переживает рестарт опубликованное (claim + commit). Резерв без commit
+        # после рестарта снимается намеренно: Telegram ещё не вызывался, а
+        # иначе восстановленный из очереди пост считался дублем и пропадал.
         await store1.claim('https://example.com/1', 'T1')
+        await store1.commit('https://example.com/1', 'T1')
         await store1.claim('https://example.com/2', 'T2')
+        await store1.commit('https://example.com/2', 'T2')
 
         # Новый инстанс с тем же файлом
         store2 = SentLinksStore(tmp_json)

@@ -106,7 +106,13 @@ class TestRecentTitlesPersistence:
     def test_survives_restart(self, tmp_path):
         p = tmp_path / 's.json'
         s = SentLinksStore(p)
-        asyncio.run(s.claim('https://a.com/1', 'Mamonotsukai no Musume Gets TV Anime'))
+
+        async def publish():
+            # claim + commit: резерв без commit после рестарта намеренно
+            # снимается — Telegram ещё не вызывался.
+            await s.claim('https://a.com/1', 'Mamonotsukai no Musume Gets TV Anime')
+            await s.commit('https://a.com/1', 'Mamonotsukai no Musume Gets TV Anime')
+        asyncio.run(publish())
         s2 = SentLinksStore(p)
         assert len(s2._recent_titles) == 1
         assert s2.has_similar_title('Mamono Tsukai no Musume Anime: Cast Announced') is True

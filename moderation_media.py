@@ -56,6 +56,11 @@ class Scan:
     # проверено целиком», но смотреть его руками админу не на что: письмо
     # приходило на каждый такой ролик в чате. Запись в журнал остаётся.
     review: bool = True
+    # Виноват сам файл, а не детектор: не медиа, битый, пустой. Такой исход
+    # не должен выключать проверку. Раньше три файла субтитров .srt подряд
+    # считались тремя отказами детектора и ставили его на паузу на 10 минут —
+    # всё, что присылали в это время, оставалось непроверенным.
+    bad_input: bool = False
 
 
 def _address_space_peak_mb():
@@ -89,6 +94,22 @@ def classify_detections(detections, explicit_threshold=.80, suggestive_threshold
     return result
 
 
+# Документы, которые Telegram не показывает картинкой: субтитры, тексты,
+# архивы. Проверять в них нечего, а письмо админу на каждый .srt — шум.
+NON_MEDIA_SUFFIXES = frozenset({
+    '.srt', '.ass', '.ssa', '.vtt', '.sub', '.txt', '.md', '.pdf', '.doc', '.docx',
+    '.xls', '.xlsx', '.csv', '.json', '.xml', '.zip', '.rar', '.7z', '.tar', '.gz',
+    '.torrent', '.epub', '.fb2', '.apk', '.exe', '.py', '.log',
+})
+
+
+def _non_media_document(item) -> bool:
+    """Вызывается после проверок на картинку и видео — их MIME сюда не доходит."""
+    mime = str(getattr(item, 'mime_type', '') or '').lower()
+    suffix = Path(str(getattr(item, 'file_name', '') or '')).suffix.lower()
+    return mime.startswith('text/') or suffix in NON_MEDIA_SUFFIXES
+
+
 def media_attachment(message):
     """Choose original content, never judge a video by its thumbnail."""
     for attr in ('sticker', 'animation', 'video', 'video_note', 'photo', 'document'):
@@ -112,6 +133,8 @@ def media_attachment(message):
             return item, 'video'
         if suffix == '.tgs' or mime == 'application/x-tgsticker':
             return item, 'tgs'
+        if _non_media_document(item):
+            return None
         # Documents can hide media under a false name/MIME; sniff in worker.
         return item, 'unknown'
     return None
@@ -297,7 +320,7 @@ def build_detector():
 def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
     from PIL import Image, UnidentifiedImageError
     if not 0 < Path(path).stat().st_size <= MAX_BYTES:
-        return Scan('unchecked', reason='Размер файла вне допустимого диапазона')
+        return Scan('unchecked', reason='Размер файла вне допустимого диапазона', bad_input=True)
     if kind == 'tgs':
         frames = _tgs_frames(path)
     else:
@@ -312,13 +335,29 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
                 magic = stream.read(16)
             if not (magic[4:8] == b'ftyp' or magic[:4] == b'\x1aE\xdf\xa3' or
                     (magic[:4] == b'RIFF' and magic[8:12] == b'AVI ')):
-                return Scan('unchecked', reason='Неподдерживаемый формат файла')
+                # Не картинка и не видео: Telegram покажет это файлом, а не
+                # медиа. Смотреть админу нечего.
+                return Scan('unchecked', reason='Неподдерживаемый формат файла',
+                            bad_input=True, review=False)
             frames = _video_frames(path)
     detector = build_detector()  # 320n.onnx is included in the pinned wheel.
     best, count = Scan('checked'), 0
     uncertain = None
     suggestive_frames = 0
-    for frame in frames:
+    frame_iter = iter(frames)
+    while True:
+        # Ошибка разбора кадра — это битый файл, его может прислать кто угодно;
+        # ошибка самого детектора (scan_frame) по-прежнему роняет воркер и
+        # считается отказом. Нехватка памяти — тоже отказ, а не вина файла.
+        try:
+            frame = next(frame_iter)
+        except StopIteration:
+            break
+        except MemoryError:
+            raise
+        except Exception as exc:
+            return Scan('unchecked', reason=f'Файл не декодируется: {type(exc).__name__}',
+                        frames=count, bad_input=True)
         detection = scan_frame(detector, frame, explicit_threshold, suggestive_threshold)
         count += 1
         if detection.category == 'nsfw':
@@ -332,7 +371,7 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
         if detection.status == 'unchecked':
             uncertain = detection
     if not count:
-        return Scan('unchecked', reason='Нет декодированных кадров')
+        return Scan('unchecked', reason='Нет декодированных кадров', bad_input=True)
     if best.category == 'spoiler_16':
         # A single frame exactly on the NudeNet threshold caused real false
         # positives (e.g. BUTTOCKS_EXPOSED=0.85). Require either repeated
@@ -559,7 +598,7 @@ class MediaScanner:
             self._paused_until = 0.0
             return
         reason = str(result.reason or '').casefold()
-        if 'ручн' in reason or 'пограничн' in reason:
+        if 'ручн' in reason or 'пограничн' in reason or getattr(result, 'bad_input', False):
             return
         self._failures += 1
         if self._failures >= self.failure_limit:

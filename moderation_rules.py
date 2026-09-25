@@ -18,11 +18,13 @@ class Verdict:
 
 _HOMOGLYPHS = str.maketrans('aceopxykmth03', 'асеорхукмтноз')
 _URL = r'(?:https?://|www\.|t\.me/|discord\.gg/)\S+'
+# «Нато» из списка убрано: «на-то была причина» склеивалось в «нато» и
+# удалялось как политика. Замаскированное «н.а.т.о» ловит модель.
 _MASKED_WORD = re.compile(
     r'(?:шлюх\w*|проститут\w*|мраз\w*|долбоеб\w*|хуесос\w*|пидор\w*|'
     r'уеб\w*|ебан\w*|ебал\w*|сука|суки|сучк\w*|дебил\w*|идиот\w*|'
     r'мать|матери|мам[ауыое]|мамк\w*|тво[яюейих]+|сдохни\w*|убейся|'
-    r'убью|зарежу|повесься|путин\w*|зеленск\w*|нато|сво)\Z')
+    r'убью|зарежу|повесься|путин\w*|зеленск\w*|сво)\Z')
 _SEPARATED = re.compile(r'(?<!\w)[а-яa-z0-9](?:[.\-_*|\s]+[а-яa-z0-9]){2,}(?!\w)')
 _PUNCTUATED = re.compile(r'(?<!\w)[а-яa-z0-9]+(?:[.\-_*|]+[а-яa-z0-9]+)+(?!\w)')
 
@@ -37,7 +39,9 @@ def normalize(text: str) -> str:
 
     def normalize_part(part):
         part = unicodedata.normalize('NFKC', part).casefold().replace('ё', 'е')
-        part = ''.join(c for c in part if unicodedata.category(c) != 'Cf')
+        # Ударения и прочие надстрочные знаки: «пи́дор» с ударением проходило
+        # мимо всех правил. «Й» после NFKC — одна буква, её это не задевает.
+        part = ''.join(c for c in part if unicodedata.category(c) not in ('Cf', 'Mn'))
 
         def unmask(match):
             original = match.group()
@@ -65,7 +69,22 @@ _FAMILY = r'(?:мать|матер[ьиьюям]+|мам[ауыое]|мамк\w*
 _YOUR = r'(?:тво(?:я|е|ю|и|й|его|ей|ему|им|их|ими|ем)|ваш(?:а|е|у|и|его|ей|ему|им|их|ими|ем)?)'
 _TARGET_FAMILY = rf'(?:{_YOUR}\s+(?:вся\s+|все\s+|всю\s+)?{_FAMILY}|{_FAMILY}\s+{_YOUR})'
 _FAMILY_BRIDGE = r'(?:[\s,—–:]+(?:это|просто|еще|та|такие|все|сам\w*|настоящ\w*|кончен\w*|ебан\w*|туп\w*|полн\w*|сборищ\w*|назову|считаю)\b){0,4}[\s,—–:]+'
-_LINK = re.compile(r'https?://\S+|t\.me/\S+|discord\.gg/\S+|@[a-z0-9_]{5,}', re.IGNORECASE)
+# Оскорбление ПЕРЕД семьёй — «шлюха твоя мать» — без запятой. С запятой это
+# междометие: «сука, твой брат опять выиграл», «я идиот, твоя сестра была
+# права» — за такое был мут на сутки как за оскорбление семьи.
+_FAMILY_BRIDGE_TIGHT = r'(?:[\s—–:]+(?:это|просто|еще|та|такие|все|сам\w*|настоящ\w*|кончен\w*|ебан\w*|туп\w*|полн\w*)\b){0,4}[\s—–:]+'
+# «Твою мать», «мать твою» — ругательство-восклицание, а не слово о матери:
+# «твою мать, сука, опять перенос». Оскорбление матери говорит о ней в
+# именительном: «твоя мать …». Сексуальные фразы ловит отдельная проверка.
+# Восклицание отделено знаком: «твою мать, сука, опять перенос». Без знака
+# это уже дополнение: «твою мать назову шлюхой» — оскорбление.
+_FAMILY_IDIOM = re.compile(r'\b(?:(?:твою|вашу)\s+(?:мать|маму)|(?:мать|маму)\s+(?:твою|вашу))\s*[,!?.—–]')
+# «@» после буквы — это почта, а не упоминание канала.
+_LINK = re.compile(r'https?://\S+|t\.me/\S+|discord\.gg/\S+|(?<![\w.])@[a-z0-9_]{5,}', re.IGNORECASE)
+# «Без риска» — обещание скама только рядом с деньгами: «смотреть без риска
+# спойлеров» удалялось как мошенничество, если рядом была ссылка.
+_MONEY_CONTEXT = re.compile(r'\b(?:вложени\w*|доход\w*|деньг\w*|денег|заработ\w*|прибыл\w*|'
+                            r'инвест\w*|руб\w*|usdt|крипт\w*|ставк\w*)|[%₽$]')
 # «Трамп» с любым хвостом — это и «трамплин», и «трампарк»: в аниме про спорт
 # трамплин встречается чаще, чем президент. Окончания перечислены закрытым
 # списком, как у оскорблений: цена ошибки здесь — вердикт «политика» за
@@ -89,6 +108,7 @@ _POLITICS = re.compile(
 _POLITICS_AMBIGUOUS = frozenset({'путина', 'путину', 'путине', 'путины', 'путиной'})
 _PHONE = re.compile(r'(?<!\d)\+?\d[\d ()\-]{8,20}\d(?!\d)')
 _IP = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+_VERSION_BEFORE = re.compile(r'\b(?:билд\w*|верси\w*|патч\w*|обновлени\w*|build|version|ver|v)\W*$')
 _ADDRESS = re.compile(r'\b(?:улиц[аеуы]|ул\.|проспект|пр-т|переулок|пер\.)\s+[а-яa-z][\w -]{1,40}[, ]+(?:(?:д\.|дом)\s*)?\d{1,4}\b')
 _DOX_INTENT = re.compile(r'\b(?:сливаю|слейте|слил|деанон\w*|докс\w*|(?:его|ее|твой) (?:номер|адрес|телефон|ip)|вот (?:номер|адрес|телефон)\s+@\w+)\b')
 _THREAT = re.compile(
@@ -161,9 +181,26 @@ def _harmless_dismissal(text: str, match: re.Match) -> bool:
                 or re.match(rf'[\s,!.]*{_BOT_ADDRESSEE}\b', after))
 
 
+# Пересказ реплики персонажа без кавычек: «он сказал ей: я тебя убью»,
+# «а потом он такой: убью тебя», «дьявол сказал: сгори в аду». За пересказ
+# сюжета выдавался мут. Говорящий — третье лицо: «я сказал: убью» остаётся
+# своей речью.
+_REPORT_COLON = re.compile(
+    r'\b(?:сказал|сказала|сказали|говорит|говорил\w*|кричит|крикнул\w*|кричал\w*|'
+    r'ответил\w*|заявил\w*|орет|орал\w*|такой|такая|такие)'
+    r'(?:\s+(?:ей|ему|им|мне|всем))?\s*:\s*[^\n]*')
+
+
+def _strip_reported_colon(text: str) -> str:
+    def cut(match):
+        before = text[max(0, match.start() - 30):match.start()]
+        return match.group() if re.search(r'\b(?:я|мы)\s+(?:\w+\s+)?$', before) else ' '
+    return _REPORT_COLON.sub(cut, text)
+
+
 def _direct_speech(text: str) -> str:
     """Remove attributed reports/quotes, not arbitrary quoted evasion."""
-    return _REPORT_QUOTE.sub(' ', text)
+    return _strip_reported_colon(_REPORT_QUOTE.sub(' ', text))
 
 
 def _negated(text: str, match: re.Match) -> bool:
@@ -180,16 +217,41 @@ def _forbidden_infinitive(text: str, match: re.Match) -> bool:
         r'[^,;.!?]{0,40}\b(?:запрещено|нельзя)\b', text[match.end():]))
 
 
+_LAUGHTER = re.compile(r'(?:ах){2,}|(?:ха){2,}|(?:хе){2,}|\bхд\b|\bxd\b|[😂🤣😆😹]|\){2,}')
+
+
 def _conditional_game_joke(text: str, threat: re.Match) -> bool:
     """Keep the chat's spoiler/raid banter exception narrow, not all 'if' threats."""
     if 'убью' not in threat.group():
         return False
     if re.search(r'\b(?:нож\w*|зарежу|адрес|деньги|переведешь|в реале|у дома)\b', text):
         return False
+    after = text[threat.end():]
+    # «Убью тебя за такие спойлеры 😂», «я тебя сейчас убью ахаха» — шутка
+    # в споре о спойлерах, за которую выдавался мут. Нож, адрес и «в реале»
+    # выше по-прежнему делают угрозу угрозой.
+    if re.match(r'[\s,:—-]*за\s+(?:так\w*\s+|эт\w*\s+)?спойлер\w*', after) or _LAUGHTER.search(text):
+        return True
     return bool(re.match(
         r'[\s,:—-]*(?:если\s+(?:ты\s+)?(?:заспойлер\w*|спойлер\w*|расскажешь концовку)|'
         r'когда\s+(?:мы\s+)?встретимся\s+в\s+(?:рейде|игре|данже))\b',
-        text[threat.end():]))
+        after))
+
+
+def _admin_interjection(text: str, match: re.Match) -> bool:
+    """«Админ, сука, спасибо за перевод!» и «админ, говно серия» — не про админа.
+
+    Обращение, потом «сука» между запятыми — восклицание; «говно» перед
+    существительным — оценка серии. За обе фразы был мут на час как за
+    оскорбление администратора. «Админ, ты сука» по-прежнему оскорбление.
+    """
+    found = match.group()
+    if re.search(r'\b(?:ты|вы|сам|сами)\b', found):
+        return False
+    after = text[match.end():]
+    if re.search(r',\s*(?:сука|суки)$', found) and re.match(r'\s*,\s*\w', after):
+        return True
+    return found.endswith('говно') and bool(re.match(r'\s+[а-яa-z]', after))
 
 
 def _clauses(text: str):
@@ -200,9 +262,13 @@ def _clauses(text: str):
 def _private_details(text: str) -> bool:
     if _ADDRESS.search(text) or any(10 <= sum(c.isdigit() for c in m.group()) <= 15 for m in _PHONE.finditer(text)):
         return True
-    for candidate in _IP.findall(text):
+    for match in _IP.finditer(text):
+        # «Слил билд 1.0.2.3» — номер версии, а не чей-то IP: за него был мут
+        # на сутки как за раскрытие чужих данных.
+        if _VERSION_BEFORE.search(text[max(0, match.start() - 20):match.start()]):
+            continue
         try:
-            ipaddress.IPv4Address(candidate)
+            ipaddress.IPv4Address(match.group())
             return True
         except ipaddress.AddressValueError:
             pass
@@ -257,7 +323,9 @@ def _check_clause(value: str, *, reply_to_user: bool,
     # Keep the original value for domain and scam-destination checks.
     direct = re.sub(_URL, ' ', value, flags=re.IGNORECASE)
     uncertain = None
-    family = re.search(rf'\b{_TARGET_FAMILY}\b{_FAMILY_BRIDGE}{_INSULT}\b|\b{_INSULT}\b{_FAMILY_BRIDGE}{_TARGET_FAMILY}\b', direct)
+    family = re.search(rf'\b{_TARGET_FAMILY}\b{_FAMILY_BRIDGE}{_INSULT}\b|\b{_INSULT}\b{_FAMILY_BRIDGE_TIGHT}{_TARGET_FAMILY}\b', direct)
+    if family and _FAMILY_IDIOM.search(family.group()):
+        family = None
     # Чья мать — решает всё: «ебал твою мать» оскорбляет собеседника, а «он
     # трахал сестру всю мангу» пересказывает сюжет. Без «твою/вашу» фраза
     # о чужой семье, и правила чата сюжет не запрещают.
@@ -301,6 +369,11 @@ def _check_clause(value: str, *, reply_to_user: bool,
                               r'получи(?:те|шь)?\s+бесплатно|заработок без вложений)\b', direct))
     payment = re.search(r'\b(?:переведи|переведите|оплати|оплатите|предоплат\w*|кошелек|крипт\w*)\b', direct)
     active_requests = [item for item in solicitation if not _negated(direct, item)]
+    profit = [item for item in profit
+              if item.group() != 'без риска' or _MONEY_CONTEXT.search(direct)]
+    # Пароль от вайфая просят у друзей, а не у жертвы.
+    if secrets and re.search(r'пароль\s+от\s+(?:вай-?фа\w*|wi-?fi|вифи|роутер\w*|сети)\b', direct):
+        secrets = None
     profit_request = (any(not _negated(direct, item) for item in profit)
                       and (_LINK.search(value) or payment))
     if (secrets and active_requests) or profit_request:
@@ -323,6 +396,13 @@ def _check_clause(value: str, *, reply_to_user: bool,
         r'(?:их|этот|тот|чужой|чужую|эту|ту|вражеск\w*)\s+(?:канал|группу))\b', direct)
     game = re.search(r'\b(?:игровой рейд|босс\w*|подземел\w*|данж\w*|гильди\w*|wow|варкрафт)\b', direct)
     explicit_spam = re.search(r'\b(?:заспам\w*|флудим|спамим|завалим спамом)\b', direct)
+    # «Заспамим лайками канал студии», «флудим этот чат стикерами в честь
+    # финала» — фанатская акция, а не атака: мут на сутки за такое — ошибка.
+    # «Рейдим» сюда не относится: рейд со стикерами — всё ещё рейд.
+    raids = [item for item in raids if not (
+        item.group() in ('заспамим', 'заспамить', 'флудим', 'спамим') and not _LINK.search(value)
+        and re.match(r'(?:\s+\w+){0,3}?\s+(?:лайк\w*|реакци\w*|голос\w*|сердечк\w*|стикер\w*|'
+                     r'эмодзи|смайл\w*|комментари\w*)\b', direct[item.end():]))]
     if destination and (not game or explicit_spam) and any(
             not _negated(direct, item) and not _forbidden_infinitive(direct, item)
             and (chat_target or item.group() not in ('атакуем', 'набег'))
@@ -331,7 +411,8 @@ def _check_clause(value: str, *, reply_to_user: bool,
     if any(not _negated(direct, threat) and not _conditional_game_joke(direct, threat)
            for threat in _THREAT.finditer(direct)):
         return Verdict('aggression', 'Прямая угроза или пожелание смерти', 3)
-    direct_admin = any(not re.search(r'\bне\b', item.group()) for item in re.finditer(
+    direct_admin = any(not re.search(r'\bне\b', item.group()) and not _admin_interjection(direct, item)
+                       for item in re.finditer(
         rf'\b(?:админ\w*|модератор\w*)\W+(?:(?:ты|вы|сам|сами|реально|просто|настоящ\w*|полн\w*|кончен\w*|туп\w*)\W+){{0,3}}{_INSULT}\b|'
         rf'\b{_INSULT}\W+(?:админ\w*|модератор\w*)', direct))
     # Bind each insult to its recipient; self-irony elsewhere in the message
@@ -343,10 +424,14 @@ def _check_clause(value: str, *, reply_to_user: bool,
         return Verdict('toxic_admin', 'Оскорбление администратора', 3)
     if re.search(rf'\bты\s+(?:кончен\w*|ебан\w*|туп\w*)\s+{_INSULT}\b', direct):
         return Verdict('toxic', 'Явное личное оскорбление')
-    if re.search(r'\b(?:ты|вы)\s+(?:мразь|тварь|хуесос\w*|уебище|долбоеб\w*)\b', direct):
+    # «Уебок» и «долбаеб» через «а» раньше проходили мимо.
+    if re.search(r'\b(?:ты|вы)\s+(?:мразь|тварь|хуесос\w*|уеб(?:ище|ок|ан)\w*|долб[оа]еб\w*)\b', direct):
         return Verdict('toxic', 'Грубое личное оскорбление')
     # One mild insult can be a joke; repeated personal put-downs are tracked.
-    dismissals = re.finditer(r'\b(?:заткнись|завали (?:рот|ебало)|пошел на хуй|пошел нахуй)\b', direct)
+    # «Иди нахуй» и женский род раньше проходили вовсе без реакции, а
+    # «пошел нахуй» получал предупреждение — на живых ответах было три таких.
+    dismissals = re.finditer(r'\b(?:заткнись|завали (?:рот|ебало)|'
+                             r'(?:пошел|пошла|пошли|иди|идите|вали|валите)\s+(?:на хуй|нахуй))\b', direct)
     if any(not _negated(direct, item) and not _harmless_dismissal(direct, item)
            for item in dismissals):
         return Verdict('aggression', 'Агрессивное обращение к собеседнику')
