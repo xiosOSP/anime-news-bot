@@ -82,7 +82,12 @@ async def test_primary_timeout_reaches_reserve(pair, monkeypatch):
     primary, _, calls = pair
     original_timeout = asyncio.timeout
     # Exercise the real timeout handler without a multi-second test delay.
-    monkeypatch.setattr('moderation_llm.asyncio.timeout', lambda _: original_timeout(.01))
+    # Короткий таймаут — только первому (основному) запросу. Раньше 0.01 с
+    # получал и резервный: на медленной машине CI его запрос с записью
+    # состояния на диск не укладывался в 10 мс, и тест падал через раз.
+    budgets = iter([.01])
+    monkeypatch.setattr('moderation_llm.asyncio.timeout',
+                        lambda seconds: original_timeout(next(budgets, seconds)))
 
     async def slow(_):
         await asyncio.sleep(10)
