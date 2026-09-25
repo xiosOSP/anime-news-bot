@@ -390,7 +390,7 @@
 | `STARTUP_REPORT_MAX_IN_WINDOW` | `3` | anime_news_bot.py |
 | `STARTUP_REPORT_WINDOW_SEC` | `1800` | anime_news_bot.py |
 | `TELEGRAM_BOT_TOKEN` | — | anime_news_bot.py |
-| `TRANSLATION_DEFER_MAX_AGE_SEC` | — | anime_news_bot.py |
+| `TRANSLATION_DEFER_MAX_AGE_SEC` | `21600` | anime_news_bot.py |
 | `TRANSLATION_DEFER_MAX_ATTEMPTS` | `6` | anime_news_bot.py |
 | `WORK_LOOKUP_PER_CYCLE` | `40` | anime_news_bot.py |
 | `WORK_LOOKUP_URL` | `https://shikimori.io/api/graphql` | anime_news_bot.py |

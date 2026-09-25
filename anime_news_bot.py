@@ -21698,7 +21698,7 @@ def _llm_outage_is_temporary() -> bool:
 # Сколько раз и сколько времени ждать переводчика для одной новости. Google
 # отвечает серверным адресам 429 часами; дальше новость уже несвежая.
 TRANSLATION_DEFER_MAX_ATTEMPTS = max(1, min(50, _env_int('TRANSLATION_DEFER_MAX_ATTEMPTS', 6)))
-TRANSLATION_DEFER_MAX_AGE_SEC = max(600, min(3 * 86400, _env_int('TRANSLATION_DEFER_MAX_AGE_SEC', 6 * 3600)))
+TRANSLATION_DEFER_MAX_AGE_SEC = max(600, min(3 * 86400, _env_int('TRANSLATION_DEFER_MAX_AGE_SEC', 21600)))  # 6 ч
 _translation_deferral_store = None
 
 
