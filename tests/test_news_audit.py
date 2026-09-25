@@ -617,3 +617,144 @@ def test_editorial_prompt_forbids_plot_spoilers():
     assert 'Не раскрывай сюжет серий и глав' in LLM_SYSTEM_PROMPT
     assert 'Не раскрывай сюжет серий и глав' in LLM_BATCH_SYSTEM_PROMPT
     assert bot.DEFAULT_LLM_PROMPT_VERSION != 'editorial-v5-2026-09-23'
+
+
+# ---------- п.9. Проверки ответа модели не отклоняют верный пересказ ----------
+
+JP_SOURCE = ('秋アニメ『魔法の姉妹ルルットリリィ』第2クール OP主題歌を使用したメインPV公開\n'
+             '10月4日より放送開始。第14話の場面カット')
+
+
+@pytest.mark.parametrize(('source', 'output'), [
+    (JP_SOURCE, 'Второй кур аниме выйдет 4 октября, опубликован PV с опенингом. Кадры 14 серии.'),
+    ('The anime premieres on October 4th. The 2nd season will have 12 episodes.',
+     'Премьера 4 октября, во 2-м сезоне 12 серий.'),
+    ('The manga sold 1,000,000 copies', 'Тираж манги превысил 1000000 копий'),
+])
+def test_numbers_glued_to_letters_are_found_in_source(source, output):
+    from llm_protocol import _llm_numbers_supported
+    assert _llm_numbers_supported(source, output)
+
+
+def test_invented_number_is_still_rejected():
+    from llm_protocol import _llm_numbers_supported
+    assert not _llm_numbers_supported(JP_SOURCE, 'Третий кур выйдет 5 октября.')
+    # Цифра внутри имени исполнителя — часть имени, а не число.
+    assert _llm_numbers_supported('Bleach opening by jo0ji', 'Опенинг Bleach записал jo0ji')
+
+
+def test_japanese_month_supports_russian_month():
+    assert bot._llm_dates_supported(JP_SOURCE, 'Аниме выйдет 4 октября.')
+    assert not bot._llm_dates_supported(JP_SOURCE, 'Аниме выйдет 4 ноября.')
+
+
+def test_leak_in_background_paragraph_is_not_lost_uncertainty():
+    """«Leaked» в предыстории статьи отклонял пересказ официального анонса."""
+    from llm_protocol import _editorial_rejection
+    source = ('Oshi no Ko Season 3 Announced\nThe anime was announced at the event on Sunday.\n'
+              'Earlier this year a leaked schedule had hinted at the return.')
+    assert _editorial_rejection(source, 'Анонсирован третий сезон «Звёздного дитя»', '') == ''
+    rumor = 'Black Clover Season 2 Will Be Split Cour, According to Leak\nDetails below.'
+    assert _editorial_rejection(rumor, 'Второй сезон «Чёрного клевера» разделят на два кура', '') \
+        == 'lost_uncertainty'
+
+
+# ---------- п.10. Пустой разбор пачки не глушит одиночный вызов ----------
+
+def test_batch_item_without_title_is_not_cached():
+    from llm_protocol import _llm_batch_usable
+    raw = json.dumps({'items': [{'id': 1, 'topic': 'аниме', 'kind': 'новость', 'subject': 'Bleach'},
+                                {'id': 2, 'topic': 'прочее', 'kind': 'новость'},
+                                {'id': 3, 'topic': 'аниме', 'kind': 'подборка'},
+                                {'id': 4, 'topic': 'аниме', 'title': 'Вышел трейлер Bleach'}]},
+                     ensure_ascii=False)
+    assert set(bot._llm_parse_batch(raw)) == {2, 3, 4}
+    assert not _llm_batch_usable({'topic': 'аниме', 'kind': 'новость'})
+
+
+# ---------- п.11. MyAnimeList — из RSS, с датой ----------
+
+MAL_RSS = '''<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/"><channel><title>News - MyAnimeList</title>
+<item><title>&#039;Bless&#039; Unveils Additional Cast, Character Promo</title>
+<description>The official website for the television anime adaptation of Yukino Sonoyama&amp;#039;s Bless manga
+unveiled additional cast and the character promotional video on Thursday.</description>
+<media:thumbnail>https://cdn.myanimelist.net/s/common/uploaded_files/1790249127-8c85.jpeg</media:thumbnail>
+<pubDate>{date}</pubDate><link>https://myanimelist.net/news/74754247?_location=rss</link></item>
+</channel></rss>'''
+
+
+def test_myanimelist_items_come_with_date_and_lead(monkeypatch, http_response):
+    from email.utils import format_datetime
+    from datetime import datetime, timezone
+    rss = MAL_RSS.replace('{date}', format_datetime(datetime.now(timezone.utc)))
+    asked = []
+
+    def get(url, **kwargs):
+        asked.append(url)
+        return http_response(content=rss.encode('utf-8'))
+
+    monkeypatch.setattr(bot, 'http_get_with_retry', get)
+    monkeypatch.setattr(bot, 'fetch_og_image', lambda link: None)
+    rows = bot.get_myanimelist()
+    assert asked == [bot.MAL_NEWS_RSS]
+    assert len(rows) == 1
+    assert rows[0]['published_parsed'] is not None
+    assert rows[0]['link'] == 'https://myanimelist.net/news/74754247'
+    assert 'additional cast' in rows[0]['summary']
+
+
+def test_undated_item_ages_from_first_sighting(monkeypatch, tmp_path):
+    """Карточка без даты считалась свежей вечно — фильтр возраста её не видел."""
+    monkeypatch.setattr(bot, 'DATA_DIR', tmp_path)
+    monkeypatch.setattr(bot, 'first_seen_store', None)
+    monkeypatch.setattr(bot, 'settings', MagicMock(post_max_age_hours=48))
+    item = {'link': 'https://myanimelist.net/news/1', 'title': 'Old card', 'published_parsed': None}
+    assert bot._undated_too_old(item) is False
+    now = bot.time.time()
+    monkeypatch.setattr(bot.time, 'time', lambda: now + 49 * 3600)
+    assert bot._undated_too_old(item) is True
+
+
+# ---------- п.13. Телеграм-пост: списки, призывы, русское название ----------
+
+def test_bullet_list_keeps_its_lines():
+    from post_text import _tg_title_and_summary
+    text = ('⚡️Вышел опенинг аниме «Невероятное приключение ДжоДжо: Гонка «Стальной шар»»\n'
+            '• Продолжение выйдет 25 сентября 2026 года.\n'
+            '• В новой пачке будет 11 серий (охватят 2 и 3 стадии).\n'
+            '• Новые серии каждую пятницу.')
+    _, body = _tg_title_and_summary(text, 'animetarakans', 'TG: animetarakans')
+    assert body.split('\n') == ['• Продолжение выйдет 25 сентября 2026 года.',
+                                '• В новой пачке будет 11 серий (охватят 2 и 3 стадии).',
+                                '• Новые серии каждую пятницу.']
+
+
+def test_wrapped_sentence_is_still_one_line():
+    from post_text import _tg_title_and_summary
+    _, body = _tg_title_and_summary('Заголовок новости тут\nСериал выйдет в октябре\nна Crunchyroll.',
+                                    'x', 'TG: x')
+    assert '\n' not in body
+
+
+@pytest.mark.parametrize(('text', 'kept'), [
+    ('Main PV della serie. ➡️ Cliccate qui per vederlo.', 'Main PV della serie.'),
+    ("Staff: Shunsuke Machiya. ➡️ Potete leggere l'introduzione dell'anime al seguente link: "
+     'https://telegra.ph/Introduzione-09-2', 'Staff: Shunsuke Machiya.'),
+    ('Премьера 2 октября. ➡️ Ознакомиться с аниме можно по следующей ссылке.', 'Премьера 2 октября.'),
+    ('Нажмите здесь, чтобы посмотреть трейлер. Премьера 2 октября.', 'Премьера 2 октября.'),
+    # Двойник: слово «ссылка» в самой новости — не призыв.
+    ('Студия сослалась на ссылку в договоре. Премьера 2 октября.',
+     'Студия сослалась на ссылку в договоре. Премьера 2 октября.'),
+])
+def test_call_to_action_without_link_is_dropped(text, kept):
+    from post_text import _strip_links
+    assert _strip_links(text) == kept
+
+
+def test_russian_title_replaces_the_whole_quoted_name():
+    """Было: «Киберпанк: Бегущие по краю» (Cyberpunk: Edgerunners) 2»."""
+    news = {'_work_russian': 'Киберпанк: Бегущие по краю', '_work_name': 'Cyberpunk: Edgerunners'}
+    title = bot._with_russian_work_name('Отрывок из аниме «Cyberpunk: Edgerunners 2»', news)
+    assert title == 'Отрывок из аниме «Киберпанк: Бегущие по краю 2» (Cyberpunk: Edgerunners 2)'
+    assert title.count('«') == title.count('»')

@@ -9,6 +9,7 @@
 подмен в тестах, поэтому перенос не меняет того, что тесты проверяют.
 """
 import re
+import unicodedata
 
 
 def smart_truncate(text: str, limit: int) -> str:
@@ -205,7 +206,43 @@ def _tg_title_and_summary(full_text: str, channel: str, label: str,
     if tail:
         rest.insert(0, tail)
     # The source headline is evidence for the editor: never cut it mid-name.
-    return head, ' '.join(rest)[:3500]
+    return head, _tg_join_body(rest)[:3500]
+
+
+# Начало пункта списка: «•», «-», «1.», эмодзи-маркер «📍 Где искать:».
+_TG_LIST_MARK_RE = re.compile(r'^(?:[•·▪▫◾◽●○◦‣⁃*]|[-–—➖]\s|\d{1,2}[.)]\s)')
+
+
+def _tg_is_list_item(line: str) -> bool:
+    line = line.lstrip()
+    if not line:
+        return False
+    if _TG_LIST_MARK_RE.match(line):
+        return True
+    return unicodedata.category(line[0]) == 'So'
+
+
+def _tg_join_body(lines: list) -> str:
+    """Склеивает строки тела поста, сохраняя списки.
+
+    Раньше все строки склеивались пробелом: «• Продолжение выйдет 25
+    сентября. • В новой пачке будет 11 серий. • Новые серии каждую пятницу»
+    приходило в канал одной сплошной строкой. Пункт списка и строка после
+    двоеточия идут с новой строки; обычный перенос внутри фразы, как и
+    раньше, — пробел: каналы рвут предложения переносами.
+    """
+    out = ''
+    for line in lines:
+        line = str(line or '').strip()
+        if not line:
+            continue
+        if not out:
+            out = line
+        elif _tg_is_list_item(line) or out.endswith(':'):
+            out += '\n' + line
+        else:
+            out += ' ' + line
+    return out
 
 
 # Ссылки в тексте поста. Ловим и голые домены: RSS-описания и телеграм-посты
@@ -293,8 +330,10 @@ def _strip_links(text: str) -> str:
     это не текст, а огрызок. Предложение с собственным смыслом сохраняем,
     убрав ссылку и подводку к ней.
     """
-    if not text or not _POST_URL_RE.search(str(text)):
-        return text or ''
+    if not text:
+        return ''
+    if not _POST_URL_RE.search(str(text)):
+        return _drop_call_to_action(str(text))
     out = []
     for sentence in re.split(r'(?<=[.!?…])\s+', str(text)):
         if not _POST_URL_RE.search(sentence):
@@ -314,7 +353,33 @@ def _strip_links(text: str) -> str:
         if not merged.endswith(('.', '!', '?', '…')):
             merged += '.'
         out.append(merged)
-    return ' '.join(x.strip() for x in out if x.strip()).strip()
+    return _drop_call_to_action(' '.join(x.strip() for x in out if x.strip()).strip())
+
+
+# Призыв перейти по ссылке, которой в посте уже нет. Итальянский канал пишет
+# «➡️ Cliccate qui per vederlo.» (ссылка была в тексте-якоре) и «Potete
+# leggere … al seguente link: https://…» — после удаления адреса в канал
+# уходило «Ознакомиться с аниме можно по следующей ссылке.» без ссылки.
+_CALL_TO_ACTION_RE = re.compile(
+    r'\bclicc?a(?:te)?\s+qui\b|\bal seguente link\b|\bnel link\b|\bclick here\b|'
+    r'\b(?:at|via) the (?:following )?link\b|\blink (?:below|in bio)\b|'
+    r'\bнажми(?:те)?\s+(?:здесь|сюда|на ссылку|кнопку)|\bпо (?:следующей )?ссылке\b|'
+    r'\bпереходи(?:те)?\s+по ссылке\b|\bссылк[аеу] (?:ниже|в описании|в профиле)\b',
+    re.IGNORECASE)
+
+
+def _drop_call_to_action(text: str) -> str:
+    """Выбрасывает предложения-призывы «нажмите здесь», строки сохраняет."""
+    if not text or not _CALL_TO_ACTION_RE.search(text):
+        return text
+    lines = []
+    for line in text.split('\n'):
+        kept = [sentence for sentence in re.split(r'(?<=[.!?…])\s+', line)
+                if not _CALL_TO_ACTION_RE.search(sentence)]
+        line = ' '.join(kept).strip()
+        if line:
+            lines.append(line)
+    return '\n'.join(lines)
 
 
 def _extract_sentences(text: str, max_sentences: int = 3, max_len: int = 700) -> str:

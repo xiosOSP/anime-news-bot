@@ -180,12 +180,28 @@ LLM_SUMMARY_MAX = 650       # 2-3 коротких абзаца; вместе с
 LLM_MAX_PARAGRAPHS = 3
 
 
+def _llm_number_set(text: str) -> set[str]:
+    """Числа текста в одном написании.
+
+    Граница числа — не «конец слова»: в японском цифра приклеена к
+    иероглифам («第2期», «10月4日»), в английском — к окончанию («4th»).
+    Прежняя проверка таких чисел в источнике не видела и отклоняла верный
+    пересказ «4 октября, 14 серия» как выдумавший цифры. Разделители тысяч
+    снимаются: «1,000,000» в источнике и «1000000» в посте — одно число.
+    Цифра внутри латинского имени («jo0ji», «S3») — часть имени, не число.
+    """
+    out: set[str] = set()
+    for raw in re.findall(r'(?<![A-Za-z\d.,])(\d+(?:[.,]\d+)*)(?:st|nd|rd|th)?(?![A-Za-z\d])',
+                          str(text or '')):
+        if re.fullmatch(r'\d{1,3}(?:,\d{3})+', raw):
+            raw = raw.replace(',', '')
+        out.add(raw.replace(',', '.'))
+    return {n for n in out if len(n.split('.')[0]) <= 7}
+
+
 def _llm_numbers_supported(source_text: str, output_text: str) -> bool:
     """Отклоняет новые числа/даты, которых не было в исходной новости."""
-    def nums(text: str) -> set[str]:
-        return {m.replace(',', '.') for m in re.findall(
-            r'(?<!\w)\d{1,6}(?:[.,]\d+)?(?!\w)', text or '')}
-    return nums(output_text).issubset(nums(source_text))
+    return _llm_number_set(output_text).issubset(_llm_number_set(source_text))
 
 
 def _sanity_ok(value: str, limit: int) -> bool:
@@ -204,9 +220,22 @@ _ATTRIBUTED_NEWS_RE = re.compile(
     r'\b(?:по данным|по словам|сообщает|сообщают|может|возможно|вероятно)\b', re.I)
 
 
+def _source_lead(source: str) -> str:
+    """Заголовок и первый абзац источника — там статья объявляет, слух ли это.
+
+    Слово «leak» в пятом абзаце — это предыстория («ранее утёкшее
+    расписание намекало…»), а не пометка «новость — слух». По всей статье
+    проверка отклоняла верные пересказы официальных анонсов.
+    """
+    lines = [line.strip() for line in str(source or '').split('\n')]
+    head = lines[0] if lines else ''
+    lead = next((line for line in lines[1:] if line), '')
+    return f'{head}\n{lead}'
+
+
 def _editorial_rejection(source: str, title: str, summary: str) -> str:
     """Cheap structural/factual checks shared by cached, batch and single replies."""
-    if _UNCERTAIN_NEWS_RE.search(source) and not (
+    if _UNCERTAIN_NEWS_RE.search(_source_lead(source)) and not (
             _UNCERTAIN_NEWS_RE.search(title) or _ATTRIBUTED_NEWS_RE.search(title)):
         return 'lost_uncertainty'
     if (title.count('«') != title.count('»')
@@ -285,8 +314,15 @@ def _llm_batch_usable(data: dict) -> bool:
     навсегда лишить новость модели: кеш ответит на все следующие попытки.
     """
     data = _llm_editorial_data(data)
-    return any(data.get(field)
-               for field in ('title', 'summary', 'topic', 'kind', 'subject'))
+    if data.get('title'):
+        return True
+    # Без заголовка разбор годен, только если новость им отсеяна: этого
+    # достаточно, чтобы не звать модель второй раз. Пачка возвращала
+    # {"topic":"аниме","kind":"новость"} без текста, кеш держал это шесть
+    # часов, и одиночный вызов, который дал бы перевод, так и не случался —
+    # пост уходил сырым машинным переводом.
+    return (data.get('kind') in LLM_KINDS_FILLER or data.get('topic') == 'прочее'
+            or data.get('relevant') is False)
 
 
 def _llm_words(text: str) -> set:

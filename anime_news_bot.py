@@ -9953,7 +9953,28 @@ def get_gkids_news():
     )
 
 
+# RSS MyAnimeList отдаёт дату и первый абзац новости. Страница-список даты
+# не показывает вовсе: все её карточки считались свежими, и фильтр возраста
+# на них не работал. Список остаётся запасным путём.
+MAL_NEWS_RSS = 'https://myanimelist.net/rss/news.xml'
+
+
 def get_myanimelist():
+    rows = _parse_rss_with_fallback(MAL_NEWS_RSS, 'MyAnimeList')
+    if isinstance(rows, list) and rows:
+        out = []
+        for row in rows:
+            # «?_location=rss» — метка ленты. Со страницы-списка та же новость
+            # приходит без неё, и дедуп по ссылке видел бы две разные.
+            row['link'] = re.sub(r'[?&]_location=rss\b', '', str(row.get('link') or ''))
+            if sent_links is not None and row['link'] in sent_links:
+                continue
+            out.append(row)
+        return out
+    return _get_myanimelist_listing()
+
+
+def _get_myanimelist_listing():
     news_list = []
     try:
         response = http_get_with_retry(
@@ -11259,7 +11280,20 @@ def _with_russian_work_name(title: str, news: dict) -> str:
     if (not russian or not original or not _russian_titles_on()
             or re.search(r'[А-Яа-яЁё]', original) or russian.casefold() in title.casefold()):
         return title
-    match = re.search(r'[«"“]?' + re.escape(original) + r'[»"”]?', title, re.IGNORECASE)
+    # Имя в кавычках вместе с хвостом до закрывающей кавычки: «Cyberpunk:
+    # Edgerunners 2». Раньше заменялось только само имя с открывающей
+    # кавычкой, и получалось «Киберпанк: Бегущие по краю» (Cyberpunk:
+    # Edgerunners) 2». — с лишней кавычкой и номером за скобкой.
+    # Хвост — только номер части: «Grand Blue Dreaming» — уже другое имя.
+    quoted = re.search(r'([«"“])' + re.escape(original)
+                       + r'((?:\s+(?:\d{1,3}|[IVX]{1,4}|(?:Season|Part|сезон)\s*\d{1,3}))?)\s*([»"”])',
+                       title, re.IGNORECASE)
+    if quoted:
+        tail = quoted.group(2).rstrip()
+        written = title[quoted.start(1) + 1:quoted.start(2)]
+        replacement = f'«{russian}{tail}»' + (f' ({written}{tail})' if len(written) <= 30 else '')
+        return title[:quoted.start()] + replacement + title[quoted.end():]
+    match = re.search(r'(?<![«"“\w])' + re.escape(original) + r'(?![»"”\w])', title, re.IGNORECASE)
     if not match:
         return title
     replacement = f'«{russian}»' + (f' ({original})' if len(original) <= 30 else '')
@@ -16441,6 +16475,64 @@ def _normalize_collected_news(item, source: str) -> Optional[dict]:
     return news
 
 
+class FirstSeenStore:
+    """Когда бот впервые увидел новость без даты — на диске, переживает рестарт."""
+    MAX_ITEMS = 5000
+    TTL_DAYS = 14
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._items: dict[str, float] = {}
+        self._dirty = False
+        self._lock = threading.Lock()
+        try:
+            raw = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+            items = raw.get('items') if isinstance(raw, dict) else None
+            if isinstance(items, dict):
+                self._items = {str(k): float(v) for k, v in items.items()
+                               if isinstance(v, (int, float)) and math.isfinite(v)}
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning(f'first_seen не загружен: {e}')
+
+    def seen_at(self, link: str) -> float:
+        key = normalize_url(link) or str(link or '')
+        with self._lock:
+            if key not in self._items:
+                self._items[key] = time.time()
+                self._dirty = True
+            return self._items[key]
+
+    def flush(self) -> None:
+        with self._lock:
+            if not self._dirty:
+                return
+            edge = time.time() - self.TTL_DAYS * 86400
+            kept = sorted(((k, v) for k, v in self._items.items() if v >= edge), key=lambda kv: kv[1])
+            self._items = dict(kept[-self.MAX_ITEMS:])
+            try:
+                _atomic_write_json(self.path, {'schema_version': 1, 'items': self._items})
+                self._dirty = False
+            except OSError as e:
+                logger.warning(f'first_seen не сохранён: {e}')
+
+
+first_seen_store: Optional[FirstSeenStore] = None
+
+
+def _undated_too_old(item: dict) -> bool:
+    global first_seen_store
+    link = str(item.get('link') or '')
+    if not link:
+        return False
+    path = DATA_DIR / 'news_first_seen.json'
+    if first_seen_store is None or first_seen_store.path != path:
+        first_seen_store = FirstSeenStore(path)
+    max_age = getattr(settings, 'post_max_age_hours', POST_MAX_AGE_HOURS)
+    if not isinstance(max_age, (int, float)) or isinstance(max_age, bool):
+        max_age = POST_MAX_AGE_HOURS
+    return time.time() - first_seen_store.seen_at(link) > max_age * 3600
+
+
 async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
     """Собирает свежие новости со всех включённых источников.
     Возвращает (all_news, stats_lines, errors)."""
@@ -16522,6 +16614,12 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
                 if settings.require_image and not _news_has_media_candidate(item):
                     no_image_skipped += 1
                     continue
+                # Без даты фильтр возраста пропускал новость всегда: карточка
+                # со страницы-списка висела бы кандидатом неделями. Возраст
+                # такой новости считаем от первого раза, когда бот её увидел.
+                if not item.get('published_parsed') and _undated_too_old(item):
+                    duplicate_skipped += 1
+                    continue
                 if norm_url:
                     seen_urls.add(norm_url)
                 if norm_title:
@@ -16590,6 +16688,8 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
             _note_source_failure(name, message, hard=True, save=False)
     if source_health is not None:
         await asyncio.to_thread(source_health.flush)
+    if first_seen_store is not None:
+        await asyncio.to_thread(first_seen_store.flush)
     try:
         await _run_source_discovery(all_news)
     except Exception as e:
@@ -21500,6 +21600,10 @@ def _llm_dates_supported(source_text: str, output_text: str) -> bool:
     # Whole month words: Mark/Augustus are names, and мая/мае are forms of May.
     source_months = {i for i, pattern in enumerate(_MONTH_PATTERNS)
                      if pattern.search(source_text or '')}
+    # Японский источник пишет месяц числом: «10月4日より放送開始». Без этого
+    # пересказ «выйдет 4 октября» отклонялся как подменивший месяц.
+    source_months |= {int(m) - 1 for m in re.findall(r'(?<!\d)(\d{1,2})\s*月', source_text or '')
+                      if 1 <= int(m) <= 12}
     output_months = {i for i, pattern in enumerate(_MONTH_PATTERNS)
                      if pattern.search(output_text or '')}
     return output_months.issubset(source_months)
