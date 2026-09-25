@@ -21,7 +21,18 @@ _BLOCKS = frozenset({
 # описание RSS первой строкой, и в пост уезжало «Courtesy of Netflix
 # Cyberpunk: Edgerunners is coming back…»: кредит фото склеивался с первой
 # фразой новости, и отделить его потом было уже нечем.
-_HIDDEN = frozenset({'script', 'style', 'noscript', 'template', 'svg', 'figcaption'})
+_HIDDEN = frozenset({'script', 'style', 'noscript', 'template', 'svg', 'figcaption',
+                     # Текст под спойлером в телеграм-посте: канал сам скрыл
+                     # его от читателя, а бот выкладывал открытым текстом.
+                     'tg-spoiler'})
+
+
+def _is_spoiler_span(tag: str, attrs) -> bool:
+    """Старая разметка спойлера: <span class="tg-spoiler">."""
+    if tag != 'span':
+        return False
+    classes = ' '.join(str(value or '') for name, value in attrs or () if name == 'class')
+    return 'tg-spoiler' in classes.split()
 
 
 class _FragmentText(HTMLParser):
@@ -34,9 +45,13 @@ class _FragmentText(HTMLParser):
         self.separator = '\n' if paragraphs else ' '
 
     def handle_starttag(self, tag, attrs):
-        if tag in _HIDDEN:
+        if tag in _HIDDEN or _is_spoiler_span(tag, attrs):
             if not self.hidden:
                 self.parts.append(' ')
+            self.hidden.append(tag)
+        elif self.hidden and tag == 'span':
+            # Вложенный span внутри скрытого: без учёта его </span> закрыл бы
+            # спойлер раньше времени, и хвост спойлера попал бы в текст.
             self.hidden.append(tag)
         elif not self.hidden and tag in _BLOCKS:
             self.parts.append(self.separator)

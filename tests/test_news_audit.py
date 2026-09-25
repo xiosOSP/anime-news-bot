@@ -554,3 +554,66 @@ def test_final_text_still_matches_the_same_news(tmp_path):
 ])
 def test_release_date_prefers_release_context(text, date):
     assert bot.extract_release_date_from_text(text) == date
+
+
+# ---------- п.7–8. Не-новости и спойлеры без модели ----------
+
+# (заголовок, источник, причина) — и двойник: похожие слова, но это новость.
+NOISE_PAIRS = [
+    (('10 New Fall 2026 Anime to Watch This October (& Where to Find Them)', 'ComicBook Anime', 'подборка'),
+     ('3 New Cast Members Join Oshi no Ko Season 3', 'ComicBook Anime')),
+    (('The Best Anime of Summer 2026', 'CBR Anime', 'подборка'),
+     ('Frieren Wins Best Anime of the Year at Crunchyroll Anime Awards', 'CBR Anime')),
+    (('『ONE PIECE』シャンクス　生い立ちと経歴を解説', 'AnimateTimes(JP)', 'объяснялка, а не новость'),
+     ('『葬送のフリーレン』第2期、解説付き上映会の開催決定', 'AnimateTimes(JP)')),
+    (('Celebrating Sixteen Years of Anime Herald', 'Anime Herald', 'самореклама источника'),
+     ('Celebrating 30 Years of Evangelion: New Exhibition Announced', 'Anime Herald')),
+    (("LEGO Keeps Studio Ghibli's Princess Mononoke Set Alive for 41 More Days", 'CBR Anime', 'мерч и игры'),
+     ("Studio Ghibli's Princess Mononoke Returns to Theaters in 4K", 'CBR Anime')),
+    (('Animal Crossing Meets Pokémon Sleep in New Cozy Steam Game', 'CBR Anime', 'мерч и игры'),
+     ('Pokémon Horizons Anime Reveals Final Season Trailer', 'CBR Anime')),
+    (("Gundam's Biggest Model Kit of Its Kind Is Already Selling Out Before Release", 'CBR Anime',
+      'мерч и игры'),
+     ('Gundam GQuuuuuuX Movie Reveals Release Date', 'CBR Anime')),
+    (("📺 Su ANiME GENERATION è ora disponibile l'anime special Marine Express doppiato in italiano.",
+      'TG: VanitasNews', 'серия в дубляже'),
+     ("📺 Annunciata la quarta stagione dell'anime di Grand Blue Dreaming, che inizierà prossimamente.",
+      'TG: VanitasNews')),
+    (('⚠️ Новая информация о 2 половине 2 сезона аниме Операция: Семейка Ёдзакура будет обьявлена '
+      '25 сентября!', 'TG: CurrentAnime', 'анонс анонса'),
+     ('Объявлена дата выхода второй половины 2 сезона «Семейки Ёдзакура»', 'TG: CurrentAnime')),
+    (('One Piece Chapter 1160 Spoilers Reveal Shocking Death', 'AnimeHunch', 'спойлер'),
+     ('One Piece Chapter 1160 Delayed by One Week', 'AnimeHunch')),
+    (('『無職転生Ⅲ』第14話あらすじ＆場面カット', 'AnimateTimes(JP)', 'спойлер'),
+     ('『無職転生Ⅲ』第14話先行カット公開', 'AnimateTimes(JP)')),
+    (('Сюжет 14 серии «Реинкарнации безработного»: чем закончится арка', 'TG: X', 'спойлер'),
+     ('Кадры к 14 серии 3 сезона аниме Реинкарнация безработного.', 'TG: X')),
+]
+
+
+@pytest.mark.parametrize(('noise', 'news'), NOISE_PAIRS)
+def test_non_news_is_caught_and_real_news_stays(noise, news):
+    title, source, reason = noise
+    assert bot.noise_reason({'title': title, 'source': source}) == reason
+    twin_title, twin_source = news
+    assert bot.noise_reason({'title': twin_title, 'source': twin_source}) == ''
+
+
+@pytest.mark.parametrize(('markup', 'text'), [
+    ('Вышла 14 серия.<br>В конце <tg-spoiler>Рудеус теряет руку</tg-spoiler> — смотрите!',
+     'Вышла 14 серия.\nВ конце — смотрите!'),
+    # Старая разметка и вложенный span: хвост спойлера не должен вытечь.
+    ('Итог: <span class="tg-spoiler">он <span>выжил</span> и ушёл</span>. Конец.', 'Итог: . Конец.'),
+    ('Обычный <span class="emoji">🔥</span> текст', 'Обычный 🔥 текст'),
+])
+def test_telegram_spoiler_text_is_dropped(markup, text):
+    from news_parser import message_html_text
+    assert message_html_text(markup) == text
+
+
+def test_editorial_prompt_forbids_plot_spoilers():
+    """Правило в промпте меняет ответы — кеш разборов обязан сброситься."""
+    from llm_protocol import LLM_BATCH_SYSTEM_PROMPT, LLM_SYSTEM_PROMPT
+    assert 'Не раскрывай сюжет серий и глав' in LLM_SYSTEM_PROMPT
+    assert 'Не раскрывай сюжет серий и глав' in LLM_BATCH_SYSTEM_PROMPT
+    assert bot.DEFAULT_LLM_PROMPT_VERSION != 'editorial-v5-2026-09-23'

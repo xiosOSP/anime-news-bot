@@ -604,7 +604,7 @@ GOLDEN_DATASET_FILE = Path(__file__).with_name('golden') / 'editorial_cases.json
 STORY_UPDATE_LOOKBACK_DAYS = max(1, min(90, _env_int('STORY_UPDATE_LOOKBACK_DAYS', 21)))
 STORY_UPDATE_SIMILARITY = max(0.60, min(0.95, _env_float('STORY_UPDATE_SIMILARITY', 0.76)))
 REPLAY_BUFFER_MAX = max(20, min(2000, _env_int('REPLAY_BUFFER_MAX', 300)))
-DEFAULT_LLM_PROMPT_VERSION = 'editorial-v5-2026-09-23'
+DEFAULT_LLM_PROMPT_VERSION = 'editorial-v6-2026-09-25'
 LLM_PROMPT_VERSION = (_env('LLM_PROMPT_VERSION', DEFAULT_LLM_PROMPT_VERSION).strip()
                       or DEFAULT_LLM_PROMPT_VERSION)
 LLM_JUDGE_MAX_TOKENS = max(80, min(500, _env_int('LLM_JUDGE_MAX_TOKENS', 180)))
@@ -10882,6 +10882,12 @@ NOISE_TITLE_RULES = (
         # «まとめ一覧» и «キャラクター一覧» — сводные списки. Просто «まとめ»
         # не берём: «まとめて配信» значит «выложат все серии разом».
         r'特集[!！]?\s*$|\d+\s*つの理由|まとめ一覧|(?:キャラクター|登場人物)（?[^）]*）?一覧',
+        # «10 New Fall 2026 Anime to Watch This October» — подборка на сезон.
+        r"^\s*\d{1,3}\s+(?:[\w’'&-]+\s+){0,5}to\s+watch\b",
+        # «The Best Anime of Summer 2026». «Best Anime of the Year» — это
+        # премия, то есть новость, поэтому только сезон или год.
+        r'\bbest\b.{0,40}\bof\s+(?:the\s+)?(?:spring|summer|fall|autumn|winter)?\s*20\d\d\b',
+        r'\bbest\b.{0,40}\bof\s+(?:the\s+)?(?:spring|summer|fall|autumn|winter)\b',
     )),
     ('тест или опрос', (
         r'^\s*(?:quiz|poll|survey)\b',
@@ -10911,6 +10917,36 @@ NOISE_TITLE_RULES = (
         r'^\s*всё,? что известно\b',
         r'\bобъясняем\b',
         r'\bв каком порядке смотреть\b',
+        # Японские объяснялки: «『ONE PIECE』シャンクス 生い立ちと経歴を解説» —
+        # биография персонажа. «解説付き上映会» (показ с комментарием) — новость.
+        r'を解説(?!付)|【解説】|解説[!！]?\s*$',
+    )),
+    # Спойлеры: канал обещает подписчикам их не публиковать. Пересказ
+    # сюжета будущей серии («あらすじ», «сюжет 14 серии») и «Chapter 1160
+    # Spoilers» уходили в канал как обычные новости.
+    ('спойлер', (
+        r'\bspoilers?\b',
+        r'\bспойлер\w*',
+        r'あらすじ|ネタバレ',
+        r'\bсюжет\w*\s+(?:\d+|\w+ой|\w+ей)[-\s]?(?:й\s+|го\s+)?(?:серии|эпизода|главы)\b',
+    )),
+    # Анонс анонса: «Новая информация … будет объявлена 25 сентября!» —
+    # фактов в ней нет, новость появится, когда их объявят.
+    ('анонс анонса', (
+        r'\bбуд(?:ет|ут)\s+об[ъь]явлен[аоы]?\b',
+        r'\bwill be (?:announced|revealed) (?:on|at|in|this|next)\b',
+    )),
+    # Игрушки и игры. «LEGO Keeps Studio Ghibli's Princess Mononoke Set
+    # Alive» и «Animal Crossing Meets Pokémon Sleep in New Cozy Steam Game»
+    # аниме-ленты ставят в общий поток, а владелец канала публикует только
+    # новости аниме и манги.
+    ('мерч и игры', (
+        r'\blego\b',
+        r'\bmodel kits?\b',
+        r'\bplush(?:ies?)?\b',
+        r'\bnendoroids?\b|\bfigma\b|\bgunpla\b',
+        r'\bscale figures?\b|\bfigures?\s+(?:pre-?orders?|revealed|unveiled|launch\w*)\b',
+        r'\bsteam game\b',
     )),
     ('годовщина и ностальгия', (
         r'\b\d{1,2}\s+years\s+(?:later|ago)\b',
@@ -10940,6 +10976,10 @@ NOISE_TITLE_RULES = (
     # владельца канала серии в дубляже не публикуются вовсе.
     ('серия в дубляже', (
         r'\([^()]{2,30}\s+dub\)\s*[-–—:]?\s*(?:episode|ep\.?)\s*\d+',
+        # Итальянский канал: «Su ANiME GENERATION è ora disponibile l'anime
+        # special Marine Express doppiato in italiano» — выход дубляжа на
+        # итальянском сервисе, русскому каналу это не новость.
+        r'\bdoppiat[oaie]\b',
     )),
     ('фан-контент', (
         r'\bfan\s?art\b',
@@ -10985,7 +11025,27 @@ def noise_reason(news: dict) -> str:
     for reason, pattern in _NOISE_TITLE_RE:
         if pattern.search(title):
             return reason
+    if _self_promo(title, str(news.get('source') or '')):
+        return 'самореклама источника'
     return ''
+
+
+_ANNIVERSARY_OF = re.compile(r'\bcelebrat\w*\s+(?:[\w-]+\s+){1,3}years?\s+of\s+(.+?)\s*[!.]?$',
+                             re.IGNORECASE)
+
+
+def _self_promo(title: str, source: str) -> bool:
+    """«Celebrating Sixteen Years of Anime Herald» в ленте Anime Herald.
+
+    Юбилей самого источника — не новость. «Celebrating 30 Years of
+    Evangelion» — юбилей тайтла, это новость, поэтому сверяем с именем ленты.
+    """
+    match = _ANNIVERSARY_OF.search(title)
+    if not match or not source:
+        return False
+    own = re.sub(r'[^0-9a-zа-яё]+', '', source.casefold())
+    named = re.sub(r'[^0-9a-zа-яё]+', '', match.group(1).casefold())
+    return bool(own and named and (own in named or named in own))
 
 
 def matches_keywords(news: dict) -> bool:
