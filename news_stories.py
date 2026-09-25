@@ -349,6 +349,13 @@ _WORK_QUOTED_AFTER_ANCHOR = re.compile(
 _WORK_BARE_AFTER_ANCHOR = re.compile(
     rf'{_WORK_ANCHOR}\s+(?:по\s+\w+\s+)?([А-ЯЁA-Z][^.!?\n«»"“”()]{{2,80}})')
 _WORK_QUOTED = re.compile(r'«([^»]{2,80})»|"([^"]{2,80})"|“([^”]{2,80})”|『([^』]{1,60})』|「([^」]{1,60})」')
+# MyAnimeList пишет тайтл в одинарных кавычках: «'Phantom Busters' TV Anime
+# Announced For 2027». Без них имя бралось вместе с хвостом — «Phantom
+# Busters' TV», база его не узнавала, и анонс уходил в канал вторым постом.
+# Кавычка засчитывается только на границе слова: апостроф в «JoJo's» и
+# «Don’t» — не кавычка.
+_WORK_SINGLE_QUOTED = re.compile(
+    r"(?:^|(?<=[\s(«\"“:—–-]))['‘]([A-ZА-ЯЁ0-9][^'‘’\n]{1,80}?)['’](?=[\s,.:;!?)»”]|$)")
 # Перед кавычками — песня, а не тайтл: «опенинг "SPIN"», «кавер на "…"».
 _WORK_SONG_BEFORE = re.compile(
     r'(?:песн\w*|опенинг\w*|эндинг\w*|трек\w*|кавер\w*|сингл\w*|song|opening|ending|theme|'
@@ -359,8 +366,10 @@ _WORK_PAREN_LATIN = re.compile(r'\((?!(?:Part|Parte|Season|Stagione)\b)([A-Z][^(
 # Латинское имя внутри русского или итальянского текста: «Super Psychic
 # Policeman Chojo», «Grand Blue Dreaming». Служебные слова внутри имени
 # допускаются, с них имя начинаться не может.
+# «&» внутри имени тоже связка: «Welsh & Shedar» рвалось на два огрызка, и
+# итальянский анонс того же тайтла оставался без ключа — отдельным постом.
 _WORK_LATIN_RUN = re.compile(
-    r"(?:[A-Z][\w'’.!-]*|\d+)(?:[ :]+(?:[A-Z][\w'’.!-]*|(?:and|the|of|to|an|in|on|no|wa|ga|a|x)\b|\d+))*"
+    r"(?:[A-Z][\w'’.!-]*|\d+)(?:[ :]+(?:[A-Z][\w'’.!-]*|(?:and|the|of|to|an|in|on|no|wa|ga|a|x)\b|&|\d+))*"
     r"(?:[ :]+(?:[A-Z][\w'’.!-]*|\d+))")
 # Английский заголовок: имя стоит в начале, до первого слова о событии.
 _WORK_EN_STOP = re.compile(
@@ -376,8 +385,70 @@ _OTHER_LETTERS = re.compile(r'[А-Яа-яЁё぀-ヿ一-鿿]')
 
 
 def _clean_work_name(name: str) -> str:
-    name = re.sub(r'\s+', ' ', str(name or '')).strip(' .,:;!?—–-"\'«»“”')
+    name = re.sub(r'\s+', ' ', str(name or '')).strip(' .,:;!?—–-"\'«»“”‘’')
     return _WORK_SEASON_TAIL.sub('', name).strip(' .,:;!?—–-')
+
+
+# Слова оформления поста, а не имени: итальянский канал пишет «Main PV della
+# serie…», «Key visual e main PV della Parte 2…», и первым «тайтлом» из
+# заголовка выходило «Main PV» или «Parte». Такой кандидат тратил запрос к
+# базе на пустое место, а тайтл, стоявший дальше, до сверки не доживал.
+_WORK_GENERIC_WORDS = frozenset((
+    'main', 'key', 'pv', 'cm', 'teaser', 'trailer', 'visual', 'visuals', 'opening', 'ending',
+    'parte', 'part', 'season', 'stagione', 'episode', 'episodio', 'anime', 'manga', 'official',
+    'new', 'nuovo', 'nuova', 'final', 'promo', 'video', 'tv', 'the', 'and', 'of', 'e', 'il',
+    'la', 'di', 'della', 'dell', 'cour'))
+
+
+def _generic_work_name(name: str) -> bool:
+    words = re.findall(r"[\w'’]+", name.casefold())
+    return bool(words) and all(w in _WORK_GENERIC_WORDS or w.isdigit() for w in words)
+
+
+# Английская «голова» заголовка кончается на первом слове о событии, но
+# начинаться может с чужого: «Rudy Takes Action in Mushoku Tensei Season 3…».
+# Хвост головы из слов с заглавной — «Mushoku Tensei» — отдельный кандидат.
+_WORK_EN_TAIL_RUN = re.compile(r"\s(?:in|from|for|with|at|on|by)\s+((?:[A-Z][\w'’!-]*\s+)+[A-Z][\w'’!-]*)\s*$")
+
+
+def _explicit_work_names(text: str) -> list[str]:
+    """Имена, выделенные самим текстом: кавычками, скобками, словом «аниме»."""
+    found: list[str] = []
+    found += [m.group(1) for m in _WORK_QUOTED_AFTER_ANCHOR.finditer(text)]
+    found += [m.group(1) for m in _WORK_BARE_AFTER_ANCHOR.finditer(text)]
+    found += _WORK_PAREN_LATIN.findall(text)
+    for m in _WORK_QUOTED.finditer(text):
+        if not _WORK_SONG_BEFORE.search(text[max(0, m.start() - 40):m.start()]):
+            found.append(next(group for group in m.groups() if group))
+    for m in _WORK_SINGLE_QUOTED.finditer(text):
+        if not _WORK_SONG_BEFORE.search(text[max(0, m.start() - 40):m.start()]):
+            found.append(m.group(1))
+    return found
+
+
+def story_explicit_work_names(news_or_title) -> list[str]:
+    """Имена из заголовка, которые источник выделил сам: кавычки, скобки,
+    «аниме по манге X». В отличие от «головы» английского заголовка это
+    действительно название, а не «Netflix Locks Down»."""
+    out: list[str] = []
+    for name in _explicit_work_names(_story_title_of(news_or_title)):
+        name = _clean_work_name(name)
+        if (len(re.findall(r'\w', name)) >= 3 and not _generic_work_name(name)
+                and name.casefold() not in (x.casefold() for x in out)):
+            out.append(name)
+    return out
+
+
+_FIRST_SENTENCE = re.compile(r'^.*?(?:[.!?。！？](?=\s|$)|$)', re.DOTALL)
+
+
+def _summary_lead(news_or_title) -> str:
+    """Первое предложение описания — только для новости-словаря."""
+    if not isinstance(news_or_title, dict):
+        return ''
+    summary = re.sub(r'\s+', ' ', str(news_or_title.get('summary') or '')).strip()[:400]
+    match = _FIRST_SENTENCE.match(summary)
+    return match.group(0).strip() if match else ''
 
 
 def story_work_names(news_or_title, limit: int = 4) -> list[str]:
@@ -388,19 +459,17 @@ def story_work_names(news_or_title, limit: int = 4) -> list[str]:
     кавычках бывает и песня («опенинг "SPIN"»), и цитата.
     """
     title = _story_title_of(news_or_title)
-    found: list[str] = []
-    found += [m.group(1) for m in _WORK_QUOTED_AFTER_ANCHOR.finditer(title)]
-    found += [m.group(1) for m in _WORK_BARE_AFTER_ANCHOR.finditer(title)]
-    found += _WORK_PAREN_LATIN.findall(title)
-    for m in _WORK_QUOTED.finditer(title):
-        if not _WORK_SONG_BEFORE.search(title[max(0, m.start() - 40):m.start()]):
-            found.append(next(group for group in m.groups() if group))
+    found: list[str] = _explicit_work_names(title)
     latin = len(_LATIN_LETTERS.findall(title))
     other = len(_OTHER_LETTERS.findall(title))
     english = latin and not other and not re.search(r"\b(?:dell|della|di|il|la|stagione|annunciat\w*)\b",
                                                    title, re.IGNORECASE)
     if english:
-        found.append(_WORK_EN_STOP.split(title, maxsplit=1)[0])
+        head = _WORK_EN_STOP.split(title, maxsplit=1)[0]
+        found.append(head)
+        tail = _WORK_EN_TAIL_RUN.search(head)
+        if tail:
+            found.append(tail.group(1))
     else:
         found += [m.group(0) for m in _WORK_LATIN_RUN.finditer(title)]
     # Длинное название с подзаголовком Shikimori может не найти целиком:
@@ -409,11 +478,23 @@ def story_work_names(news_or_title, limit: int = 4) -> list[str]:
     found += [name.split(':')[0] for name in list(found)
               if ':' in name and len(name.split(':')[0].split()) >= 2]
     out: list[str] = []
-    for name in found:
-        name = _clean_work_name(name)
-        letters = len(re.findall(r'\w', name))
-        if letters >= 3 and name.casefold() not in (x.casefold() for x in out):
-            out.append(name)
+
+    def add(names) -> None:
+        for name in names:
+            name = _clean_work_name(name)
+            letters = len(re.findall(r'\w', name))
+            if (letters >= 3 and not _generic_work_name(name)
+                    and name.casefold() not in (x.casefold() for x in out)):
+                out.append(name)
+
+    add(found)
+    if not out:
+        # Заголовок-лозунг без имени: «🍀 КЛЕВЕР ПОЙДЕТ ДО КОНЦА.». Тайтл тогда
+        # назван в первой фразе («…2 сезон «Черного Клевера» станет
+        # финальным»), и без неё новость не склеивалась с двумя другими
+        # пересказами того же инсайда. Берём оттуда только явно выделенные
+        # имена: первая фраза статьи — не заголовок, «голова» в ней — мусор.
+        add(_explicit_work_names(_summary_lead(news_or_title)))
     return out[:limit]
 
 
@@ -432,8 +513,10 @@ _EVENT_CLASS_PATTERNS = {
     'date': r'премьер\w*|дата\s+(?:выхода|премьеры)|выйд[её]т|стартует|premiere\w*|release date|'
             r'inizier\w*|放送開始|配信開始',
     # «Тизер-постер» и «teaser visual» — картинка, а не ролик.
+    # «Main Promo» у MyAnimeList — тот же ролик, что «Trailer» у Crunchyroll.
     'trailer': r'трейлер\w*|(?:тизер|teaser)\w*(?![\s-]*(?:визуал|постер|visual|poster))|отрыв\w*|'
-               r'фрагмент\w*|ролик\w*|промо\w*|trailer\w*|sneak peek|(?<![a-z])pv(?![a-z])|予告',
+               r'фрагмент\w*|ролик\w*|промо\w*|trailer\w*|sneak peek|(?<![a-z])pv(?![a-z])|予告|'
+               r'(?<![a-z])promo(?![a-z])|promotional video',
     'episode': r'сери[яиюей]|эпизод\w*|кадры|episode\w*|episodio|第\s*\d+\s*話|あらすじ|場面カット',
     'music': r'опенинг\w*|эндинг\w*|песн\w*|саундтрек\w*|opening|ending|theme song|(?<![a-z])ost(?![a-z])|'
              r'sigla|主題歌',
@@ -443,18 +526,38 @@ _EVENT_CLASS_PATTERNS = {
     'collab': r'коллаборац\w*|collab\w*|コラボ',
     'death': r'скончал\w*|(?<![а-я])умер(?:ла|ли)?(?![а-я])|passed away|(?<![a-z])died(?![a-z])|逝去|死去',
     'delay': r'перенос\w*|перенес\w*|отлож\w*|delay\w*|postpone\w*|rinviat\w*|延期',
+    # Инсайд — своё событие. Три канала пересказали одну утечку про «Чёрный
+    # клевер» тремя заголовками без единого слова о событии, и все три ушли
+    # в канал: без рода события склейка по тайтлу запрещена.
+    'rumor': r'слух\w*|инсайд\w*|утечк\w*|(?<![a-z])leak\w*|rumou?r\w*|insider\w*|reportedly|リーク',
 }
 _EVENT_CLASS_RE = {name: re.compile(pattern, re.IGNORECASE)
                    for name, pattern in _EVENT_CLASS_PATTERNS.items()}
 _EVENT_FAMILY = {'announce': 'announce', 'visual': 'announce', 'date': 'announce',
                  'trailer': 'trailer', 'episode': 'episode', 'music': 'music',
                  'break': 'break', 'cast': 'cast', 'health': 'health', 'collab': 'collab',
-                 'death': 'death', 'delay': 'delay'}
+                 'death': 'death', 'delay': 'delay', 'rumor': 'rumor'}
+
+
+def _event_classes_of(text: str) -> frozenset:
+    return frozenset(name for name, pattern in _EVENT_CLASS_RE.items() if pattern.search(text))
 
 
 def story_event_classes(news_or_title) -> frozenset:
-    title = _story_title_of(news_or_title)
-    return frozenset(name for name, pattern in _EVENT_CLASS_RE.items() if pattern.search(title))
+    """Род события по заголовку; заголовок-лозунг — по первой фразе текста.
+
+    «🍀 КЛЕВЕР ПОЙДЕТ ДО КОНЦА.» ничего не говорит о событии, а первая фраза
+    («Инсайдеры утверждают, что…») говорит. Текст смотрим, только когда
+    заголовок молчит: в глубине статьи упоминается что угодно.
+    """
+    classes = _event_classes_of(_story_title_of(news_or_title))
+    if not classes:
+        classes = _event_classes_of(_summary_lead(news_or_title))
+    return classes
+
+
+def story_event_families(news_or_title) -> set:
+    return {_EVENT_FAMILY[c] for c in story_event_classes(news_or_title)}
 
 
 def story_events_compatible(a, b) -> bool:
@@ -466,9 +569,7 @@ def story_events_compatible(a, b) -> bool:
     франшизы таких «безымянных» новостей несколько в день, и лишний повтор
     дешевле тихой потери.
     """
-    fa = {_EVENT_FAMILY[c] for c in story_event_classes(a)}
-    fb = {_EVENT_FAMILY[c] for c in story_event_classes(b)}
-    return bool(fa & fb)
+    return bool(story_event_families(a) & story_event_families(b))
 
 
 # Номер сезона, части или серии. Порядковое слово считается номером только
@@ -491,9 +592,12 @@ _WORK_ORDINAL = {
 }
 _WORK_ORDINAL_BEFORE_UNIT = re.compile(
     rf'\b([a-zа-яё]+)\s+{_WORK_UNIT}\b', re.IGNORECASE)
+# Итальянские месяцы — для итальянского телеграм-канала: «dal 2 ottobre»
+# считалось номером сезона «2», и анонс расходился с тем же анонсом без даты.
 _WORK_MONTHS = (r'(?:jan\w*|feb\w*|mar\w*|apr\w*|may|jun\w*|jul\w*|aug\w*|sep\w*|oct\w*|nov\w*|'
                 r'dec\w*|январ\w*|феврал\w*|март\w*|апрел\w*|ма[йяе]|июн\w*|июл\w*|август\w*|'
-                r'сентябр\w*|октябр\w*|ноябр\w*|декабр\w*)')
+                r'сентябр\w*|октябр\w*|ноябр\w*|декабр\w*|gennaio|febbraio|marzo|aprile|maggio|'
+                r'giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)')
 _WORK_DATE = re.compile(
     rf'\b{_WORK_MONTHS}\s+\d{{1,2}}(?:st|nd|rd|th)?\b|\b\d{{1,2}}(?:-?го)?\s+{_WORK_MONTHS}\b'
     r'|\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\b', re.IGNORECASE)
@@ -520,9 +624,90 @@ def same_work_event(a: dict, b: dict) -> bool:
     key_a, key_b = a.get('_work_key'), b.get('_work_key')
     if not key_a or key_a != key_b:
         return False
-    if story_work_numbers(a) != story_work_numbers(b):
+    # Номер, названный только одним источником, — не разница: «Отрывок из
+    # «Cyberpunk: Edgerunners 2»» и «Тизер нового сезона «Киберпанк»» —
+    # один ролик, но требование равных номеров разводило их, и в канал
+    # ушли три поста. Разные номера у обоих («сезон 2» и «сезон 3») — разные
+    # новости по-прежнему.
+    if numbers_conflict(story_work_numbers(a), story_work_numbers(b)):
         return False
     media_a, media_b = _story_media(a), _story_media(b)
     if media_a and media_b and not (media_a & media_b):
         return False
     return story_events_compatible(a, b)
+
+
+def numbers_conflict(a, b) -> bool:
+    """Номера противоречат, только если у КАЖДОЙ стороны есть свой номер.
+
+    {2} и {1, 2} — «2 сезон» и «1 серия 2 сезона»: один источник назвал
+    больше, это не другая новость. {12} и {14} — разные серии.
+    """
+    a, b = set(a or ()), set(b or ())
+    return bool(a - b) and bool(b - a)
+
+
+# ============== ОБЩЕЕ ЯДРО ЗАГОЛОВКОВ ДЛЯ ДЕДУПА ==============
+# Рубрика — слова, которыми источник оформляет любую новость: «кадры»,
+# «серии», «постер», «announced for». Совпадение по ним одним ничего не
+# говорит о том, что новость та же: «Кадры 12 серии «Табакошки»» и «Кадры
+# к 14 серии «Реинкарнации безработного»» совпадали на две трети слов, а
+# «…Anime Announced for 2027» у двух разных тайтлов — общей строкой в 16
+# букв «announcedfor2027». Обе пары считались повтором, и настоящая новость
+# молча терялась. Дубль признаём, только если общее есть и помимо рубрики.
+_RUBRIC_EXACT = frozenset((
+    # английские
+    'season', 'seasons', 'episode', 'episodes', 'trailer', 'trailers', 'teaser', 'visual',
+    'visuals', 'key', 'main', 'poster', 'cast', 'staff', 'theme', 'song', 'songs', 'opening',
+    'ending', 'promo', 'video', 'preview', 'anime', 'manga', 'announced', 'announces',
+    'announce', 'reveals', 'revealed', 'unveils', 'unveiled', 'new', 'for', 'part', 'cour',
+    'premiere', 'premieres', 'release', 'releases', 'released', 'date', 'film', 'movie',
+    'series', 'official', 'additional', 'more', 'first', 'final', 'info', 'character',
+    'characters', 'adaptation', 'gets', 'confirmed', 'confirms', 'tv', 'the', 'and', 'with',
+    'from', 'its', 'this', 'that', 'will', 'has', 'have', 'watch', 'now', 'launches',
+    'debuts', 'coming', 'shares', 'drops', 'returns', 'animation', 'animated',
+    # русские служебные
+    'выдали', 'показали', 'представили', 'опубликовали', 'вышел', 'вышла', 'вышли',
+    'новый', 'новая', 'новое', 'новые', 'нового', 'новой', 'новую', 'аниме', 'манга',
+    'манги', 'манге', 'мангу', 'для', 'уже', 'года', 'году',
+    # итальянские (VanitasNews) и месяцы
+    'stagione', 'annunciata', 'annunciato', 'annunciati', 'annunciate', 'dell', 'della',
+    'del', 'che', 'inizierà', 'prossimamente', 'nuovo', 'nuova', 'serie', 'animata', 'sarà',
+    'diretta', 'diretto', 'presso', 'trasmessa', 'dal', 'parte', 'adattamento', 'episodi',
+    'episodio', 'disponibile', 'ora', 'doppiato', 'italiano', 'essere', 'giappone',
+    'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september',
+    'october', 'november', 'december', 'gennaio', 'febbraio', 'marzo', 'aprile', 'maggio',
+    'giugno', 'luglio', 'agosto', 'settembre', 'ottobre', 'novembre', 'dicembre',
+))
+# Русские рубрики — по основе: «серии», «серия», «серий» — одно слово.
+_RUBRIC_STEMS = ('кадр', 'сери', 'сезон', 'постер', 'трейлер', 'тизер', 'опенинг', 'эндинг',
+                 'эпизод', 'анонс', 'премьер', 'релиз', 'дат', 'визуал', 'промо', 'ролик',
+                 'отрыв', 'фрагмент', 'половин', 'част', 'озвуч', 'каст', 'состав', 'фильм',
+                 'январ', 'феврал', 'март', 'апрел', 'июн', 'июл', 'август', 'сентябр',
+                 'октябр', 'ноябр', 'декабр')
+
+
+def is_rubric_word(word: str) -> bool:
+    """Слово оформления, а не названия: само по себе не делает новости одной."""
+    low = str(word or '').casefold().replace('ё', 'е')
+    if not low or low.isdigit() or low in _RUBRIC_EXACT:
+        return True
+    if _ordinal_word_value(low) is not None or low in _WORK_ORDINAL:
+        return True
+    return bool(re.fullmatch(r'[а-я]+', low)) and any(
+        low.startswith(stem) and len(low) - len(stem) <= 4 for stem in _RUBRIC_STEMS)
+
+
+def title_core_words(words) -> set:
+    """Слова заголовка без рубрики и чисел — то, что называет предмет новости."""
+    return {w for w in words or () if not is_rubric_word(w)}
+
+
+def title_numbers(text: str, words=()) -> set:
+    """Номера заголовка: цифры и порядковые числительные («второй», «fourth»)."""
+    found = {n.lstrip('0') or '0' for n in re.findall(r'\d+', str(text or ''))}
+    for word in words or ():
+        value = _ordinal_word_value(word) or _WORK_ORDINAL.get(str(word).casefold())
+        if value:
+            found.add(value)
+    return found

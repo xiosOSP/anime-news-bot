@@ -27,7 +27,17 @@ def test_translator_copies_query_parameters_between_threads(monkeypatch):
 @pytest.mark.parametrize('html', ['<html>captcha</html>', '<div class="t0"></div>'])
 def test_missing_translation_does_not_silently_succeed(monkeypatch, html):
     response = MagicMock(text=html)
-    monkeypatch.setattr(requests, 'get', lambda *a, **kw: response)
+    calls = []
+
+    def get(*a, **kw):
+        calls.append(a)
+        return response
+
+    monkeypatch.setattr(requests, 'get', get)
     with pytest.raises(ValueError):
         GoogleTranslator(source='en', target='ru').translate('news')
-    response.close.assert_called_once()
+    # Переводчик теперь пробует два бесплатных endpoint Google по очереди
+    # (словарный и мобильный), и мок отдаёт один объект на оба запроса.
+    # Смысл проверки прежний: каждый полученный ответ закрыт ровно один раз.
+    assert len(calls) == 2
+    assert response.close.call_count == len(calls)

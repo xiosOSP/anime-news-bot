@@ -92,6 +92,7 @@ from llm_protocol import (
 from news_stories import (
     _clean_work_name,
     same_work_event,
+    story_explicit_work_names,
     story_work_names,
     _STORY_STOPWORDS,
     _anchor_identity_match,
@@ -6294,6 +6295,11 @@ class StoryRegistry:
             return True
 
 
+# Версия правила сверки имён. Промахи, записанные прежним правилом, в кеше не
+# доверяются: см. WorkTitleResolver.cached.
+WORK_MATCH_RULE = 2
+
+
 class WorkTitleResolver:
     """Какой тайтл назван в новости — по базе Shikimori, с кешем на диске.
 
@@ -6363,6 +6369,11 @@ class WorkTitleResolver:
         # начал писать русские названия: спросим ещё раз, один раз.
         if row.get('key') and 'russian' not in row:
             return None
+        # Промах записан по старому правилу сверки, которое не узнавало
+        # «Mushoku Tensei» в «Mushoku Tensei: Isekai Ittara Honki Dasu».
+        # Такой промах держался бы неделю — спрашиваем заново.
+        if not row.get('key') and row.get('rule') != WORK_MATCH_RULE:
+            return None
         try:
             age = datetime.now(timezone.utc) - datetime.fromisoformat(str(row.get('at')))
         except (TypeError, ValueError):
@@ -6376,25 +6387,84 @@ class WorkTitleResolver:
             row = self._items.get(self._norm(name)) or {}
         return str(row.get('russian') or '') if row.get('key') else ''
 
+    @classmethod
+    def names_match(cls, query: str, names) -> bool:
+        """Похоже ли одно из имён записи на запрос. Общее правило и для AniList.
+
+        Поиск у баз нечёткий и всегда что-нибудь возвращает: AniList на
+        «October» отвечал «Saint October», и это имя вписывалось в пост.
+        """
+        wanted = cls._norm(query)
+        if not wanted:
+            return False
+        for name in names or ():
+            raw = _clean_work_name(str(name or ''))
+            have = cls._norm(raw)
+            if not have:
+                continue
+            # Короткое имя сходится только целиком: у «Spin» с любым
+            # коротким словом сходство высокое, а тайтл это другой.
+            if min(len(have), len(wanted)) <= 5:
+                if have == wanted:
+                    return True
+            elif difflib.SequenceMatcher(None, wanted, have).ratio() >= cls.ACCEPT:
+                return True
+            # Основное имя до подзаголовка. Все пишут «Mushoku Tensei» и
+            # «Реинкарнация безработного», а в базе — «Mushoku Tensei: Isekai
+            # Ittara Honki Dasu»: сходство 0.5, тайтл не опознавался ни на
+            # одном языке, и четыре поста о 14-й серии не склеились. Главная
+            # часть должна быть не из одного слова: «Cyberpunk» — ещё не
+            # «Cyberpunk: Edgerunners».
+            main = re.split(r'\s*[:～~]\s*', raw, maxsplit=1)[0].strip()
+            main_norm = cls._norm(main)
+            if (main and main != raw and len(main_norm) > 5
+                    and (len(main.split()) >= 2 or re.search(r'[぀-ヿ一-鿿]{3}', main))
+                    and difflib.SequenceMatcher(None, wanted, main_norm).ratio() >= cls.ACCEPT):
+                return True
+            if main and main != raw and main_norm == wanted and re.search(
+                    r'[぀-ヿ一-鿿]{3}', main):
+                return True
+        return False
+
     def _accept(self, query: str, candidates: list) -> Optional[dict]:
-        wanted = self._norm(query)
         for row in candidates or []:
             if not isinstance(row, dict) or not row.get('id'):
                 continue
             names = [row.get('name'), row.get('russian'), row.get('english'), row.get('japanese'),
                      *(row.get('synonyms') or [])]
-            for name in names:
-                have = self._norm(_clean_work_name(str(name or '')))
-                if not have:
-                    continue
-                # Короткое имя сходится только целиком: у «Spin» с любым
-                # коротким словом сходство высокое, а тайтл это другой.
-                if min(len(have), len(wanted)) <= 5:
-                    if have == wanted:
-                        return row
-                elif difflib.SequenceMatcher(None, wanted, have).ratio() >= self.ACCEPT:
-                    return row
+            if self.names_match(query, names):
+                return row
         return None
+
+    # Окончания русских падежей: «Черного Клевера» и «Реинкарнации
+    # Безработного» — тот же тайтл, что «Чёрный клевер», но поиск Shikimori
+    # склонённое имя не находит вовсе.
+    _RU_ENDING = re.compile(r'(?:ого|его|ому|ему|ыми|ими|ый|ий|ой|ая|яя|ое|ее|ые|ие|ых|их|ым|им|'
+                            r'ую|юю|ом|ем|ей|ам|ям|ах|ях|ов|ев|а|я|у|ю|е|ы|и|о|й|ь)$')
+
+    @classmethod
+    def _stem_key(cls, value: str) -> str:
+        words = re.findall(r'[а-я]+|[a-z0-9]+', str(value or '').casefold().replace('ё', 'е'))
+        if not any(w[0] >= 'а' for w in words):
+            return ''
+        return ' '.join(cls._RU_ENDING.sub('', w) if w[0] >= 'а' and len(w) > 4 else w
+                        for w in words)
+
+    def cached_by_stem(self, name: str) -> tuple[str, str]:
+        """Ключ и русское имя тайтла из кеша, если имя — его склонённая форма.
+
+        Сеть не нужна: тайтл уже опознан по другой новости того же цикла.
+        """
+        want = self._stem_key(name)
+        if len(want.replace(' ', '')) < 6:
+            return '', ''
+        with self._lock:
+            rows = [row for row in self._items.values() if row.get('key')]
+        for row in rows:
+            russian = str(row.get('russian') or '')
+            if russian and want in (self._stem_key(russian), self._stem_key(russian.split(':')[0])):
+                return str(row['key']), russian
+        return '', ''
 
     def lookup(self, name: str) -> Optional[str]:
         """Спросить Shikimori. None — сеть не ответила: в кеш это не пишем."""
@@ -6422,6 +6492,7 @@ class WorkTitleResolver:
             self._items[self._norm(name)] = {
                 'key': key, 'name': str((found or {}).get('name') or '')[:120],
                 'russian': re.sub(r'\s+', ' ', str((found or {}).get('russian') or '')).strip()[:160],
+                'rule': WORK_MATCH_RULE,
                 'at': datetime.now(timezone.utc).isoformat()}
             self._dirty = True
         return key
@@ -6444,10 +6515,20 @@ def _annotate_work_keys(items: list[dict], *, budget: int = WORK_LOOKUP_PER_CYCL
     # Пока кеш пуст, сорок запросов с паузой — это полминуты сбора. Что не
     # успели сейчас, опознается в следующем цикле: новости никуда не денутся.
     deadline = time.monotonic() + WORK_LOOKUP_WALL_SEC
-    for item in items:
+    # Лимит запросов тратился по порядку сбора: подборки, распродажи LEGO и
+    # новости кино из общих лент съедали его раньше, чем очередь доходила до
+    # настоящих анонсов (замер: 40 из 40 запросов первого цикла, треть — на
+    # то, что потом отсеял бы фильтр). Шум не публикуется никогда — его не
+    # сверяем вовсе; непрофильное из общих лент — только если лимит остался.
+    wanted = [item for item in items if not _cheap_noise(item)]
+    wanted.sort(key=lambda item: bool(settings is not None and settings.local_topic_filter
+                                      and off_topic_without_llm(item)))
+    pending: list[tuple[dict, list[str]]] = []
+    for item in wanted:
         if item.get('_work_key') or (sent_links is not None and item.get('link') in sent_links):
             continue
-        for name in story_work_names(item):
+        names = story_work_names(item)
+        for name in names:
             key = work_titles.cached(name)
             if (key is None and budget > 0 and failures < 3
                     and time.monotonic() < deadline):
@@ -6464,8 +6545,83 @@ def _annotate_work_keys(items: list[dict], *, budget: int = WORK_LOOKUP_PER_CYCL
                     item['_work_russian'] = work_titles.russian(name)
                 marked += 1
                 break
+        else:
+            pending.append((item, names))
+    # Русские каналы склоняют название: «2 сезон «Черного Клевера»». Поиск
+    # такую форму не находит, но тайтл к этому моменту уже опознан по
+    # соседней новости — сверяем основы слов с кешем, без сети.
+    unresolved: list[dict] = []
+    for item, names in pending:
+        for name in names:
+            key, russian = work_titles.cached_by_stem(name)
+            if key:
+                item['_work_key'] = key
+                if not item.get('_work_russian'):
+                    item['_work_name'] = name
+                    item['_work_russian'] = russian
+                marked += 1
+                break
+        else:
+            unresolved.append(item)
+    for item in unresolved:
+        explicit = story_explicit_work_names(item)
+        confirmed: list[str] = []
+        for name in story_work_names(item):
+            # Английское имя, которого нет в записи Shikimori: «Isshiki-san
+            # Wants to Know About Love» Crunchyroll пишет так, а у Shikimori
+            # есть только ромадзи. У AniList это имя есть среди синонимов, а
+            # его ромадзи уже опознано по соседней новости — склеиваем через
+            # него. Спрашиваем только латиницу из двух слов и больше и в
+            # пределах того же лимита запросов.
+            if (anilist is None or not re.search(r'[A-Za-z]', name) or re.search(r'[А-Яа-яЁё]', name)
+                    or not _anilist_candidate_ok(name) or budget <= 0
+                    or time.monotonic() >= deadline):
+                continue
+            budget -= 1
+            info = anilist.lookup(name)
+            if not info or not WorkTitleResolver.names_match(name, _anilist_names(info)):
+                continue
+            confirmed.append(name)
+            for alt in [info.get('romaji'), info.get('english'), *(info.get('synonyms') or [])]:
+                key = work_titles.cached(alt) if alt else None
+                if key:
+                    item['_work_key'] = key
+                    if not item.get('_work_russian'):
+                        item['_work_name'] = name
+                        item['_work_russian'] = work_titles.russian(alt)
+                    marked += 1
+                    break
+            if item.get('_work_key'):
+                break
+        if item.get('_work_key'):
+            continue
+        # Свежего анонса в базе ещё нет: «Phantom Busters» Shikimori не
+        # знает, и четыре пересказа анонса из четырёх источников ушли в канал
+        # тремя постами. Имя, которое источник сам выделил кавычками или
+        # словами «аниме по манге» либо которое подтвердил AniList, — тоже
+        # ключ: совпадёт оно только с тем же названием. Имя из одного слова не
+        # годится — «Odekake» или фамилия автора совпадут с чем угодно.
+        for name in explicit + confirmed:
+            norm = WorkTitleResolver._norm(name)
+            if len(name.split()) >= 2 and len(norm) >= 6:
+                item['_work_key'] = 'name:' + norm
+                break
     work_titles.flush()
     return marked
+
+
+def _cheap_noise(item: dict) -> bool:
+    """Отсеет ли новость бесплатный фильтр сбора — без записи в лог и метрики.
+
+    matches_keywords пишет в лог и считает метрику на каждый вызов, а здесь
+    нужен только ответ: иначе один отсев попадал бы в статистику дважды.
+    """
+    if matches_blacklist(item):
+        return True
+    check_text = (item.get('title') or '') + ' ' + (item.get('summary') or '')[:300]
+    if any(pattern.search(check_text) for pattern in DIGEST_SKIP_PATTERNS):
+        return True
+    return bool(settings is not None and settings.local_noise_filter and noise_reason(item))
 
 
 source_yield: Optional['SourceYieldStore'] = None
@@ -7137,6 +7293,7 @@ class AniListClient:
       Media(search: $search, type: ANIME) {
         id
         title { romaji english native }
+        synonyms
       }
     }
     """
@@ -7146,6 +7303,7 @@ class AniListClient:
       Media(search: $search, type: MANGA) {
         id
         title { romaji english native }
+        synonyms
       }
     }
     """
@@ -7210,10 +7368,14 @@ class AniListClient:
         if not media:
             return None
         title_obj = media.get('title') or {}
+        # Синонимы нужны сверке: английское имя «Isshiki-san Wants to Know
+        # About Love» у записи есть только среди них.
+        synonyms = [str(x) for x in (media.get('synonyms') or []) if isinstance(x, str)][:12]
         return {
             'romaji': title_obj.get('romaji'),
             'english': title_obj.get('english'),
             'native': title_obj.get('native'),
+            'synonyms': synonyms,
         }
 
     def lookup(self, query: str) -> Optional[dict]:
@@ -7236,6 +7398,7 @@ class AniListClient:
                     'romaji': cached.get('romaji'),
                     'english': cached.get('english'),
                     'native': cached.get('native'),
+                    'synonyms': list(cached.get('synonyms') or []),
                 }
             return None
 
@@ -7251,11 +7414,12 @@ class AniListClient:
                 'romaji': result.get('romaji'),
                 'english': result.get('english'),
                 'native': result.get('native'),
+                'synonyms': list(result.get('synonyms') or []),
                 'checked_at': datetime.now().isoformat(),
             }
             self._cache[key] = entry
             self._save()
-            return result
+            return {field: entry[field] for field in ('romaji', 'english', 'native', 'synonyms')}
         else:
             self._cache[key] = {
                 'found': False,
@@ -7488,30 +7652,87 @@ _ANILIST_CANDIDATE = re.compile(
 )
 
 
-def anilist_protect_titles(text: str, start_index: int = 2000) -> tuple[str, dict]:
+# Слова, из которых названия не состоят сами по себе: месяцы, дни недели,
+# рубрики заголовков. Кандидат целиком из них — не название, сколько бы
+# заглавных букв в нём ни было.
+_ANILIST_NOT_TITLE_WORDS = frozenset((
+    'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september',
+    'october', 'november', 'december', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
+    'saturday', 'sunday', 'spring', 'summer', 'fall', 'autumn', 'winter', 'season', 'episode',
+    'part', 'cour', 'preview', 'trailer', 'teaser', 'visual', 'key', 'main', 'cast', 'staff',
+    'theme', 'song', 'songs', 'opening', 'ending', 'anime', 'manga', 'movie', 'film', 'series',
+    'tv', 'official', 'new', 'more', 'additional', 'final', 'first', 'release', 'date',
+    'premiere', 'reveals', 'revealed', 'announces', 'announced', 'unveils', 'info', 'promo',
+    'video', 'character', 'characters', 'adaptation', 'news', 'update', 'the', 'a', 'an',
+    'of', 'in', 'on', 'at', 'for', 'and', 'or', 'to', 'with', 'from', 'by', 'is', 'are',
+))
+# Хвост кандидата из тех же рубрик: «Mushoku Tensei Season» ищем как
+# «Mushoku Tensei» — иначе имя не сойдётся ни с одним именем записи.
+_ANILIST_RUBRIC_TAIL = re.compile(
+    r'(?:\s+(?:Season|Episode|Part|Cour|Preview|Trailer|Teaser|Anime|Manga|Movie|Film|Series|'
+    r'TV|Visual|Key|Main|Cast|Staff|Opening|Ending|Promo|Video))+$')
+
+
+def _anilist_candidate_ok(candidate: str) -> bool:
+    words = candidate.split()
+    if len(words) < 2:
+        # Одно слово AniList «узнаёт» всегда: «October» — это «Saint October»,
+        # «Preview» — «Stitch! Special». Названий из одного слова в новостях
+        # мало, и их берёт regex-защита (капс, кавычки, японские частицы).
+        return False
+    return not all(w.casefold().strip('-') in _ANILIST_NOT_TITLE_WORDS for w in words)
+
+
+def _anilist_names(info: dict) -> list:
+    return [info.get('romaji'), info.get('english'), info.get('native'),
+            *(info.get('synonyms') or [])]
+
+
+def anilist_protect_titles(text: str, start_index: int = 2000,
+                           known_names=()) -> tuple[str, dict]:
     """Дополнительная защита через AniList API.
     Ищет в тексте последовательности слов с заглавной буквы, спрашивает AniList,
     защищает плейсхолдером если подтверждено что это название аниме/манги.
 
-    Использует ROMAJI как форму возврата (Tonari no Wakao-kun).
+    Защищается ТОЛЬКО исходная подстрока, в тексте ничего не подменяется.
+    Раньше в пост вписывалось romaji первого нечёткого совпадения, и живой
+    прогон дал «Season 3 Episode 14 Preview» → «…Shunkashuutou Daikousha…»,
+    «in October» → «in Saint October», «January 2027» → «1-gatsu ni wa
+    Christmas 2027»: поиск AniList всегда что-нибудь находит, а ответ
+    хранился в кеше неделями. Теперь найденное принимается, только если одно
+    из имён записи действительно похоже на кандидата (то же правило, что у
+    сверки тайтлов с Shikimori), — это же отсекает и старые записи кеша.
+
+    ``known_names`` — имена, уже опознанные по базе Shikimori (``_work_name``):
+    их защищаем без запроса к AniList.
     """
-    if anilist is None:
-        return text, {}
     placeholders: dict[str, str] = {}
     result = text
     counter = [start_index]
-    checked: set[str] = set()  # чтобы не спрашивать одно и то же дважды в этом проходе
 
-    def make_placeholder(value: str) -> str:
+    def protect(name: str) -> None:
+        nonlocal result
+        pattern = re.compile(r'(?<!\w)' + re.escape(name) + r'(?!\w)', re.IGNORECASE)
+        match = pattern.search(result)
+        if not match or '〖' in match.group(0):
+            return
         ph = _make_token(counter[0])
         counter[0] += 1
-        placeholders[ph] = value
-        return ph
+        placeholders[ph] = match.group(0)           # как в тексте, без подмены
+        result = result[:match.start()] + ph + result[match.end():]
+
+    for name in sorted({str(n).strip() for n in known_names or () if n and str(n).strip()},
+                       key=len, reverse=True):
+        if len(name) >= 3 and not re.search(r'[А-Яа-яЁё]', name):
+            protect(name)
+    if anilist is None:
+        return result, placeholders
+    checked: set[str] = set()  # чтобы не спрашивать одно и то же дважды в этом проходе
 
     # Собираем кандидатов (от длинных к коротким, чтобы длинные находились первыми)
     candidates = []
-    for m in _ANILIST_CANDIDATE.finditer(text):
-        candidate = m.group(1).strip()
+    for m in _ANILIST_CANDIDATE.finditer(result):
+        candidate = _ANILIST_RUBRIC_TAIL.sub('', m.group(1).strip())
         # Пропускаем слишком короткие (не имена) и слишком длинные (точно не названия)
         if len(candidate) < 4 or len(candidate) > 80:
             continue
@@ -7522,44 +7743,27 @@ def anilist_protect_titles(text: str, start_index: int = 2000) -> tuple[str, dic
         first = candidate.split()[0]
         if first.lower() in _COMMON_FIRST:
             continue
+        if not _anilist_candidate_ok(candidate):
+            continue
         # Пропускаем если кандидат покрывает большую часть текста: это скорее
         # газетный Title-Case заголовок целиком ("PlayStation to End Physical
         # Disc Production"), а не название внутри него. Защита такого «кандидата»
         # блокирует перевод всего заголовка.
-        if len(candidate) >= 0.55 * len(text.strip()):
+        if len(candidate) >= 0.55 * len(result.strip()):
             continue
-        candidates.append((m.start(), m.end(), candidate))
+        candidates.append(candidate)
 
     # Сортируем по длине убывающе, чтобы длинные имена защищались первыми
-    candidates.sort(key=lambda x: -len(x[2]))
+    candidates.sort(key=lambda x: -len(x))
 
-    for start, end, candidate in candidates:
+    for candidate in candidates:
         if candidate.lower() in checked:
             continue
         checked.add(candidate.lower())
-
         info = anilist.lookup(candidate)
-        if info:
-            # Выбираем "лучшую" форму названия:
-            # - если исходный текст совпадает с какой-то формой AniList (romaji/english/native) — оставляем как есть
-            # - иначе предпочитаем romaji (вариант A)
-            cand_lower = candidate.lower()
-            forms = [info.get('romaji'), info.get('english'), info.get('native')]
-            preferred = candidate  # по умолчанию — что было в тексте
-            for form in forms:
-                if form and form.lower() == cand_lower:
-                    preferred = form  # каноническая форма с правильным регистром
-                    break
-            else:
-                # Не нашли точного совпадения — берём romaji (или english если romaji нет)
-                preferred = info.get('romaji') or info.get('english') or candidate
-
-            # Заменяем ВСЕ вхождения этого кандидата в результирующем тексте
-            pattern = re.compile(r'\b' + re.escape(candidate) + r'\b', re.IGNORECASE)
-            if pattern.search(result):
-                ph = make_placeholder(preferred)
-                result = pattern.sub(ph, result, count=1)
-                logger.debug(f"AniList: защищено '{candidate}' → '{preferred}'")
+        if info and WorkTitleResolver.names_match(candidate, _anilist_names(info)):
+            protect(candidate)
+            logger.debug(f"AniList: защищено '{candidate}'")
 
     return result, placeholders
 
@@ -7710,18 +7914,39 @@ def _deepl_translate(text: str) -> Optional[str]:
     return None
 
 
-def translate_text(text: str, input_limit: int = TRANSLATION_INPUT_LIMIT) -> str:
+# Счётчик отказов перевода в текущем потоке. translate_text при отказе
+# возвращает исходник, и снаружи это было не отличить от перевода: пост
+# проверялся по доле кириллицы, а её давали вставленное русское название
+# тайтла и хэштег — английский текст целиком уходил в русский канал.
+# Поток, а не глобальная переменная: посты готовятся в to_thread параллельно.
+_translation_local = threading.local()
+
+
+def _translation_failures() -> int:
+    return int(getattr(_translation_local, 'failures', 0))
+
+
+def _note_translation_failure() -> None:
+    _translation_local.failures = _translation_failures() + 1
+
+
+def translate_text(text: str, input_limit: int = TRANSLATION_INPUT_LIMIT,
+                   known_names=()) -> str:
     """Переводит на русский с защитой терминов и пост-обработкой.
     input_limit — сколько символов исходного текста максимум переводить
     (для режима ветки передаём больший лимит, чтобы текст не обрезался).
+    known_names — названия, уже опознанные по базе тайтлов: не переводятся.
 
-    Переводчик: DeepL (если задан DEEPL_API_KEY), иначе/при ошибке — Google Translate."""
+    Переводчик: DeepL (если задан DEEPL_API_KEY), иначе/при ошибке — Google Translate.
+    При отказе возвращает исходник и отмечает отказ (см. _translation_failures)."""
     if not text:
         return text
     text = text[:input_limit]
+    known_names = tuple(n for n in (known_names or ()) if n)
+    cache_key = text if not known_names else text + '\x00' + '\x00'.join(known_names)
 
-    if text in _translation_cache:
-        return _translation_cache[text]
+    if cache_key in _translation_cache:
+        return _translation_cache[cache_key]
 
     # 1. Защита явных терминов из словаря
     protected_text, term_placeholders = protect_terms(text)
@@ -7730,7 +7955,8 @@ def translate_text(text: str, input_limit: int = TRANSLATION_INPUT_LIMIT) -> str
     protected_text, auto_placeholders = auto_protect_proper_nouns(protected_text, start_index=1000)
 
     # 3. Дополнительная защита через AniList API (только то, что не покрыто авто-защитой)
-    protected_text, anilist_placeholders = anilist_protect_titles(protected_text, start_index=2000)
+    protected_text, anilist_placeholders = anilist_protect_titles(protected_text, start_index=2000,
+                                                                  known_names=known_names)
 
     # Объединяем словари плейсхолдеров
     all_placeholders = {**term_placeholders, **auto_placeholders, **anilist_placeholders}
@@ -7748,9 +7974,11 @@ def translate_text(text: str, input_limit: int = TRANSLATION_INPUT_LIMIT) -> str
             translated = translator.translate(protected_text)
         except Exception as e:
             logger.warning(f"Ошибка перевода: {e}")
+            _note_translation_failure()
             return text
 
     if not translated:
+        _note_translation_failure()
         return text
 
     # 5. Возвращаем плейсхолдеры
@@ -7765,7 +7993,7 @@ def translate_text(text: str, input_limit: int = TRANSLATION_INPUT_LIMIT) -> str
     if len(_translation_cache) >= TRANSLATION_CACHE_MAX:
         for old_key in list(_translation_cache.keys())[:TRANSLATION_CACHE_MAX // 3]:
             del _translation_cache[old_key]
-    _translation_cache[text] = translated
+    _translation_cache[cache_key] = translated
     return translated
 
 
@@ -10949,8 +11177,13 @@ def format_news_short(news: dict) -> str:
             return _apply_editorial_rules(format_episode_post(ep, news.get('published_parsed')), news)
 
     # Заголовок
+    failures_before = _translation_failures()
+    # Тайтл, уже опознанный по базе, переводчику не отдаём: «Grand Blue»
+    # иначе становился «Большой синевой» — рядом с официальным русским
+    # названием, которое подставит _with_russian_work_name.
+    known = {'known_names': (str(news['_work_name']),)} if news.get('_work_name') else {}
     raw_title = _strip_links(news['title'])
-    ru_title = (raw_title if is_ru else translate_text(raw_title)).rstrip('.')
+    ru_title = (raw_title if is_ru else translate_text(raw_title, **known)).rstrip('.')
     # Санити-чек: если перевод «съел» заголовок до огрызка («Netflix.») —
     # лучше показать оригинал целиком, чем обрывок.
     if (not is_ru and len(ru_title) < 15
@@ -10973,9 +11206,14 @@ def format_news_short(news: dict) -> str:
         translated_max = 620 if compact else 850
         excerpt = _extract_sentences(summary, max_sentences=max_sentences, max_len=source_max)
         if excerpt:
-            ru_summary = excerpt if is_ru else translate_text(excerpt, input_limit=1200)
+            ru_summary = excerpt if is_ru else translate_text(excerpt, input_limit=1200, **known)
             ru_summary = _extract_sentences(_strip_links(ru_summary),
                                             max_sentences=max_sentences, max_len=translated_max)
+
+    if not is_ru:
+        # Явный флаг отказа: по нему пост откладывается, а не уходит в канал
+        # на английском (см. _left_untranslated).
+        news['_translation_failed'] = _translation_failures() > failures_before
 
     # Remove only the repeated sentence, keeping the facts that follow it.
     ru_summary = _strip_title_echo(ru_title, ru_summary)
@@ -11012,11 +11250,33 @@ def _left_untranslated(news: dict) -> bool:
     """
     if news.get('_edited_text') or news.get('_llm_text') or news.get('lang') == 'ru':
         return False
-    letters = [char for char in format_news_short(news) if char.isalpha()]
+    news.pop('_translation_failed', None)
+    text = format_news_short(news)
+    # Переводчик отказал — пост остался на языке источника. Русский текст без
+    # пометки lang (такие ленты есть) от этого хуже не стал, поэтому смотрим,
+    # на каком языке был сам источник.
+    if news.get('_translation_failed') and _cyrillic_share(
+            f"{news.get('title') or ''} {news.get('summary') or ''}") < UNTRANSLATED_CYRILLIC_SHARE:
+        return True
+    # Считаем только то, что написал переводчик. Официальное русское название
+    # тайтла, хэштег из него и строка даты — кириллица, которую вставили мы
+    # сами: с ними непереведённый пост «Grand Blue Season 4 Announced»
+    # набирал долю кириллицы выше порога и уходил в канал на английском.
+    russian = str(news.get('_work_russian') or '').strip()
+    if russian:
+        text = text.replace(f'«{russian}»', ' ').replace(russian, ' ')
+    text = re.sub(r'(?m)^📅.*$', ' ', text)
+    text = re.sub(r'#\w+', ' ', text)
+    return _cyrillic_share(text) < UNTRANSLATED_CYRILLIC_SHARE
+
+
+def _cyrillic_share(text: str) -> float:
+    """Доля кириллицы среди букв; текст без букв считается русским."""
+    letters = [char for char in str(text or '') if char.isalpha()]
     if not letters:
-        return False
+        return 1.0
     cyrillic = sum(1 for char in letters if 'а' <= char.lower() <= 'я' or char in 'ёЁ')
-    return cyrillic / len(letters) < UNTRANSLATED_CYRILLIC_SHARE
+    return cyrillic / len(letters)
 
 
 def format_news_text_long(news: dict) -> str:
@@ -11589,6 +11849,17 @@ async def _prepare_news_for_send(news: dict, source: str,
         # Google отвечает серверным адресам 429 часами, так что это не редкость.
         # Откладываем так же, как при недоступной модели: новость вернётся в
         # следующем цикле, а устаревшую отсеет фильтр возраста.
+        if not await asyncio.to_thread(_untranslated_defer_news, news):
+            # Ждать дальше бессмысленно: переводчик молчит часами, а каждый
+            # новый заход заново качал картинки и видео этой новости — без
+            # счётчика попыток она откладывалась бесконечно. Публиковать
+            # по-английски нельзя, поэтому новость снимаем.
+            logger.info('⊘ Перевод так и не удался, новость снята: %s',
+                        str(news.get('title', ''))[:60])
+            metrics.inc('anime_bot_untranslated_dropped_total')
+            if count_stats:
+                await stats.record_skipped('filtered', source)
+            return 'skipped_filter'
         logger.info('⏸ Пост отложен: перевод не удался — %s', str(news.get('title', ''))[:60])
         metrics.inc('anime_bot_untranslated_deferred_total')
         return 'deferred'
@@ -15585,19 +15856,25 @@ def _cluster_news(items: list[dict], *, persist_intelligence: bool = True) -> li
         best_score = STORY_CLUSTER_SIMILARITY
         # Не сравниваем со всей бесконечной историей: clustering работает в одном batch.
         for idx, cluster in enumerate(clusters[-STORY_CLUSTER_MAX_COMPARE:]):
-            rep = cluster[0]
-            # Тот же тайтл, номер и тип события — одна новость, на каком бы
-            # языке её ни написали. Проверка раньше конфликта маркеров: у
-            # «постера к 4 сезону» и «Season 4 Announced» слова событий разные.
-            if same_work_event(item, rep):
-                sim = 1.0
-            # Доставка это проверяла, а пачка — нет: трейлер и ключевой визуал
-            # одного сезона склеивались в один пост при сходстве 0.91.
-            elif _story_events_conflict(item, rep):
-                continue
-            else:
-                sim = _story_similarity(item, rep)
-            if sim >= best_score:
+            # Сравниваем со всеми новостями кластера, а не только с первой.
+            # Первой в кластер мог попасть итальянский пост без ключа тайтла,
+            # и английский пересказ того же анонса, опознанный по базе, к нему
+            # уже не подходил — в канал уходили оба (живой цикл 24.09: семь
+            # историй по два-три поста).
+            sim = 0.0
+            for rep in cluster:
+                # Тот же тайтл, номер и тип события — одна новость, на каком бы
+                # языке её ни написали. Проверка раньше конфликта маркеров: у
+                # «постера к 4 сезону» и «Season 4 Announced» слова событий разные.
+                if same_work_event(item, rep):
+                    sim = 1.0
+                    break
+                # Доставка это проверяла, а пачка — нет: трейлер и ключевой визуал
+                # одного сезона склеивались в один пост при сходстве 0.91.
+                if _story_events_conflict(item, rep):
+                    continue
+                sim = max(sim, _story_similarity(item, rep))
+            if sim and sim >= best_score:
                 best_score = sim
                 best_idx = len(clusters) - min(len(clusters), STORY_CLUSTER_MAX_COMPARE) + idx
         if best_idx is None:
@@ -21159,6 +21436,30 @@ def _llm_outage_is_temporary() -> bool:
             and not llm_budget.can_charge(_estimate_llm_tokens([], LLM_MAX_TOKENS))):
         return False
     return True
+
+
+# Сколько раз и сколько времени ждать переводчика для одной новости. Google
+# отвечает серверным адресам 429 часами; дальше новость уже несвежая.
+TRANSLATION_DEFER_MAX_ATTEMPTS = max(1, min(50, _env_int('TRANSLATION_DEFER_MAX_ATTEMPTS', 6)))
+TRANSLATION_DEFER_MAX_AGE_SEC = max(600, min(3 * 86400, _env_int('TRANSLATION_DEFER_MAX_AGE_SEC', 6 * 3600)))
+_translation_deferral_store = None
+
+
+def _untranslated_defer_news(news: dict) -> bool:
+    """Можно ли ещё раз отложить новость без перевода. Счёт переживает рестарт."""
+    global _translation_deferral_store
+    with _llm_deferral_lock:
+        key = normalize_url(str(news.get('link') or '')) or str(news.get('title') or '')[:120]
+        if not key:
+            return False
+        path = DATA_DIR / 'news_translation_deferrals.json'
+        if _translation_deferral_store is None or _translation_deferral_store.path != path:
+            _translation_deferral_store = NewsDeferralStore(path)
+        seen = _safe_nonnegative_int(news.get('_translation_defer_attempts', 0))
+        wait, attempts = _translation_deferral_store.reserve(
+            key, seen, TRANSLATION_DEFER_MAX_ATTEMPTS, TRANSLATION_DEFER_MAX_AGE_SEC)
+        news['_translation_defer_attempts'] = attempts
+        return wait
 
 
 def _llm_defer_news(news: dict) -> bool:
