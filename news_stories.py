@@ -728,11 +728,9 @@ def _month_of(word: str) -> str:
 
 
 def title_numbers(text: str, words=()) -> set:
-    """Номера заголовка: цифры, порядковые числительные («второй», «fourth») и
-    месяцы («m12»)."""
-    text = str(text or '')
-    found = {n.lstrip('0') or '0' for n in re.findall(r'\d+', text)}
-    found |= {month for month in map(_month_of, _MONTH_WORD.findall(text)) if month}
+    """Номера заголовка: цифры из текста; порядковые числительные («второй»,
+    «fourth») и месяцы («m12») — из слов (в склеенном заголовке их не видно)."""
+    found = {n.lstrip('0') or '0' for n in re.findall(r'\d+', str(text or ''))}
     for word in words or ():
         value = _ordinal_word_value(word) or _WORK_ORDINAL.get(str(word).casefold())
         if not value and _MONTH_WORD.fullmatch(str(word)):

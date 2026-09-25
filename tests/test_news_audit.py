@@ -76,7 +76,8 @@ def test_anilist_never_writes_another_title_into_the_text(fuzzy_anilist, text):
 
 
 def test_single_words_and_months_are_not_sent_to_anilist(fuzzy_anilist):
-    bot.anilist_protect_titles('The anime premieres in October. Main Visual and New Cast revealed.')
+    bot.anilist_protect_titles('The anime premieres in October. Main Visual and New Cast revealed. '
+                               'Rudy takes action in the finale.')
     assert not any(len(q.split()) < 2 for q in fuzzy_anilist.asked), fuzzy_anilist.asked
     assert 'Main Visual' not in fuzzy_anilist.asked
     assert 'New Cast' not in fuzzy_anilist.asked
@@ -144,6 +145,51 @@ def _grand_blue():
 
 def test_failed_translation_with_russian_title_is_detected(translator_down):
     assert bot._left_untranslated(_grand_blue()) is True
+
+
+def test_title_untranslated_while_summary_came_from_cache(translator_down):
+    """Описание переведено раньше и лежит в кеше, заголовок упёрся в 429.
+
+    Кириллицы в посте больше половины — по доле его не поймать, а заголовок
+    ушёл бы в канал по-английски. Ловит явный флаг отказа.
+    """
+    news = {k: v for k, v in _grand_blue().items() if not k.startswith('_work')}
+    bot._translation_cache[news['summary']] = ('Аниме вернётся после финала третьего сезона, '
+                                               'который покажут 22 октября на японском телевидении.')
+    assert bot._left_untranslated(news) is True
+
+
+def test_echoed_source_with_russian_title_is_detected(monkeypatch):
+    """Google иногда отвечает 200 и возвращает исходник как «перевод».
+
+    Отказа нет, флаг молчит; поймать можно только долей кириллицы — и её
+    нельзя считать вместе с русским названием и хэштегом, вставленными ботом.
+    """
+    monkeypatch.setattr(bot, 'translator', MagicMock(translate=lambda text: text))
+    monkeypatch.setattr(bot, 'anilist', None)
+    monkeypatch.setattr(bot, 'DEEPL_API_KEY', '')
+    monkeypatch.setattr(bot, '_translation_cache', {})
+    # Короткий заголовок без текста: вставленное «Необъятный океан» — больше
+    # трети букв поста.
+    assert bot._left_untranslated(dict(_grand_blue(), title='Grand Blue Season 4 Announced',
+                                       summary='')) is True
+
+
+def test_known_title_is_not_translated_in_the_post(monkeypatch):
+    """«Grand Blue» переводчик делал «Большой синевой», и русское название
+    Shikimori уже не находило, куда встать."""
+    def translate(text):
+        return (text.replace('Season 4 Announced With Teaser Visual', 'Анонсирован 4 сезон с тизер-постером')
+                    .replace('Grand Blue', 'Большая синева')
+                    .replace('The anime returns after the third season finale on October 22.',
+                             'Аниме вернётся после финала третьего сезона 22 октября.'))
+    monkeypatch.setattr(bot, 'translator', MagicMock(translate=translate))
+    monkeypatch.setattr(bot, 'anilist', None)
+    monkeypatch.setattr(bot, 'DEEPL_API_KEY', '')
+    monkeypatch.setattr(bot, '_translation_cache', {})
+    post = bot.format_news_short(_grand_blue())
+    assert 'Большая синева' not in post
+    assert '«Необъятный океан» (Grand Blue)' in post
 
 
 def _prepare_patched(monkeypatch):
@@ -444,6 +490,16 @@ def test_work_name_from_single_quotes_and_title_tail(title, name):
     assert not any(n.startswith('s ') for n in story_work_names("JoJo's Bizarre Adventure Opening"))
 
 
+def test_layout_words_and_italian_dates_are_not_work_data():
+    """«Main PV della serie…» — «Main PV» не тайтл; «dal 2 ottobre» — не номер."""
+    from news_stories import story_work_names, story_work_numbers
+    title = ('📺 Main PV della serie animata original Welsh & Shedar, che inizierà ad essere '
+             'trasmessa in Giappone dal 2 ottobre e sarà diretta da Naoki Horiuchi presso STUDIO MASSKET.')
+    assert story_work_names(title)[0] == 'Welsh & Shedar'
+    assert 'Main PV' not in story_work_names(title)
+    assert story_work_numbers(title) == frozenset()
+
+
 def test_slogan_title_takes_the_name_from_the_first_sentence():
     from news_stories import story_work_names
     news = {'title': '🍀 КЛЕВЕР ПОЙДЕТ ДО КОНЦА.',
@@ -535,6 +591,20 @@ def test_final_text_does_not_match_on_rubric_words(tmp_path, second):
     """«Кадры 12 серии «Табакошка»» глушил «Кадры к 14 серии «Реинкарнации»»."""
     texts = bot.PublishedTexts(tmp_path / 'texts.json')
     texts.add('Кадры 12 серии аниме «Табакошка».')
+    assert texts.find_similar(second) is None
+
+
+@pytest.mark.parametrize(('first', 'second'), [
+    # Общие слова — только рубрика «вышел трейлер второго сезона».
+    ('Вышел трейлер второго сезона «Атаки титанов»', 'Вышел трейлер второго сезона «Магической битвы»'),
+    # Тот же тайтл, но другая серия.
+    ('Кадры 12 серии аниме «Табакошка»', 'Кадры 13 серии аниме «Табакошка»'),
+    # Тот же издатель, другой месяц.
+    ('Новые лицензии Yen Press на декабрь 2026', 'Новые лицензии Yen Press на сентябрь 2026'),
+])
+def test_final_text_needs_same_core_and_same_numbers(tmp_path, first, second):
+    texts = bot.PublishedTexts(tmp_path / 'texts.json')
+    texts.add(first)
     assert texts.find_similar(second) is None
 
 
@@ -640,7 +710,8 @@ def test_invented_number_is_still_rejected():
     from llm_protocol import _llm_numbers_supported
     assert not _llm_numbers_supported(JP_SOURCE, 'Третий кур выйдет 5 октября.')
     # Цифра внутри имени исполнителя — часть имени, а не число.
-    assert _llm_numbers_supported('Bleach opening by jo0ji', 'Опенинг Bleach записал jo0ji')
+    assert _llm_numbers_supported('Bleach: Thousand-Year Blood War opening released today',
+                                  'Вышел опенинг Bleach от jo0ji')
 
 
 def test_japanese_month_supports_russian_month():
@@ -714,6 +785,26 @@ def test_undated_item_ages_from_first_sighting(monkeypatch, tmp_path):
     now = bot.time.time()
     monkeypatch.setattr(bot.time, 'time', lambda: now + 49 * 3600)
     assert bot._undated_too_old(item) is True
+
+
+def test_collection_drops_undated_card_seen_long_ago(monkeypatch, tmp_path):
+    monkeypatch.setitem(bot.FEATURE_FLAGS, 'source_discovery', False)
+    monkeypatch.setattr(bot, 'DATA_DIR', tmp_path)
+    monkeypatch.setattr(bot, 'first_seen_store', None)
+    cards = [{'title': 'Old card without date', 'link': 'https://myanimelist.net/news/1', 'images': ['i']},
+             {'title': 'Dated news', 'link': 'https://myanimelist.net/news/2', 'images': ['i'],
+              'published_parsed': bot.time.gmtime()}]
+    monkeypatch.setattr(bot, 'SOURCES', [('MyAnimeList', lambda: [dict(c) for c in cards])])
+    monkeypatch.setattr(bot, 'settings', MagicMock(is_source_enabled=lambda n: True, require_image=False,
+                                                   post_max_age_hours=48))
+    monkeypatch.setattr(bot, 'stats', MagicMock(record_collected=AsyncMock(), record_skipped=AsyncMock(),
+                                                record_source_error=AsyncMock()))
+    first, _, _ = asyncio.run(bot.collect_all_news())
+    assert {n['title'] for n in first} == {'Old card without date', 'Dated news'}
+    now = bot.time.time()
+    monkeypatch.setattr(bot.time, 'time', lambda: now + 49 * 3600)
+    later, _, _ = asyncio.run(bot.collect_all_news())
+    assert {n['title'] for n in later} == {'Dated news'}
 
 
 # ---------- п.13. Телеграм-пост: списки, призывы, русское название ----------

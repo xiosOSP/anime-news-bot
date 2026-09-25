@@ -10907,8 +10907,7 @@ NOISE_TITLE_RULES = (
         r"^\s*\d{1,3}\s+(?:[\w’'&-]+\s+){0,5}to\s+watch\b",
         # «The Best Anime of Summer 2026». «Best Anime of the Year» — это
         # премия, то есть новость, поэтому только сезон или год.
-        r'\bbest\b.{0,40}\bof\s+(?:the\s+)?(?:spring|summer|fall|autumn|winter)?\s*20\d\d\b',
-        r'\bbest\b.{0,40}\bof\s+(?:the\s+)?(?:spring|summer|fall|autumn|winter)\b',
+        r'\bbest\b.{0,40}\bof\s+(?:the\s+)?(?:spring|summer|fall|autumn|winter|20\d\d)\b',
     )),
     ('тест или опрос', (
         r'^\s*(?:quiz|poll|survey)\b',
