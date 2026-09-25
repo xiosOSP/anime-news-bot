@@ -92,7 +92,13 @@ from llm_protocol import (
 from news_stories import (
     _clean_work_name,
     same_work_event,
+    story_event_families,
+    story_explicit_work_names,
     story_work_names,
+    is_rubric_word,
+    numbers_conflict,
+    title_numbers,
+    titles_share_core,
     _STORY_STOPWORDS,
     _anchor_identity_match,
     _story_canonical_markers,
@@ -356,6 +362,12 @@ CHANNEL_ID = int(_channel_raw) if re.fullmatch(r'-?\d+', _channel_raw) \
 _admin_env = (os.getenv('ADMIN_ID') or '').strip()
 ADMIN_FROM_ENV = bool(re.fullmatch(r'-?\d+', _admin_env))
 ADMIN_ID = int(_admin_env) if ADMIN_FROM_ENV else 5056873937
+# Служебные «отправители» Telegram: у них один id на все чаты мира. От
+# GroupAnonymousBot приходит любое сообщение анонимного админа любой группы,
+# от Channel_Bot — любое сообщение от имени любого канала, от 777000 —
+# автопересылки из каналов. Права для такого id достались бы каждому анониму
+# в любой группе, поэтому админом они не бывают никогда.
+TELEGRAM_SERVICE_USER_IDS = frozenset({1087968824, 136817688, 777000})
 
 # Группа обсуждения и ветка (тема форума) для режима "слать всё в ветку".
 # Узнать ID можно командой /chatinfo внутри нужной ветки.
@@ -592,7 +604,7 @@ GOLDEN_DATASET_FILE = Path(__file__).with_name('golden') / 'editorial_cases.json
 STORY_UPDATE_LOOKBACK_DAYS = max(1, min(90, _env_int('STORY_UPDATE_LOOKBACK_DAYS', 21)))
 STORY_UPDATE_SIMILARITY = max(0.60, min(0.95, _env_float('STORY_UPDATE_SIMILARITY', 0.76)))
 REPLAY_BUFFER_MAX = max(20, min(2000, _env_int('REPLAY_BUFFER_MAX', 300)))
-DEFAULT_LLM_PROMPT_VERSION = 'editorial-v5-2026-09-23'
+DEFAULT_LLM_PROMPT_VERSION = 'editorial-v6-2026-09-25'
 LLM_PROMPT_VERSION = (_env('LLM_PROMPT_VERSION', DEFAULT_LLM_PROMPT_VERSION).strip()
                       or DEFAULT_LLM_PROMPT_VERSION)
 LLM_JUDGE_MAX_TOKENS = max(80, min(500, _env_int('LLM_JUDGE_MAX_TOKENS', 180)))
@@ -3205,6 +3217,21 @@ def _title_tokens(title: str) -> frozenset:
     return frozenset(w for w in words if len(w) >= 3 and w not in _TITLE_STOPWORDS)
 
 
+def _ledger_same_core(norm: str, tokens, old_norm: str, old_tokens, common: str = '') -> bool:
+    """Похожесть заголовков в ledger — только по ядру, не по рубрикам.
+
+    Живой прогон: «'Phantom Busters' TV Anime Announced For 2027» и «Ace
+    Attorney: Dual Destinies VR Announced for 2027» совпадали общей строкой
+    «announcedfor2027», и вторая новость молча выбрасывалась как повтор; так
+    же «Isshiki… Announces Additional Cast» глушил «Hyouken… Announces
+    Additional Cast». Совпадение засчитываем, только если общее есть в словах
+    названия и номера (серия, сезон, месяц) не противоречат.
+    """
+    return titles_share_core(tokens, old_tokens,
+                             title_numbers(norm, tokens), title_numbers(old_norm, old_tokens),
+                             common)
+
+
 class SentLinksStore:
     """История публикаций + короткоживущие транзакционные резервирования.
 
@@ -3456,14 +3483,16 @@ class SentLinksStore:
                 continue
             if tokens and old_tokens:
                 union = len(tokens | old_tokens)
-                if union and len(tokens & old_tokens) / union >= 0.6:
+                if (union and len(tokens & old_tokens) / union >= 0.6
+                        and _ledger_same_core(norm, tokens, old_norm, old_tokens)):
                     return True
             if norm_len >= 16 and len(old_norm) >= 16:
                 # Длина общей подстроки симметрична, поэтому порядок аргументов
                 # можно поменять местами без изменения результата.
                 matcher.set_seq1(old_norm)
                 m = matcher.find_longest_match(0, len(old_norm), 0, norm_len)
-                if m.size >= 16:
+                if m.size >= 16 and _ledger_same_core(norm, tokens, old_norm, old_tokens,
+                                                      old_norm[m.a:m.a + m.size]):
                     return True
         return False
 
@@ -4221,7 +4250,10 @@ class BotSettings:
                 uid = int(value)
             except (TypeError, ValueError):
                 continue
-            if uid > 0 and uid != ADMIN_ID and uid not in admins:
+            # Служебный id мог попасть в список до запрета — вычищаем при
+            # загрузке, иначе дыра осталась бы открытой на уже живых ботах.
+            if (uid > 0 and uid != ADMIN_ID and uid not in admins
+                    and uid not in TELEGRAM_SERVICE_USER_IDS):
                 admins.append(uid)
         self._data['extra_admins'] = admins
         raw_disabled = self._data.get('disabled_sources', [])
@@ -4720,12 +4752,17 @@ class BotSettings:
     def extra_admins(self) -> list[int]:
         return [x for x in self._data.get('extra_admins', []) if isinstance(x, int) and x > 0]
 
-    def add_admin(self, user_id: int) -> bool:
+    def add_admin(self, user_id: int, *, is_bot: bool = False) -> bool:
+        uid = int(user_id)
+        # Последний рубеж, даже если вызывающий код не проверил: бот, чат/канал
+        # (id ≤ 0) или служебный id Telegram админом стать не могут.
+        if is_bot or uid <= 0 or uid in TELEGRAM_SERVICE_USER_IDS:
+            return False
         with self._lock:
             ids = self._data.setdefault('extra_admins', [])
-            if int(user_id) in ids or int(user_id) == ADMIN_ID:
+            if uid in ids or uid == ADMIN_ID:
                 return False
-            ids.append(int(user_id))
+            ids.append(uid)
         self.save()
         return True
 
@@ -6280,6 +6317,11 @@ class StoryRegistry:
             return True
 
 
+# Версия правила сверки имён. Промахи, записанные прежним правилом, в кеше не
+# доверяются: см. WorkTitleResolver.cached.
+WORK_MATCH_RULE = 2
+
+
 class WorkTitleResolver:
     """Какой тайтл назван в новости — по базе Shikimori, с кешем на диске.
 
@@ -6349,6 +6391,11 @@ class WorkTitleResolver:
         # начал писать русские названия: спросим ещё раз, один раз.
         if row.get('key') and 'russian' not in row:
             return None
+        # Промах записан по старому правилу сверки, которое не узнавало
+        # «Mushoku Tensei» в «Mushoku Tensei: Isekai Ittara Honki Dasu».
+        # Такой промах держался бы неделю — спрашиваем заново.
+        if not row.get('key') and row.get('rule') != WORK_MATCH_RULE:
+            return None
         try:
             age = datetime.now(timezone.utc) - datetime.fromisoformat(str(row.get('at')))
         except (TypeError, ValueError):
@@ -6362,25 +6409,84 @@ class WorkTitleResolver:
             row = self._items.get(self._norm(name)) or {}
         return str(row.get('russian') or '') if row.get('key') else ''
 
+    @classmethod
+    def names_match(cls, query: str, names) -> bool:
+        """Похоже ли одно из имён записи на запрос. Общее правило и для AniList.
+
+        Поиск у баз нечёткий и всегда что-нибудь возвращает: AniList на
+        «October» отвечал «Saint October», и это имя вписывалось в пост.
+        """
+        wanted = cls._norm(query)
+        if not wanted:
+            return False
+        for name in names or ():
+            raw = _clean_work_name(str(name or ''))
+            have = cls._norm(raw)
+            if not have:
+                continue
+            # Короткое имя сходится только целиком: у «Spin» с любым
+            # коротким словом сходство высокое, а тайтл это другой.
+            if min(len(have), len(wanted)) <= 5:
+                if have == wanted:
+                    return True
+            elif difflib.SequenceMatcher(None, wanted, have).ratio() >= cls.ACCEPT:
+                return True
+            # Основное имя до подзаголовка. Все пишут «Mushoku Tensei» и
+            # «Реинкарнация безработного», а в базе — «Mushoku Tensei: Isekai
+            # Ittara Honki Dasu»: сходство 0.5, тайтл не опознавался ни на
+            # одном языке, и четыре поста о 14-й серии не склеились. Главная
+            # часть должна быть не из одного слова: «Cyberpunk» — ещё не
+            # «Cyberpunk: Edgerunners».
+            main = re.split(r'\s*[:～~]\s*', raw, maxsplit=1)[0].strip()
+            main_norm = cls._norm(main)
+            if (main and main != raw and len(main_norm) > 5
+                    and (len(main.split()) >= 2 or re.search(r'[぀-ヿ一-鿿]{3}', main))
+                    and difflib.SequenceMatcher(None, wanted, main_norm).ratio() >= cls.ACCEPT):
+                return True
+            if main and main != raw and main_norm == wanted and re.search(
+                    r'[぀-ヿ一-鿿]{3}', main):
+                return True
+        return False
+
     def _accept(self, query: str, candidates: list) -> Optional[dict]:
-        wanted = self._norm(query)
         for row in candidates or []:
             if not isinstance(row, dict) or not row.get('id'):
                 continue
             names = [row.get('name'), row.get('russian'), row.get('english'), row.get('japanese'),
                      *(row.get('synonyms') or [])]
-            for name in names:
-                have = self._norm(_clean_work_name(str(name or '')))
-                if not have:
-                    continue
-                # Короткое имя сходится только целиком: у «Spin» с любым
-                # коротким словом сходство высокое, а тайтл это другой.
-                if min(len(have), len(wanted)) <= 5:
-                    if have == wanted:
-                        return row
-                elif difflib.SequenceMatcher(None, wanted, have).ratio() >= self.ACCEPT:
-                    return row
+            if self.names_match(query, names):
+                return row
         return None
+
+    # Окончания русских падежей: «Черного Клевера» и «Реинкарнации
+    # Безработного» — тот же тайтл, что «Чёрный клевер», но поиск Shikimori
+    # склонённое имя не находит вовсе.
+    _RU_ENDING = re.compile(r'(?:ого|его|ому|ему|ыми|ими|ый|ий|ой|ая|яя|ое|ее|ые|ие|ых|их|ым|им|'
+                            r'ую|юю|ом|ем|ей|ам|ям|ах|ях|ов|ев|а|я|у|ю|е|ы|и|о|й|ь)$')
+
+    @classmethod
+    def _stem_key(cls, value: str) -> str:
+        words = re.findall(r'[а-я]+|[a-z0-9]+', str(value or '').casefold().replace('ё', 'е'))
+        if not any(w[0] >= 'а' for w in words):
+            return ''
+        return ' '.join(cls._RU_ENDING.sub('', w) if w[0] >= 'а' and len(w) > 4 else w
+                        for w in words)
+
+    def cached_by_stem(self, name: str) -> tuple[str, str]:
+        """Ключ и русское имя тайтла из кеша, если имя — его склонённая форма.
+
+        Сеть не нужна: тайтл уже опознан по другой новости того же цикла.
+        """
+        want = self._stem_key(name)
+        if len(want.replace(' ', '')) < 6:
+            return '', ''
+        with self._lock:
+            rows = [row for row in self._items.values() if row.get('key')]
+        for row in rows:
+            russian = str(row.get('russian') or '')
+            if russian and want in (self._stem_key(russian), self._stem_key(russian.split(':')[0])):
+                return str(row['key']), russian
+        return '', ''
 
     def lookup(self, name: str) -> Optional[str]:
         """Спросить Shikimori. None — сеть не ответила: в кеш это не пишем."""
@@ -6408,6 +6514,7 @@ class WorkTitleResolver:
             self._items[self._norm(name)] = {
                 'key': key, 'name': str((found or {}).get('name') or '')[:120],
                 'russian': re.sub(r'\s+', ' ', str((found or {}).get('russian') or '')).strip()[:160],
+                'rule': WORK_MATCH_RULE,
                 'at': datetime.now(timezone.utc).isoformat()}
             self._dirty = True
         return key
@@ -6430,10 +6537,20 @@ def _annotate_work_keys(items: list[dict], *, budget: int = WORK_LOOKUP_PER_CYCL
     # Пока кеш пуст, сорок запросов с паузой — это полминуты сбора. Что не
     # успели сейчас, опознается в следующем цикле: новости никуда не денутся.
     deadline = time.monotonic() + WORK_LOOKUP_WALL_SEC
-    for item in items:
+    # Лимит запросов тратился по порядку сбора: подборки, распродажи LEGO и
+    # новости кино из общих лент съедали его раньше, чем очередь доходила до
+    # настоящих анонсов (замер: 40 из 40 запросов первого цикла, треть — на
+    # то, что потом отсеял бы фильтр). Шум не публикуется никогда — его не
+    # сверяем вовсе; непрофильное из общих лент — только если лимит остался.
+    wanted = [item for item in items if not _cheap_noise(item)]
+    wanted.sort(key=lambda item: bool(settings is not None and settings.local_topic_filter
+                                      and off_topic_without_llm(item)))
+    pending: list[tuple[dict, list[str]]] = []
+    for item in wanted:
         if item.get('_work_key') or (sent_links is not None and item.get('link') in sent_links):
             continue
-        for name in story_work_names(item):
+        names = story_work_names(item)
+        for name in names:
             key = work_titles.cached(name)
             if (key is None and budget > 0 and failures < 3
                     and time.monotonic() < deadline):
@@ -6450,8 +6567,83 @@ def _annotate_work_keys(items: list[dict], *, budget: int = WORK_LOOKUP_PER_CYCL
                     item['_work_russian'] = work_titles.russian(name)
                 marked += 1
                 break
+        else:
+            pending.append((item, names))
+    # Русские каналы склоняют название: «2 сезон «Черного Клевера»». Поиск
+    # такую форму не находит, но тайтл к этому моменту уже опознан по
+    # соседней новости — сверяем основы слов с кешем, без сети.
+    unresolved: list[dict] = []
+    for item, names in pending:
+        for name in names:
+            key, russian = work_titles.cached_by_stem(name)
+            if key:
+                item['_work_key'] = key
+                if not item.get('_work_russian'):
+                    item['_work_name'] = name
+                    item['_work_russian'] = russian
+                marked += 1
+                break
+        else:
+            unresolved.append(item)
+    for item in unresolved:
+        explicit = story_explicit_work_names(item)
+        confirmed: list[str] = []
+        for name in story_work_names(item):
+            # Английское имя, которого нет в записи Shikimori: «Isshiki-san
+            # Wants to Know About Love» Crunchyroll пишет так, а у Shikimori
+            # есть только ромадзи. У AniList это имя есть среди синонимов, а
+            # его ромадзи уже опознано по соседней новости — склеиваем через
+            # него. Спрашиваем только латиницу из двух слов и больше и в
+            # пределах того же лимита запросов.
+            if (anilist is None or not re.search(r'[A-Za-z]', name) or re.search(r'[А-Яа-яЁё]', name)
+                    or not _anilist_candidate_ok(name) or budget <= 0
+                    or time.monotonic() >= deadline):
+                continue
+            budget -= 1
+            info = anilist.lookup(name)
+            if not info or not WorkTitleResolver.names_match(name, _anilist_names(info)):
+                continue
+            confirmed.append(name)
+            for alt in [info.get('romaji'), info.get('english'), *(info.get('synonyms') or [])]:
+                key = work_titles.cached(alt) if alt else None
+                if key:
+                    item['_work_key'] = key
+                    if not item.get('_work_russian'):
+                        item['_work_name'] = name
+                        item['_work_russian'] = work_titles.russian(alt)
+                    marked += 1
+                    break
+            if item.get('_work_key'):
+                break
+        if item.get('_work_key'):
+            continue
+        # Свежего анонса в базе ещё нет: «Phantom Busters» Shikimori не
+        # знает, и четыре пересказа анонса из четырёх источников ушли в канал
+        # тремя постами. Имя, которое источник сам выделил кавычками или
+        # словами «аниме по манге» либо которое подтвердил AniList, — тоже
+        # ключ: совпадёт оно только с тем же названием. Имя из одного слова не
+        # годится — «Odekake» или фамилия автора совпадут с чем угодно.
+        for name in explicit + confirmed:
+            norm = WorkTitleResolver._norm(name)
+            if len(name.split()) >= 2 and len(norm) >= 6:
+                item['_work_key'] = 'name:' + norm
+                break
     work_titles.flush()
     return marked
+
+
+def _cheap_noise(item: dict) -> bool:
+    """Отсеет ли новость бесплатный фильтр сбора — без записи в лог и метрики.
+
+    matches_keywords пишет в лог и считает метрику на каждый вызов, а здесь
+    нужен только ответ: иначе один отсев попадал бы в статистику дважды.
+    """
+    if matches_blacklist(item):
+        return True
+    check_text = (item.get('title') or '') + ' ' + (item.get('summary') or '')[:300]
+    if any(pattern.search(check_text) for pattern in DIGEST_SKIP_PATTERNS):
+        return True
+    return bool(settings is not None and settings.local_noise_filter and noise_reason(item))
 
 
 source_yield: Optional['SourceYieldStore'] = None
@@ -6568,12 +6760,29 @@ class PublishedStoryStore:
             return None
         old_facts = set(best.get('facts') or [])
         new_only = new_facts - old_facts
-        old_nums = set(best.get('numbers') or [])
-        number_change = bool(new_nums and new_nums != old_nums)
         novelty = len(new_only) / max(1, len(new_facts))
-        # Same wording is a duplicate, not an update. Require either a changed
-        # number/date or several genuinely new content tokens.
-        if not number_change and not (len(new_only) >= 3 and novelty >= 0.18):
+        # Обновление — это новый факт, а не новые слова. Раньше хватало трёх
+        # новых слов (новизна ≥0.18), а пересказ той же новости другим
+        # источником всегда пишется другими словами: «'Phantom Busters' TV
+        # Anime Announced» и «Phantom Busters Anime Adaptation Announced»
+        # давали новизну 0.5, второй пост уходил с пометкой «Обновление:» и
+        # обходил дедуп. Теперь нужен новый номер в заголовке (которого не было
+        # ни в заголовке, ни в тексте прошлой новости), новая дата выхода или
+        # новый род события (был анонс — появился трейлер).
+        old_title = str(best.get('title') or '')
+        old_summary = str(best.get('summary') or '')
+        old_nums = _story_numbers({'title': f'{old_title} {old_summary}'})
+        number_change = bool(new_nums - old_nums)
+        new_date = extract_release_date_from_text(
+            f"{news.get('title') or ''}\n{str(news.get('summary') or '')[:600]}")
+        old_date = extract_release_date_from_text(f'{old_title}\n{old_summary[:600]}')
+        date_change = bool(new_date and new_date != old_date)
+        # Род события прошлой новости — по заголовку И тексту: «Reveals Main
+        # Cast» с текстом «…premiere in 2027» уже сообщала дату, и «Main Cast,
+        # 2027 Release Date» от другого сайта ничего нового не несёт.
+        new_family = bool(story_event_families(news)
+                          - story_event_families(f'{old_title} {old_summary[:600]}'))
+        if not (number_change or date_change or new_family):
             return None
         out = dict(best)
         out['_similarity'] = round(best_score, 3)
@@ -7029,15 +7238,46 @@ def extract_release_date_from_text(text: str) -> str:
                     formatted = f'{day} {RU_MONTHS[month]}'
                 else:
                     continue
-                candidates.append((m.start(), _KIND_PRIORITY[kind], formatted))
+                candidates.append((_date_context_rank(text, m.start(), m.end()), m.start(),
+                                   _KIND_PRIORITY[kind], formatted))
             except (ValueError, IndexError, KeyError):
                 continue
 
+    # Дата, у которой рядом «announced on», — день анонса, а не выхода:
+    # «…getting a TV anime adaptation in 2027, as announced on September 24»
+    # давало в пост «📅 24 сентября», будто аниме выходит завтра.
+    candidates = [c for c in candidates if c[0] < 2]
     if not candidates:
         return ''
-    # Первая по позиции; при равной позиции — конкретнее
-    candidates.sort(key=lambda c: (c[0], c[1]))
-    return candidates[0][2]
+    # Сначала дата со словами о выходе рядом («premieres», «выйдет»,
+    # «放送開始»), затем первая по позиции; при равной позиции — конкретнее.
+    candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+    return candidates[0][3]
+
+
+# Слова о выходе рядом с датой: «premieres October 4», «10月4日より放送開始».
+_DATE_RELEASE_CONTEXT = re.compile(
+    r'premier\w*|releas\w*|\bairs?\b|\bairing\b|debut\w*|launch\w*|stream\w*|broadcast\w*|'
+    r'\bbegins?\b|\bstarts?\b|\bopens?\b|in theaters|arriv\w*|\bout\b|выйд\w*|выход\w*|'
+    r'стартует|старт\w*|премьер\w*|релиз\w*|эфир\w*|покаж\w*|放送|配信|公開|発売|上映|スタート|'
+    r'inizi\w*|uscit\w*', re.IGNORECASE)
+# Слова об анонсе прямо перед датой: «announced on September 24».
+_DATE_ANNOUNCE_CONTEXT = re.compile(
+    r'(?:announc\w*|reveal\w*|unveil\w*|confirm\w*|объявил\w*|объявлен\w*|анонсир\w*|'
+    r'сообщил\w*|опубликова\w*|発表)\W*(?:on|in|at|this|last)?\W*$', re.IGNORECASE)
+
+
+def _date_context_rank(text: str, start: int, end: int) -> int:
+    """0 — дата выхода, 1 — не понять, 2 — дата анонса (не годится)."""
+    before = text[max(0, start - 50):start]
+    # Контекст — в пределах той же фразы.
+    before = re.split(r'[.!?。！？\n]', before)[-1]
+    after = re.split(r'[.!?。！？\n,]', text[end:end + 20])[0]
+    if _DATE_ANNOUNCE_CONTEXT.search(before):
+        return 2
+    if _DATE_RELEASE_CONTEXT.search(before) or _DATE_RELEASE_CONTEXT.search(after):
+        return 0
+    return 1
 
 
 def parse_episode(title: str) -> Optional[dict]:
@@ -7123,6 +7363,7 @@ class AniListClient:
       Media(search: $search, type: ANIME) {
         id
         title { romaji english native }
+        synonyms
       }
     }
     """
@@ -7132,6 +7373,7 @@ class AniListClient:
       Media(search: $search, type: MANGA) {
         id
         title { romaji english native }
+        synonyms
       }
     }
     """
@@ -7196,10 +7438,14 @@ class AniListClient:
         if not media:
             return None
         title_obj = media.get('title') or {}
+        # Синонимы нужны сверке: английское имя «Isshiki-san Wants to Know
+        # About Love» у записи есть только среди них.
+        synonyms = [str(x) for x in (media.get('synonyms') or []) if isinstance(x, str)][:12]
         return {
             'romaji': title_obj.get('romaji'),
             'english': title_obj.get('english'),
             'native': title_obj.get('native'),
+            'synonyms': synonyms,
         }
 
     def lookup(self, query: str) -> Optional[dict]:
@@ -7222,6 +7468,7 @@ class AniListClient:
                     'romaji': cached.get('romaji'),
                     'english': cached.get('english'),
                     'native': cached.get('native'),
+                    'synonyms': list(cached.get('synonyms') or []),
                 }
             return None
 
@@ -7237,11 +7484,12 @@ class AniListClient:
                 'romaji': result.get('romaji'),
                 'english': result.get('english'),
                 'native': result.get('native'),
+                'synonyms': list(result.get('synonyms') or []),
                 'checked_at': datetime.now().isoformat(),
             }
             self._cache[key] = entry
             self._save()
-            return result
+            return {field: entry[field] for field in ('romaji', 'english', 'native', 'synonyms')}
         else:
             self._cache[key] = {
                 'found': False,
@@ -7474,30 +7722,87 @@ _ANILIST_CANDIDATE = re.compile(
 )
 
 
-def anilist_protect_titles(text: str, start_index: int = 2000) -> tuple[str, dict]:
+# Слова, из которых названия не состоят сами по себе: месяцы, дни недели,
+# рубрики заголовков. Кандидат целиком из них — не название, сколько бы
+# заглавных букв в нём ни было.
+_ANILIST_NOT_TITLE_WORDS = frozenset((
+    'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september',
+    'october', 'november', 'december', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
+    'saturday', 'sunday', 'spring', 'summer', 'fall', 'autumn', 'winter', 'season', 'episode',
+    'part', 'cour', 'preview', 'trailer', 'teaser', 'visual', 'key', 'main', 'cast', 'staff',
+    'theme', 'song', 'songs', 'opening', 'ending', 'anime', 'manga', 'movie', 'film', 'series',
+    'tv', 'official', 'new', 'more', 'additional', 'final', 'first', 'release', 'date',
+    'premiere', 'reveals', 'revealed', 'announces', 'announced', 'unveils', 'info', 'promo',
+    'video', 'character', 'characters', 'adaptation', 'news', 'update', 'the', 'a', 'an',
+    'of', 'in', 'on', 'at', 'for', 'and', 'or', 'to', 'with', 'from', 'by', 'is', 'are',
+))
+# Хвост кандидата из тех же рубрик: «Mushoku Tensei Season» ищем как
+# «Mushoku Tensei» — иначе имя не сойдётся ни с одним именем записи.
+_ANILIST_RUBRIC_TAIL = re.compile(
+    r'(?:\s+(?:Season|Episode|Part|Cour|Preview|Trailer|Teaser|Anime|Manga|Movie|Film|Series|'
+    r'TV|Visual|Key|Main|Cast|Staff|Opening|Ending|Promo|Video))+$')
+
+
+def _anilist_candidate_ok(candidate: str) -> bool:
+    words = candidate.split()
+    if len(words) < 2:
+        # Одно слово AniList «узнаёт» всегда: «October» — это «Saint October»,
+        # «Preview» — «Stitch! Special». Названий из одного слова в новостях
+        # мало, и их берёт regex-защита (капс, кавычки, японские частицы).
+        return False
+    return not all(w.casefold().strip('-') in _ANILIST_NOT_TITLE_WORDS for w in words)
+
+
+def _anilist_names(info: dict) -> list:
+    return [info.get('romaji'), info.get('english'), info.get('native'),
+            *(info.get('synonyms') or [])]
+
+
+def anilist_protect_titles(text: str, start_index: int = 2000,
+                           known_names=()) -> tuple[str, dict]:
     """Дополнительная защита через AniList API.
     Ищет в тексте последовательности слов с заглавной буквы, спрашивает AniList,
     защищает плейсхолдером если подтверждено что это название аниме/манги.
 
-    Использует ROMAJI как форму возврата (Tonari no Wakao-kun).
+    Защищается ТОЛЬКО исходная подстрока, в тексте ничего не подменяется.
+    Раньше в пост вписывалось romaji первого нечёткого совпадения, и живой
+    прогон дал «Season 3 Episode 14 Preview» → «…Shunkashuutou Daikousha…»,
+    «in October» → «in Saint October», «January 2027» → «1-gatsu ni wa
+    Christmas 2027»: поиск AniList всегда что-нибудь находит, а ответ
+    хранился в кеше неделями. Теперь найденное принимается, только если одно
+    из имён записи действительно похоже на кандидата (то же правило, что у
+    сверки тайтлов с Shikimori), — это же отсекает и старые записи кеша.
+
+    ``known_names`` — имена, уже опознанные по базе Shikimori (``_work_name``):
+    их защищаем без запроса к AniList.
     """
-    if anilist is None:
-        return text, {}
     placeholders: dict[str, str] = {}
     result = text
     counter = [start_index]
-    checked: set[str] = set()  # чтобы не спрашивать одно и то же дважды в этом проходе
 
-    def make_placeholder(value: str) -> str:
+    def protect(name: str) -> None:
+        nonlocal result
+        pattern = re.compile(r'(?<!\w)' + re.escape(name) + r'(?!\w)', re.IGNORECASE)
+        match = pattern.search(result)
+        if not match or '〖' in match.group(0):
+            return
         ph = _make_token(counter[0])
         counter[0] += 1
-        placeholders[ph] = value
-        return ph
+        placeholders[ph] = match.group(0)           # как в тексте, без подмены
+        result = result[:match.start()] + ph + result[match.end():]
+
+    for name in sorted({str(n).strip() for n in known_names or () if n and str(n).strip()},
+                       key=len, reverse=True):
+        if len(name) >= 3 and not re.search(r'[А-Яа-яЁё]', name):
+            protect(name)
+    if anilist is None:
+        return result, placeholders
+    checked: set[str] = set()  # чтобы не спрашивать одно и то же дважды в этом проходе
 
     # Собираем кандидатов (от длинных к коротким, чтобы длинные находились первыми)
     candidates = []
-    for m in _ANILIST_CANDIDATE.finditer(text):
-        candidate = m.group(1).strip()
+    for m in _ANILIST_CANDIDATE.finditer(result):
+        candidate = _ANILIST_RUBRIC_TAIL.sub('', m.group(1).strip())
         # Пропускаем слишком короткие (не имена) и слишком длинные (точно не названия)
         if len(candidate) < 4 or len(candidate) > 80:
             continue
@@ -7508,44 +7813,27 @@ def anilist_protect_titles(text: str, start_index: int = 2000) -> tuple[str, dic
         first = candidate.split()[0]
         if first.lower() in _COMMON_FIRST:
             continue
+        if not _anilist_candidate_ok(candidate):
+            continue
         # Пропускаем если кандидат покрывает большую часть текста: это скорее
         # газетный Title-Case заголовок целиком ("PlayStation to End Physical
         # Disc Production"), а не название внутри него. Защита такого «кандидата»
         # блокирует перевод всего заголовка.
-        if len(candidate) >= 0.55 * len(text.strip()):
+        if len(candidate) >= 0.55 * len(result.strip()):
             continue
-        candidates.append((m.start(), m.end(), candidate))
+        candidates.append(candidate)
 
     # Сортируем по длине убывающе, чтобы длинные имена защищались первыми
-    candidates.sort(key=lambda x: -len(x[2]))
+    candidates.sort(key=lambda x: -len(x))
 
-    for start, end, candidate in candidates:
+    for candidate in candidates:
         if candidate.lower() in checked:
             continue
         checked.add(candidate.lower())
-
         info = anilist.lookup(candidate)
-        if info:
-            # Выбираем "лучшую" форму названия:
-            # - если исходный текст совпадает с какой-то формой AniList (romaji/english/native) — оставляем как есть
-            # - иначе предпочитаем romaji (вариант A)
-            cand_lower = candidate.lower()
-            forms = [info.get('romaji'), info.get('english'), info.get('native')]
-            preferred = candidate  # по умолчанию — что было в тексте
-            for form in forms:
-                if form and form.lower() == cand_lower:
-                    preferred = form  # каноническая форма с правильным регистром
-                    break
-            else:
-                # Не нашли точного совпадения — берём romaji (или english если romaji нет)
-                preferred = info.get('romaji') or info.get('english') or candidate
-
-            # Заменяем ВСЕ вхождения этого кандидата в результирующем тексте
-            pattern = re.compile(r'\b' + re.escape(candidate) + r'\b', re.IGNORECASE)
-            if pattern.search(result):
-                ph = make_placeholder(preferred)
-                result = pattern.sub(ph, result, count=1)
-                logger.debug(f"AniList: защищено '{candidate}' → '{preferred}'")
+        if info and WorkTitleResolver.names_match(candidate, _anilist_names(info)):
+            protect(candidate)
+            logger.debug(f"AniList: защищено '{candidate}'")
 
     return result, placeholders
 
@@ -7696,18 +7984,39 @@ def _deepl_translate(text: str) -> Optional[str]:
     return None
 
 
-def translate_text(text: str, input_limit: int = TRANSLATION_INPUT_LIMIT) -> str:
+# Счётчик отказов перевода в текущем потоке. translate_text при отказе
+# возвращает исходник, и снаружи это было не отличить от перевода: пост
+# проверялся по доле кириллицы, а её давали вставленное русское название
+# тайтла и хэштег — английский текст целиком уходил в русский канал.
+# Поток, а не глобальная переменная: посты готовятся в to_thread параллельно.
+_translation_local = threading.local()
+
+
+def _translation_failures() -> int:
+    return int(getattr(_translation_local, 'failures', 0))
+
+
+def _note_translation_failure() -> None:
+    _translation_local.failures = _translation_failures() + 1
+
+
+def translate_text(text: str, input_limit: int = TRANSLATION_INPUT_LIMIT,
+                   known_names=()) -> str:
     """Переводит на русский с защитой терминов и пост-обработкой.
     input_limit — сколько символов исходного текста максимум переводить
     (для режима ветки передаём больший лимит, чтобы текст не обрезался).
+    known_names — названия, уже опознанные по базе тайтлов: не переводятся.
 
-    Переводчик: DeepL (если задан DEEPL_API_KEY), иначе/при ошибке — Google Translate."""
+    Переводчик: DeepL (если задан DEEPL_API_KEY), иначе/при ошибке — Google Translate.
+    При отказе возвращает исходник и отмечает отказ (см. _translation_failures)."""
     if not text:
         return text
     text = text[:input_limit]
+    known_names = tuple(n for n in (known_names or ()) if n)
+    cache_key = text if not known_names else text + '\x00' + '\x00'.join(known_names)
 
-    if text in _translation_cache:
-        return _translation_cache[text]
+    if cache_key in _translation_cache:
+        return _translation_cache[cache_key]
 
     # 1. Защита явных терминов из словаря
     protected_text, term_placeholders = protect_terms(text)
@@ -7716,7 +8025,8 @@ def translate_text(text: str, input_limit: int = TRANSLATION_INPUT_LIMIT) -> str
     protected_text, auto_placeholders = auto_protect_proper_nouns(protected_text, start_index=1000)
 
     # 3. Дополнительная защита через AniList API (только то, что не покрыто авто-защитой)
-    protected_text, anilist_placeholders = anilist_protect_titles(protected_text, start_index=2000)
+    protected_text, anilist_placeholders = anilist_protect_titles(protected_text, start_index=2000,
+                                                                  known_names=known_names)
 
     # Объединяем словари плейсхолдеров
     all_placeholders = {**term_placeholders, **auto_placeholders, **anilist_placeholders}
@@ -7734,9 +8044,11 @@ def translate_text(text: str, input_limit: int = TRANSLATION_INPUT_LIMIT) -> str
             translated = translator.translate(protected_text)
         except Exception as e:
             logger.warning(f"Ошибка перевода: {e}")
+            _note_translation_failure()
             return text
 
     if not translated:
+        _note_translation_failure()
         return text
 
     # 5. Возвращаем плейсхолдеры
@@ -7751,7 +8063,7 @@ def translate_text(text: str, input_limit: int = TRANSLATION_INPUT_LIMIT) -> str
     if len(_translation_cache) >= TRANSLATION_CACHE_MAX:
         for old_key in list(_translation_cache.keys())[:TRANSLATION_CACHE_MAX // 3]:
             del _translation_cache[old_key]
-    _translation_cache[text] = translated
+    _translation_cache[cache_key] = translated
     return translated
 
 
@@ -7805,6 +8117,16 @@ ARTICLE_MIN_WORDS = 25          # ниже этого RSS-описание сч�
 ARTICLE_MAX_CHARS = 3500        # столько текста статьи отдаём модели
 _article_cache: dict[str, dict] = {}
 _article_text_cache: dict[str, str] = {}
+# Страница статьи — недоверенный ввод. Раньше поиск ролика брал текст родителя
+# целиком на КАЖДУЮ ссылку: 16 тысяч ссылок в одном <div> разбирались около
+# двух минут, и всё это время поток был занят, а цикл новостей ждал. Потолки
+# держат работу линейной и короткой при любой разметке.
+VIDEO_SCAN_MAX_HTML_CHARS = 512 * 1024   # столько HTML отдаём BeautifulSoup
+VIDEO_SCAN_MAX_NODES = 300               # столько ссылок/плееров смотрим
+VIDEO_SCAN_CONTEXT_CHARS = 300           # столько текста вокруг берём в улики
+# Общий потолок на чтение статьи: запросы с повторами и редиректами, чтение
+# тела и разбор. Дольше ждать нельзя — за статьёй стоит вся пачка новостей.
+ARTICLE_FETCH_TIMEOUT_SEC = 60
 
 # Мусор, который на новостных сайтах лежит вперемешку с текстом
 _ARTICLE_JUNK = re.compile(
@@ -7860,10 +8182,30 @@ def _is_playable_video_url(url: str) -> bool:
     return False
 
 
+def _text_prefix(node, limit: int = VIDEO_SCAN_CONTEXT_CHARS) -> str:
+    """Начало текста узла — то же, что get_text(' ', strip=True)[:limit].
+
+    Строки берём по одной и останавливаемся на лимите: get_text собирал бы
+    весь текст родителя, а у родителя тысяч ссылок это вся страница — на
+    каждую ссылку заново, то есть квадратичная работа."""
+    if node is None:
+        return ''
+    parts: list[str] = []
+    size = 0
+    for piece in node.stripped_strings:
+        parts.append(piece)
+        size += len(piece) + 1
+        if size > limit:
+            break
+    return ' '.join(parts)[:limit]
+
+
 def _find_video_in_html(html_text: str, base_url: Optional[str] = None) -> Optional[str]:
     """Find the most relevant playable clip, not merely the first video URL."""
     try:
-        soup = BeautifulSoup(html_text, 'html.parser')
+        # Метатеги og:video и плеер статьи стоят в начале страницы; хвост
+        # огромного документа ролика не добавит, а разбор его стоит дорого.
+        soup = BeautifulSoup(str(html_text or '')[:VIDEO_SCAN_MAX_HTML_CHARS], 'html.parser')
     except Exception:
         return None
 
@@ -7924,21 +8266,21 @@ def _find_video_in_html(html_text: str, base_url: Optional[str] = None) -> Optio
             'nav, footer, aside, .related, .related-posts, .recommended, .recommendations')):
         node.decompose()
 
-    for frame in body.select('iframe, embed, video, video source'):
+    for frame in body.select('iframe, embed, video, video source', limit=VIDEO_SCAN_MAX_NODES):
         evidence = ' '.join(filter(None, [
             frame.get('title'), frame.get('aria-label'), frame.get('alt'),
-            frame.parent.get_text(' ', strip=True)[:300] if frame.parent else '',
+            _text_prefix(frame.parent),
         ]))
         base_score = 96 if frame.name in ('video', 'source') else 82
         for attr in ('src', 'data-src', 'data-lazy-src', 'data-original'):
             add(frame.get(attr), base_score, evidence)
 
-    for player in body.select('lite-youtube[videoid], [data-youtube-id]'):
+    for player in body.select('lite-youtube[videoid], [data-youtube-id]', limit=VIDEO_SCAN_MAX_NODES):
         video_id = player.get('videoid') or player.get('data-youtube-id')
         if re.fullmatch(r'[\w-]+', str(video_id or '')):
             evidence = ' '.join(filter(None, [
                 player.get('title'), player.get('aria-label'),
-                player.parent.get_text(' ', strip=True)[:300] if player.parent else '',
+                _text_prefix(player.parent),
             ]))
             add(f'https://www.youtube.com/watch?v={video_id}', 90, evidence)
 
@@ -7970,10 +8312,10 @@ def _find_video_in_html(html_text: str, base_url: Optional[str] = None) -> Optio
         except RecursionError:
             continue
 
-    for link in body.select('a[href]'):
+    for link in body.select('a[href]', limit=VIDEO_SCAN_MAX_NODES):
         evidence = ' '.join(filter(None, [
-            link.get_text(' ', strip=True), link.get('title'), link.get('aria-label'),
-            link.parent.get_text(' ', strip=True)[:300] if link.parent else '',
+            _text_prefix(link), link.get('title'), link.get('aria-label'),
+            _text_prefix(link.parent),
         ]))
         add(link.get('href'), 60, evidence)
 
@@ -8059,6 +8401,20 @@ def fetch_article_text(url: str) -> str:
     return fetch_article(url).get('text', '')
 
 
+async def _fetch_article_bounded(url: str) -> dict:
+    """fetch_article в потоке, но с общим потолком по времени.
+
+    Таймауты requests — на каждое чтение, а не на весь ответ: медленный сайт
+    может отдавать тело по байту бесконечно. Поток мы не убьём, но пачка
+    новостей дальше его ждать не будет."""
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(fetch_article, url),
+                                      timeout=ARTICLE_FETCH_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        logger.info(f"Статья читалась дольше {ARTICLE_FETCH_TIMEOUT_SEC} с — пропускаем: {str(url)[:70]}")
+        return {'text': '', 'video': None}
+
+
 async def _discover_article_video(news: dict) -> None:
     """Ищет ролик в статье независимо от доступности и настроек LLM."""
     if not settings.video_enabled:
@@ -8072,7 +8428,7 @@ async def _discover_article_video(news: dict) -> None:
     if _is_playable_video_url(news['link']):
         news['video'] = news['link']
         return
-    article = await asyncio.to_thread(fetch_article, news['link'])
+    article = await _fetch_article_bounded(news['link'])
     video = article.get('video') if isinstance(article, dict) else None
     if video:
         news['video'] = video
@@ -9597,7 +9953,28 @@ def get_gkids_news():
     )
 
 
+# RSS MyAnimeList отдаёт дату и первый абзац новости. Страница-список даты
+# не показывает вовсе: все её карточки считались свежими, и фильтр возраста
+# на них не работал. Список остаётся запасным путём.
+MAL_NEWS_RSS = 'https://myanimelist.net/rss/news.xml'
+
+
 def get_myanimelist():
+    rows = _parse_rss_with_fallback(MAL_NEWS_RSS, 'MyAnimeList')
+    if isinstance(rows, list) and rows:
+        out = []
+        for row in rows:
+            # «?_location=rss» — метка ленты. Со страницы-списка та же новость
+            # приходит без неё, и дедуп по ссылке видел бы две разные.
+            row['link'] = re.sub(r'[?&]_location=rss\b', '', str(row.get('link') or ''))
+            if sent_links is not None and row['link'] in sent_links:
+                continue
+            out.append(row)
+        return out
+    return _get_myanimelist_listing()
+
+
+def _get_myanimelist_listing():
     news_list = []
     try:
         response = http_get_with_retry(
@@ -10526,6 +10903,11 @@ NOISE_TITLE_RULES = (
         # «まとめ一覧» и «キャラクター一覧» — сводные списки. Просто «まとめ»
         # не берём: «まとめて配信» значит «выложат все серии разом».
         r'特集[!！]?\s*$|\d+\s*つの理由|まとめ一覧|(?:キャラクター|登場人物)（?[^）]*）?一覧',
+        # «10 New Fall 2026 Anime to Watch This October» — подборка на сезон.
+        r"^\s*\d{1,3}\s+(?:[\w’'&-]+\s+){0,5}to\s+watch\b",
+        # «The Best Anime of Summer 2026». «Best Anime of the Year» — это
+        # премия, то есть новость, поэтому только сезон или год.
+        r'\bbest\b.{0,40}\bof\s+(?:the\s+)?(?:spring|summer|fall|autumn|winter|20\d\d)\b',
     )),
     ('тест или опрос', (
         r'^\s*(?:quiz|poll|survey)\b',
@@ -10555,6 +10937,36 @@ NOISE_TITLE_RULES = (
         r'^\s*всё,? что известно\b',
         r'\bобъясняем\b',
         r'\bв каком порядке смотреть\b',
+        # Японские объяснялки: «『ONE PIECE』シャンクス 生い立ちと経歴を解説» —
+        # биография персонажа. «解説付き上映会» (показ с комментарием) — новость.
+        r'を解説(?!付)|【解説】|解説[!！]?\s*$',
+    )),
+    # Спойлеры: канал обещает подписчикам их не публиковать. Пересказ
+    # сюжета будущей серии («あらすじ», «сюжет 14 серии») и «Chapter 1160
+    # Spoilers» уходили в канал как обычные новости.
+    ('спойлер', (
+        r'\bspoilers?\b',
+        r'\bспойлер\w*',
+        r'あらすじ|ネタバレ',
+        r'\bсюжет\w*\s+(?:\d+|\w+ой|\w+ей)[-\s]?(?:й\s+|го\s+)?(?:серии|эпизода|главы)\b',
+    )),
+    # Анонс анонса: «Новая информация … будет объявлена 25 сентября!» —
+    # фактов в ней нет, новость появится, когда их объявят.
+    ('анонс анонса', (
+        r'\bбуд(?:ет|ут)\s+об[ъь]явлен[аоы]?\b',
+        r'\bwill be (?:announced|revealed) (?:on|at|in|this|next)\b',
+    )),
+    # Игрушки и игры. «LEGO Keeps Studio Ghibli's Princess Mononoke Set
+    # Alive» и «Animal Crossing Meets Pokémon Sleep in New Cozy Steam Game»
+    # аниме-ленты ставят в общий поток, а владелец канала публикует только
+    # новости аниме и манги.
+    ('мерч и игры', (
+        r'\blego\b',
+        r'\bmodel kits?\b',
+        r'\bplush(?:ies?)?\b',
+        r'\bnendoroids?\b|\bfigma\b|\bgunpla\b',
+        r'\bscale figures?\b|\bfigures?\s+(?:pre-?orders?|revealed|unveiled|launch\w*)\b',
+        r'\bsteam game\b',
     )),
     ('годовщина и ностальгия', (
         r'\b\d{1,2}\s+years\s+(?:later|ago)\b',
@@ -10584,6 +10996,10 @@ NOISE_TITLE_RULES = (
     # владельца канала серии в дубляже не публикуются вовсе.
     ('серия в дубляже', (
         r'\([^()]{2,30}\s+dub\)\s*[-–—:]?\s*(?:episode|ep\.?)\s*\d+',
+        # Итальянский канал: «Su ANiME GENERATION è ora disponibile l'anime
+        # special Marine Express doppiato in italiano» — выход дубляжа на
+        # итальянском сервисе, русскому каналу это не новость.
+        r'\bdoppiat[oaie]\b',
     )),
     ('фан-контент', (
         r'\bfan\s?art\b',
@@ -10629,7 +11045,27 @@ def noise_reason(news: dict) -> str:
     for reason, pattern in _NOISE_TITLE_RE:
         if pattern.search(title):
             return reason
+    if _self_promo(title, str(news.get('source') or '')):
+        return 'самореклама источника'
     return ''
+
+
+_ANNIVERSARY_OF = re.compile(r'\bcelebrat\w*\s+(?:[\w-]+\s+){1,3}years?\s+of\s+(.+?)\s*[!.]?$',
+                             re.IGNORECASE)
+
+
+def _self_promo(title: str, source: str) -> bool:
+    """«Celebrating Sixteen Years of Anime Herald» в ленте Anime Herald.
+
+    Юбилей самого источника — не новость. «Celebrating 30 Years of
+    Evangelion» — юбилей тайтла, это новость, поэтому сверяем с именем ленты.
+    """
+    match = _ANNIVERSARY_OF.search(title)
+    if not match or not source:
+        return False
+    own = re.sub(r'[^0-9a-zа-яё]+', '', source.casefold())
+    named = re.sub(r'[^0-9a-zа-яё]+', '', match.group(1).casefold())
+    return bool(own and named and (own in named or named in own))
 
 
 def matches_keywords(news: dict) -> bool:
@@ -10843,7 +11279,20 @@ def _with_russian_work_name(title: str, news: dict) -> str:
     if (not russian or not original or not _russian_titles_on()
             or re.search(r'[А-Яа-яЁё]', original) or russian.casefold() in title.casefold()):
         return title
-    match = re.search(r'[«"“]?' + re.escape(original) + r'[»"”]?', title, re.IGNORECASE)
+    # Имя в кавычках вместе с хвостом до закрывающей кавычки: «Cyberpunk:
+    # Edgerunners 2». Раньше заменялось только само имя с открывающей
+    # кавычкой, и получалось «Киберпанк: Бегущие по краю» (Cyberpunk:
+    # Edgerunners) 2». — с лишней кавычкой и номером за скобкой.
+    # Хвост — только номер части: «Grand Blue Dreaming» — уже другое имя.
+    quoted = re.search(r'([«"“])' + re.escape(original)
+                       + r'((?:\s+(?:\d{1,3}|[IVX]{1,4}|(?:Season|Part|сезон)\s*\d{1,3}))?)\s*([»"”])',
+                       title, re.IGNORECASE)
+    if quoted:
+        tail = quoted.group(2).rstrip()
+        written = title[quoted.start(1) + 1:quoted.start(2)]
+        replacement = f'«{russian}{tail}»' + (f' ({written}{tail})' if len(written) <= 30 else '')
+        return title[:quoted.start()] + replacement + title[quoted.end():]
+    match = re.search(r'(?<![«"“\w])' + re.escape(original) + r'(?![»"”\w])', title, re.IGNORECASE)
     if not match:
         return title
     replacement = f'«{russian}»' + (f' ({original})' if len(original) <= 30 else '')
@@ -10891,8 +11340,13 @@ def format_news_short(news: dict) -> str:
             return _apply_editorial_rules(format_episode_post(ep, news.get('published_parsed')), news)
 
     # Заголовок
+    failures_before = _translation_failures()
+    # Тайтл, уже опознанный по базе, переводчику не отдаём: «Grand Blue»
+    # иначе становился «Большой синевой» — рядом с официальным русским
+    # названием, которое подставит _with_russian_work_name.
+    known = {'known_names': (str(news['_work_name']),)} if news.get('_work_name') else {}
     raw_title = _strip_links(news['title'])
-    ru_title = (raw_title if is_ru else translate_text(raw_title)).rstrip('.')
+    ru_title = (raw_title if is_ru else translate_text(raw_title, **known)).rstrip('.')
     # Санити-чек: если перевод «съел» заголовок до огрызка («Netflix.») —
     # лучше показать оригинал целиком, чем обрывок.
     if (not is_ru and len(ru_title) < 15
@@ -10915,9 +11369,14 @@ def format_news_short(news: dict) -> str:
         translated_max = 620 if compact else 850
         excerpt = _extract_sentences(summary, max_sentences=max_sentences, max_len=source_max)
         if excerpt:
-            ru_summary = excerpt if is_ru else translate_text(excerpt, input_limit=1200)
+            ru_summary = excerpt if is_ru else translate_text(excerpt, input_limit=1200, **known)
             ru_summary = _extract_sentences(_strip_links(ru_summary),
                                             max_sentences=max_sentences, max_len=translated_max)
+
+    if not is_ru:
+        # Явный флаг отказа: по нему пост откладывается, а не уходит в канал
+        # на английском (см. _left_untranslated).
+        news['_translation_failed'] = _translation_failures() > failures_before
 
     # Remove only the repeated sentence, keeping the facts that follow it.
     ru_summary = _strip_title_echo(ru_title, ru_summary)
@@ -10954,11 +11413,33 @@ def _left_untranslated(news: dict) -> bool:
     """
     if news.get('_edited_text') or news.get('_llm_text') or news.get('lang') == 'ru':
         return False
-    letters = [char for char in format_news_short(news) if char.isalpha()]
+    news.pop('_translation_failed', None)
+    text = format_news_short(news)
+    # Переводчик отказал — пост остался на языке источника. Русский текст без
+    # пометки lang (такие ленты есть) от этого хуже не стал, поэтому смотрим,
+    # на каком языке был сам источник.
+    if news.get('_translation_failed') and _cyrillic_share(
+            f"{news.get('title') or ''} {news.get('summary') or ''}") < UNTRANSLATED_CYRILLIC_SHARE:
+        return True
+    # Считаем только то, что написал переводчик. Официальное русское название
+    # тайтла, хэштег из него и строка даты — кириллица, которую вставили мы
+    # сами: с ними непереведённый пост «Grand Blue Season 4 Announced»
+    # набирал долю кириллицы выше порога и уходил в канал на английском.
+    russian = str(news.get('_work_russian') or '').strip()
+    if russian:
+        text = text.replace(f'«{russian}»', ' ').replace(russian, ' ')
+    text = re.sub(r'(?m)^📅.*$', ' ', text)
+    text = re.sub(r'#\w+', ' ', text)
+    return _cyrillic_share(text) < UNTRANSLATED_CYRILLIC_SHARE
+
+
+def _cyrillic_share(text: str) -> float:
+    """Доля кириллицы среди букв; текст без букв считается русским."""
+    letters = [char for char in str(text or '') if char.isalpha()]
     if not letters:
-        return False
+        return 1.0
     cyrillic = sum(1 for char in letters if 'а' <= char.lower() <= 'я' or char in 'ёЁ')
-    return cyrillic / len(letters) < UNTRANSLATED_CYRILLIC_SHARE
+    return cyrillic / len(letters)
 
 
 def format_news_text_long(news: dict) -> str:
@@ -11531,6 +12012,17 @@ async def _prepare_news_for_send(news: dict, source: str,
         # Google отвечает серверным адресам 429 часами, так что это не редкость.
         # Откладываем так же, как при недоступной модели: новость вернётся в
         # следующем цикле, а устаревшую отсеет фильтр возраста.
+        if not await asyncio.to_thread(_untranslated_defer_news, news):
+            # Ждать дальше бессмысленно: переводчик молчит часами, а каждый
+            # новый заход заново качал картинки и видео этой новости — без
+            # счётчика попыток она откладывалась бесконечно. Публиковать
+            # по-английски нельзя, поэтому новость снимаем.
+            logger.info('⊘ Перевод так и не удался, новость снята: %s',
+                        str(news.get('title', ''))[:60])
+            metrics.inc('anime_bot_untranslated_dropped_total')
+            if count_stats:
+                await stats.record_skipped('filtered', source)
+            return 'skipped_filter'
         logger.info('⏸ Пост отложен: перевод не удался — %s', str(news.get('title', ''))[:60])
         metrics.inc('anime_bot_untranslated_deferred_total')
         return 'deferred'
@@ -12939,22 +13431,37 @@ class PublishedTexts:
         'ы': 'i', 'ь': '', 'э': 'e', 'ю': 'u', 'я': 'a',
     })
 
+    _STOP = frozenset({'аниме', 'манга', 'манге', 'манги', 'the', 'and', 'for', 'уже',
+                       'выйдет', 'вышел', 'вышла', 'состоится', 'получит', 'anime',
+                       'manga', 'премьера', 'этого', 'года'})
+
     @classmethod
     def _words(cls, text: str) -> set:
         """Значимые слова первой строки, приведённые к латинице."""
+        return cls._parts(text)[0]
+
+    @classmethod
+    def _parts(cls, text: str) -> tuple[set, set, set]:
+        """Слова первой строки, их ядро без рубрик и номера первой строки.
+
+        «Кадры 12 серии «Табакошка»» и «Кадры к 14 серии «Реинкарнации»»
+        совпадали на две трети слов — «кадры» и «серии», — и вторая новость
+        считалась повтором. Общими должны быть слова названия, а номера
+        серий не должны расходиться.
+        """
         head = (text or '').split('\n')[0].lower()
         raw = re.findall(r'[а-яёa-z0-9]{3,}', head)
-        stop = {'аниме', 'манга', 'манге', 'манги', 'the', 'and', 'for', 'уже',
-                'выйдет', 'вышел', 'вышла', 'состоится', 'получит', 'anime',
-                'manga', 'премьера', 'этого', 'года'}
-        words = set()
+        words, core = set(), set()
         for word in raw:
-            if word in stop:
+            if word in cls._STOP:
                 continue
             latin = word.translate(cls._TRANSLIT)
             if len(latin) >= 3:
                 words.add(latin[:6])
-        return words
+                if not is_rubric_word(word):
+                    core.add(latin[:6])
+        numbers = title_numbers(head, re.findall(r'[а-яёa-z]+', head))
+        return words, core, numbers
 
     @staticmethod
     def _key(words: set) -> str:
@@ -12970,12 +13477,21 @@ class PublishedTexts:
             if done:
                 self._pending.pop(key, None)
 
-    def _find_similar_words(self, words: set) -> Optional[str]:
+    def _find_similar_words(self, words: set, core: Optional[set] = None,
+                            numbers: Optional[set] = None) -> Optional[str]:
         self._prune()
         self._prune_pending()
+        core = set(words) if core is None else core
         for item in list(reversed(self._items)) + list(self._pending.values()):
             old = set(item.get('w') or [])
             if not old:
+                continue
+            # Записи до этой правки ядра и номеров не хранят — для них всё
+            # слово считается ядром, а номера неизвестны.
+            old_core = set(item['c']) if isinstance(item.get('c'), list) else old
+            if numbers_conflict(numbers or (), item.get('n') or ()):
+                continue
+            if not (words & old & core & old_core):
                 continue
             overlap = len(words & old) / min(len(words), len(old))
             if overlap >= FINAL_SIMILARITY:
@@ -12984,21 +13500,21 @@ class PublishedTexts:
 
     def find_similar(self, text: str) -> Optional[str]:
         """Заголовок недавнего или прямо сейчас отправляемого похожего поста."""
-        words = self._words(text)
+        words, core, numbers = self._parts(text)
         if len(words) < 3:
             return None
-        return self._find_similar_words(words)
+        return self._find_similar_words(words, core, numbers)
 
     def reserve(self, text: str) -> Optional[str]:
         """Резервирует финальный текст; возвращает заголовок дубля или None."""
-        words = self._words(text)
+        words, core, numbers = self._parts(text)
         if len(words) < 3:
             return None
-        duplicate = self._find_similar_words(words)
+        duplicate = self._find_similar_words(words, core, numbers)
         if duplicate:
             return duplicate
         self._pending[self._key(words)] = {
-            'w': sorted(words),
+            'w': sorted(words), 'c': sorted(core), 'n': sorted(numbers),
             't': re.sub(r'\s+', ' ', (text or '').split('\n')[0])[:70],
             '_owner': asyncio.current_task() if asyncio.get_event_loop().is_running() else None,
         }
@@ -13014,11 +13530,11 @@ class PublishedTexts:
         self.add(text)
 
     def add(self, text: str) -> None:
-        words = self._words(text)
+        words, core, numbers = self._parts(text)
         if len(words) < 3:
             return
         self._items.append({
-            'w': sorted(words),
+            'w': sorted(words), 'c': sorted(core), 'n': sorted(numbers),
             't': re.sub(r'\s+', ' ', (text or '').split('\n')[0])[:70],
             'ts': time.time(),
         })
@@ -15527,19 +16043,25 @@ def _cluster_news(items: list[dict], *, persist_intelligence: bool = True) -> li
         best_score = STORY_CLUSTER_SIMILARITY
         # Не сравниваем со всей бесконечной историей: clustering работает в одном batch.
         for idx, cluster in enumerate(clusters[-STORY_CLUSTER_MAX_COMPARE:]):
-            rep = cluster[0]
-            # Тот же тайтл, номер и тип события — одна новость, на каком бы
-            # языке её ни написали. Проверка раньше конфликта маркеров: у
-            # «постера к 4 сезону» и «Season 4 Announced» слова событий разные.
-            if same_work_event(item, rep):
-                sim = 1.0
-            # Доставка это проверяла, а пачка — нет: трейлер и ключевой визуал
-            # одного сезона склеивались в один пост при сходстве 0.91.
-            elif _story_events_conflict(item, rep):
-                continue
-            else:
-                sim = _story_similarity(item, rep)
-            if sim >= best_score:
+            # Сравниваем со всеми новостями кластера, а не только с первой.
+            # Первой в кластер мог попасть итальянский пост без ключа тайтла,
+            # и английский пересказ того же анонса, опознанный по базе, к нему
+            # уже не подходил — в канал уходили оба (живой цикл 24.09: семь
+            # историй по два-три поста).
+            sim = 0.0
+            for rep in cluster:
+                # Тот же тайтл, номер и тип события — одна новость, на каком бы
+                # языке её ни написали. Проверка раньше конфликта маркеров: у
+                # «постера к 4 сезону» и «Season 4 Announced» слова событий разные.
+                if same_work_event(item, rep):
+                    sim = 1.0
+                    break
+                # Доставка это проверяла, а пачка — нет: трейлер и ключевой визуал
+                # одного сезона склеивались в один пост при сходстве 0.91.
+                if _story_events_conflict(item, rep):
+                    continue
+                sim = max(sim, _story_similarity(item, rep))
+            if sim and sim >= best_score:
                 best_score = sim
                 best_idx = len(clusters) - min(len(clusters), STORY_CLUSTER_MAX_COMPARE) + idx
         if best_idx is None:
@@ -15952,6 +16474,64 @@ def _normalize_collected_news(item, source: str) -> Optional[dict]:
     return news
 
 
+class FirstSeenStore:
+    """Когда бот впервые увидел новость без даты — на диске, переживает рестарт."""
+    MAX_ITEMS = 5000
+    TTL_DAYS = 14
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._items: dict[str, float] = {}
+        self._dirty = False
+        self._lock = threading.Lock()
+        try:
+            raw = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+            items = raw.get('items') if isinstance(raw, dict) else None
+            if isinstance(items, dict):
+                self._items = {str(k): float(v) for k, v in items.items()
+                               if isinstance(v, (int, float)) and math.isfinite(v)}
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning(f'first_seen не загружен: {e}')
+
+    def seen_at(self, link: str) -> float:
+        key = normalize_url(link) or str(link or '')
+        with self._lock:
+            if key not in self._items:
+                self._items[key] = time.time()
+                self._dirty = True
+            return self._items[key]
+
+    def flush(self) -> None:
+        with self._lock:
+            if not self._dirty:
+                return
+            edge = time.time() - self.TTL_DAYS * 86400
+            kept = sorted(((k, v) for k, v in self._items.items() if v >= edge), key=lambda kv: kv[1])
+            self._items = dict(kept[-self.MAX_ITEMS:])
+            try:
+                _atomic_write_json(self.path, {'schema_version': 1, 'items': self._items})
+                self._dirty = False
+            except OSError as e:
+                logger.warning(f'first_seen не сохранён: {e}')
+
+
+first_seen_store: Optional[FirstSeenStore] = None
+
+
+def _undated_too_old(item: dict) -> bool:
+    global first_seen_store
+    link = str(item.get('link') or '')
+    if not link:
+        return False
+    path = DATA_DIR / 'news_first_seen.json'
+    if first_seen_store is None or first_seen_store.path != path:
+        first_seen_store = FirstSeenStore(path)
+    max_age = getattr(settings, 'post_max_age_hours', POST_MAX_AGE_HOURS)
+    if not isinstance(max_age, (int, float)) or isinstance(max_age, bool):
+        max_age = POST_MAX_AGE_HOURS
+    return time.time() - first_seen_store.seen_at(link) > max_age * 3600
+
+
 async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
     """Собирает свежие новости со всех включённых источников.
     Возвращает (all_news, stats_lines, errors)."""
@@ -16033,6 +16613,12 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
                 if settings.require_image and not _news_has_media_candidate(item):
                     no_image_skipped += 1
                     continue
+                # Без даты фильтр возраста пропускал новость всегда: карточка
+                # со страницы-списка висела бы кандидатом неделями. Возраст
+                # такой новости считаем от первого раза, когда бот её увидел.
+                if not item.get('published_parsed') and _undated_too_old(item):
+                    duplicate_skipped += 1
+                    continue
                 if norm_url:
                     seen_urls.add(norm_url)
                 if norm_title:
@@ -16101,6 +16687,8 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
             _note_source_failure(name, message, hard=True, save=False)
     if source_health is not None:
         await asyncio.to_thread(source_health.flush)
+    if first_seen_store is not None:
+        await asyncio.to_thread(first_seen_store.flush)
     try:
         await _run_source_discovery(all_news)
     except Exception as e:
@@ -16153,10 +16741,38 @@ def _all_admin_ids() -> set[int]:
     return {ADMIN_ID, *extra}
 
 
+def _is_service_or_bot_user(user) -> bool:
+    """Служебный id Telegram или бот — такой «отправитель» не человек.
+
+    `is True`, а не просто истинность: в PTB поле строго bool, а автосозданный
+    атрибут мока не должен выдавать себя за бота."""
+    uid = getattr(user, 'id', None)
+    return uid in TELEGRAM_SERVICE_USER_IDS or getattr(user, 'is_bot', False) is True
+
+
+def _sent_as_chat(message) -> bool:
+    """Сообщение отправлено от имени чата (анонимный админ, канал, автопересылка).
+
+    Настоящий автор тогда скрыт, а в from_user стоит общий для всех служебный
+    id — такому сообщению нельзя доверять как сообщению конкретного человека.
+    Проверяем именно числовой id: у настоящего Chat он всегда int."""
+    sender = getattr(message, 'sender_chat', None)
+    return isinstance(getattr(sender, 'id', None), int)
+
+
 def is_admin(update: Update) -> bool:
     """Проверяет, что отправитель — админ (главный или дополнительный)."""
     user = update.effective_user
     if not user:
+        return False
+    # Служебные id и боты — никогда: иначе анонимный админ ЛЮБОЙ группы
+    # получил бы права, если такой id когда-то попал в список админов.
+    if _is_service_or_bot_user(user):
+        return False
+    # У кнопки effective_message — сообщение самого бота, и sender_chat там
+    # ничего не говорит о нажавшем: нажимает всегда настоящий пользователь.
+    if (getattr(update, 'callback_query', None) is None
+            and _sent_as_chat(getattr(update, 'effective_message', None))):
         return False
     return user.id in _all_admin_ids()
 
@@ -16175,16 +16791,67 @@ def _audit_update(update: Update, action: str, **details) -> None:
     admin_audit.record(action, actor, **details)
 
 
+def _in_group_chat(update) -> bool:
+    """Сообщение пришло из группы или канала, а не из лички с ботом.
+
+    У сообщения Telegram тип чата всегда один из четырёх: private, group,
+    supergroup, channel — так что явный список общих чатов покрывает всё,
+    кроме лички."""
+    chat = getattr(update, 'effective_chat', None)
+    return getattr(chat, 'type', None) in ('group', 'supergroup', 'channel')
+
+
 async def deny_access(update: Update) -> None:
     """Сообщает не-админу, что доступа нет."""
     try:
         if update.callback_query:
             await update.callback_query.answer("Эта кнопка только для админа.", show_alert=True)
-        elif update.message:
+        elif update.message and not _in_group_chat(update):
             await update.message.reply_text("⛔ Этот бот только для администратора.")
+        # В группе молчим: иначе любой участник, набирая /команды, заставлял
+        # бота писать отказ в общий чат — это шум для всех и расход лимита
+        # сообщений группы, который нужен модерации и постам.
     except Exception as e:
         # Отказ в доступе не должен ронять обработчик ни при каких условиях
         logger.debug(f"deny_access: {type(e).__name__}: {e}")
+
+
+# Команды, которые по смыслу работают в самой группе: включают и выключают там
+# модерацию, смотрят и снимают предупреждения участника, показывают id чата и
+# ветки. Остальные выдают данные бота (логи, посты, настройки, бэкап, ключи),
+# и в группе их ответ увидели бы все участники.
+_GROUP_COMMANDS = frozenset({
+    'chatinfo_command', 'modhere_command', 'modoff_command', 'modmiss_command',
+    'warns_command', 'unwarn_command',
+})
+
+_PRIVATE_ONLY_HINT = ('🔒 Эта команда показывает данные бота — в группе их увидели бы '
+                      'все участники. Повтори её в личке со мной.')
+
+
+async def _require_private_chat(update, bot=None) -> bool:
+    """True — можно отвечать здесь. В группе вместо ответа — подсказка админу.
+
+    Подсказку сначала шлём в личку: в группе не остаётся ни слова. Если
+    личка закрыта (админ ещё не нажимал /start), оставляем в группе одну
+    короткую строку без данных — иначе команда молча «не работала бы».
+    """
+    if not _in_group_chat(update):
+        return True
+    user = getattr(update, 'effective_user', None)
+    if bot is not None and user is not None:
+        try:
+            await bot.send_message(chat_id=user.id, text=_PRIVATE_ONLY_HINT)
+            return False
+        except Exception as e:
+            logger.debug(f"подсказка в личку не ушла: {type(e).__name__}: {e}")
+    message = getattr(update, 'effective_message', None)
+    if message is not None:
+        try:
+            await message.reply_text(_PRIVATE_ONLY_HINT)
+        except Exception as e:
+            logger.debug(f"подсказка в группу не ушла: {type(e).__name__}: {e}")
+    return False
 
 
 # ============== INLINE-МЕНЮ "НАСТРОЙКИ" ==============
@@ -16942,8 +17609,12 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.to_thread(experiments.record, str(hidden.get('_format_variant') or 'standard'), 'hidden')
             if hidden and not actor_is_admin:
                 title = re.sub(r'\s+', ' ', hidden.get('title', ''))[:80]
+                # Письмо админу уходит с HTML-разметкой, а имя выбирает сам
+                # гость: без экранирования он вставил бы в письмо от бота свою
+                # ссылку или разметку. Заголовок из чужой ленты — тоже чужой ввод.
                 await notify_admin(context.bot,
-                                   f'👥 {actor_name} скрыл пост в ветке:\n{title}')
+                                   f'👥 {html.escape(actor_name)} скрыл пост в ветке:\n'
+                                   f'{html.escape(title)}')
             return
 
         news = pending_posts.get(key) if pending_posts is not None else None
@@ -17045,9 +17716,10 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     show_alert=True)
             await _mark_post_done(query, '\n\n✅ Опубликовано в канал')
             if not actor_is_admin:
+                # Имя гостя — его собственный ввод, а письмо размечено HTML.
                 await notify_admin(
                     context.bot,
-                    f'👥 {actor_name} опубликовал в канал пост из ветки:\n\n'
+                    f'👥 {html.escape(actor_name)} опубликовал в канал пост из ветки:\n\n'
                     f'{_post_card(news, {})}')
         else:
             if delivery.started:
@@ -17704,6 +18376,9 @@ async def reply_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not is_admin(update):
         await deny_access(update)
         return
+    # Тот же текст можно набрать руками в группе — статус и настройки туда не шлём.
+    if not await _require_private_chat(update, getattr(context, 'bot', None)):
+        return
 
     text = (update.message.text or "").strip()
 
@@ -17738,6 +18413,10 @@ def admin_only(handler):
         if not is_admin(update):
             await deny_access(update)
             return
+        # Ответ с данными бота уходит только в личку: в группе его прочли бы все.
+        if (handler.__name__ not in _GROUP_COMMANDS
+                and not await _require_private_chat(update, getattr(context, 'bot', None))):
+            return
         _audit_update(update, f'command:{handler.__name__}')
         return await handler(update, context)
     return wrapper
@@ -17750,6 +18429,9 @@ def owner_only(handler):
         user = getattr(update, 'effective_user', None)
         if not is_owner(user):
             await deny_access(update)
+            return
+        # Команды владельца показывают ключи и настройки — только в личке.
+        if not await _require_private_chat(update, getattr(context, 'bot', None)):
             return
         _audit_update(update, f'command:{handler.__name__}', role='owner')
         return await handler(update, context)
@@ -17910,9 +18592,11 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
         logger.info(f"📅 Отложен пост «{news.get('title', '')[:60]}» на {_fmt_local(when)} "
                     f"(отложил: {(by or {}).get('name', '?')})")
         if user and user.id not in _all_admin_ids():
+            # Имя гостя — его собственный ввод, а письмо размечено HTML.
             await notify_admin(
                 context.bot,
-                f'👥 {(by or {}).get("name", "?")} отложил пост на {_fmt_local(when)}:\n\n'
+                f'👥 {html.escape(str((by or {}).get("name", "?")))} отложил пост на '
+                f'{_fmt_local(when)}:\n\n'
                 f'{_post_card(news, {"by": by, "at": when})}')
         reply = (
             f'📅 Опубликую {_fmt_local(when)} — через {_human_delta(when)}.\n'
@@ -17942,9 +18626,16 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
         editor = update.effective_user
         if editor and editor.id not in _all_admin_ids():
             ed_name = editor.full_name or editor.username or str(editor.id)
+            # Письмо админу размечено HTML и приходит от имени бота. Сырой текст
+            # гостя превратился бы в ссылку «подтвердите права» прямо в личке
+            # админа — поэтому экранируем и вычищаем ссылки, а об их удалении
+            # честно пишем: правку всё равно стоит посмотреть в ветке.
+            shown = _strip_links(text)
+            note = '\n\n🔗 Ссылки из текста в этом письме убраны.' if shown != text else ''
             await notify_admin(
                 context.bot,
-                f'👥 {ed_name} изменил текст поста в ветке:\n\n{fit_to_limit(text, 500)}')
+                f'👥 {html.escape(ed_name)} изменил текст поста в ветке:\n\n'
+                f'{html.escape(fit_to_limit(shown, 500))}{note}')
         updated = await _update_preview_text(context.bot, key, text)
         msg = '✏️ Текст обновлён — в канал уйдёт именно он.'
         if not updated:
@@ -17991,7 +18682,9 @@ async def cancel_command(update, context: ContextTypes.DEFAULT_TYPE):
     Доступна всем: гость отменяет только своё собственное состояние."""
     if context.user_data and context.user_data.pop('await_input', None):
         await update.message.reply_text('Отменил. Пост остался в ветке с кнопками.')
-    else:
+    elif not _in_group_chat(update):
+        # В группе молчим: иначе любой участник заставлял бы бота отвечать
+        # «Нечего отменять» в общий чат на каждый /cancel.
         await update.message.reply_text('Нечего отменять.')
 
 
@@ -18672,8 +19365,9 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
             for idx, item in enumerate(top, 1):
                 conf = float(item.get('_confidence_score', 0.5))
                 cluster = _safe_nonnegative_int(item.get('_story_cluster_size'), 1)
+                # Заголовок из чужой ленты, а письмо размечено HTML.
                 lines.append(
-                    f'{idx}. {str(item.get("title") or "")[:120]} '
+                    f'{idx}. {html.escape(str(item.get("title") or "")[:120])} '
                     f'· score {float(item.get("_priority_score", 0)):.1f} '
                     f'· conf {conf:.2f} · источников {cluster}'
                 )
@@ -20905,6 +21599,10 @@ def _llm_dates_supported(source_text: str, output_text: str) -> bool:
     # Whole month words: Mark/Augustus are names, and мая/мае are forms of May.
     source_months = {i for i, pattern in enumerate(_MONTH_PATTERNS)
                      if pattern.search(source_text or '')}
+    # Японский источник пишет месяц числом: «10月4日より放送開始». Без этого
+    # пересказ «выйдет 4 октября» отклонялся как подменивший месяц.
+    source_months |= {int(m) - 1 for m in re.findall(r'(?<!\d)(\d{1,2})\s*月', source_text or '')
+                      if 1 <= int(m) <= 12}
     output_months = {i for i, pattern in enumerate(_MONTH_PATTERNS)
                      if pattern.search(output_text or '')}
     return output_months.issubset(source_months)
@@ -20995,6 +21693,30 @@ def _llm_outage_is_temporary() -> bool:
             and not llm_budget.can_charge(_estimate_llm_tokens([], LLM_MAX_TOKENS))):
         return False
     return True
+
+
+# Сколько раз и сколько времени ждать переводчика для одной новости. Google
+# отвечает серверным адресам 429 часами; дальше новость уже несвежая.
+TRANSLATION_DEFER_MAX_ATTEMPTS = max(1, min(50, _env_int('TRANSLATION_DEFER_MAX_ATTEMPTS', 6)))
+TRANSLATION_DEFER_MAX_AGE_SEC = max(600, min(3 * 86400, _env_int('TRANSLATION_DEFER_MAX_AGE_SEC', 21600)))  # 6 ч
+_translation_deferral_store = None
+
+
+def _untranslated_defer_news(news: dict) -> bool:
+    """Можно ли ещё раз отложить новость без перевода. Счёт переживает рестарт."""
+    global _translation_deferral_store
+    with _llm_deferral_lock:
+        key = normalize_url(str(news.get('link') or '')) or str(news.get('title') or '')[:120]
+        if not key:
+            return False
+        path = DATA_DIR / 'news_translation_deferrals.json'
+        if _translation_deferral_store is None or _translation_deferral_store.path != path:
+            _translation_deferral_store = NewsDeferralStore(path)
+        seen = _safe_nonnegative_int(news.get('_translation_defer_attempts', 0))
+        wait, attempts = _translation_deferral_store.reserve(
+            key, seen, TRANSLATION_DEFER_MAX_ATTEMPTS, TRANSLATION_DEFER_MAX_AGE_SEC)
+        news['_translation_defer_attempts'] = attempts
+        return wait
 
 
 def _llm_defer_news(news: dict) -> bool:
@@ -21114,7 +21836,7 @@ async def _llm_source_text(news: dict) -> str:
     need_video = not news.get('video') and _probably_has_video(news)
     read_article = settings is not None and settings.llm_read_article
     if read_article and news.get('link') and (need_text or need_video):
-        article = await asyncio.to_thread(fetch_article, news['link'])
+        article = await _fetch_article_bounded(news['link'])
         text = article.get('text') or ''
         if text and len(text.split()) > len(summary.split()):
             summary = text
@@ -21851,6 +22573,23 @@ def _llm_cleanup_plan(results: list[dict]) -> dict:
 # никогда: отчёт уходит в переписку, а переписка — это не то место, где
 # ключ должен появиться даже один раз.
 _ENV_SECRET_NAME_RE = re.compile(r'KEY|TOKEN|SECRET|PASSWORD|PASS\b|CREDENTIAL', re.IGNORECASE)
+# Имена, за которыми обычно адрес или строка подключения. Сам адрес показывать
+# полезно — по нему видно, куда ходит бот, — но логин и пароль в нём
+# (HTTPS_PROXY=http://user:pass@proxy:3128) — тот же секрет, что и ключ.
+_ENV_URLISH_NAME_RE = re.compile(r'PROXY|URL|DSN|AUTH|COOKIE', re.IGNORECASE)
+# Логин с паролем в URL — прячем у переменной с любым именем.
+_URL_PASSWORD_RE = re.compile(r'://[^/@\s]+:[^/@\s]+@')
+# Вся userinfo-часть адреса, включая одиночный токен (https://token@host) и
+# пароль с «@» внутри: жадно до последней «@» перед путём.
+_URL_USERINFO_RE = re.compile(r'://[^/\s?#]*@')
+# Прокси часто пишут без схемы: user:pass@host:3128.
+_BARE_USERINFO_RE = re.compile(r'^[^/\s:@]+:[^/\s]*@')
+
+
+def _mask_url_credentials(value: str) -> str:
+    """scheme://user:pass@host → scheme://***@host; host и путь остаются видны."""
+    value = _URL_USERINFO_RE.sub('://***@', value)
+    return _BARE_USERINFO_RE.sub('***@', value)
 
 
 def _dotenv_lines() -> list[tuple[int, str, str]]:
@@ -21872,6 +22611,10 @@ def _dotenv_lines() -> list[tuple[int, str, str]]:
 def _dotenv_shown_value(name: str, value: str) -> str:
     if _ENV_SECRET_NAME_RE.search(name):
         return '&lt;значение скрыто&gt;' if value else '&lt;пусто&gt;'
+    if value and (_URL_PASSWORD_RE.search(value) or (
+            _ENV_URLISH_NAME_RE.search(name)
+            and (_URL_USERINFO_RE.search(value) or _BARE_USERINFO_RE.search(value)))):
+        value = _mask_url_credentials(value)
     return f'<code>{_escape_to_limit(value, 120)}</code>' if value else '&lt;пусто&gt;'
 
 
@@ -23056,6 +23799,13 @@ class UserDirectory:
         if self._by_id.get(uid) == entry:
             return                       # ничего не изменилось — не пишем на диск
         self._by_id[uid] = entry
+        if entry['username']:
+            # @ник в каждый момент принадлежит одному человеку, но его меняют
+            # и отдают. У прежнего владельца этот ник уже чужой: оставь его —
+            # и /addadmin @ник выдал бы права не тому человеку.
+            for other_id, other in self._by_id.items():
+                if other_id != uid and other.get('username') == entry['username']:
+                    other['username'] = ''
         if len(self._by_id) > USER_DIRECTORY_MAX:
             oldest = sorted(self._by_id, key=lambda k: self._by_id[k].get('seen', ''))
             for key in oldest[:len(self._by_id) - USER_DIRECTORY_MAX]:
@@ -23074,13 +23824,21 @@ class UserDirectory:
         key = (username or '').strip().lstrip('@').lower()
         if not key:
             return None
+        # Если ник всё же числится за несколькими (старый файл, записи до
+        # чистки в remember) — верим самой свежей: ник сейчас у того, кого
+        # видели с ним последним, а не у первого попавшегося по порядку.
+        best: Optional[tuple[str, dict]] = None
         for uid, entry in self._by_id.items():
-            if entry.get('username') == key:
-                try:
-                    return int(uid), entry.get('name') or f'@{key}'
-                except ValueError:
-                    return None
-        return None
+            if entry.get('username') != key:
+                continue
+            if best is None or str(entry.get('seen', '')) > str(best[1].get('seen', '')):
+                best = (uid, entry)
+        if best is None:
+            return None
+        try:
+            return int(best[0]), best[1].get('name') or f'@{key}'
+        except ValueError:
+            return None
 
     def describe(self, user_id: int) -> str:
         """Человекочитаемое имя по id: «Вася Пупкин (@vasya)»."""
@@ -23113,6 +23871,15 @@ async def remember_user_handler(update: Update, context: ContextTypes.DEFAULT_TY
         logger.debug(f"пользователь не запомнился: {e}")
 
 
+_ANON_SENDER_REFUSAL = (
+    '⛔ Это сообщение отправлено не человеком, а анонимно: от имени группы '
+    '(анонимный админ), от имени канала, автопересылкой или ботом.\n\n'
+    'У таких сообщений Telegram подставляет общий служебный id — один и тот же '
+    'для всех групп и каналов. Права на него получил бы любой анонимный админ '
+    'любой чужой группы, поэтому так выдать админку нельзя.\n\n'
+    'Попроси человека написать от своего имени и ответь на это сообщение.')
+
+
 async def _resolve_user(update, context) -> tuple[Optional[int], str, str]:
     """Кому адресована команда: (id, имя, пояснение при неудаче).
 
@@ -23124,6 +23891,11 @@ async def _resolve_user(update, context) -> tuple[Optional[int], str, str]:
     reply = getattr(message, 'reply_to_message', None)
     if reply is not None and getattr(reply, 'from_user', None):
         user = reply.from_user
+        # Автор такого сообщения скрыт: в from_user стоит общий служебный id
+        # (GroupAnonymousBot, Channel_Bot, 777000) или бот. Выдать права ему —
+        # значит выдать их каждому анониму и каналу в любой группе.
+        if _sent_as_chat(reply) or _is_service_or_bot_user(user):
+            return None, '', _ANON_SENDER_REFUSAL
         if user_directory is not None:
             user_directory.remember(user)
         display = user.full_name or (f'@{user.username}' if user.username else str(user.id))
@@ -23167,6 +23939,9 @@ async def admins_command(update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await deny_access(update)
         return
+    # Список админов с именами и никами — не для глаз всей группы.
+    if not await _require_private_chat(update, getattr(context, 'bot', None)):
+        return
     who = user_directory.describe if user_directory else str
     lines = ['👥 <b>Администраторы</b>', '',
              f'👑 {html.escape(who(ADMIN_ID))} — главный']
@@ -23199,13 +23974,24 @@ async def addadmin_command(update, context: ContextTypes.DEFAULT_TYPE):
     if uid == ADMIN_ID:
         await update.message.reply_text('Это ты и есть — главный админ.')
         return
+    # По числовому id тоже нельзя: служебный id Telegram общий для всех
+    # анонимов, а id ≤ 0 — это группа или канал, а не человек.
+    if uid <= 0 or uid in TELEGRAM_SERVICE_USER_IDS:
+        await update.message.reply_text(
+            f'⛔ {uid} — не человек: это служебный id Telegram (общий для '
+            'анонимных админов, каналов и автопересылок во всех группах) или id '
+            'группы/канала. Права на него получил бы любой аноним в любой чужой '
+            'группе, поэтому выдать их нельзя.')
+        return
     label = html.escape(name or str(uid))
     if settings.add_admin(uid):
         if user_directory is not None:
             user_directory.flush()
         logger.info(f"👥 Выдана админка: {name} ({uid})")
+        # id в ответе — чтобы владелец видел, КОМУ именно ушли права: одно
+        # и то же имя или бывший @ник могут принадлежать разным людям.
         await update.message.reply_text(
-            f'✅ <b>{label}</b> теперь админ.\n\n'
+            f'✅ <b>{label}</b> (id <code>{uid}</code>) теперь админ.\n\n'
             f'Доступны команды бота и кнопки модерации в ветке.\n'
             f'Чтобы получать уведомления, ему нужно открыть бота и нажать /start.',
             parse_mode=ParseMode.HTML)
@@ -27059,6 +27845,9 @@ def _redact_secrets(text: str) -> str:
             out = out.replace(str(secret), '<скрыто>')
     # Затем всё, что выглядит как токен бота, включая чужие и старые.
     out = _SECRET_TOKEN_RE.sub(lambda m: f'{m.group(0).split(":")[0]}:<скрыто>', out)
+    # Логин и пароль в адресе: requests и urllib3 пишут URL прокси целиком
+    # в текст ошибки, и пароль уезжал бы в лог и админу вместе с ним.
+    out = _URL_USERINFO_RE.sub('://***@', out)
     return out
 
 

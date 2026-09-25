@@ -1,0 +1,851 @@
+"""Аудит новостного конвейера 24.09.2026: живой прогон без модели.
+
+Бот собрал 52 кандидата из всех лент и отрисовал посты так, как они ушли
+бы в канал. Каждый тест ниже — дефект, который там воспроизвёлся:
+подменённые AniList названия, английские посты в русском канале, по два-три
+поста об одной новости, потерянные настоящие новости, не-новости и спойлеры.
+Заголовки и тексты — реальные, иногда сокращённые.
+"""
+import asyncio
+import json
+import re
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+import requests
+
+import anime_news_bot as bot
+import translation
+
+
+# ---------- п.1. AniList больше не переписывает текст ----------
+
+class _FuzzyAniList:
+    """AniList отвечает на любой запрос: поиск нечёткий, пусто не бывает.
+
+    Ответы — настоящие: «October» → «Saint October», «Character Design» →
+    «Isekai Character Design ni Okeru Succubus no Seitai», «Mushoku Tensei» →
+    сам «Mushoku Tensei: Isekai Ittara Honki Dasu».
+    """
+    KNOWN = {
+        'mushoku tensei': {'romaji': 'Mushoku Tensei: Isekai Ittara Honki Dasu',
+                           'english': 'Mushoku Tensei: Jobless Reincarnation',
+                           'native': '無職転生 ～異世界行ったら本気だす～', 'synonyms': []},
+        'isshiki-san wants to know about love': {
+            'romaji': 'Isshiki-san wa Koi wo Shiritai.', 'english': None,
+            'native': '一式さんは恋を知りたい。',
+            'synonyms': ['Isshiki-san Wants to Know About Love.']},
+        'phantom busters': {'romaji': 'Phantom Busters', 'english': None,
+                            'native': 'ファントムバスターズ', 'synonyms': []},
+    }
+    WRONG = {'romaji': 'Shunkashuutou Daikousha: Haru no Mai', 'english': None,
+             'native': '春夏秋冬代行者 春の舞', 'synonyms': []}
+
+    def __init__(self):
+        self.asked = []
+
+    def lookup(self, query):
+        self.asked.append(query)
+        return self.KNOWN.get(query.casefold().strip(), self.WRONG)
+
+
+@pytest.fixture
+def fuzzy_anilist(monkeypatch):
+    client = _FuzzyAniList()
+    monkeypatch.setattr(bot, 'anilist', client)
+    return client
+
+
+@pytest.mark.parametrize('text', [
+    'Rudy Takes Action in Mushoku Tensei Season 3 Episode 14 Preview',
+    'The police rom-com series debuts in January 2027',
+    'French / Japanese co-production begins broadcasting on October 2',
+    'Isshiki-san Wants to Know About Love Anime Unveils Main Visual, More Cast',
+    'Series Composition: Koudai Minami • Character Design: Masatoshi Tsuji.',
+])
+def test_anilist_never_writes_another_title_into_the_text(fuzzy_anilist, text):
+    """«in October» → «in Saint October», «Preview» → «Shunkashuutou Daikousha».
+
+    Защищать можно только то, что уже написано в тексте: после восстановления
+    плейсхолдеров текст обязан совпасть с исходным.
+    """
+    protected, placeholders = bot.anilist_protect_titles(text, start_index=2000)
+    assert all(value in text for value in placeholders.values()), placeholders
+    assert bot.restore_terms(protected, placeholders) == text
+    assert not any('Shunkashuutou' in value for value in placeholders.values())
+
+
+def test_single_words_and_months_are_not_sent_to_anilist(fuzzy_anilist):
+    bot.anilist_protect_titles('The anime premieres in October. Main Visual and New Cast revealed. '
+                               'Rudy takes action in the finale.')
+    assert not any(len(q.split()) < 2 for q in fuzzy_anilist.asked), fuzzy_anilist.asked
+    assert 'Main Visual' not in fuzzy_anilist.asked
+    assert 'New Cast' not in fuzzy_anilist.asked
+
+
+def test_real_title_is_protected_as_written(fuzzy_anilist):
+    """«Mushoku Tensei Season 3…» — защищается «Mushoku Tensei», как в тексте."""
+    text = 'Mushoku Tensei Season 3 revealed the Episode 14 preview images.'
+    protected, placeholders = bot.anilist_protect_titles(text, start_index=2000)
+    assert list(placeholders.values()) == ['Mushoku Tensei']
+    assert protected.startswith('〖2000〗 Season 3')
+
+
+def test_stale_cache_entry_is_not_trusted(tmp_path, monkeypatch):
+    """Кеш AniList хранил «найдено» неделями: старая запись с чужим тайтлом
+    не должна ни подменять текст, ни защищать обычные слова от перевода."""
+    from datetime import datetime
+    cache = tmp_path / 'anilist.json'
+    cache.write_text(json.dumps({'character design': {
+        'found': True, 'romaji': 'Isekai Character Design ni Okeru Succubus no Seitai',
+        'english': None, 'native': None, 'checked_at': datetime.now().isoformat()}}),
+        encoding='utf-8')
+    client = bot.AniListClient(cache)
+    monkeypatch.setattr(client, '_query_api', MagicMock(return_value=None))
+    monkeypatch.setattr(bot, 'anilist', client)
+    text = 'Staff list. Character Design: Masatoshi Tsuji.'
+    protected, placeholders = bot.anilist_protect_titles(text, start_index=2000)
+    assert placeholders == {}
+    assert protected == text
+
+
+def test_known_work_name_is_protected_without_anilist(monkeypatch):
+    """Тайтл, уже опознанный по Shikimori, не уходит в переводчик."""
+    monkeypatch.setattr(bot, 'anilist', None)
+    protected, placeholders = bot.anilist_protect_titles(
+        'Grand Blue Season 4 Announced With Teaser Visual', known_names=('Grand Blue',))
+    assert list(placeholders.values()) == ['Grand Blue']
+    assert 'Grand Blue' not in protected
+
+
+# ---------- п.2–3. Непереведённый пост не уходит в канал ----------
+
+class _TooManyRequests:
+    def translate(self, text):
+        raise RuntimeError('429 Client Error: Too Many Requests')
+
+
+@pytest.fixture
+def translator_down(monkeypatch):
+    monkeypatch.setattr(bot, 'translator', _TooManyRequests())
+    monkeypatch.setattr(bot, 'anilist', None)
+    monkeypatch.setattr(bot, 'DEEPL_API_KEY', '')
+    monkeypatch.setattr(bot, '_translation_cache', {})
+
+
+def _grand_blue():
+    # Опознанный тайтл: бот сам вставит «Необъятный океан» и хэштег — это
+    # кириллица, которой у переводчика не было.
+    return {'title': 'Grand Blue Season 4 Announced With Teaser Visual',
+            'summary': 'The anime returns after the third season finale on October 22.',
+            'link': 'https://animecorner.me/grand-blue-season-4/', 'source': 'Anime Corner',
+            '_work_key': 'shiki:37105', '_work_name': 'Grand Blue',
+            '_work_russian': 'Необъятный океан'}
+
+
+def test_failed_translation_with_russian_title_is_detected(translator_down):
+    assert bot._left_untranslated(_grand_blue()) is True
+
+
+def test_title_untranslated_while_summary_came_from_cache(translator_down):
+    """Описание переведено раньше и лежит в кеше, заголовок упёрся в 429.
+
+    Кириллицы в посте больше половины — по доле его не поймать, а заголовок
+    ушёл бы в канал по-английски. Ловит явный флаг отказа.
+    """
+    news = {k: v for k, v in _grand_blue().items() if not k.startswith('_work')}
+    bot._translation_cache[news['summary']] = ('Аниме вернётся после финала третьего сезона, '
+                                               'который покажут 22 октября на японском телевидении.')
+    assert bot._left_untranslated(news) is True
+
+
+def test_echoed_source_with_russian_title_is_detected(monkeypatch):
+    """Google иногда отвечает 200 и возвращает исходник как «перевод».
+
+    Отказа нет, флаг молчит; поймать можно только долей кириллицы — и её
+    нельзя считать вместе с русским названием и хэштегом, вставленными ботом.
+    """
+    monkeypatch.setattr(bot, 'translator', MagicMock(translate=lambda text: text))
+    monkeypatch.setattr(bot, 'anilist', None)
+    monkeypatch.setattr(bot, 'DEEPL_API_KEY', '')
+    monkeypatch.setattr(bot, '_translation_cache', {})
+    # Короткий заголовок без текста: вставленное «Необъятный океан» — больше
+    # трети букв поста.
+    assert bot._left_untranslated(dict(_grand_blue(), title='Grand Blue Season 4 Announced',
+                                       summary='')) is True
+
+
+def test_known_title_is_not_translated_in_the_post(monkeypatch):
+    """«Grand Blue» переводчик делал «Большой синевой», и русское название
+    Shikimori уже не находило, куда встать."""
+    def translate(text):
+        return (text.replace('Season 4 Announced With Teaser Visual', 'Анонсирован 4 сезон с тизер-постером')
+                    .replace('Grand Blue', 'Большая синева')
+                    .replace('The anime returns after the third season finale on October 22.',
+                             'Аниме вернётся после финала третьего сезона 22 октября.'))
+    monkeypatch.setattr(bot, 'translator', MagicMock(translate=translate))
+    monkeypatch.setattr(bot, 'anilist', None)
+    monkeypatch.setattr(bot, 'DEEPL_API_KEY', '')
+    monkeypatch.setattr(bot, '_translation_cache', {})
+    post = bot.format_news_short(_grand_blue())
+    assert 'Большая синева' not in post
+    assert '«Необъятный океан» (Grand Blue)' in post
+
+
+def _prepare_patched(monkeypatch):
+    monkeypatch.setattr(bot, 'settings', MagicMock(local_topic_filter=True, translator_engine='google'))
+    for name in ('_improve_thumb', '_discover_article_video', '_optimize_news_media'):
+        monkeypatch.setattr(bot, name, AsyncMock(return_value=None))
+    monkeypatch.setattr(bot, '_assign_format_variant', lambda news: None)
+    monkeypatch.setattr(bot, '_llm_enrich', AsyncMock(return_value='off'))
+    monkeypatch.setattr(bot, 'stats', MagicMock(record_skipped=AsyncMock()))
+
+
+def test_translator_429_with_russian_title_defers_the_post(translator_down, monkeypatch):
+    _prepare_patched(monkeypatch)
+    result = asyncio.run(bot._prepare_news_for_send(_grand_blue(), 'Anime Corner',
+                                                    apply_dedup=False))
+    assert result == 'deferred'
+
+
+def test_untranslated_post_is_not_deferred_forever(translator_down, monkeypatch, tmp_path):
+    """Каждый заход заново качал медиа: без счётчика новость ждала вечно."""
+    _prepare_patched(monkeypatch)
+    monkeypatch.setattr(bot, 'DATA_DIR', tmp_path)
+    monkeypatch.setattr(bot, 'TRANSLATION_DEFER_MAX_ATTEMPTS', 2)
+    results = [asyncio.run(bot._prepare_news_for_send(_grand_blue(), 'Anime Corner',
+                                                      apply_dedup=False)) for _ in range(4)]
+    assert results[:2] == ['deferred', 'deferred']
+    assert results[2:] == ['skipped_filter', 'skipped_filter']
+
+
+class _Response:
+    def __init__(self, status, text):
+        self.status_code, self.text = status, text
+        self.closed = False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f'{self.status_code} Client Error', response=self)
+
+    def close(self):
+        self.closed = True
+
+
+def test_dict_endpoint_translates_when_mobile_page_is_rate_limited(monkeypatch):
+    """/m отвечал 429 весь прогон, словарный endpoint — 200 на тот же текст."""
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append(url)
+        if 'clients5' in url:
+            return _Response(200, '[["Аниме-адаптация Phantom Busters анонсирована на 2027 год","en"]]')
+        return _Response(429, 'Too Many Requests')
+
+    monkeypatch.setattr(requests, 'get', get)
+    out = translation.GoogleTranslator(source='auto', target='ru').translate(
+        'Phantom Busters Anime Adaptation Announced for 2027')
+    assert out == 'Аниме-адаптация Phantom Busters анонсирована на 2027 год'
+    assert len(calls) == 1
+
+
+def test_rate_limited_endpoint_is_paused(monkeypatch):
+    """После 429 endpoint не дёргается на каждый пост — это продлевает бан."""
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append('dict' if 'clients5' in url else 'mobile')
+        if 'clients5' in url:
+            return _Response(429, '')
+        return _Response(200, '<div class="t0">перевод</div>')
+
+    monkeypatch.setattr(requests, 'get', get)
+    translator = translation.GoogleTranslator(source='auto', target='ru')
+    assert translator.translate('first') == 'перевод'
+    assert translator.translate('second') == 'перевод'
+    assert calls == ['dict', 'mobile', 'mobile']
+
+
+# ---------- п.4. Одна история — один пост ----------
+
+# Настоящие записи Shikimori (поля сокращены) и соседи, которых нечёткий поиск
+# возвращает вместе с ними.
+SHIKIMORI = [
+    {'id': '62808', 'name': 'Isshiki-san wa Koi wo Shiritai.', 'russian': 'Иссики хочет узнать о любви',
+     'english': None, 'japanese': '一式さんは恋を知りたい。', 'synonyms': []},
+    {'id': '37999', 'name': 'Kaguya-sama wa Kokurasetai: Tensai-tachi no Renai Zunousen',
+     'russian': 'Госпожа Кагуя: в любви как на войне', 'english': 'Kaguya-sama: Love is War',
+     'japanese': None, 'synonyms': []},
+    {'id': '65009', 'name': 'Aoki Denshou Welsh & Shedar', 'russian': 'Лазурные сказания Уэлша и Шедара',
+     'english': None, 'japanese': '蒼き伝承 ウェルシュ＆シェダー',
+     'synonyms': ['Welsh & Shedar', 'The Azure Legend: Welsh & Shedar', 'Aoki Densho Welsh & Shedar']},
+    {'id': '42310', 'name': 'Cyberpunk: Edgerunners', 'russian': 'Киберпанк: Бегущие по краю',
+     'english': 'Cyberpunk: Edgerunners', 'japanese': 'サイバーパンク エッジランナーズ', 'synonyms': []},
+    {'id': '34572', 'name': 'Black Clover', 'russian': 'Чёрный клевер', 'english': 'Black Clover',
+     'japanese': 'ブラッククローバー', 'synonyms': []},
+    {'id': '31564', 'name': 'Sansha Sanyou', 'russian': 'Трёхсторонний клевер', 'english': None,
+     'japanese': None, 'synonyms': []},
+    {'id': '59741', 'name': 'Tsuihou sareta Tensei Juukishi wa Game Chishiki de Musou suru',
+     'russian': 'Изгнанный реинкарнированный тяжёлый рыцарь не имеет себе равных в знаниях игры',
+     'english': 'The Exiled Heavy Knight Knows How to Game the System', 'japanese': None, 'synonyms': []},
+    {'id': '39535', 'name': 'Mushoku Tensei: Isekai Ittara Honki Dasu',
+     'russian': 'Реинкарнация безработного: История о приключениях в другом мире',
+     'english': 'Mushoku Tensei: Jobless Reincarnation',
+     'japanese': '無職転生 ～異世界行ったら本気だす～', 'synonyms': []},
+    {'id': '59443', 'name': 'Reincarnation no Kaben', 'russian': 'Лепестки реинкарнации',
+     'english': None, 'japanese': None, 'synonyms': []},
+    {'id': '5682', 'name': 'Phantom: Requiem for the Phantom', 'russian': 'Фантом: Реквием по Призраку',
+     'english': 'Phantom: Requiem for the Phantom', 'japanese': None, 'synonyms': []},
+]
+
+
+def _words(value):
+    return set(re.findall(r'\w+', str(value or '').casefold()))
+
+
+def _shikimori_post(url, json=None, **kwargs):
+    """Нечёткий поиск, как у Shikimori: три записи с общими словами."""
+    query = _words(json['variables']['s'])
+    scored = []
+    for row in SHIKIMORI:
+        names = [row['name'], row['russian'], row['english'], row['japanese'], *row['synonyms']]
+        score = len(query & set().union(*(_words(n) for n in names)))
+        if score:
+            scored.append((score, row))
+    scored.sort(key=lambda pair: -pair[0])
+    response = MagicMock(status_code=200)
+    response.json.return_value = {'data': {'animes': [row for _, row in scored[:3]]}}
+    return response
+
+
+# Заголовки и начало текста — как в ленте 24.09. Каждая история ушла бы в
+# канал двумя-тремя постами.
+STORIES = {
+    'phantom': [
+        ('MyAnimeList', None, "'Phantom Busters' TV Anime Announced For 2027",
+         "A television anime adaptation of Shoco's Phantom Busters manga was announced on Thursday."),
+        ('Shikimori', 'ru', 'Анонс и год премьеры аниме-экранизации манги «Phantom Busters»',
+         'По манге «Phantom Busters» (Охотники за привидениями) анонсировали аниме-сериал. Премьера в 2027 году.'),
+        ('Anime Corner', None, 'Phantom Busters Anime Adaptation Announced for 2027',
+         "Neoshoco's Phantom Busters manga is officially getting a TV anime adaptation in 2027."),
+        ('TG: CurrentAnime', 'ru', '😲 Анонсировано аниме по манге Phantom Busters (Охотники на призраков)',
+         'Первоклассник Юджин Корекиши - отличник с нулевыми экстрасенсорными способностями.'),
+    ],
+    'isshiki': [
+        ('MyAnimeList', None, "'Isshiki-san wa Koi wo Shiritai.' Announces Additional Cast",
+         'The official website revealed additional cast and a key visual on Thursday.'),
+        ('Shikimori', 'ru', 'Постер «Isshiki-san wa Koi wo Shiritai»',
+         'Вышел постер аниме-сериала «Isshiki-san wa Koi wo Shiritai» (Иссики хочет узнать о любви).'),
+        ('Crunchyroll', None, 'Isshiki-san Wants to Know About Love Anime Unveils Main Visual, More Cast',
+         'The police rom-com series debuts in January 2027'),
+    ],
+    'welsh': [
+        ('MyAnimeList', None, "'Aoki Denshou Welsh & Shedar' Reveals Additional Cast, Theme Songs, Main Promo",
+         'The official website revealed additional cast, theme songs and the main promotional video.'),
+        ('Crunchyroll', None, 'Aoki Densho Welsh & Shedar Anime Reveals Trailer, Additional Cast, Theme Song Info',
+         'French / Japanese co-production begins broadcasting on October 2'),
+        ('TG: VanitasNews', None, '📺 Main PV della serie animata original Welsh & Shedar, che inizierà '
+         'ad essere trasmessa in Giappone dal 2 ottobre e sarà diretta da Naoki Horiuchi presso STUDIO MASSKET.',
+         '❗Prodotta interamente in Giappone.'),
+    ],
+    'cyberpunk': [
+        ('Shikimori', 'ru', 'Отрывок из аниме «Cyberpunk: Edgerunners 2»',
+         'Компания Netflix опубликовала отрывок из предстоящего аниме. Премьера 20 октября 2026 года.'),
+        ('TG: YtkaNews', 'ru', '⚡Тизер нового сезона аниме сериала «Киберпанк: Бегущие по краю»',
+         'Премьера 20 октября! Производство студии TRIGGER.'),
+        ('TG: Nexvlsz', 'ru', 'Отрывок к 1-й серии 2-го сезона "Киберпанк: Бегущие по краю".',
+         'Снимает студия Trigger. Премьера 20-го октября.'),
+    ],
+    'clover': [
+        ('TG: Advance', 'ru', '🍀 КЛЕВЕР ПОЙДЕТ ДО КОНЦА.',
+         'Инсайдеры утверждают, что 2 сезон «Черного Клевера» станет финальным и охватит всю '
+         'оставшуюся мангу. Причем за 26 серий сплит-куром.'),
+        ('TG: animetarakans', 'ru', '🍀 Продолжение аниме «Черный клевер» полностью завершит экранизацию '
+         'оригинальной манги.', 'Согласно инсайдам, долгожданный сиквел выйдет в формате двух раздельных куров.'),
+        ('TG: VanitasNews', None, "📺⚠️ Stando ad un leak di SugoiLITE, la seconda stagione dell'anime di "
+         "Black Clover adatterà tutto il materiale del manga in due cour non consecutivi, per un totale di "
+         "26 episodi (ogni cour è attualmente previsto che abbia 13 episodi).", '⚠️ Sempre secondo il leak.'),
+    ],
+    'exiled': [
+        ('Shikimori', 'ru', 'Постер и трейлер следующих серий «Tsuihou sareta Tensei Juukishi wa Game '
+         'Chishiki de Musou suru»', 'Вышел постер и трейлер следующих серий.'),
+        ('Anime Corner', None, 'The Exiled Heavy Knight Knows How to Game the System Part 2 Reveals Main '
+         'Trailer, Visual, Theme Songs and New Cast', 'A new visual and main trailer for Part 2.'),
+        ('TG: Advance', 'ru', '📛 Выдали постер ко 2 половине аниме «Изгнанный реинкарнированный тяжелый '
+         'рыцарь не имеет себе равных в знаниях игры» (Tsuihou Sareta Tenshou Juu Kishi wa game Chishiki '
+         'de Suru).', 'В сериале 26 эпизодов, так что он остается с нами на осень.'),
+        ('TG: YtkaNews', 'ru', '⚔️Постер аниме «Изгнанный реинкарнированный тяжёлый рыцарь не имеет себе '
+         'равных в знаниях игры»', 'Новые серии выходят по четвергам.'),
+        ('TG: VanitasNews', None, "📺 Key visual e main PV della Parte 2 dell'anime (attualmente in corso) "
+         'di The Exiled Heavy Knight Knows How to Game the System.', ''),
+    ],
+    'mushoku14': [
+        ('Anime Corner', None, 'Rudy Takes Action in Mushoku Tensei Season 3 Episode 14 Preview',
+         'Mushoku Tensei Season 3 revealed the Episode 14 preview images ahead of its September 27 premiere.'),
+        ('TG: Advance', 'ru', 'Выдали кадры к 14 серии 3 сезона «Реинкарнации Безработного» (Mushoku '
+         'Tensei), после которой сериал отправится на перерыв.', 'Прибудет эпизод 27 сентября.'),
+        ('TG: CurrentAnime', 'ru', '😊Кадры к 14 серии 3 сезона аниме Реинкарнация безработного.',
+         'Серия выйдет 27 сентября!'),
+    ],
+    # Тот же день, похожие слова — но другие новости: склеивать их нельзя.
+    'other_clover': [
+        ('TG: anilibria', 'ru', 'Клевер удачи или главный кошмар?',
+         'Анонсировано аниме по манге "Ты — четырехлистный клевер" (Kimi wa Yotsuba no Clover). '
+         'Подробности позже.'),
+    ],
+    'other_netflix': [
+        ('ComicBook Anime', None, 'Netflix Locks Down First Major 2027 Anime Exclusive – Watch Trailer',
+         'Netflix has done a remarkable job building up its anime catalogue, streaming Cyberpunk: Edgerunners.'),
+    ],
+    'other_mushoku13': [
+        ('TG: YtkaNews', 'ru', 'Кадры к 13 серии 3 сезона аниме «Реинкарнация безработного»',
+         'Серия выйдет 20 сентября.'),
+    ],
+}
+
+
+@pytest.fixture
+def audit_cycle(monkeypatch, tmp_path, fuzzy_anilist):
+    monkeypatch.setitem(bot.FEATURE_FLAGS, 'work_identity', True)
+    resolver = bot.WorkTitleResolver(tmp_path / 'work_titles.json')
+    resolver.MIN_INTERVAL = 0
+    monkeypatch.setattr(bot, 'work_titles', resolver)
+    monkeypatch.setattr(bot.requests, 'post', _shikimori_post)
+    items = []
+    for story, rows in STORIES.items():
+        for idx, (source, lang, title, summary) in enumerate(rows):
+            items.append({'title': title, 'summary': summary, 'source': source, 'lang': lang,
+                          'link': f'https://example.test/{story}/{idx}', '_audit_story': story,
+                          'images': [f'https://example.test/{story}/{idx}.jpg']})
+    return items
+
+
+def test_seven_stories_from_one_cycle_become_seven_posts(audit_cycle):
+    bot._annotate_work_keys(audit_cycle, budget=200)
+    clusters = bot._cluster_news(audit_cycle, persist_intelligence=False)
+    story_of = {item['link']: item['_audit_story'] for item in audit_cycle}
+    stories_per_cluster = [{story_of[link] for link in c['_story_links']} for c in clusters]
+    clusters_per_story = {story: sum(story in found for found in stories_per_cluster)
+                          for story in STORIES}
+    assert clusters_per_story == {story: 1 for story in STORIES}
+    # И ни одна история не проглотила чужую.
+    assert all(len(found) == 1 for found in stories_per_cluster), stories_per_cluster
+
+
+def test_number_on_one_side_only_is_not_a_different_story():
+    from news_stories import same_work_event
+    a = {'title': 'Отрывок из аниме «Cyberpunk: Edgerunners 2»', '_work_key': 'shiki:42310'}
+    b = {'title': '⚡Тизер нового сезона аниме сериала «Киберпанк: Бегущие по краю»',
+         '_work_key': 'shiki:42310'}
+    c = {'title': 'Отрывок к 3-й серии 2-го сезона "Киберпанк: Бегущие по краю".',
+         '_work_key': 'shiki:42310'}
+    d = {'title': 'Отрывок к 4-й серии 2-го сезона "Киберпанк: Бегущие по краю".',
+         '_work_key': 'shiki:42310'}
+    assert same_work_event(a, b) and same_work_event(a, c)
+    assert not same_work_event(c, d)        # номера у обоих, и они разные
+
+
+def test_cluster_is_joined_through_any_member():
+    """Первой в кластер попала новость без ключа тайтла (лимит запросов к
+    базе кончился), второй — тот же заголовок с ключом. Английский пересказ
+    с тем же ключом сравнивался только с первой и уходил отдельным постом."""
+    title = ('⚔️Постер аниме «Изгнанный реинкарнированный тяжёлый рыцарь не имеет себе равных '
+             'в знаниях игры»')
+    first = {'title': title, 'source': 'TG: YtkaNews', 'link': 'https://a.test/1'}
+    second = dict(first, source='TG: Advance', link='https://a.test/2', _work_key='shiki:59741')
+    third = {'title': 'The Exiled Heavy Knight Knows How to Game the System Part 2 Reveals Main '
+                      'Trailer, Visual', 'source': 'Anime Corner', 'link': 'https://a.test/3',
+             '_work_key': 'shiki:59741'}
+    clusters = bot._cluster_news([first, second, third], persist_intelligence=False)
+    assert len(clusters) == 1
+
+
+def test_shikimori_budget_goes_to_news_first(monkeypatch, tmp_path):
+    """Первый цикл тратил все 40 запросов по порядку сбора — на подборки и LEGO."""
+    monkeypatch.setitem(bot.FEATURE_FLAGS, 'work_identity', True)
+    monkeypatch.setattr(bot, 'settings', MagicMock(local_noise_filter=True, local_topic_filter=True))
+    resolver = bot.WorkTitleResolver(tmp_path / 'wt.json')
+    asked = []
+    resolver.lookup = lambda name: asked.append(name) or ''
+    monkeypatch.setattr(bot, 'work_titles', resolver)
+    monkeypatch.setattr(bot, 'anilist', None)
+    items = [
+        {'title': '10 New Fall 2026 Anime to Watch This October', 'source': 'ComicBook Anime', 'summary': ''},
+        {'title': 'Transformers Gives Optimus Prime a Blacked-Out Upgrade', 'source': 'Collider', 'summary': ''},
+        {'title': 'Phantom Busters Anime Adaptation Announced for 2027', 'source': 'Anime Corner',
+         'summary': ''},
+    ]
+    bot._annotate_work_keys(items, budget=1)
+    assert asked == ['Phantom Busters']
+
+
+@pytest.mark.parametrize(('title', 'name'), [
+    ("'Phantom Busters' TV Anime Announced For 2027", 'Phantom Busters'),
+    ('Rudy Takes Action in Mushoku Tensei Season 3 Episode 14 Preview', 'Mushoku Tensei'),
+])
+def test_work_name_from_single_quotes_and_title_tail(title, name):
+    from news_stories import story_work_names
+    assert name in story_work_names(title)
+    # Апостроф внутри слова — не кавычка: «JoJo's …» не даёт имени «s …».
+    assert not any(n.startswith('s ') for n in story_work_names("JoJo's Bizarre Adventure Opening"))
+
+
+def test_layout_words_and_italian_dates_are_not_work_data():
+    """«Main PV della serie…» — «Main PV» не тайтл; «dal 2 ottobre» — не номер."""
+    from news_stories import story_work_names, story_work_numbers
+    title = ('📺 Main PV della serie animata original Welsh & Shedar, che inizierà ad essere '
+             'trasmessa in Giappone dal 2 ottobre e sarà diretta da Naoki Horiuchi presso STUDIO MASSKET.')
+    assert story_work_names(title)[0] == 'Welsh & Shedar'
+    assert 'Main PV' not in story_work_names(title)
+    assert story_work_numbers(title) == frozenset()
+
+
+def test_slogan_title_takes_the_name_from_the_first_sentence():
+    from news_stories import story_work_names
+    news = {'title': '🍀 КЛЕВЕР ПОЙДЕТ ДО КОНЦА.',
+            'summary': 'Инсайдеры утверждают, что 2 сезон «Черного Клевера» станет финальным. '
+                       'А «Магическая битва» тут ни при чём.'}
+    assert story_work_names(news) == ['Черного Клевера']
+
+
+# ---------- п.5. Пересказ другим источником — не «Обновление:» ----------
+
+@pytest.fixture
+def story_history(tmp_path, monkeypatch):
+    monkeypatch.setitem(bot.FEATURE_FLAGS, 'story_updates', True)
+    return bot.PublishedStoryStore(tmp_path / 'stories.json')
+
+
+def _published(store, title, summary, link):
+    news = {'title': title, 'summary': summary, 'link': link, 'source': 'X'}
+    news['_story_id'] = bot._story_id(news)
+    store.record(news)
+
+
+@pytest.mark.parametrize(('old', 'new'), [
+    (("'Phantom Busters' TV Anime Announced For 2027",
+      "A television anime adaptation of Shoco's Phantom Busters manga was announced on Thursday."),
+     ('Phantom Busters Anime Adaptation Announced for 2027',
+      "Neoshoco's Phantom Busters manga is officially getting a TV anime adaptation in 2027, "
+      'as announced on September 24.')),
+    (("'Shin Oishinbo'  Reveals Main Cast, Staff",
+      "The official website for the anime adaptation of Tetsu Kariya's Oishinbo manga revealed "
+      'the main cast, staff and a teaser visual on Thursday. The anime is scheduled to premiere in 2027.'),
+     ('New Oishinbo TV Anime Reveals Main Cast, 2027 Release Date', 'The original series aired in 1988')),
+    (("'Aoki Denshou Welsh & Shedar' Reveals Additional Cast, Theme Songs, Main Promo",
+      'The official website revealed additional cast, theme songs and the main promotional video '
+      'on Thursday. The anime is scheduled to premiere on October 2 at 9:25 p.m. on Tokyo MX.'),
+     ('Aoki Densho Welsh & Shedar Anime Reveals Trailer, Additional Cast, Theme Song Info',
+      'French / Japanese co-production begins broadcasting on October 2')),
+])
+def test_retelling_by_another_source_is_not_an_update(story_history, old, new):
+    """Три новых слова давали «новизну» 0.5 — и пересказ обходил дедуп."""
+    _published(story_history, *old, 'https://old.test/1')
+    fresh = {'title': new[0], 'summary': new[1], 'link': 'https://new.test/2', 'source': 'Y'}
+    fresh['_story_id'] = bot._story_id(fresh)
+    assert story_history.classify_update(fresh) is None
+
+
+def test_new_release_date_is_still_an_update(story_history):
+    _published(story_history, 'Phantom Busters Anime Adaptation Announced for 2027',
+               'The manga is getting a TV anime adaptation.', 'https://old.test/1')
+    fresh = {'title': 'Phantom Busters Anime Reveals Teaser, Premiere Date',
+             'summary': 'The anime will premiere on April 4, 2027.', 'link': 'https://new.test/2',
+             'source': 'Y'}
+    fresh['_story_id'] = bot._story_id(fresh)
+    assert story_history.classify_update(fresh) is not None
+
+
+# ---------- п.6. Ложные повторы теряли настоящие новости ----------
+
+@pytest.mark.parametrize(('first', 'second'), [
+    # Общая строка «announcedfor2027» — у двух разных тайтлов.
+    ("'Phantom Busters' TV Anime Announced For 2027", 'Ace Attorney: Dual Destinies VR Announced for 2027'),
+    # «Announces Additional Cast» — рубрика, а тайтлы разные.
+    ("'Isshiki-san wa Koi wo Shiritai.' Announces Additional Cast",
+     "'Hyouken no Majutsushi ga Sekai wo Suberu II' Announces Additional Cast Pair"),
+    # Разные месяцы — разные подборки лицензий.
+    ('Exciting New Licenses Coming in December 2026', 'Exciting New Licenses Coming in September 2026'),
+    # «к 1-й серии 2-го сезона» — рубрика и номера, тайтлы разные.
+    ('Кадры к 1-й серии 2-го сезона аниме "Чёрный клевер".',
+     'Отрывок к 1-й серии 2-го сезона "Киберпанк: Бегущие по краю".'),
+])
+async def test_ledger_does_not_match_on_rubric_words(tmp_path, first, second):
+    store = bot.SentLinksStore(tmp_path / 'sent.json')
+    assert await store.claim('https://a.test/1', first)
+    assert not store.has_similar_title(second)
+
+
+async def test_ledger_still_matches_the_same_title(tmp_path):
+    store = bot.SentLinksStore(tmp_path / 'sent.json')
+    assert await store.claim('https://a.test/1',
+                             'From Old Country Bumpkin to Master Swordsman Season 3 Anime Announced')
+    assert store.has_similar_title('From Old Country Bumpkin to Master Swordsman Season 3 Announced')
+
+
+@pytest.mark.parametrize('second', [
+    'Кадры к 14 серии 3 сезона аниме Реинкарнация безработного.',
+    'Кадры к 1 серии аниме Я могу давать магическую силу в кредит!',
+])
+def test_final_text_does_not_match_on_rubric_words(tmp_path, second):
+    """«Кадры 12 серии «Табакошка»» глушил «Кадры к 14 серии «Реинкарнации»»."""
+    texts = bot.PublishedTexts(tmp_path / 'texts.json')
+    texts.add('Кадры 12 серии аниме «Табакошка».')
+    assert texts.find_similar(second) is None
+
+
+@pytest.mark.parametrize(('first', 'second'), [
+    # Общие слова — только рубрика «вышел трейлер второго сезона».
+    ('Вышел трейлер второго сезона «Атаки титанов»', 'Вышел трейлер второго сезона «Магической битвы»'),
+    # Тот же тайтл, но другая серия.
+    ('Кадры 12 серии аниме «Табакошка»', 'Кадры 13 серии аниме «Табакошка»'),
+    # Тот же издатель, другой месяц.
+    ('Новые лицензии Yen Press на декабрь 2026', 'Новые лицензии Yen Press на сентябрь 2026'),
+])
+def test_final_text_needs_same_core_and_same_numbers(tmp_path, first, second):
+    texts = bot.PublishedTexts(tmp_path / 'texts.json')
+    texts.add(first)
+    assert texts.find_similar(second) is None
+
+
+def test_final_text_still_matches_the_same_news(tmp_path):
+    texts = bot.PublishedTexts(tmp_path / 'texts.json')
+    texts.add('Кадры 12 серии аниме «Табакошка».')
+    assert texts.find_similar('🚬 Кадры к 12 серии аниме Табакошка.')
+
+
+# ---------- п.12. Дата выхода, а не дата анонса ----------
+
+@pytest.mark.parametrize(('text', 'date'), [
+    ("Neoshoco's Phantom Busters manga is officially getting a TV anime adaptation in 2027, "
+     'as announced on September 24.', ''),
+    ('The anime was announced on September 20. It premieres October 4 on Netflix.', '4 октября'),
+    ('The event on September 24 revealed a trailer; the anime airs October 4.', '4 октября'),
+])
+def test_release_date_prefers_release_context(text, date):
+    assert bot.extract_release_date_from_text(text) == date
+
+
+# ---------- п.7–8. Не-новости и спойлеры без модели ----------
+
+# (заголовок, источник, причина) — и двойник: похожие слова, но это новость.
+NOISE_PAIRS = [
+    (('10 New Fall 2026 Anime to Watch This October (& Where to Find Them)', 'ComicBook Anime', 'подборка'),
+     ('3 New Cast Members Join Oshi no Ko Season 3', 'ComicBook Anime')),
+    (('The Best Anime of Summer 2026', 'CBR Anime', 'подборка'),
+     ('Frieren Wins Best Anime of the Year at Crunchyroll Anime Awards', 'CBR Anime')),
+    (('『ONE PIECE』シャンクス　生い立ちと経歴を解説', 'AnimateTimes(JP)', 'объяснялка, а не новость'),
+     ('『葬送のフリーレン』第2期、解説付き上映会の開催決定', 'AnimateTimes(JP)')),
+    (('Celebrating Sixteen Years of Anime Herald', 'Anime Herald', 'самореклама источника'),
+     ('Celebrating 30 Years of Evangelion: New Exhibition Announced', 'Anime Herald')),
+    (("LEGO Keeps Studio Ghibli's Princess Mononoke Set Alive for 41 More Days", 'CBR Anime', 'мерч и игры'),
+     ("Studio Ghibli's Princess Mononoke Returns to Theaters in 4K", 'CBR Anime')),
+    (('Animal Crossing Meets Pokémon Sleep in New Cozy Steam Game', 'CBR Anime', 'мерч и игры'),
+     ('Pokémon Horizons Anime Reveals Final Season Trailer', 'CBR Anime')),
+    (("Gundam's Biggest Model Kit of Its Kind Is Already Selling Out Before Release", 'CBR Anime',
+      'мерч и игры'),
+     ('Gundam GQuuuuuuX Movie Reveals Release Date', 'CBR Anime')),
+    (("📺 Su ANiME GENERATION è ora disponibile l'anime special Marine Express doppiato in italiano.",
+      'TG: VanitasNews', 'серия в дубляже'),
+     ("📺 Annunciata la quarta stagione dell'anime di Grand Blue Dreaming, che inizierà prossimamente.",
+      'TG: VanitasNews')),
+    (('⚠️ Новая информация о 2 половине 2 сезона аниме Операция: Семейка Ёдзакура будет обьявлена '
+      '25 сентября!', 'TG: CurrentAnime', 'анонс анонса'),
+     ('Объявлена дата выхода второй половины 2 сезона «Семейки Ёдзакура»', 'TG: CurrentAnime')),
+    (('One Piece Chapter 1160 Spoilers Reveal Shocking Death', 'AnimeHunch', 'спойлер'),
+     ('One Piece Chapter 1160 Delayed by One Week', 'AnimeHunch')),
+    (('『無職転生Ⅲ』第14話あらすじ＆場面カット', 'AnimateTimes(JP)', 'спойлер'),
+     ('『無職転生Ⅲ』第14話先行カット公開', 'AnimateTimes(JP)')),
+    (('Сюжет 14 серии «Реинкарнации безработного»: чем закончится арка', 'TG: X', 'спойлер'),
+     ('Кадры к 14 серии 3 сезона аниме Реинкарнация безработного.', 'TG: X')),
+]
+
+
+@pytest.mark.parametrize(('noise', 'news'), NOISE_PAIRS)
+def test_non_news_is_caught_and_real_news_stays(noise, news):
+    title, source, reason = noise
+    assert bot.noise_reason({'title': title, 'source': source}) == reason
+    twin_title, twin_source = news
+    assert bot.noise_reason({'title': twin_title, 'source': twin_source}) == ''
+
+
+@pytest.mark.parametrize(('markup', 'text'), [
+    ('Вышла 14 серия.<br>В конце <tg-spoiler>Рудеус теряет руку</tg-spoiler> — смотрите!',
+     'Вышла 14 серия.\nВ конце — смотрите!'),
+    # Старая разметка и вложенный span: хвост спойлера не должен вытечь.
+    ('Итог: <span class="tg-spoiler">он <span>выжил</span> и ушёл</span>. Конец.', 'Итог: . Конец.'),
+    ('Обычный <span class="emoji">🔥</span> текст', 'Обычный 🔥 текст'),
+])
+def test_telegram_spoiler_text_is_dropped(markup, text):
+    from news_parser import message_html_text
+    assert message_html_text(markup) == text
+
+
+def test_editorial_prompt_forbids_plot_spoilers():
+    """Правило в промпте меняет ответы — кеш разборов обязан сброситься."""
+    from llm_protocol import LLM_BATCH_SYSTEM_PROMPT, LLM_SYSTEM_PROMPT
+    assert 'Не раскрывай сюжет серий и глав' in LLM_SYSTEM_PROMPT
+    assert 'Не раскрывай сюжет серий и глав' in LLM_BATCH_SYSTEM_PROMPT
+    assert bot.DEFAULT_LLM_PROMPT_VERSION != 'editorial-v5-2026-09-23'
+
+
+# ---------- п.9. Проверки ответа модели не отклоняют верный пересказ ----------
+
+JP_SOURCE = ('秋アニメ『魔法の姉妹ルルットリリィ』第2クール OP主題歌を使用したメインPV公開\n'
+             '10月4日より放送開始。第14話の場面カット')
+
+
+@pytest.mark.parametrize(('source', 'output'), [
+    (JP_SOURCE, 'Второй кур аниме выйдет 4 октября, опубликован PV с опенингом. Кадры 14 серии.'),
+    ('The anime premieres on October 4th. The 2nd season will have 12 episodes.',
+     'Премьера 4 октября, во 2-м сезоне 12 серий.'),
+    ('The manga sold 1,000,000 copies', 'Тираж манги превысил 1000000 копий'),
+])
+def test_numbers_glued_to_letters_are_found_in_source(source, output):
+    from llm_protocol import _llm_numbers_supported
+    assert _llm_numbers_supported(source, output)
+
+
+def test_invented_number_is_still_rejected():
+    from llm_protocol import _llm_numbers_supported
+    assert not _llm_numbers_supported(JP_SOURCE, 'Третий кур выйдет 5 октября.')
+    # Цифра внутри имени исполнителя — часть имени, а не число.
+    assert _llm_numbers_supported('Bleach: Thousand-Year Blood War opening released today',
+                                  'Вышел опенинг Bleach от jo0ji')
+
+
+def test_japanese_month_supports_russian_month():
+    assert bot._llm_dates_supported(JP_SOURCE, 'Аниме выйдет 4 октября.')
+    assert not bot._llm_dates_supported(JP_SOURCE, 'Аниме выйдет 4 ноября.')
+
+
+def test_leak_in_background_paragraph_is_not_lost_uncertainty():
+    """«Leaked» в предыстории статьи отклонял пересказ официального анонса."""
+    from llm_protocol import _editorial_rejection
+    source = ('Oshi no Ko Season 3 Announced\nThe anime was announced at the event on Sunday.\n'
+              'Earlier this year a leaked schedule had hinted at the return.')
+    assert _editorial_rejection(source, 'Анонсирован третий сезон «Звёздного дитя»', '') == ''
+    rumor = 'Black Clover Season 2 Will Be Split Cour, According to Leak\nDetails below.'
+    assert _editorial_rejection(rumor, 'Второй сезон «Чёрного клевера» разделят на два кура', '') \
+        == 'lost_uncertainty'
+
+
+# ---------- п.10. Пустой разбор пачки не глушит одиночный вызов ----------
+
+def test_batch_item_without_title_is_not_cached():
+    from llm_protocol import _llm_batch_usable
+    raw = json.dumps({'items': [{'id': 1, 'topic': 'аниме', 'kind': 'новость', 'subject': 'Bleach'},
+                                {'id': 2, 'topic': 'прочее', 'kind': 'новость'},
+                                {'id': 3, 'topic': 'аниме', 'kind': 'подборка'},
+                                {'id': 4, 'topic': 'аниме', 'title': 'Вышел трейлер Bleach'}]},
+                     ensure_ascii=False)
+    assert set(bot._llm_parse_batch(raw)) == {2, 3, 4}
+    assert not _llm_batch_usable({'topic': 'аниме', 'kind': 'новость'})
+
+
+# ---------- п.11. MyAnimeList — из RSS, с датой ----------
+
+MAL_RSS = '''<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/"><channel><title>News - MyAnimeList</title>
+<item><title>&#039;Bless&#039; Unveils Additional Cast, Character Promo</title>
+<description>The official website for the television anime adaptation of Yukino Sonoyama&amp;#039;s Bless manga
+unveiled additional cast and the character promotional video on Thursday.</description>
+<media:thumbnail>https://cdn.myanimelist.net/s/common/uploaded_files/1790249127-8c85.jpeg</media:thumbnail>
+<pubDate>{date}</pubDate><link>https://myanimelist.net/news/74754247?_location=rss</link></item>
+</channel></rss>'''
+
+
+def test_myanimelist_items_come_with_date_and_lead(monkeypatch, http_response):
+    from email.utils import format_datetime
+    from datetime import datetime, timezone
+    rss = MAL_RSS.replace('{date}', format_datetime(datetime.now(timezone.utc)))
+    asked = []
+
+    def get(url, **kwargs):
+        asked.append(url)
+        return http_response(content=rss.encode('utf-8'))
+
+    monkeypatch.setattr(bot, 'http_get_with_retry', get)
+    monkeypatch.setattr(bot, 'fetch_og_image', lambda link: None)
+    rows = bot.get_myanimelist()
+    assert asked == [bot.MAL_NEWS_RSS]
+    assert len(rows) == 1
+    assert rows[0]['published_parsed'] is not None
+    assert rows[0]['link'] == 'https://myanimelist.net/news/74754247'
+    assert 'additional cast' in rows[0]['summary']
+
+
+def test_undated_item_ages_from_first_sighting(monkeypatch, tmp_path):
+    """Карточка без даты считалась свежей вечно — фильтр возраста её не видел."""
+    monkeypatch.setattr(bot, 'DATA_DIR', tmp_path)
+    monkeypatch.setattr(bot, 'first_seen_store', None)
+    monkeypatch.setattr(bot, 'settings', MagicMock(post_max_age_hours=48))
+    item = {'link': 'https://myanimelist.net/news/1', 'title': 'Old card', 'published_parsed': None}
+    assert bot._undated_too_old(item) is False
+    now = bot.time.time()
+    monkeypatch.setattr(bot.time, 'time', lambda: now + 49 * 3600)
+    assert bot._undated_too_old(item) is True
+
+
+def test_collection_drops_undated_card_seen_long_ago(monkeypatch, tmp_path):
+    monkeypatch.setitem(bot.FEATURE_FLAGS, 'source_discovery', False)
+    monkeypatch.setattr(bot, 'DATA_DIR', tmp_path)
+    monkeypatch.setattr(bot, 'first_seen_store', None)
+    cards = [{'title': 'Old card without date', 'link': 'https://myanimelist.net/news/1', 'images': ['i']},
+             {'title': 'Dated news', 'link': 'https://myanimelist.net/news/2', 'images': ['i'],
+              'published_parsed': bot.time.gmtime()}]
+    monkeypatch.setattr(bot, 'SOURCES', [('MyAnimeList', lambda: [dict(c) for c in cards])])
+    monkeypatch.setattr(bot, 'settings', MagicMock(is_source_enabled=lambda n: True, require_image=False,
+                                                   post_max_age_hours=48))
+    monkeypatch.setattr(bot, 'stats', MagicMock(record_collected=AsyncMock(), record_skipped=AsyncMock(),
+                                                record_source_error=AsyncMock()))
+    first, _, _ = asyncio.run(bot.collect_all_news())
+    assert {n['title'] for n in first} == {'Old card without date', 'Dated news'}
+    now = bot.time.time()
+    monkeypatch.setattr(bot.time, 'time', lambda: now + 49 * 3600)
+    later, _, _ = asyncio.run(bot.collect_all_news())
+    assert {n['title'] for n in later} == {'Dated news'}
+
+
+# ---------- п.13. Телеграм-пост: списки, призывы, русское название ----------
+
+def test_bullet_list_keeps_its_lines():
+    from post_text import _tg_title_and_summary
+    text = ('⚡️Вышел опенинг аниме «Невероятное приключение ДжоДжо: Гонка «Стальной шар»»\n'
+            '• Продолжение выйдет 25 сентября 2026 года.\n'
+            '• В новой пачке будет 11 серий (охватят 2 и 3 стадии).\n'
+            '• Новые серии каждую пятницу.')
+    _, body = _tg_title_and_summary(text, 'animetarakans', 'TG: animetarakans')
+    assert body.split('\n') == ['• Продолжение выйдет 25 сентября 2026 года.',
+                                '• В новой пачке будет 11 серий (охватят 2 и 3 стадии).',
+                                '• Новые серии каждую пятницу.']
+
+
+def test_wrapped_sentence_is_still_one_line():
+    from post_text import _tg_title_and_summary
+    _, body = _tg_title_and_summary('Заголовок новости тут\nСериал выйдет в октябре\nна Crunchyroll.',
+                                    'x', 'TG: x')
+    assert '\n' not in body
+
+
+@pytest.mark.parametrize(('text', 'kept'), [
+    ('Main PV della serie. ➡️ Cliccate qui per vederlo.', 'Main PV della serie.'),
+    ("Staff: Shunsuke Machiya. ➡️ Potete leggere l'introduzione dell'anime al seguente link: "
+     'https://telegra.ph/Introduzione-09-2', 'Staff: Shunsuke Machiya.'),
+    ('Премьера 2 октября. ➡️ Ознакомиться с аниме можно по следующей ссылке.', 'Премьера 2 октября.'),
+    ('Нажмите здесь, чтобы посмотреть трейлер. Премьера 2 октября.', 'Премьера 2 октября.'),
+    # Двойник: слово «ссылка» в самой новости — не призыв.
+    ('Студия сослалась на ссылку в договоре. Премьера 2 октября.',
+     'Студия сослалась на ссылку в договоре. Премьера 2 октября.'),
+])
+def test_call_to_action_without_link_is_dropped(text, kept):
+    from post_text import _strip_links
+    assert _strip_links(text) == kept
+
+
+def test_russian_title_replaces_the_whole_quoted_name():
+    """Было: «Киберпанк: Бегущие по краю» (Cyberpunk: Edgerunners) 2»."""
+    news = {'_work_russian': 'Киберпанк: Бегущие по краю', '_work_name': 'Cyberpunk: Edgerunners'}
+    title = bot._with_russian_work_name('Отрывок из аниме «Cyberpunk: Edgerunners 2»', news)
+    assert title == 'Отрывок из аниме «Киберпанк: Бегущие по краю 2» (Cyberpunk: Edgerunners 2)'
+    assert title.count('«') == title.count('»')
