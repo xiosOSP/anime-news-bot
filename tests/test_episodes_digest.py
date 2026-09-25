@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
-from telegram.error import NetworkError
+from telegram.error import RetryAfter
 
 import anime_news_bot as bot
 
@@ -227,7 +227,11 @@ async def test_shikimori_down_is_retried_on_the_next_tick(job):
 
 @pytest.mark.asyncio
 async def test_failed_send_is_retried_on_the_next_tick(job):
-    job.send.side_effect = [NetworkError('timeout'), NS(message_id=78)]
+    # Отказ, после которого сообщения точно нет (флуд-лимит), повторяется.
+    # Раньше здесь был NetworkError, но он неоднозначен: Telegram мог принять
+    # сообщение, и повтор давал дубль. Теперь такой день закрывается как
+    # «неизвестно» — это проверяет tests/test_reliability_audit.py.
+    job.send.side_effect = [RetryAfter(30), NS(message_id=78)]
     await job.run()
     assert not bot.EPISODES_DIGEST_FILE.exists()
     await job.run()

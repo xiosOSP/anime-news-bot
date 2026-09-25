@@ -66,13 +66,19 @@ def _pending(tmp_path):
     return bot.PendingPosts(tmp_path / 'pending.json')
 
 
-def test_autopost_takes_oldest_first(tmp_path):
-    """Канал должен повторять ленту ветки, а не выдавать её вперемешку."""
+def test_autopost_takes_newest_first(tmp_path):
+    """Канал берёт самый свежий пост ветки.
+
+    Раньше брался самый старый («повторять ленту»), но когда ветка получает
+    больше постов, чем канал выпускает по интервалу, канал публиковал новости
+    многодневной давности, а сегодняшние ждали. Порядок изменён намеренно;
+    предел возраста проверяет tests/test_reliability_audit.py.
+    """
     store = _pending(tmp_path)
-    first = store.add({'title': 'Первый', 'link': 'https://x/1'})
-    store.add({'title': 'Второй', 'link': 'https://x/2'})
+    store.add({'title': 'Первый', 'link': 'https://x/1'})
+    second = store.add({'title': 'Второй', 'link': 'https://x/2'})
     key, news = store.next_for_autopost()
-    assert key == first and news['title'] == 'Первый'
+    assert key == second and news['title'] == 'Второй'
 
 
 def test_published_post_is_not_offered_again(tmp_path):

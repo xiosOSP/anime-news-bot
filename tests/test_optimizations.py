@@ -106,9 +106,12 @@ class TestSentLinksTrim:
         return anime_news_bot.SentLinksStore(tmp_path / 'links.json')
 
     def _fill(self, store, n):
+        # claim + commit — как у опубликованного поста: резерв без commit
+        # после рестарта намеренно снимается (Telegram ещё не вызывался).
         async def go():
             for i in range(n):
                 await store.claim(f'https://s.com/a{i}', f'Заголовок номер {i}')
+                await store.commit(f'https://s.com/a{i}', f'Заголовок номер {i}')
         asyncio.run(go())
 
     def test_titles_survive_trim(self, store):

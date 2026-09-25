@@ -26,6 +26,7 @@ import subprocess
 import tempfile
 import zipfile
 import copy
+import contextlib
 import time
 import difflib
 try:
@@ -305,7 +306,9 @@ def _bounded_bytes_cache_put(cache: dict, key, value, max_items: int, max_bytes:
     # dict сохраняет порядок вставки, поэтому первый ключ — самый старый.
     while cache and (len(cache) >= max_items or used + size > max_bytes):
         oldest = next(iter(cache))
-        dropped = cache.pop(oldest)
+        # С default: ключ мог исчезнуть между выбором и удалением, и KeyError
+        # вылетал из загрузки картинки вместо обычного «не скачалось».
+        dropped = cache.pop(oldest, None)
         if isinstance(dropped, (bytes, bytearray)):
             used -= len(dropped)
     cache[key] = value
@@ -3221,11 +3224,27 @@ class SentLinksStore:
         self._reservations: dict[str, dict] = {}
         self._rejected: dict[str, dict] = {}
         self._lock = asyncio.Lock()
+        # Читают историю не только из event loop: `link in sent_links` и
+        # has_title() зовут потоки сборщиков и _annotate_work_keys, а
+        # uncertain_count() — HTTP-поток /metrics. Раньше чтение ещё и чистило
+        # просроченные записи, и json.dump в _save() падал посреди записи с
+        # «dictionary changed size during iteration» — RuntimeError вылетал из
+        # commit() уже после успешной отправки. Теперь чтение ничего не меняет,
+        # а изменения и снимок для записи идут под этим замком.
+        self._state_lock = threading.RLock()
         self._load()
+
+    @contextlib.asynccontextmanager
+    async def _locked(self):
+        """asyncio-замок сериализует транзакции, threading-замок — читателей из потоков."""
+        async with self._lock:
+            with self._state_lock:
+                yield
 
     def _load(self) -> None:
         if not self.path.exists():
             return
+        dropped_claims: list[tuple[str, str]] = []
         try:
             with self.path.open('r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -3255,13 +3274,25 @@ class SentLinksStore:
                     if isinstance(v, dict) and normalize_url(str(k))
                 }
                 recovered_uncertain = False
-                for meta in self._reservations.values():
+                for norm_url, meta in self._reservations.items():
                     state = str(meta.get('state') or 'claimed')
                     if state == 'sending':
                         meta['state'] = 'uncertain'
                         recovered_uncertain = True
-                    elif state not in ('claimed', 'uncertain'):
-                        meta['state'] = 'claimed'
+                    elif state != 'uncertain':
+                        # claimed — процесс умер во время подготовки (модель,
+                        # загрузка видео), до mark_sending, то есть Telegram
+                        # ещё не вызывался. Раньше резерв жил после рестарта
+                        # ещё 15 минут, и восстановленный из inflight пост
+                        # очередь признавала дублем и выбрасывала, хотя он
+                        # не был отправлен ни разу. Освобождаем сразу.
+                        dropped_claims.append((norm_url, str(meta.get('title') or '')))
+                for norm_url, norm_title in dropped_claims:
+                    self._reservations.pop(norm_url, None)
+                    self._remove_unlocked(norm_url, norm_title)
+                if dropped_claims:
+                    logger.info(f'Ledger: снято {len(dropped_claims)} резервов прерванной '
+                                'подготовки (до Telegram не дошло)')
                 if recovered_uncertain:
                     logger.warning('Ledger: найдена прерванная отправка; URL оставлен '
                                    'в uncertain, автоматический повтор заблокирован')
@@ -3271,24 +3302,31 @@ class SentLinksStore:
                     normalize_url(str(k)): v for k, v in raw_rej.items()
                     if isinstance(v, dict) and normalize_url(str(k))
                 }
-            if self._purge_transient_unlocked():
+            if self._purge_transient_unlocked() or dropped_claims:
                 self._save()
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"Не удалось прочитать {self.path}: {e}")
 
     def _save(self) -> bool:
-        try:
-            _atomic_write_json(self.path, {
+        # json.dump идёт по снимку, снятому под замком: живые словари в это
+        # время может читать поток, и сериализация не должна их видеть.
+        with self._state_lock:
+            snapshot = {
                 'schema_version': 1,
-                'urls': self._urls,
-                'titles': self._titles,
+                'urls': list(self._urls),
+                'titles': list(self._titles),
                 'recent': [[ts, norm, sorted(tokens)] for ts, norm, tokens in self._recent_titles],
-                'reservations': self._reservations,
-                'rejected': self._rejected,
-            })
+                'reservations': {k: dict(v) for k, v in self._reservations.items()},
+                'rejected': {k: dict(v) for k, v in self._rejected.items()},
+            }
+        try:
+            _atomic_write_json(self.path, snapshot)
             return True
-        except OSError as e:
-            logger.error(f"Не удалось сохранить {self.path}: {e}")
+        except Exception as e:
+            # Не только OSError: любое исключение отсюда вылетало из commit()
+            # после успешной отправки, пост возвращался в очередь и мог уйти
+            # второй раз. Вызывающий код умеет обрабатывать именно False.
+            logger.error(f"Не удалось сохранить {self.path}: {type(e).__name__}: {e}")
             return False
 
     def _remove_unlocked(self, norm_url: str, norm_title: str = '') -> None:
@@ -3308,46 +3346,99 @@ class SentLinksStore:
                 maxlen=self._recent_titles.maxlen,
             )
 
+    @staticmethod
+    def _reservation_expired(meta: dict, now: float) -> bool:
+        state = str(meta.get('state') or 'claimed')
+        ttl = (DEDUP_UNCERTAIN_TTL_SEC if state == 'uncertain'
+               else DEDUP_RESERVATION_TTL_SEC)
+        try:
+            return now - float(meta.get('at', 0)) > ttl
+        except (TypeError, ValueError):
+            return True
+
+    @staticmethod
+    def _reject_ttl_sec() -> float:
+        """Срок отказа не короче окна свежести постов.
+
+        Отказ жил 24 часа, а источники отдают новость 72 часа (настройка
+        свежести). Истёкший отказ возвращал ту же новость в кандидаты, и
+        модель заново судила её каждые сутки — за тот же самый материал.
+        """
+        try:
+            hours = float(getattr(settings, 'post_max_age_hours', POST_MAX_AGE_HOURS)
+                          or POST_MAX_AGE_HOURS)
+        except (TypeError, ValueError):
+            hours = float(POST_MAX_AGE_HOURS)
+        return max(float(DEDUP_REJECT_TTL_SEC), hours * 3600)
+
+    @staticmethod
+    def _rejection_expired(meta: dict, now: float, ttl: float) -> bool:
+        try:
+            return now - float(meta.get('at', 0)) > ttl
+        except (TypeError, ValueError):
+            return True
+
     def _purge_transient_unlocked(self) -> bool:
         now = time.time()
         changed = False
         for norm_url, meta in list(self._reservations.items()):
-            state = str(meta.get('state') or 'claimed')
-            ttl = (DEDUP_UNCERTAIN_TTL_SEC if state == 'uncertain'
-                   else DEDUP_RESERVATION_TTL_SEC)
-            try:
-                expired = now - float(meta.get('at', 0)) > ttl
-            except (TypeError, ValueError):
-                expired = True
-            if expired:
+            if self._reservation_expired(meta, now):
+                state = str(meta.get('state') or 'claimed')
                 self._remove_unlocked(norm_url, str(meta.get('title') or ''))
                 self._reservations.pop(norm_url, None)
                 changed = True
                 logger.info(f"Освобождено просроченное {state}-резервирование URL: {norm_url[:80]}")
+        reject_ttl = self._reject_ttl_sec()
         for norm_url, meta in list(self._rejected.items()):
-            try:
-                expired = now - float(meta.get('at', 0)) > DEDUP_REJECT_TTL_SEC
-            except (TypeError, ValueError):
-                expired = True
-            if expired:
+            if self._rejection_expired(meta, now, reject_ttl):
                 self._rejected.pop(norm_url, None)
                 changed = True
         return changed
+
+    def _expired_reservation_titles_unlocked(self, now: float) -> set[str]:
+        return {str(meta.get('title') or '') for meta in self._reservations.values()
+                if self._reservation_expired(meta, now)} - {''}
 
     @property
     def _set(self) -> set[str]:
         """Совместимость со старым кодом/диагностикой."""
         return self._url_set
 
+    # Чтение ничего не меняет: просроченные резервы только не учитываются, а
+    # удаляет их claim() под замком. Так отвечает и прежняя чистка при чтении,
+    # но без правки словарей из чужого потока.
     def __contains__(self, link: str) -> bool:
-        self._purge_transient_unlocked()
-        return normalize_url(link) in self._url_set
+        norm_url = normalize_url(link)
+        with self._state_lock:
+            if norm_url not in self._url_set:
+                return False
+            meta = self._reservations.get(norm_url)
+            return meta is None or not self._reservation_expired(meta, time.time())
 
     def has_title(self, title: str) -> bool:
-        self._purge_transient_unlocked()
-        return normalize_title(title) in self._title_set
+        norm_title = normalize_title(title)
+        with self._state_lock:
+            if norm_title not in self._title_set:
+                return False
+            return norm_title not in self._expired_reservation_titles_unlocked(time.time())
 
-    def _has_similar_title_unlocked(self, title: str, window_hours: int = 48) -> bool:
+    def is_rejected(self, link: str) -> bool:
+        """Новость уже отсеяна фильтром/дедупом подготовки и срок отказа не вышел.
+
+        reject() убирает ссылку из истории опубликованных, поэтому `link in
+        sent_links` её не видит. Без этой проверки отсеянная новость каждый
+        цикл снова попадала в кандидаты: в тихом режиме админ получал письмо
+        «0 отправлено, 1 отсеяно» каждые полчаса, а в режиме канала она снова
+        ложилась в очередь.
+        """
+        norm_url = normalize_url(link)
+        with self._state_lock:
+            meta = self._rejected.get(norm_url)
+            return meta is not None and not self._rejection_expired(
+                meta, time.time(), self._reject_ttl_sec())
+
+    def _has_similar_title_unlocked(self, title: str, window_hours: int = 48,
+                                    skip: frozenset | set = frozenset()) -> bool:
         if not title:
             return False
         norm = normalize_title(title)
@@ -3361,7 +3452,7 @@ class SentLinksStore:
         matcher.set_seq2(norm)
         norm_len = len(norm)
         for ts, old_norm, old_tokens in self._recent_titles:
-            if now - ts > window_hours * 3600:
+            if now - ts > window_hours * 3600 or old_norm in skip:
                 continue
             if tokens and old_tokens:
                 union = len(tokens | old_tokens)
@@ -3377,14 +3468,15 @@ class SentLinksStore:
         return False
 
     def has_similar_title(self, title: str, window_hours: int = 48) -> bool:
-        self._purge_transient_unlocked()
-        return self._has_similar_title_unlocked(title, window_hours)
+        with self._state_lock:
+            skip = self._expired_reservation_titles_unlocked(time.time())
+            return self._has_similar_title_unlocked(title, window_hours, skip)
 
     async def claim(self, link: str, title: str = '', *, check_similar: bool = False) -> bool:
         """Атомарно резервирует URL/заголовок на время подготовки и отправки."""
         norm_url = normalize_url(link)
         norm_title = normalize_title(title)
-        async with self._lock:
+        async with self._locked():
             if self._purge_transient_unlocked():
                 self._save()
             if norm_url in self._url_set or norm_url in self._rejected:
@@ -3417,7 +3509,7 @@ class SentLinksStore:
     async def mark_sending(self, link: str) -> bool:
         """Фиксирует durable-границу непосредственно перед Telegram API."""
         norm_url = normalize_url(link)
-        async with self._lock:
+        async with self._locked():
             meta = self._reservations.get(norm_url)
             if not meta or str(meta.get('state') or 'claimed') != 'claimed':
                 return False
@@ -3435,7 +3527,7 @@ class SentLinksStore:
     async def mark_uncertain(self, link: str) -> bool:
         """Сохраняет ambiguous delivery при отмене/обрыве после начала Telegram API."""
         norm_url = normalize_url(link)
-        async with self._lock:
+        async with self._locked():
             meta = self._reservations.get(norm_url)
             if not meta:
                 return False
@@ -3447,13 +3539,15 @@ class SentLinksStore:
             return saved
 
     def uncertain_count(self) -> int:
-        self._purge_transient_unlocked()
-        return sum(1 for meta in self._reservations.values()
-                   if str(meta.get('state') or 'claimed') == 'uncertain')
+        now = time.time()
+        with self._state_lock:
+            return sum(1 for meta in self._reservations.values()
+                       if str(meta.get('state') or 'claimed') == 'uncertain'
+                       and not self._reservation_expired(meta, now))
 
     async def clear(self) -> bool:
         """Полностью очищает историю только после durable-записи."""
-        async with self._lock:
+        async with self._locked():
             old_urls = list(self._urls)
             old_url_set = set(self._url_set)
             old_titles = list(self._titles)
@@ -3483,7 +3577,7 @@ class SentLinksStore:
     async def commit(self, link: str, title: str = '') -> bool:
         """Подтверждает публикацию; при disk-error оставляет in-memory uncertain."""
         norm_url = normalize_url(link)
-        async with self._lock:
+        async with self._locked():
             meta = self._reservations.pop(norm_url, None)
             if self._save():
                 return True
@@ -3499,7 +3593,7 @@ class SentLinksStore:
         """Откатывает резервирование; при disk-error остаётся fail-closed in-memory."""
         norm_url = normalize_url(link)
         norm_title = normalize_title(title)
-        async with self._lock:
+        async with self._locked():
             meta = self._reservations.pop(norm_url, None)
             if meta is None:
                 return
@@ -3516,7 +3610,7 @@ class SentLinksStore:
         """Фиксирует осознанный фильтр отдельно от истории опубликованных постов."""
         norm_url = normalize_url(link)
         norm_title = normalize_title(title)
-        async with self._lock:
+        async with self._locked():
             meta = self._reservations.pop(norm_url, None)
             self._remove_unlocked(norm_url, str((meta or {}).get('title') or norm_title))
             self._rejected[norm_url] = {
@@ -3775,11 +3869,15 @@ class PostQueue:
             skipped = 0
             for _ in range(len(self._items)):
                 item = self._items.pop(0)
-                changed = True
                 news = item['news']
                 if self._retry_pending(news):
+                    # Ждущий отсрочки пост уходит в хвост; после полного круга
+                    # порядок тот же, писать на диск нечего. Раньше changed
+                    # ставился на каждый pop, и тик публикатора раз в минуту
+                    # делал fsync очереди, где лежали только ждущие посты.
                     self._items.append(item)
                     continue
+                changed = True
                 if require_img and not _news_has_media_candidate(news):
                     skipped += 1
                     continue
@@ -6026,7 +6124,7 @@ class SourceYieldStore:
 class StoryRegistry:
     """Cross-cycle evidence memory for stories before publication."""
     def __init__(self, path: Path):
-        self.path=path; self._items:list[dict]=[]; self._lock=threading.RLock(); self._load()
+        self.path=path; self._items:list[dict]=[]; self._lock=threading.RLock(); self._dirty=False; self._load()
 
     def _load(self) -> None:
         try:
@@ -6037,8 +6135,18 @@ class StoryRegistry:
         except (OSError,ValueError,TypeError) as e: logger.warning(f'story registry не загружен: {e}')
 
     def _save(self) -> None:
-        try: _atomic_write_json(self.path,{'schema_version':1,'stories':self._items[-STORY_REGISTRY_MAX:]},indent=2)
-        except OSError as e: logger.warning(f'story registry не сохранён: {e}')
+        # Компактный JSON: с indent=2 файл на 5000 историй весил около 3 МБ.
+        with self._lock:
+            try:
+                _atomic_write_json(self.path,{'schema_version':1,'stories':self._items[-STORY_REGISTRY_MAX:]})
+                self._dirty=False
+            except OSError as e: logger.warning(f'story registry не сохранён: {e}')
+
+    def flush(self) -> None:
+        """Пишет накопленное observe() на диск — один раз за цикл сбора."""
+        with self._lock:
+            if self._dirty:
+                self._save()
 
     def _prune(self, *, save: bool=True) -> None:
         cutoff=datetime.now(timezone.utc)-timedelta(days=STORY_REGISTRY_TTL_DAYS); kept=[]
@@ -6136,7 +6244,10 @@ class StoryRegistry:
                          'work_key':str(news.get('_work_key') or best.get('work_key') or ''),
                          'sources':merged, 'links':list(dict.fromkeys([*best.get('links',[]),*links]))[-30:],
                          'last_seen':now, 'observations':_safe_nonnegative_int(best.get('observations'))+1})
-            self._items=self._items[-STORY_REGISTRY_MAX:]; self._save()
+            # Только отметка: запись — flush() после кластеризации. Раньше каждый
+            # кластер переписывал весь файл с fsync прямо в event loop — ~0.1 с
+            # на вызов, при сотне кластеров цикл вешал бота на ~10 с.
+            self._items=self._items[-STORY_REGISTRY_MAX:]; self._dirty=True
             delivered_duplicate = self._delivery_match(news, best)
             return {'registry_id':best['registry_id'],'sources':merged,'links':best['links'],'source_count':len(merged),
                     'new_sources':[x for x in merged if x not in before],'first_seen':best.get('first_seen'),
@@ -13728,6 +13839,11 @@ IMAGE_BYTES_CACHE_MAX = 40      # столько скачанных картин
 IMAGE_BYTES_CACHE_MAX_MB = max(4, min(512, _env_int('IMAGE_BYTES_CACHE_MAX_MB', 48)))
 IMAGE_BYTES_CACHE_MAX_BYTES = IMAGE_BYTES_CACHE_MAX_MB * 1024 * 1024
 _image_bytes_cache: dict = {}
+# _optimize_news_media качает до шести картинок параллельно через to_thread, и
+# все потоки кладут результат в один кеш. Без замка подсчёт объёма обходил
+# .values(), пока соседний поток вытеснял записи: RuntimeError/KeyError
+# вылетали из загрузки и роняли подготовку поста. Сеть — вне замка.
+_image_bytes_cache_lock = threading.Lock()
 
 
 def _cached_image_bytes(url: str) -> Optional[bytes]:
@@ -13735,15 +13851,23 @@ def _cached_image_bytes(url: str) -> Optional[bytes]:
 
     Один и тот же файл нужен несколько раз: посчитать отпечаток для дедупа,
     измерить размер превью, отправить байтами при отказе Bot API. Раньше каждый
-    шаг качал заново — лишний трафик и задержка на ровном месте."""
+    шаг качал заново — лишний трафик и задержка на ровном месте.
+
+    Никогда не бросает: для вызывающих любой сбой — это «картинки нет»."""
     if not url:
         return None
-    if url in _image_bytes_cache:
-        return _image_bytes_cache[url]
-    data = _download_image_bytes(url)
-    _bounded_bytes_cache_put(_image_bytes_cache, url, data,
-                             IMAGE_BYTES_CACHE_MAX, IMAGE_BYTES_CACHE_MAX_BYTES)
-    return data
+    try:
+        with _image_bytes_cache_lock:
+            if url in _image_bytes_cache:
+                return _image_bytes_cache[url]
+        data = _download_image_bytes(url)
+        with _image_bytes_cache_lock:
+            _bounded_bytes_cache_put(_image_bytes_cache, url, data,
+                                     IMAGE_BYTES_CACHE_MAX, IMAGE_BYTES_CACHE_MAX_BYTES)
+        return data
+    except Exception as e:
+        logger.warning(f'Кеш картинок: {type(e).__name__}: {e} ({str(url)[:80]})')
+        return None
 
 
 def _image_width(data: Optional[bytes]) -> Optional[int]:
@@ -13937,6 +14061,15 @@ class PendingPosts:
         key = str(self._counter)
         clean = {k: v for k, v in news.items() if k != 'published_parsed'}
         self._items[key] = {'news': clean, 'ts': time.time(), 'channel_state': 'pending'}
+        # Дату публикации в источнике помним отдельно: published_parsed в JSON
+        # не хранится, а по ней автопостинг отличает вчерашнюю новость от старой.
+        published = news.get('published_parsed')
+        if published:
+            try:
+                self._items[key]['published_ts'] = datetime(
+                    *published[:6], tzinfo=timezone.utc).timestamp()
+            except (TypeError, ValueError, OverflowError):
+                pass
         self._cleanup()
         # Under value-based overflow the new candidate itself may be the weakest.
         # Do not return a callback key that no longer exists; reject it explicitly.
@@ -13994,15 +14127,25 @@ class PendingPosts:
         return saved
 
     def next_for_autopost(self) -> Optional[tuple[str, dict]]:
-        """Самый старый пост из ветки, ещё не ушедший в канал.
+        """Самый свежий пост из ветки, ещё не ушедший в канал.
 
-        Порядок по времени попадания в ветку: канал должен повторять ленту, а
-        не выдавать её вперемешку. Состояния sending и uncertain пропускаются —
-        такой пост уже кто-то публикует или его результат неизвестен, и
-        повторная отправка дала бы дубль в канале.
+        Раньше брался самый старый и без предела возраста: когда ветка получает
+        больше постов, чем канал успевает выпустить по интервалу, канал
+        публиковал новости недельной давности, а сегодняшние ждали. Теперь
+        посты старше настройки свежести (post_max_age_hours — по дате в
+        источнике, если она известна, иначе по времени попадания в ветку)
+        пропускаются, а из остальных берётся самый свежий. Состояния sending
+        и uncertain пропускаются — такой пост уже кто-то публикует или его
+        результат неизвестен, и повторная отправка дала бы дубль в канале.
         """
+        try:
+            max_age_hours = float(getattr(settings, 'post_max_age_hours', POST_MAX_AGE_HOURS)
+                                  or POST_MAX_AGE_HOURS)
+        except (TypeError, ValueError):
+            max_age_hours = float(POST_MAX_AGE_HOURS)
+        cutoff = time.time() - max_age_hours * 3600
         best_key: Optional[str] = None
-        best_ts: Optional[float] = None
+        best_rank: Optional[tuple[float, float]] = None
         for key, item in self._items.items():
             if str(item.get('channel_state') or 'pending') != 'pending':
                 continue
@@ -14012,8 +14155,15 @@ class PendingPosts:
                 ts = float(item.get('ts') or 0.0)
             except (TypeError, ValueError):
                 ts = 0.0
-            if best_ts is None or ts < best_ts:
-                best_key, best_ts = key, ts
+            try:
+                fresh_ts = float(item.get('published_ts') or ts)
+            except (TypeError, ValueError):
+                fresh_ts = ts
+            if fresh_ts < cutoff:
+                continue
+            rank = (fresh_ts, ts)
+            if best_rank is None or rank > best_rank:
+                best_key, best_rank = key, rank
         if best_key is None:
             return None
         return best_key, dict(self._items[best_key]['news'])
@@ -15968,6 +16118,9 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
     all_news = _cluster_news(all_news, persist_intelligence=False)
     if feature_enabled('source_intelligence') and source_intelligence is not None:
         await asyncio.to_thread(source_intelligence.flush)
+    if story_registry is not None:
+        # Реестр историй пишется один раз за цикл и вне event loop.
+        await asyncio.to_thread(story_registry.flush)
     all_news = await _apply_active_verification(all_news)
     all_news = _annotate_story_updates(all_news)
     all_news = _annotate_editorial_automation(all_news)
@@ -17717,6 +17870,16 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
             context.user_data.pop('await_input', None)
             await update.message.reply_text('Пост уже публикуется; отложить его сейчас нельзя.')
             raise ApplicationHandlerStop
+        # Кнопку 📅 проверяли при нажатии, но пока админ вводил время,
+        # автопостинг мог отправить пост в канал без подтверждения Telegram.
+        # Отложка такого поста — второй выход в канал, почти наверняка дубль.
+        if pending_posts.channel_state(key) == 'uncertain':
+            context.user_data.pop('await_input', None)
+            await update.message.reply_text(
+                '❓ Этот пост уже отправлялся в канал, но Telegram не подтвердил '
+                'результат. Отложить его нельзя: вышел бы дубль. Проверь канал; '
+                'если поста там нет — опубликуй кнопкой 📢.')
+            raise ApplicationHandlerStop
         user = update.effective_user
         by = {'id': user.id,
               'name': (user.full_name or user.username or str(user.id))} if user else None
@@ -18233,6 +18396,7 @@ async def news_command(update, context: ContextTypes.DEFAULT_TYPE):
         n for n in all_news
         if matches_keywords(n)
         and n['link'] not in sent_links
+        and not sent_links.is_rejected(n['link'])
         and (bool(n.get('_story_update_of')) or not sent_links.has_title(n.get('title', '')))
     ]
     if not filtered:
@@ -18328,6 +18492,27 @@ def _backpressure_candidates(news_list: list[dict], queue_size: int, *, thread_m
 # Гарантия что одновременно идёт максимум одна проверка новостей
 _check_news_lock = asyncio.Lock()
 _check_failure_streak = 0        # сколько автопроверок подряд упало
+
+# Кандидаты, уже отсеянные в прошлых циклах ветки. В тихом режиме «0 отправлено,
+# N отсеяно» — повод написать админу, но только про новые отсевы: дубль по
+# похожему заголовку или ожидание модели в историю не пишутся, возвращаются
+# каждый цикл, и одно и то же письмо приходило админу каждые полчаса.
+_quiet_seen_skips: dict[str, None] = {}
+_QUIET_SEEN_SKIPS_MAX = 2000
+
+
+def _first_seen_skip(news: dict) -> bool:
+    """True, если этот кандидат отсеян впервые (и запоминает его)."""
+    link = str(news.get('link') or '')
+    key = normalize_url(link) if link else normalize_title(str(news.get('title') or ''))
+    if not key:
+        return True
+    if key in _quiet_seen_skips:
+        return False
+    _quiet_seen_skips[key] = None
+    while len(_quiet_seen_skips) > _QUIET_SEEN_SKIPS_MAX:
+        _quiet_seen_skips.pop(next(iter(_quiet_seen_skips)), None)
+    return True
 
 
 def _find_silent_sources(hours: int = 72) -> list[str]:
@@ -18446,7 +18631,8 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
             logger.exception('Adaptive publishing: снимок не построен, продолжаю цикл')
             metrics.inc('anime_bot_advisory_errors_total', labels={'stage': 'adaptive'})
 
-        _image_bytes_cache.clear()      # цикл закончился, картинки больше не нужны
+        with _image_bytes_cache_lock:   # публикатор может качать картинки параллельно
+            _image_bytes_cache.clear()  # цикл закончился, картинки больше не нужны
 
         # Накопленные предупреждения (квота переводчика и т.п.)
         while _pending_admin_alerts:
@@ -18461,12 +18647,15 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                 f'Больше {AUTO_DISABLE_AFTER_HOURS} ч не отдаёт новостей.\n'
                 f'{reason[:180]}\n\n'
                 f'Включить обратно: /settings → 📡 Источники')
-        # Только то, что подходит по фильтру и не было отправлено ранее
+        # Только то, что подходит по фильтру и не было отправлено ранее.
+        # Отсеянное подготовкой (reject) тоже не берём: иначе оно возвращалось
+        # каждый цикл — повторное письмо админу в ветке и повторная очередь в канале.
         fresh = [
             n for n in all_news
             if matches_keywords(n)
             and _editorial_allowed(n)
             and n['link'] not in sent_links
+            and not sent_links.is_rejected(n['link'])
             and (bool(n.get('_story_update_of')) or not sent_links.has_title(n.get('title', '')))
             and (bool(n.get('_story_update_of')) or not n.get('_story_registry_duplicate'))
         ]
@@ -18550,6 +18739,7 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
             failed_count = 0
             uncertain_count = 0
             skipped_count = 0
+            new_skipped_count = 0        # отсеяно впервые (см. _first_seen_skip)
             skipped_reasons: dict[str, int] = {}
             # Потолок пачки считаем по фактическим обращениям к Telegram, а не по
             # сырым кандидатам. Старый вариант резал список ДО финальных фильтров,
@@ -18608,6 +18798,8 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                 else:
                     skipped_count += 1
                     skipped_reasons[result] = skipped_reasons.get(result, 0) + 1
+                    if _first_seen_skip(news):
+                        new_skipped_count += 1
                 # Пауза нужна только после пути, который мог обратиться к
                 # Telegram. Дубликаты/фильтр физически ничего не отправляют и
                 # раньше зря растягивали цикл на минуты.
@@ -18618,8 +18810,9 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
 
             # Если кандидаты были, но все отсеялись уже в send-pipeline, это тоже
             # диагностически важно: иначе quiet-mode снова выглядит как «бот молчит».
+            # Но только про новые отсевы: повтор того же кандидата уже сообщён.
             has_problems = (bool(errors) or failed_count > 0 or uncertain_count > 0
-                            or (sent_count == 0 and skipped_count > 0))
+                            or (sent_count == 0 and new_skipped_count > 0))
             # В тихом режиме обычный успешный цикл не шумит, но 0 отправок при
             # наличии отсеянных кандидатов показываем с причинами.
             if not settings.quiet_mode or has_problems:
@@ -24318,6 +24511,30 @@ def _build_backup_archive() -> Optional[tuple[bytes, str]]:
     return data, f'anime_bot_backup_{stamp}.zip'
 
 
+# День, за который админам уже сообщили о проваленной проверке бэкапа. Джоб
+# повторяется каждый час, и без отметки письмо приходило бы ежечасно.
+_backup_check_alerted_day = ''
+
+
+async def _alert_backup_check_failed(bot: Bot, today: str, stage: str, errors) -> None:
+    """Раз в день говорит админам, почему ежедневный бэкап не ушёл.
+
+    Раньше провал проверки архива только писался в лог: бэкап молча
+    переставал приходить, и узнавали об этом, когда он уже был нужен.
+    """
+    global _backup_check_alerted_day
+    if _backup_check_alerted_day == today:
+        return
+    reason = '; '.join(str(e) for e in (errors or []))[:500] or 'причина не указана'
+    delivered = await notify_admin(
+        bot,
+        f'⚠️ Ежедневный бэкап не отправлен: архив не прошёл {stage}.\n'
+        f'Причина: {reason}\n\n'
+        f'Бот попробует снова через час. Ручной бэкап: /backup')
+    if delivered:
+        _backup_check_alerted_day = today
+
+
 async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
     """Раз в сутки присылает архив данных в личку админам.
 
@@ -24340,10 +24557,13 @@ async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
         check = await asyncio.to_thread(_verify_backup_archive, data)
         if not check['ok']:
             logger.error(f"Ежедневный бэкап не прошёл self-check: {check['errors']}")
+            await _alert_backup_check_failed(context.bot, today, 'самопроверку', check['errors'])
             return
         restore_check = await asyncio.to_thread(_backup_restore_selftest, data)
         if not restore_check['ok']:
             logger.error(f"Ежедневный бэкап не прошёл restore-test: {restore_check['errors']}")
+            await _alert_backup_check_failed(context.bot, today, 'проверку восстановления',
+                                             restore_check['errors'])
             return
     caption = (f'📦 Ежедневный бэкап данных бота\n'
                f'{filename} — {_fmt_size(len(data))}\n'
@@ -27728,6 +27948,9 @@ async def _post_shutdown(app: Application) -> None:
             saver = getattr(store, '_save', None)
             if callable(saver):
                 saver()
+        if story_registry is not None:
+            # observe() только помечает реестр; несброшенное пишем при остановке.
+            story_registry.flush()
     except Exception as e:
         logger.warning(f'Не удалось сбросить runtime-хранилища: {e}')
     await _stop_event_loop_lag_monitor()
@@ -27926,23 +28149,54 @@ async def episodes_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         state = json.loads(EPISODES_DIGEST_FILE.read_text(encoding='utf-8'))
     except (OSError, ValueError):
         state = {}
+    # Состояние дня — по каждому адресату. В режиме «и в ветку, и в канал»
+    # сбой одного адреса раньше означал повтор для обоих, то есть дубль там,
+    # куда уже ушло. Запись старого формата без targets закрывает день целиком.
+    done: dict = {}
     if isinstance(state, dict) and state.get('date') == today:
-        return
+        done = state.get('targets')
+        if not isinstance(done, dict):
+            return
+    targets = [(chat_id, extra) for chat_id, extra in _episodes_digest_targets()
+               if str(chat_id) not in done]
+    if not targets:
+        return                              # всем уже ушло (или слать некуда)
     calendar = await asyncio.to_thread(_fetch_episode_calendar)
     if calendar is None:
         return                              # Shikimori не ответил — следующий тик
     text = _episodes_digest_text(calendar, now.date(), _admin_tz())
-    sent = []
-    for chat_id, extra in (_episodes_digest_targets() if text else []):
+    progress = False
+    for chat_id, extra in targets:
+        if not text:
+            # Пустой день: отмечаем, чтобы не качать календарь каждые 10 минут.
+            done[str(chat_id)] = {'status': 'empty'}
+            progress = True
+            continue
         try:
             message = await context.bot.send_message(chat_id, text, disable_web_page_preview=True, **extra)
-            sent.append(getattr(message, 'message_id', None))
+            done[str(chat_id)] = {'status': 'sent', 'message_id': getattr(message, 'message_id', None)}
+            progress = True
         except TelegramError as e:
+            try:
+                _raise_if_ambiguous_tg_error(e)
+            except DeliveryUncertain:
+                # TimedOut/NetworkError: Telegram мог принять сообщение, ответ
+                # потерялся. Повтор через 10 минут дал бы вторую рубрику в
+                # канале — день для этого адреса закрываем как «неизвестно».
+                done[str(chat_id)] = {'status': 'uncertain', 'error': f'{type(e).__name__}: {e}'[:200]}
+                progress = True
+                logger.warning('Серии дня: результат отправки в %s неизвестен (%s), '
+                               'повтора не будет', chat_id, e)
+                continue
             logger.warning('Серии дня: не отправилось в %s: %s', chat_id, e)
-    if text and not sent:
+    if not progress:
         return                              # никуда не ушло — попробуем в следующий тик
     try:
-        _atomic_write_json(EPISODES_DIGEST_FILE, {'date': today, 'messages': sent})
+        _atomic_write_json(EPISODES_DIGEST_FILE, {
+            'date': today, 'targets': done,
+            'messages': [row.get('message_id') for row in done.values()
+                         if isinstance(row, dict) and row.get('status') == 'sent'],
+        })
     except OSError as e:
         logger.warning('Серии дня: отметка о публикации не сохранена: %s', e)
 

@@ -20,6 +20,9 @@ class _NoHistory:
     def has_title(self, _title):
         return False
 
+    def is_rejected(self, _link):
+        return False
+
 
 class _Settings(SimpleNamespace):
     pass
