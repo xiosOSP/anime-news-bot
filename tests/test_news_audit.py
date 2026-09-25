@@ -450,3 +450,107 @@ def test_slogan_title_takes_the_name_from_the_first_sentence():
             'summary': 'Инсайдеры утверждают, что 2 сезон «Черного Клевера» станет финальным. '
                        'А «Магическая битва» тут ни при чём.'}
     assert story_work_names(news) == ['Черного Клевера']
+
+
+# ---------- п.5. Пересказ другим источником — не «Обновление:» ----------
+
+@pytest.fixture
+def story_history(tmp_path, monkeypatch):
+    monkeypatch.setitem(bot.FEATURE_FLAGS, 'story_updates', True)
+    return bot.PublishedStoryStore(tmp_path / 'stories.json')
+
+
+def _published(store, title, summary, link):
+    news = {'title': title, 'summary': summary, 'link': link, 'source': 'X'}
+    news['_story_id'] = bot._story_id(news)
+    store.record(news)
+
+
+@pytest.mark.parametrize(('old', 'new'), [
+    (("'Phantom Busters' TV Anime Announced For 2027",
+      "A television anime adaptation of Shoco's Phantom Busters manga was announced on Thursday."),
+     ('Phantom Busters Anime Adaptation Announced for 2027',
+      "Neoshoco's Phantom Busters manga is officially getting a TV anime adaptation in 2027, "
+      'as announced on September 24.')),
+    (("'Shin Oishinbo'  Reveals Main Cast, Staff",
+      "The official website for the anime adaptation of Tetsu Kariya's Oishinbo manga revealed "
+      'the main cast, staff and a teaser visual on Thursday. The anime is scheduled to premiere in 2027.'),
+     ('New Oishinbo TV Anime Reveals Main Cast, 2027 Release Date', 'The original series aired in 1988')),
+    (("'Aoki Denshou Welsh & Shedar' Reveals Additional Cast, Theme Songs, Main Promo",
+      'The official website revealed additional cast, theme songs and the main promotional video '
+      'on Thursday. The anime is scheduled to premiere on October 2 at 9:25 p.m. on Tokyo MX.'),
+     ('Aoki Densho Welsh & Shedar Anime Reveals Trailer, Additional Cast, Theme Song Info',
+      'French / Japanese co-production begins broadcasting on October 2')),
+])
+def test_retelling_by_another_source_is_not_an_update(story_history, old, new):
+    """Три новых слова давали «новизну» 0.5 — и пересказ обходил дедуп."""
+    _published(story_history, *old, 'https://old.test/1')
+    fresh = {'title': new[0], 'summary': new[1], 'link': 'https://new.test/2', 'source': 'Y'}
+    fresh['_story_id'] = bot._story_id(fresh)
+    assert story_history.classify_update(fresh) is None
+
+
+def test_new_release_date_is_still_an_update(story_history):
+    _published(story_history, 'Phantom Busters Anime Adaptation Announced for 2027',
+               'The manga is getting a TV anime adaptation.', 'https://old.test/1')
+    fresh = {'title': 'Phantom Busters Anime Reveals Teaser, Premiere Date',
+             'summary': 'The anime will premiere on April 4, 2027.', 'link': 'https://new.test/2',
+             'source': 'Y'}
+    fresh['_story_id'] = bot._story_id(fresh)
+    assert story_history.classify_update(fresh) is not None
+
+
+# ---------- п.6. Ложные повторы теряли настоящие новости ----------
+
+@pytest.mark.parametrize(('first', 'second'), [
+    # Общая строка «announcedfor2027» — у двух разных тайтлов.
+    ("'Phantom Busters' TV Anime Announced For 2027", 'Ace Attorney: Dual Destinies VR Announced for 2027'),
+    # «Announces Additional Cast» — рубрика, а тайтлы разные.
+    ("'Isshiki-san wa Koi wo Shiritai.' Announces Additional Cast",
+     "'Hyouken no Majutsushi ga Sekai wo Suberu II' Announces Additional Cast Pair"),
+    # Разные месяцы — разные подборки лицензий.
+    ('Exciting New Licenses Coming in December 2026', 'Exciting New Licenses Coming in September 2026'),
+    # «к 1-й серии 2-го сезона» — рубрика и номера, тайтлы разные.
+    ('Кадры к 1-й серии 2-го сезона аниме "Чёрный клевер".',
+     'Отрывок к 1-й серии 2-го сезона "Киберпанк: Бегущие по краю".'),
+])
+async def test_ledger_does_not_match_on_rubric_words(tmp_path, first, second):
+    store = bot.SentLinksStore(tmp_path / 'sent.json')
+    assert await store.claim('https://a.test/1', first)
+    assert not store.has_similar_title(second)
+
+
+async def test_ledger_still_matches_the_same_title(tmp_path):
+    store = bot.SentLinksStore(tmp_path / 'sent.json')
+    assert await store.claim('https://a.test/1',
+                             'From Old Country Bumpkin to Master Swordsman Season 3 Anime Announced')
+    assert store.has_similar_title('From Old Country Bumpkin to Master Swordsman Season 3 Announced')
+
+
+@pytest.mark.parametrize('second', [
+    'Кадры к 14 серии 3 сезона аниме Реинкарнация безработного.',
+    'Кадры к 1 серии аниме Я могу давать магическую силу в кредит!',
+])
+def test_final_text_does_not_match_on_rubric_words(tmp_path, second):
+    """«Кадры 12 серии «Табакошка»» глушил «Кадры к 14 серии «Реинкарнации»»."""
+    texts = bot.PublishedTexts(tmp_path / 'texts.json')
+    texts.add('Кадры 12 серии аниме «Табакошка».')
+    assert texts.find_similar(second) is None
+
+
+def test_final_text_still_matches_the_same_news(tmp_path):
+    texts = bot.PublishedTexts(tmp_path / 'texts.json')
+    texts.add('Кадры 12 серии аниме «Табакошка».')
+    assert texts.find_similar('🚬 Кадры к 12 серии аниме Табакошка.')
+
+
+# ---------- п.12. Дата выхода, а не дата анонса ----------
+
+@pytest.mark.parametrize(('text', 'date'), [
+    ("Neoshoco's Phantom Busters manga is officially getting a TV anime adaptation in 2027, "
+     'as announced on September 24.', ''),
+    ('The anime was announced on September 20. It premieres October 4 on Netflix.', '4 октября'),
+    ('The event on September 24 revealed a trailer; the anime airs October 4.', '4 октября'),
+])
+def test_release_date_prefers_release_context(text, date):
+    assert bot.extract_release_date_from_text(text) == date

@@ -703,11 +703,58 @@ def title_core_words(words) -> set:
     return {w for w in words or () if not is_rubric_word(w)}
 
 
+# Месяц — тоже «номер»: «Licenses Coming in December 2026» и «…in September
+# 2026» у Yen Press — два разных анонса, а слова у них одни и те же.
+_MONTH_STEMS = (
+    ('jan', 'январ', 'gennai'), ('feb', 'феврал', 'febbrai'), ('mar', 'март', 'marzo'),
+    ('apr', 'апрел', 'aprile'), ('may', 'ма', 'maggi'), ('jun', 'июн', 'giugn'),
+    ('jul', 'июл', 'lugli'), ('aug', 'август', 'agost'), ('sep', 'сентябр', 'settembr'),
+    ('oct', 'октябр', 'ottobr'), ('nov', 'ноябр', 'novembr'), ('dec', 'декабр', 'dicembr'),
+)
+_MONTH_WORD = re.compile(
+    r'\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|'
+    r'sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|январ[ьяюе]|феврал[ьяюе]|'
+    r'март[аеу]?|апрел[ьяюе]|ма[йяюе]|июн[ьяюе]|июл[ьяюе]|август[аеу]?|сентябр[ьяюе]|'
+    r'октябр[ьяюе]|ноябр[ьяюе]|декабр[ьяюе]|gennaio|febbraio|marzo|aprile|maggio|giugno|'
+    r'luglio|agosto|settembre|ottobre|novembre|dicembre)\b', re.IGNORECASE)
+
+
+def _month_of(word: str) -> str:
+    low = word.casefold()
+    for index, stems in enumerate(_MONTH_STEMS, 1):
+        if any(low.startswith(stem) for stem in stems):
+            return f'm{index}'
+    return ''
+
+
 def title_numbers(text: str, words=()) -> set:
-    """Номера заголовка: цифры и порядковые числительные («второй», «fourth»)."""
-    found = {n.lstrip('0') or '0' for n in re.findall(r'\d+', str(text or ''))}
+    """Номера заголовка: цифры, порядковые числительные («второй», «fourth») и
+    месяцы («m12»)."""
+    text = str(text or '')
+    found = {n.lstrip('0') or '0' for n in re.findall(r'\d+', text)}
+    found |= {month for month in map(_month_of, _MONTH_WORD.findall(text)) if month}
     for word in words or ():
         value = _ordinal_word_value(word) or _WORK_ORDINAL.get(str(word).casefold())
+        if not value and _MONTH_WORD.fullmatch(str(word)):
+            value = _month_of(str(word))
         if value:
             found.add(value)
     return found
+
+
+def titles_share_core(tokens_a, tokens_b, numbers_a, numbers_b, common: str = '') -> bool:
+    """Могут ли два заголовка быть одной новостью с точки зрения ядра.
+
+    Общими должны быть слова названия, а не рубрики, и номера не должны
+    противоречить друг другу. ``common`` — общая подстрока склеенных
+    заголовков: она обязана содержать хоть одно общее слово ядра, иначе
+    совпадение — это «announcedfor2027» у двух разных тайтлов.
+    """
+    if numbers_conflict(numbers_a, numbers_b):
+        return False
+    shared = {t for t in title_core_words(set(tokens_a or ()) & set(tokens_b or ())) if len(t) >= 3}
+    if not shared:
+        return False
+    if common:
+        return any(len(t) >= 4 and t in common for t in shared)
+    return True

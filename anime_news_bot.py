@@ -92,8 +92,13 @@ from llm_protocol import (
 from news_stories import (
     _clean_work_name,
     same_work_event,
+    story_event_families,
     story_explicit_work_names,
     story_work_names,
+    is_rubric_word,
+    numbers_conflict,
+    title_numbers,
+    titles_share_core,
     _STORY_STOPWORDS,
     _anchor_identity_match,
     _story_canonical_markers,
@@ -3212,6 +3217,21 @@ def _title_tokens(title: str) -> frozenset:
     return frozenset(w for w in words if len(w) >= 3 and w not in _TITLE_STOPWORDS)
 
 
+def _ledger_same_core(norm: str, tokens, old_norm: str, old_tokens, common: str = '') -> bool:
+    """Похожесть заголовков в ledger — только по ядру, не по рубрикам.
+
+    Живой прогон: «'Phantom Busters' TV Anime Announced For 2027» и «Ace
+    Attorney: Dual Destinies VR Announced for 2027» совпадали общей строкой
+    «announcedfor2027», и вторая новость молча выбрасывалась как повтор; так
+    же «Isshiki… Announces Additional Cast» глушил «Hyouken… Announces
+    Additional Cast». Совпадение засчитываем, только если общее есть в словах
+    названия и номера (серия, сезон, месяц) не противоречат.
+    """
+    return titles_share_core(tokens, old_tokens,
+                             title_numbers(norm, tokens), title_numbers(old_norm, old_tokens),
+                             common)
+
+
 class SentLinksStore:
     """История публикаций + короткоживущие транзакционные резервирования.
 
@@ -3463,14 +3483,16 @@ class SentLinksStore:
                 continue
             if tokens and old_tokens:
                 union = len(tokens | old_tokens)
-                if union and len(tokens & old_tokens) / union >= 0.6:
+                if (union and len(tokens & old_tokens) / union >= 0.6
+                        and _ledger_same_core(norm, tokens, old_norm, old_tokens)):
                     return True
             if norm_len >= 16 and len(old_norm) >= 16:
                 # Длина общей подстроки симметрична, поэтому порядок аргументов
                 # можно поменять местами без изменения результата.
                 matcher.set_seq1(old_norm)
                 m = matcher.find_longest_match(0, len(old_norm), 0, norm_len)
-                if m.size >= 16:
+                if m.size >= 16 and _ledger_same_core(norm, tokens, old_norm, old_tokens,
+                                                      old_norm[m.a:m.a + m.size]):
                     return True
         return False
 
@@ -6738,12 +6760,29 @@ class PublishedStoryStore:
             return None
         old_facts = set(best.get('facts') or [])
         new_only = new_facts - old_facts
-        old_nums = set(best.get('numbers') or [])
-        number_change = bool(new_nums and new_nums != old_nums)
         novelty = len(new_only) / max(1, len(new_facts))
-        # Same wording is a duplicate, not an update. Require either a changed
-        # number/date or several genuinely new content tokens.
-        if not number_change and not (len(new_only) >= 3 and novelty >= 0.18):
+        # Обновление — это новый факт, а не новые слова. Раньше хватало трёх
+        # новых слов (новизна ≥0.18), а пересказ той же новости другим
+        # источником всегда пишется другими словами: «'Phantom Busters' TV
+        # Anime Announced» и «Phantom Busters Anime Adaptation Announced»
+        # давали новизну 0.5, второй пост уходил с пометкой «Обновление:» и
+        # обходил дедуп. Теперь нужен новый номер в заголовке (которого не было
+        # ни в заголовке, ни в тексте прошлой новости), новая дата выхода или
+        # новый род события (был анонс — появился трейлер).
+        old_title = str(best.get('title') or '')
+        old_summary = str(best.get('summary') or '')
+        old_nums = _story_numbers({'title': f'{old_title} {old_summary}'})
+        number_change = bool(new_nums - old_nums)
+        new_date = extract_release_date_from_text(
+            f"{news.get('title') or ''}\n{str(news.get('summary') or '')[:600]}")
+        old_date = extract_release_date_from_text(f'{old_title}\n{old_summary[:600]}')
+        date_change = bool(new_date and new_date != old_date)
+        # Род события прошлой новости — по заголовку И тексту: «Reveals Main
+        # Cast» с текстом «…premiere in 2027» уже сообщала дату, и «Main Cast,
+        # 2027 Release Date» от другого сайта ничего нового не несёт.
+        new_family = bool(story_event_families(news)
+                          - story_event_families(f'{old_title} {old_summary[:600]}'))
+        if not (number_change or date_change or new_family):
             return None
         out = dict(best)
         out['_similarity'] = round(best_score, 3)
@@ -7199,15 +7238,46 @@ def extract_release_date_from_text(text: str) -> str:
                     formatted = f'{day} {RU_MONTHS[month]}'
                 else:
                     continue
-                candidates.append((m.start(), _KIND_PRIORITY[kind], formatted))
+                candidates.append((_date_context_rank(text, m.start(), m.end()), m.start(),
+                                   _KIND_PRIORITY[kind], formatted))
             except (ValueError, IndexError, KeyError):
                 continue
 
+    # Дата, у которой рядом «announced on», — день анонса, а не выхода:
+    # «…getting a TV anime adaptation in 2027, as announced on September 24»
+    # давало в пост «📅 24 сентября», будто аниме выходит завтра.
+    candidates = [c for c in candidates if c[0] < 2]
     if not candidates:
         return ''
-    # Первая по позиции; при равной позиции — конкретнее
-    candidates.sort(key=lambda c: (c[0], c[1]))
-    return candidates[0][2]
+    # Сначала дата со словами о выходе рядом («premieres», «выйдет»,
+    # «放送開始»), затем первая по позиции; при равной позиции — конкретнее.
+    candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+    return candidates[0][3]
+
+
+# Слова о выходе рядом с датой: «premieres October 4», «10月4日より放送開始».
+_DATE_RELEASE_CONTEXT = re.compile(
+    r'premier\w*|releas\w*|\bairs?\b|\bairing\b|debut\w*|launch\w*|stream\w*|broadcast\w*|'
+    r'\bbegins?\b|\bstarts?\b|\bopens?\b|in theaters|arriv\w*|\bout\b|выйд\w*|выход\w*|'
+    r'стартует|старт\w*|премьер\w*|релиз\w*|эфир\w*|покаж\w*|放送|配信|公開|発売|上映|スタート|'
+    r'inizi\w*|uscit\w*', re.IGNORECASE)
+# Слова об анонсе прямо перед датой: «announced on September 24».
+_DATE_ANNOUNCE_CONTEXT = re.compile(
+    r'(?:announc\w*|reveal\w*|unveil\w*|confirm\w*|объявил\w*|объявлен\w*|анонсир\w*|'
+    r'сообщил\w*|опубликова\w*|発表)\W*(?:on|in|at|this|last)?\W*$', re.IGNORECASE)
+
+
+def _date_context_rank(text: str, start: int, end: int) -> int:
+    """0 — дата выхода, 1 — не понять, 2 — дата анонса (не годится)."""
+    before = text[max(0, start - 50):start]
+    # Контекст — в пределах той же фразы.
+    before = re.split(r'[.!?。！？\n]', before)[-1]
+    after = re.split(r'[.!?。！？\n,]', text[end:end + 20])[0]
+    if _DATE_ANNOUNCE_CONTEXT.search(before):
+        return 2
+    if _DATE_RELEASE_CONTEXT.search(before) or _DATE_RELEASE_CONTEXT.search(after):
+        return 0
+    return 1
 
 
 def parse_episode(title: str) -> Optional[dict]:
@@ -13268,22 +13338,37 @@ class PublishedTexts:
         'ы': 'i', 'ь': '', 'э': 'e', 'ю': 'u', 'я': 'a',
     })
 
+    _STOP = frozenset({'аниме', 'манга', 'манге', 'манги', 'the', 'and', 'for', 'уже',
+                       'выйдет', 'вышел', 'вышла', 'состоится', 'получит', 'anime',
+                       'manga', 'премьера', 'этого', 'года'})
+
     @classmethod
     def _words(cls, text: str) -> set:
         """Значимые слова первой строки, приведённые к латинице."""
+        return cls._parts(text)[0]
+
+    @classmethod
+    def _parts(cls, text: str) -> tuple[set, set, set]:
+        """Слова первой строки, их ядро без рубрик и номера первой строки.
+
+        «Кадры 12 серии «Табакошка»» и «Кадры к 14 серии «Реинкарнации»»
+        совпадали на две трети слов — «кадры» и «серии», — и вторая новость
+        считалась повтором. Общими должны быть слова названия, а номера
+        серий не должны расходиться.
+        """
         head = (text or '').split('\n')[0].lower()
         raw = re.findall(r'[а-яёa-z0-9]{3,}', head)
-        stop = {'аниме', 'манга', 'манге', 'манги', 'the', 'and', 'for', 'уже',
-                'выйдет', 'вышел', 'вышла', 'состоится', 'получит', 'anime',
-                'manga', 'премьера', 'этого', 'года'}
-        words = set()
+        words, core = set(), set()
         for word in raw:
-            if word in stop:
+            if word in cls._STOP:
                 continue
             latin = word.translate(cls._TRANSLIT)
             if len(latin) >= 3:
                 words.add(latin[:6])
-        return words
+                if not is_rubric_word(word):
+                    core.add(latin[:6])
+        numbers = title_numbers(head, re.findall(r'[а-яёa-z]+', head))
+        return words, core, numbers
 
     @staticmethod
     def _key(words: set) -> str:
@@ -13299,12 +13384,21 @@ class PublishedTexts:
             if done:
                 self._pending.pop(key, None)
 
-    def _find_similar_words(self, words: set) -> Optional[str]:
+    def _find_similar_words(self, words: set, core: Optional[set] = None,
+                            numbers: Optional[set] = None) -> Optional[str]:
         self._prune()
         self._prune_pending()
+        core = set(words) if core is None else core
         for item in list(reversed(self._items)) + list(self._pending.values()):
             old = set(item.get('w') or [])
             if not old:
+                continue
+            # Записи до этой правки ядра и номеров не хранят — для них всё
+            # слово считается ядром, а номера неизвестны.
+            old_core = set(item['c']) if isinstance(item.get('c'), list) else old
+            if numbers_conflict(numbers or (), item.get('n') or ()):
+                continue
+            if not (words & old & core & old_core):
                 continue
             overlap = len(words & old) / min(len(words), len(old))
             if overlap >= FINAL_SIMILARITY:
@@ -13313,21 +13407,21 @@ class PublishedTexts:
 
     def find_similar(self, text: str) -> Optional[str]:
         """Заголовок недавнего или прямо сейчас отправляемого похожего поста."""
-        words = self._words(text)
+        words, core, numbers = self._parts(text)
         if len(words) < 3:
             return None
-        return self._find_similar_words(words)
+        return self._find_similar_words(words, core, numbers)
 
     def reserve(self, text: str) -> Optional[str]:
         """Резервирует финальный текст; возвращает заголовок дубля или None."""
-        words = self._words(text)
+        words, core, numbers = self._parts(text)
         if len(words) < 3:
             return None
-        duplicate = self._find_similar_words(words)
+        duplicate = self._find_similar_words(words, core, numbers)
         if duplicate:
             return duplicate
         self._pending[self._key(words)] = {
-            'w': sorted(words),
+            'w': sorted(words), 'c': sorted(core), 'n': sorted(numbers),
             't': re.sub(r'\s+', ' ', (text or '').split('\n')[0])[:70],
             '_owner': asyncio.current_task() if asyncio.get_event_loop().is_running() else None,
         }
@@ -13343,11 +13437,11 @@ class PublishedTexts:
         self.add(text)
 
     def add(self, text: str) -> None:
-        words = self._words(text)
+        words, core, numbers = self._parts(text)
         if len(words) < 3:
             return
         self._items.append({
-            'w': sorted(words),
+            'w': sorted(words), 'c': sorted(core), 'n': sorted(numbers),
             't': re.sub(r'\s+', ' ', (text or '').split('\n')[0])[:70],
             'ts': time.time(),
         })
