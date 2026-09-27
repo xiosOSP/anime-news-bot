@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "a56722bc3d477b878ed8187b8aed3526cb27ce8d",
-  "generated_at_utc": "2026-09-25T13:03:01.504881+00:00",
+  "git_commit": "f9907b00731aabf210e4b0fc80543268f84f76d3",
+  "generated_at_utc": "2026-09-25T20:21:16.550701+00:00",
   "files": {
     ".env.example": {
       "sha256": "1d45114ec32deffad57d13ba2928bab66cf9fc248bb0e9bcb2f959028479257a",
@@ -494,8 +494,8 @@
       "bytes": 12614
     },
     "tests/test_moderation_provider_fallback.py": {
-      "sha256": "7e13b21d804b2ca11b8fb1f4af4d2c4e5585882675630ced18179ce2d1404a2d",
-      "bytes": 8258
+      "sha256": "093708925b6d5b272a331d70958292b34806db41f0e1bfc2f3d06209f3bb80b0",
+      "bytes": 8704
     },
     "tests/test_moderation_quiet_notices.py": {
       "sha256": "10a3dde08914385b5fa8047a3c5187bf896933439fdd42997c75e91b728cd4ff",
