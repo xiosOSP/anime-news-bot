@@ -162,3 +162,8 @@ async def test_handler_deletes_repeated_16_plus_gif(tmp_path, monkeypatch):
     tg = await run(media.Scan('checked', 'spoiler_16', reason, 16, .85, hits=2), 2)
     tg.delete_message.assert_not_awaited()
     assert store.warn_count(-100, 52) == 0
+
+
+def test_one_hit_is_not_backed_by_near_explicit_frames():
+    scan = media.Scan('checked', 'spoiler_16', 'x', frames=16, score=.86, hits=1, near_explicit=3)
+    assert media.media_confidence(scan) == .86

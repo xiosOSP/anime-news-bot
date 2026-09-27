@@ -69,6 +69,13 @@ class Scan:
     # и без этих счётчиков оно терялось.
     hits: int = 0
     near_explicit: int = 0
+    # Пограничная находка — не сбой детектора, а вопрос к человеку: такой
+    # результат идёт админу отчётом с кнопками, а не техническим письмом,
+    # которое прячется на 15 минут после первого.
+    borderline: bool = False
+    # Отпечатки проверенных кадров (frame_hash). По ним чёрный список узнаёт
+    # ту же гифку, пересжатую или загруженную заново под другим file_id.
+    hashes: tuple = ()
 
 
 def _address_space_peak_mb():
@@ -142,6 +149,76 @@ def media_evidence(scan) -> str:
     if near:
         text += f', признаки 18+ чуть ниже порога на {near}'
     return text
+
+
+# Отпечаток кадра — разностный хэш 16×16 (256 бит). Замерено на кадре живой
+# гифки из чата: пересжатие JPEG q30, уменьшение вчетверо, размытие и +15%
+# яркости дают расстояние 1–3 бита; разные картинки — от 40 и выше, кроме
+# почти одинаковых скриншотов интерфейса Telegram (8–30). Порог 20 ловит
+# копии и не ловит соседние кадры других сцен. Обрезку хэш не переживает —
+# это сознательно: иначе растёт риск удалить чужую безобидную картинку.
+HASH_SIZE = 16
+HASH_MATCH_BITS = 20
+
+
+def frame_hash(frame):
+    """Отпечаток кадра или None, если в кадре нет рисунка.
+
+    Чёрный кадр затемнения, заливка или плавный градиент дают почти
+    одинаковый хэш у совершенно разных гифок — по ним «совпадало» бы всё.
+    """
+    from PIL import Image
+    gray = frame.convert('L').resize((HASH_SIZE + 1, HASH_SIZE), Image.BILINEAR)
+    px = gray.tobytes()
+    mean = sum(px) / len(px)
+    spread = (sum((v - mean) ** 2 for v in px) / len(px)) ** .5
+    bits = 0
+    for row in range(HASH_SIZE):
+        base = row * (HASH_SIZE + 1)
+        for col in range(HASH_SIZE):
+            bits = (bits << 1) | (px[base + col] > px[base + col + 1])
+    ones = bits.bit_count()
+    total = HASH_SIZE * HASH_SIZE
+    if spread < 12 or not total * .15 <= ones <= total * .85:
+        return None
+    return f'{bits:0{total // 4}x}'
+
+
+def parse_hashes(values):
+    """Отпечатки числами. Уже разобранные (int) проходят как есть."""
+    if isinstance(values, str):
+        values = (values,)
+    parsed = []
+    for value in values or ():
+        if isinstance(value, int):
+            parsed.append(value)
+            continue
+        try:
+            parsed.append(int(str(value), 16))
+        except ValueError:
+            continue
+    return parsed
+
+
+def hashes_match(candidate, known) -> bool:
+    """Та же картинка или гифка: достаточно кадров близки к известным.
+
+    Картинка с картинкой — по одному кадру. Всё, где есть гифка, — только по
+    двум близким кадрам: один общий кадр бывает и у разных роликов (заставка,
+    титр), а кадр безобидной сцены из нарезки не должен делать запрещённой
+    любую картинку с этой сценой.
+    """
+    ours, theirs = parse_hashes(candidate), parse_hashes(known)
+    if not ours or not theirs:
+        return False
+    need = 1 if len(ours) == 1 and len(theirs) == 1 else 2
+    close = 0
+    for value in ours:
+        if any((value ^ other).bit_count() <= HASH_MATCH_BITS for other in theirs):
+            close += 1
+            if close >= need:
+                return True
+    return False
 
 
 # Документы, которые Telegram не показывает картинкой: субтитры, тексты,
@@ -313,7 +390,7 @@ def detection_variants(frame):
 def scan_frame(detector, frame, explicit_threshold=.80, suggestive_threshold=.85):
     import numpy as np
     best = Scan('checked')
-    suspicious = False
+    suspicious = 0.0
     near_explicit = False
     for variant in detection_variants(frame):
         # NudeNet expects OpenCV BGR, Pillow yields RGB. Keep the thresholds:
@@ -333,12 +410,12 @@ def scan_frame(detector, frame, explicit_threshold=.80, suggestive_threshold=.85
             if not math.isfinite(score):
                 continue
             if label in EXPLICIT and score >= explicit_threshold - .15:
-                suspicious = near_explicit = True
+                suspicious, near_explicit = max(suspicious, score), True
             elif label in SUGGESTIVE and score >= suggestive_threshold - .15:
-                suspicious = True
+                suspicious = max(suspicious, score)
     if not best.category and suspicious:
         return Scan('unchecked', reason='Пограничная оценка наготы; нужна ручная проверка',
-                    near_explicit=int(near_explicit))
+                    score=suspicious, near_explicit=int(near_explicit), borderline=True)
     return replace(best, near_explicit=int(near_explicit)) if near_explicit else best
 
 
@@ -400,6 +477,7 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
     uncertain = None
     suggestive_frames = 0
     near_explicit_frames = 0
+    hashes = []
     frame_iter = iter(frames)
     while True:
         # Ошибка разбора кадра — это битый файл, его может прислать кто угодно;
@@ -413,20 +491,23 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
             raise
         except Exception as exc:
             return Scan('unchecked', reason=f'Файл не декодируется: {type(exc).__name__}',
-                        frames=count, bad_input=True)
+                        frames=count, bad_input=True, hashes=tuple(hashes))
+        fingerprint = frame_hash(frame)
+        if fingerprint:
+            hashes.append(fingerprint)
         detection = scan_frame(detector, frame, explicit_threshold, suggestive_threshold)
         count += 1
         near_explicit_frames += int(bool(detection.near_explicit))
         if detection.category == 'nsfw':
             return Scan('checked', detection.category, detection.reason, count, detection.score,
-                        hits=1)
+                        hits=1, hashes=tuple(hashes))
         if detection.category == 'spoiler_16':
             suggestive_frames += 1
             if not best.category or detection.score > best.score:
                 best = detection
         elif detection.category and (not best.category or detection.score > best.score):
             best = detection
-        if detection.status == 'unchecked':
+        if detection.status == 'unchecked' and (uncertain is None or detection.score > uncertain.score):
             uncertain = detection
     if not count:
         return Scan('unchecked', reason='Нет декодированных кадров', bad_input=True)
@@ -441,13 +522,14 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
                 reason=(f'Один пограничный кадр 16+ ({best.score:.2f}); '
                         'нужна ручная проверка'),
                 frames=count, score=best.score, hits=suggestive_frames,
-                near_explicit=near_explicit_frames)
+                near_explicit=near_explicit_frames, borderline=True, hashes=tuple(hashes))
     if not best.category and uncertain is not None:
-        return Scan('unchecked', reason=uncertain.reason, frames=count,
-                    near_explicit=near_explicit_frames)
+        return Scan('unchecked', reason=uncertain.reason, frames=count, score=uncertain.score,
+                    near_explicit=near_explicit_frames, borderline=uncertain.borderline,
+                    hashes=tuple(hashes))
     return Scan('checked', best.category, best.reason, count, best.score,
                 hits=suggestive_frames if best.category == 'spoiler_16' else 0,
-                near_explicit=near_explicit_frames)
+                near_explicit=near_explicit_frames, hashes=tuple(hashes))
 
 
 def clamp_worker_memory(memory_mb):
@@ -527,8 +609,12 @@ def run_worker(path, kind, timeout, explicit_threshold, suggestive_threshold,
     if result.returncode:
         return Scan('unchecked', reason=worker_failure_reason(result.returncode, result.stderr))
     try:
-        return Scan(**json.loads(result.stdout))
-    except (ValueError, TypeError):
+        data = json.loads(result.stdout)
+        raw_hashes = data.get('hashes') or ()
+        data['hashes'] = tuple(str(value) for value in (
+            raw_hashes if isinstance(raw_hashes, (list, tuple)) else ())[:64])
+        return Scan(**data)
+    except (ValueError, TypeError, AttributeError):
         tail = worker_error_tail(result.stderr) or worker_error_tail(result.stdout)
         return Scan('unchecked', reason='Детектор ответил неразборчиво'
                                         + (f': {tail}' if tail else ''))
@@ -660,7 +746,8 @@ class MediaScanner:
             self._paused_until = 0.0
             return
         reason = str(result.reason or '').casefold()
-        if 'ручн' in reason or 'пограничн' in reason or getattr(result, 'bad_input', False):
+        if ('ручн' in reason or 'пограничн' in reason or getattr(result, 'bad_input', False)
+                or getattr(result, 'borderline', False)):
             return
         self._failures += 1
         if self._failures >= self.failure_limit:
@@ -739,9 +826,11 @@ class MediaScanner:
         if preview_scan.category:
             return Scan('unchecked', category=preview_scan.category,
                         reason=f'{found_prefix}; на превью: {preview_scan.reason}',
-                        frames=preview_scan.frames, score=preview_scan.score)
+                        frames=preview_scan.frames, score=preview_scan.score,
+                        hashes=tuple(preview_scan.hashes or ()))
         return Scan('unchecked', reason=f'{limit}; превью чистое, весь файл не проверен',
-                    frames=preview_scan.frames, review=False)
+                    frames=preview_scan.frames, review=False,
+                    hashes=tuple(preview_scan.hashes or ()))
 
     async def check(self, bot, message):
         attachment = media_attachment(message)
