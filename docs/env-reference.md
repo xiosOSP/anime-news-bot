@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 291 переменных. Почти все — точная настройка со значением
+Бот читает 293 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -251,12 +251,14 @@
 | `MODERATION_LOG_FLUSH_SEC` | `30` | anime_news_bot.py |
 | `MODERATION_LOG_MAX` | `50` | anime_news_bot.py |
 | `MODERATION_MAX_MESSAGE_CHARS` | `1000` | anime_news_bot.py |
+| `MODERATION_MEDIA_BLOCKLIST_MAX` | `2000` | anime_news_bot.py |
 | `MODERATION_MEDIA_ENABLED` | `true` | anime_news_bot.py |
 | `MODERATION_MEDIA_EXPLICIT_THRESHOLD` | `0.8` | anime_news_bot.py |
 | `MODERATION_MEDIA_MEMORY_MB` | — | anime_news_bot.py |
 | `MODERATION_MEDIA_NOTICE_SEC` | `900` | anime_news_bot.py |
 | `MODERATION_MEDIA_QUEUE` | `4` | anime_news_bot.py |
 | `MODERATION_MEDIA_SUGGESTIVE_THRESHOLD` | `0.85` | anime_news_bot.py |
+| `MODERATION_MEDIA_SWEEP_SEC` | `3600` | anime_news_bot.py |
 | `MODERATION_MEDIA_TIMEOUT_SEC` | `25` | anime_news_bot.py |
 | `MODERATION_MODE` | — | anime_news_bot.py |
 | `MODERATION_REPEAT_LIMIT` | `3` | anime_news_bot.py |

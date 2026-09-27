@@ -112,7 +112,8 @@ from news_stories import (
     _story_update_anchor,
     normalize_title,
 )
-from moderation_media import (MediaScanner, media_attachment, media_confidence,
+from moderation_media import (MediaScanner, hashes_match, media_attachment, media_confidence,
+                              parse_hashes,
                               media_evidence, probe as media_probe,
                               WORKER_MEMORY_MB_DEFAULT, WORKER_MEMORY_MB_MIN)
 from moderation_llm import ChatModelClient
@@ -1722,6 +1723,17 @@ MODERATION_LATEST_MAX = 4000
 # десяти NSFW-фото удалялся наполовину: первые пять проверялись и удалялись,
 # остальные упирались в переполненную очередь детектора и оставались в чате.
 _moderation_album_verdicts: 'OrderedDict[tuple[int, str], dict]' = OrderedDict()
+# Недавние медиа по чатам: что пришло, с каким file_id и отпечатками кадров.
+# Когда медиа попадает в чёрный список — сам бот удалил его или админ нажал
+# «✅ Верно», — копии, уже прошедшие в чат, находятся здесь и удаляются.
+# Раньше две одинаковые гифки получали разный вердикт: одна удалена, вторая
+# (другая кодировка, оценка чуть ниже порога) осталась висеть.
+_moderation_recent_media: dict[int, deque] = {}
+MODERATION_MEDIA_SWEEP_SEC = max(60, min(86400, _env_int('MODERATION_MEDIA_SWEEP_SEC', 3600)))
+MODERATION_MEDIA_BLOCKLIST_MAX = max(50, min(20000, _env_int('MODERATION_MEDIA_BLOCKLIST_MAX', 2000)))
+# Отпечатков на запись: 16 кадров гифки хватает, а файл хранилища пишется
+# целиком в цикле событий — лишние килобайты в каждой записи стоят времени.
+MODERATION_MEDIA_HASHES_MAX = 16
 _moderation_recent: dict[str, deque] = {}      # (chat,user) -> времена сообщений
 
 # Ссылки и приглашения — типовой спам. Списки намеренно короткие: задача
@@ -2355,6 +2367,8 @@ class ChatModerationStore:
         self._last_save = 0.0
         # Почему состояние не прочиталось. Пусто — всё в порядке.
         self.load_error = ''
+        # Разобранные отпечатки чёрного списка; None — пересобрать.
+        self._blocked_index = None
         self._load()
 
     def _set_aside_corrupt(self, reason: str) -> None:
@@ -2408,6 +2422,10 @@ class ChatModerationStore:
                 'incidents': raw.get('incidents') if isinstance(raw.get('incidents'), dict) else {},
                 'reviews': raw.get('reviews') if isinstance(raw.get('reviews'), dict) else {},
                 'misses': raw.get('misses') if isinstance(raw.get('misses'), dict) else {},
+                'media_blocklist': {
+                    str(key): row for key, row in (
+                        raw.get('media_blocklist') if isinstance(raw.get('media_blocklist'), dict)
+                        else {}).items() if isinstance(row, dict)},
             }
         except OSError as e:
             self.load_error = f'файл не прочитан: {e}'[:300]
@@ -2462,7 +2480,7 @@ class ChatModerationStore:
 
     def ensure_review(self, review_id: str, chat_id: int, user_id: int,
                       category: str, action: str, source: str, reason: str,
-                      text: str) -> bool:
+                      text: str, media: Optional[dict] = None) -> bool:
         """Persist exactly what an administrator is asked to judge.
 
         Observe-mode reports used to have buttons that did not write anything,
@@ -2489,6 +2507,22 @@ class ChatModerationStore:
                 'text': str(text)[:400],
                 'feedback': '',
             }
+            if isinstance(media, dict):
+                # Что было в сообщении под отчётом. Без этого кнопка «✅ Верно»
+                # могла только записать оценку: гифка оставалась в чате, а её
+                # копии бот не узнавал.
+                reviews[review_id]['media'] = {
+                    'file_unique_id': str(media.get('file_unique_id') or '')[:64],
+                    'hashes': [str(h)[:64] for h in (media.get('hashes') or ())][:MODERATION_MEDIA_HASHES_MAX],
+                    'version': str(media.get('version') or '')[:64],
+                    'blocked_id': str(media.get('blocked_id') or '')[:40],
+                    'severity': int(media.get('severity') or 2),
+                    'message_id': int(media.get('message_id') or 0),
+                    'thread_id': (media.get('thread_id')
+                                  if isinstance(media.get('thread_id'), int) else None),
+                    'pending': bool(media.get('pending')),
+                    'name': str(media.get('name') or '')[:64],
+                }
             if not self._save():
                 self._data = before
                 return False
@@ -2497,6 +2531,118 @@ class ChatModerationStore:
     def review(self, review_id: str) -> dict:
         with self._lock:
             return copy.deepcopy(self._data.get('reviews', {}).get(review_id, {}))
+
+    def finish_review_media(self, review_id: str) -> None:
+        with self._lock:
+            row = self._data.get('reviews', {}).get(review_id) or {}
+            if isinstance(row.get('media'), dict) and row['media'].get('pending'):
+                row['media']['pending'] = False
+                self._save()
+
+    def block_media(self, entry_id: str, chat_id: int, category: str, file_ids,
+                    hashes, source: str) -> dict:
+        """Внести медиа в чёрный список; вернуть запись (пустую — если не вышло).
+
+        Ключ — отчёт, по которому медиа осуждено: «❌ Ошибка» или «↩️ Снять»
+        на нём убирают запись. Отпечатки — только исходного медиа и не больше
+        MODERATION_MEDIA_HASHES_MAX: запись не должна «расползаться» на кадры
+        других сцен, которых никто не осуждал.
+        """
+        file_ids = [str(x)[:64] for x in (file_ids or ()) if x]
+        hashes = [str(h)[:64] for h in (hashes or ()) if h]
+        if not entry_id or (not file_ids and not hashes):
+            return {}
+        with self._lock:
+            before = copy.deepcopy(self._data)
+            blocklist = self._data.setdefault('media_blocklist', {})
+            row = blocklist.get(entry_id)
+            if row is None:
+                while len(blocklist) >= MODERATION_MEDIA_BLOCKLIST_MAX:
+                    # Налёт автоматических записей не должен вытеснять то,
+                    # что подтвердил человек: сначала уходят самые старые авто.
+                    victim = next((key for key, value in blocklist.items()
+                                   if value.get('source') != 'admin'), next(iter(blocklist)))
+                    blocklist.pop(victim)
+                row = blocklist[entry_id] = {
+                    'at': time.time(), 'chat_id': int(chat_id), 'category': str(category)[:40],
+                    'file_ids': [], 'hashes': [], 'source': str(source)[:16], 'hits': 0}
+            elif source == 'admin':
+                # Подтверждение человека сильнее автоматического вердикта.
+                row['source'] = 'admin'
+            row['file_ids'] = list(dict.fromkeys(row.get('file_ids', []) + file_ids))[-20:]
+            if not row.get('hashes'):
+                row['hashes'] = list(dict.fromkeys(hashes))[:MODERATION_MEDIA_HASHES_MAX]
+            self._blocked_index = None
+            if not self._save():
+                self._data = before
+                return {}
+            return dict(copy.deepcopy(row), id=entry_id)
+
+    def unblock_media(self, entry_id: str, file_ids=(), hashes=()) -> int:
+        """Убрать запись и всё, что узнаёт это же медиа. Вернуть число записей.
+
+        Копию удаляет запись, заведённая по другому отчёту, — «❌ Ошибка» на
+        отчёте о копии должна снять и её, иначе следующая копия снова уйдёт.
+        """
+        file_ids = {str(x) for x in (file_ids or ()) if x}
+        with self._lock:
+            blocklist = self._data.get('media_blocklist', {})
+            doomed = [key for key, row in blocklist.items()
+                      if key == entry_id or file_ids & set(row.get('file_ids') or ())
+                      or (hashes and hashes_match(hashes, row.get('hashes') or ()))]
+            if not doomed:
+                return 0
+            before = copy.deepcopy(self._data)
+            for key in doomed:
+                blocklist.pop(key, None)
+            self._blocked_index = None
+            if not self._save():
+                self._data = before
+                return 0
+            return len(doomed)
+
+    def find_blocked_media(self, file_unique_id: str = '', hashes=()) -> dict:
+        """Запись чёрного списка для этого медиа: по file_id или по отпечаткам."""
+        with self._lock:
+            blocklist = self._data.get('media_blocklist', {})
+            if file_unique_id:
+                for entry_id, row in reversed(list(blocklist.items())):
+                    if file_unique_id in (row.get('file_ids') or ()):
+                        return dict(copy.deepcopy(row), id=entry_id)
+            if not hashes:
+                return {}
+            if self._blocked_index is None:
+                # Разбор шестнадцатеричных строк на каждое медиа стоил бы
+                # заметного времени в цикле событий при полном списке.
+                self._blocked_index = [(key, parse_hashes(row.get('hashes')))
+                                       for key, row in blocklist.items()]
+            index = self._blocked_index
+            ours = parse_hashes(hashes)
+            for entry_id, theirs in reversed(index):
+                if hashes_match(ours, theirs) and entry_id in blocklist:
+                    return dict(copy.deepcopy(blocklist[entry_id]), id=entry_id)
+        return {}
+
+    def note_blocked_hit(self, entry_id: str, file_unique_id: str = '') -> None:
+        """Запомнить file_id найденной копии: следующая узнается без детектора.
+
+        Отпечатки копии не добавляются: иначе каждое совпадение по двум
+        кадрам приносило бы остальные кадры чужого ролика, и запись шаг за
+        шагом уходила бы к картинкам, которых никто не осуждал.
+        """
+        with self._lock:
+            row = self._data.get('media_blocklist', {}).get(entry_id)
+            if not row:
+                return
+            row['hits'] = int(row.get('hits') or 0) + 1
+            if file_unique_id:
+                row['file_ids'] = list(dict.fromkeys(
+                    (row.get('file_ids') or []) + [str(file_unique_id)[:64]]))[-20:]
+        self._save_soon()
+
+    def blocked_media_count(self) -> int:
+        with self._lock:
+            return len(self._data.get('media_blocklist', {}))
 
     def record_review_feedback(self, review_id: str, verdict: str) -> bool:
         """Store one human label per report and aggregate quality metrics."""
@@ -16823,6 +16969,7 @@ async def deny_access(update: Update) -> None:
 # и в группе их ответ увидели бы все участники.
 _GROUP_COMMANDS = frozenset({
     'chatinfo_command', 'modhere_command', 'modoff_command', 'modmiss_command',
+    'modunblock_command',
     'warns_command', 'unwarn_command',
 })
 
@@ -26123,6 +26270,11 @@ MODERATION_LLM_AUTO_THRESHOLDS = {
     'toxic': .95, 'aggression': .96, 'spam': .96, 'belittling': .97,
 }
 MODERATION_MEDIA_AUTO_THRESHOLDS = {'nsfw': .90, 'spoiler_16': .92}
+MODERATION_MEDIA_SOURCE = 'локальный детектор медиа'
+MODERATION_BLOCKLIST_SOURCE = 'чёрный список медиа'
+# Исходы, после которых медиа точно осуждено и удалено: только они пополняют
+# чёрный список без человека. Режим наблюдения и сбои удаления — нет.
+MODERATION_MEDIA_BLOCK_ACTIONS = frozenset({'delete', 'warn', 'mute', 'escalate'})
 
 
 def _mod_decision_state(category: str, source: str, *, confidence=None,
@@ -26148,7 +26300,9 @@ def _mod_decision_state(category: str, source: str, *, confidence=None,
         if not math.isfinite(value):
             value = 0.0
         value = max(0.0, min(1.0, value))
-        return ('review' if value < threshold else 'auto', value, threshold)
+        # Пограничная находка (ниже порога категории) идёт человеку при любой
+        # оценке: один кадр 0.93 без повтора — ещё не повод для санкции.
+        return ('review' if needs_review or value < threshold else 'auto', value, threshold)
     return 'auto', 1.0, 1.0
 
 
@@ -26278,6 +26432,194 @@ async def _mod_media_unchecked(bot: Bot, message, reason: str, *, notify: bool =
             await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML, disable_notification=True)
         except TelegramError:
             logger.info('Модерация: отчёт о непроверенном медиа не доставлен')
+
+
+def _mod_remember_media(chat_id: int, message, file_unique_id: str, hashes) -> None:
+    """Запомнить медиа на час: вдруг его осудят позже — тогда удалим и эту копию."""
+    rows = _moderation_recent_media.setdefault(int(chat_id), deque(maxlen=300))
+    now = time.monotonic()
+    while rows and now - rows[0]['at'] > MODERATION_MEDIA_SWEEP_SEC:
+        rows.popleft()
+    rows.append(dict(message=message, message_id=getattr(message, 'message_id', None),
+                     file_unique_id=str(file_unique_id or ''), hashes=list(hashes or ()),
+                     at=now, handled=False))
+    while len(_moderation_recent_media) > 200:
+        _moderation_recent_media.pop(next(iter(_moderation_recent_media)))
+
+
+def _mod_recent_media_row(chat_id: int, message_id) -> Optional[dict]:
+    for row in reversed(_moderation_recent_media.get(int(chat_id), ())):
+        if row.get('message_id') == message_id:
+            return row
+    return None
+
+
+def _mod_blocked_reason(entry: dict) -> str:
+    who = ('подтвердил админ' if entry.get('source') == 'admin'
+           else 'бот уже удалял такое медиа')
+    return f'Копия медиа из чёрного списка ({who})'
+
+
+async def _mod_enforce(bot: Bot, message, category: str, reason: str, source: str, *,
+                       report: bool = True, logged_text: str = '', severity: int = 2) -> str:
+    """Санкция по готовому вердикту — тем же путём, что автоматическая."""
+    if chat_moderation is None or category not in MODERATION_RULES:
+        return ''
+    if category == 'spoiler_16' and getattr(message, 'has_media_spoiler', False):
+        return ''
+    user_id, name = _mod_actor(message)
+    decision = _mod_decide(category, severity, chat_moderation.warn_count(message.chat_id, user_id))
+    if decision.get('action', 'none') == 'none':
+        return ''
+    decision.update(severity=severity, confidence=1.0, confidence_threshold=1.0,
+                    decision_state='auto')
+    async with _moderation_action_lock:
+        applied = await _mod_apply(bot, message, decision, category, reason)
+        chat_moderation.log_decision(message.chat_id, user_id, name, category,
+                                     decision.get('applied_action', 'none'), source, reason,
+                                     logged_text or _mod_message_text(message))
+    if report:
+        await _mod_report(bot, message, category, decision, reason, applied, source)
+    return applied
+
+
+async def _mod_media_enforce(bot: Bot, message, entry: dict, *, report: bool = True) -> str:
+    """Санкция за медиа из чёрного списка."""
+    return await _mod_enforce(bot, message, str(entry.get('category') or 'spoiler_16'),
+                              _mod_blocked_reason(entry), MODERATION_BLOCKLIST_SOURCE,
+                              report=report)
+
+
+def _mod_unblock_for_review(review_id: str, review: dict) -> int:
+    """Снять из чёрного списка всё, что осудило медиа этого отчёта."""
+    if chat_moderation is None:
+        return 0
+    target = review.get('media') if isinstance(review.get('media'), dict) else {}
+    extra_ids = [str(target.get('blocked_id') or '')]
+    removed = chat_moderation.unblock_media(
+        review_id, [target.get('file_unique_id')], target.get('hashes') or ())
+    for entry_id in extra_ids:
+        if entry_id and entry_id != review_id:
+            removed += chat_moderation.unblock_media(entry_id)
+    return removed
+
+
+async def _mod_tell_admin_result(bot: Bot, query, text: str) -> None:
+    """Итог подтверждения — отдельным сообщением: ответ на кнопку уже ушёл."""
+    chat = getattr(getattr(query, 'message', None), 'chat_id', None)
+    if chat is None:
+        chat = getattr(getattr(query, 'from_user', None), 'id', None)
+    if chat is None:
+        return
+    try:
+        await bot.send_message(chat, '🛡 ' + text)
+    except TelegramError:
+        logger.info('Модерация: итог подтверждения не доставлен')
+
+
+def _mod_message_stub(chat_id: int, user_id: int, message_id: int, *, name: str = '',
+                      thread_id=None):
+    """Сообщение, которого уже нет в памяти (отчёт подтвердили через час).
+
+    Для удаления и предупреждения нужны только чат, автор и id сообщения.
+    """
+    from types import SimpleNamespace
+    person = user_id > 0
+    return SimpleNamespace(
+        chat_id=int(chat_id), message_id=int(message_id), message_thread_id=thread_id,
+        from_user=SimpleNamespace(id=user_id, full_name=name or 'участник', is_bot=False)
+        if person else None,
+        sender_chat=None if person else SimpleNamespace(id=user_id, title=name or 'от имени чата'),
+        media_group_id=None, has_media_spoiler=False, text=None, caption=None, link=None)
+
+
+async def _mod_confirm_review(bot: Bot, chat_id: int, review_id: str, review: dict) -> str:
+    """«✅ Верно»: подтверждение админа доводит вердикт до конца.
+
+    Раньше кнопка только записывала оценку. Вердикт «на ручную оценку»
+    оставлял сообщение в чате и после подтверждения, а копии медиа бот не
+    узнавал. Теперь: медиа — в чёрный список, копии за последний час убраны;
+    сообщение, по которому санкции ещё не было, удаляется с той же санкцией,
+    что при автоматическом вердикте (бана нет — его даёт только кнопка).
+    """
+    target_row = review.get('media') if isinstance(review.get('media'), dict) else None
+    category = str(review.get('category') or '')
+    if chat_moderation is None or not target_row:
+        return ''
+    parts, entry = [], {}
+    message_id = int(target_row.get('message_id') or 0)
+    latest = _moderation_latest.get((int(chat_id), message_id)) if message_id else None
+    version = str(target_row.get('version') or '')
+    if latest is not None and version and latest.get('repeat_key') not in (None, version):
+        # Сообщение отредактировали после отчёта: админ оценил старую версию.
+        # Наказывать за новую нельзя — обработчик и сам отбрасывает такие
+        # вердикты. Оценка записана, новая версия проверяется как обычно.
+        return ' Сообщение изменено после отчёта: санкция не применена.'
+    if category in ('nsfw', 'spoiler_16') and (target_row.get('file_unique_id') or target_row.get('hashes')):
+        # Отчёт о копии из чёрного списка: подтверждаем ту же запись, а не
+        # заводим вторую.
+        entry = chat_moderation.block_media(
+            str(target_row.get('blocked_id') or review_id), chat_id, category,
+            [target_row.get('file_unique_id')], target_row.get('hashes'), 'admin')
+        parts.append(' Медиа в чёрном списке: копии будут удаляться сразу.' if entry
+                     else ' Медиа в чёрный список не записалось.')
+    if target_row.get('pending') and message_id:
+        row = _mod_recent_media_row(chat_id, message_id)
+        handled = row is not None and row.get('handled')
+        if row is not None:
+            row['handled'] = True
+        target = None if handled else row['message'] if row is not None else _mod_message_stub(
+            chat_id, int(review.get('user_id') or 0), message_id,
+            name=str(target_row.get('name') or ''), thread_id=target_row.get('thread_id'))
+        # Сообщение могло уже уйти: его удалил поиск копий по другому отчёту.
+        if target is None:
+            applied = ''
+        else:
+            applied = await _mod_enforce(
+                bot, target, category, 'Подтверждено админом: ' + str(review.get('reason') or ''),
+                str(review.get('source') or 'админ'), report=False,
+                logged_text=str(review.get('text') or ''),
+                severity=int(target_row.get('severity') or 2))
+        chat_moderation.finish_review_media(review_id)
+        if applied:
+            parts.append(f' Сообщение: {applied}.')
+    if entry:
+        swept = await _mod_media_sweep(bot, entry, skip=(int(chat_id), message_id))
+        if swept:
+            parts.append(f' Найдено и убрано копий: {swept}.')
+    return ''.join(parts)
+
+
+async def _mod_media_sweep(bot: Bot, entry: dict, *, skip=None) -> int:
+    """Удалить копии только что осуждённого медиа, уже прошедшие в чат.
+
+    Две одинаковые гифки проверяются параллельно или приходят в разной
+    кодировке — и одна получала оценку чуть ниже порога. Теперь осуждение
+    одной догоняет остальные за последний час.
+    """
+    if chat_moderation is None or chat_moderation.mode != 'active':
+        return 0
+    file_ids = set(entry.get('file_ids') or ())
+    hashes = entry.get('hashes') or ()
+    now = time.monotonic()
+    found = []
+    for chat_id, rows in list(_moderation_recent_media.items()):
+        if not chat_moderation.is_enabled(chat_id):
+            continue
+        for row in list(rows):
+            if row.get('handled') or now - row['at'] > MODERATION_MEDIA_SWEEP_SEC:
+                continue
+            if skip is not None and (chat_id, row.get('message_id')) == skip:
+                continue
+            if row['file_unique_id'] in file_ids or hashes_match(row.get('hashes'), hashes):
+                row['handled'] = True
+                found.append(row)
+    for row in found:
+        try:
+            await _mod_media_enforce(bot, row['message'], entry)
+        except TelegramError as exc:
+            logger.info('Модерация: копия из чёрного списка не обработана (%s)', type(exc).__name__)
+    return len(found)
 
 
 async def _mod_unjudged_text(bot: Bot, message, category: str, reason: str) -> None:
@@ -26426,6 +26768,7 @@ async def _mod_apply(bot: Bot, message, decision: dict, category: str,
                 raise BadRequest('Telegram returned false')
             done.append('сообщение удалено')
             decision['applied_action'] = 'delete'
+            decision['deleted'] = True
         except TelegramError as exc:
             deletion_status = 'failed' if isinstance(exc, BadRequest) else 'unknown'
             done.append(f'удаление не подтверждено ({type(exc).__name__})')
@@ -26564,6 +26907,17 @@ async def _mod_tell_user(bot: Bot, message, decision: dict, category: str,
         logger.info('Модерация: объяснение не отправлено (%s)', type(exc).__name__)
 
 
+def _mod_review_id(message, decision: dict, category: str, source: str) -> str:
+    """Ключ отчёта: инцидент, если санкция была, иначе хэш сообщения и вердикта."""
+    incident_id = str(decision.get('incident_id') or '')
+    if incident_id:
+        return incident_id
+    user_id, _ = _mod_actor(message)
+    seed = (f'{message.chat_id}:{getattr(message, "message_id", 0)}:{user_id}:'
+            f'{category}:{source}:{decision.get("action", "")}')
+    return hashlib.sha256(seed.encode()).hexdigest()[:20]
+
+
 def _mod_report_markup(chat_id: int, user_id: int, review_id: str = '',
                        incident_id: str = '', *, allow_ban: bool = True) -> InlineKeyboardMarkup:
     """Feedback is always available; destructive controls require an incident."""
@@ -26593,6 +26947,12 @@ async def _mod_report(bot: Bot, message, category: str, decision: dict,
     report_key = (message.chat_id, user_id, category, decision.get('applied_action', 'none'))
     now = time.monotonic()
     report_key += (int(decision.get('minutes') or 0),)
+    pending = decision.get('decision_state') == 'review'
+    if pending:
+        # Отчёт на ручную оценку прятать нельзя: без него у сообщения нет
+        # кнопок, и оно висит в чате. Раньше вторая пограничная гифка того же
+        # участника за минуту молча уходила только в журнал.
+        report_key += (getattr(message, 'message_id', 0),)
     if now - _moderation_report_recent.get(report_key, -3600) < 60:
         return
     _moderation_report_recent[report_key] = now
@@ -26604,7 +26964,7 @@ async def _mod_report(bot: Bot, message, category: str, decision: dict,
     if now - started > MODERATION_REPORT_BURST_SEC:
         carried, started, sent, hidden = hidden, now, 0, 0
     ban_level = category in MODERATION_HUMAN_ONLY
-    if sent >= MODERATION_REPORT_BURST_MAX and not ban_level:
+    if sent >= MODERATION_REPORT_BURST_MAX and not ban_level and not pending:
         # Уровень бана не прячем: там решение только за человеком.
         _moderation_report_bursts[burst_key] = (started, sent, hidden + 1)
         return
@@ -26641,15 +27001,14 @@ async def _mod_report(bot: Bot, message, category: str, decision: dict,
                  f'{MODERATION_REPORT_BURST_SEC // 60} минут идут без писем, только в /modlog.')
 
     incident_id = str(decision.get('incident_id') or '')
-    review_seed = (
-        f'{message.chat_id}:{getattr(message, "message_id", 0)}:{user_id}:'
-        f'{category}:{source}:{decision.get("action", "")}'
-    )
-    review_id = incident_id or hashlib.sha256(review_seed.encode()).hexdigest()[:20]
+    review_id = _mod_review_id(message, decision, category, source)
+    media = decision.get('media')
+    if isinstance(media, dict):
+        media = dict(media, pending=decision.get('decision_state') == 'review')
     if chat_moderation is not None:
         chat_moderation.ensure_review(
             review_id, message.chat_id, user_id, category,
-            str(decision.get('action') or ''), source, reason, message_text)
+            str(decision.get('action') or ''), source, reason, message_text, media=media)
     decision['review_id'] = review_id
 
     for admin_id in _all_admin_ids():
@@ -26740,13 +27099,62 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
     album_group = getattr(message, 'media_group_id', None)
     album_key = (int(chat.id), str(album_group)) if album_group else None
     album_verdict = _moderation_album_verdicts.get(album_key) if album_key else None
+    media_meta = None
+    has_spoiler = bool(getattr(message, 'has_media_spoiler', False))
+    human_only_text = bool(local and local.get('confident')
+                           and local.get('category') in MODERATION_HUMAN_ONLY)
     if attachment is not None and not remove_locally and album_verdict is not None:
         # Альбом уже осуждён по одному из снимков: остальные не ждут очереди.
-        local, source = dict(album_verdict), 'локальный детектор медиа'
+        local, source = dict(album_verdict), str(album_verdict.get('source') or MODERATION_MEDIA_SOURCE)
     elif attachment is not None and not remove_locally:
-        if MODERATION_MEDIA_ENABLED:
+        # Сначала чёрный список по file_id: копия уже осуждённого медиа
+        # удаляется сразу, без очереди детектора и без его пограничных оценок.
+        blocked = chat_moderation.find_blocked_media(attachment_key) if attachment_key else {}
+        if not blocked and MODERATION_MEDIA_ENABLED:
             media = await _moderation_media_scanner.check(context.bot, message)
-        if media is None or media.status == 'unchecked':
+            if media is not None and not (media.status == 'checked' and media.category == 'nsfw'):
+                # И file_id проверяем ещё раз: пока это медиа ждало детектор,
+                # его копию могли осудить, и без отпечатков (сбой, очередь)
+                # узнать его можно только так.
+                # Сверка отпечатков с полным списком — десятки миллисекунд;
+                # в цикле событий это пауза для всех чатов, поэтому в потоке.
+                blocked = await asyncio.to_thread(
+                    chat_moderation.find_blocked_media,
+                    attachment_key, getattr(media, 'hashes', None) or ())
+        hashes = [str(h) for h in (getattr(media, 'hashes', None) or ())]
+        media_meta = dict(file_unique_id=attachment_key, hashes=hashes,
+                          message_id=getattr(message, 'message_id', 0) or 0,
+                          thread_id=getattr(message, 'message_thread_id', None), name=actor_name,
+                          version=repeat_key)
+        _mod_remember_media(chat.id, message, attachment_key, hashes)
+        if blocked:
+            if not human_only_text and not (blocked.get('category') == 'spoiler_16' and has_spoiler):
+                chat_moderation.note_blocked_hit(blocked['id'], attachment_key)
+                media_meta['blocked_id'] = blocked['id']
+                local = dict(category=str(blocked.get('category') or 'spoiler_16'), confident=True,
+                             severity=2, confidence=1.0, needs_review=False,
+                             reason=_mod_blocked_reason(blocked), media=media_meta,
+                             source=MODERATION_BLOCKLIST_SOURCE)
+                source = MODERATION_BLOCKLIST_SOURCE
+                if album_key is not None:
+                    _moderation_album_verdicts[album_key] = dict(local)
+                    while len(_moderation_album_verdicts) > 500:
+                        _moderation_album_verdicts.popitem(last=False)
+        elif media is not None and media.status == 'unchecked' and getattr(media, 'borderline', False):
+            # Пограничная находка — вопрос к человеку: отчёт с кнопками, как у
+            # любого вердикта на ручную оценку. Раньше это было техническое
+            # письмо без кнопок, и все следующие такие же 15 минут молча
+            # уходили в журнал — гифка оставалась в чате.
+            category = 'nsfw' if getattr(media, 'near_explicit', 0) else 'spoiler_16'
+            if not human_only_text and not (category == 'spoiler_16' and has_spoiler):
+                evidence = media_evidence(media)
+                local = dict(category=category, confident=True, severity=2,
+                             confidence=float(media.score or 0.0), needs_review=True,
+                             reason=(f'{media.reason}; оценка детектора {float(media.score or 0):.2f}'
+                                     + (f'; {evidence}' if evidence else '')),
+                             media=media_meta)
+                source = MODERATION_MEDIA_SOURCE
+        elif media is None or media.status == 'unchecked':
             await _mod_media_unchecked(context.bot, message,
                 media.reason if media else 'Локальный детектор отключён',
                 notify=media is None or getattr(media, 'review', True))
@@ -26758,8 +27166,9 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
                 local = dict(category=media.category, confident=True, severity=2,
                              confidence=media_confidence(media), needs_review=False,
                              reason=(f'{media.reason}; оценка детектора {media.score:.2f}; '
-                                     + (evidence if evidence else f'кадров {media.frames}')))
-                source = 'локальный детектор медиа'
+                                     + (evidence if evidence else f'кадров {media.frames}')),
+                             media=media_meta)
+                source = MODERATION_MEDIA_SOURCE
                 if album_key is not None:
                     _moderation_album_verdicts[album_key] = dict(local)
                     while len(_moderation_album_verdicts) > 500:
@@ -26831,13 +27240,39 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
             applied = await _mod_apply(context.bot, message, decision, category, reason)
             chat_moderation.log_decision(chat.id, user_id, actor_name, category,
                                         decision.get('applied_action', 'none'), source, reason, text)
+            if decision.get('applied_action') in MODERATION_MEDIA_BLOCK_ACTIONS:
+                row = _mod_recent_media_row(chat.id, getattr(message, 'message_id', None))
+                if row is not None:
+                    row['handled'] = True
             # Остальной альбом подметает тот, кто вынес вердикт; снимки, пришедшие
             # позже, берут готовый вердикт и удаляются каждый сам.
-            if album_key is not None and album_verdict is None and source == 'локальный детектор медиа' \
+            if album_key is not None and album_verdict is None \
+                    and source in (MODERATION_MEDIA_SOURCE, MODERATION_BLOCKLIST_SOURCE) \
                     and decision.get('delete') and chat_moderation.mode == 'active':
                 await _mod_delete_album_rest(context.bot, chat.id, user_id, album_group,
                                              getattr(message, 'message_id', None))
+    media_meta = local.get('media') if isinstance(local.get('media'), dict) else None
+    if media_meta:
+        decision['media'] = dict(media_meta, severity=severity)
+    elif state == 'review':
+        # Текст на ручной оценке: запомнить, какое сообщение подтверждает админ
+        # и в какой версии — правка после отчёта отменяет подтверждение.
+        decision['media'] = dict(message_id=getattr(message, 'message_id', 0) or 0,
+                                 thread_id=getattr(message, 'message_thread_id', None),
+                                 name=actor_name, version=repeat_key, severity=severity)
     await _mod_report(context.bot, message, category, decision, reason, applied, source)
+    if (source == MODERATION_MEDIA_SOURCE and media_meta and state == 'auto'
+            and decision.get('deleted')
+            and decision.get('applied_action') in MODERATION_MEDIA_BLOCK_ACTIONS):
+        # Бот сам удалил медиа — копии той же картинки (другая кодировка,
+        # оценка чуть ниже порога) должны уйти тем же путём, а не висеть.
+        # «❌ Ошибка» или «↩️ Снять» на отчёте убирают запись.
+        entry = chat_moderation.block_media(
+            str(decision.get('review_id') or _mod_review_id(message, decision, category, source)),
+            chat.id, category, [media_meta.get('file_unique_id')], media_meta.get('hashes'), 'auto')
+        if entry:
+            await _mod_media_sweep(context.bot, entry,
+                                   skip=(int(chat.id), getattr(message, 'message_id', None)))
 
 
 @admin_only
@@ -26999,7 +27434,15 @@ async def modtest_command(update, context: ContextTypes.DEFAULT_TYPE):
     replied = getattr(update.message, 'reply_to_message', None)
     if not text and replied is not None and media_attachment(replied) is not None:
         scan = await _moderation_media_scanner.check(context.bot, replied) if MODERATION_MEDIA_ENABLED else None
-        if scan is None or scan.status != 'checked':
+        attachment = media_attachment(replied)
+        blocked = chat_moderation.find_blocked_media(
+            str(getattr(attachment[0], 'file_unique_id', '') or ''),
+            getattr(scan, 'hashes', None) or ()) if chat_moderation is not None else {}
+        if blocked:
+            detail = (f'{_mod_blocked_reason(blocked)}: категория '
+                      f'«{MODERATION_RULES.get(blocked.get("category"), {}).get("human", blocked.get("category"))}». '
+                      'Такое медиа удаляется сразу, без оценки детектора.')
+        elif scan is None or scan.status != 'checked':
             detail = scan.reason if scan else 'Проверка медиа отключена'
         elif not scan.category:
             detail = f'На {scan.frames} проверенных кадрах нагота не обнаружена. Это не гарантия безопасности всего файла.'
@@ -27298,10 +27741,51 @@ async def modmiss_command(update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('❌ Не удалось сохранить пропуск.')
         return
     human = MODERATION_RULES.get(category, {}).get('human', category)
+    blocked_note = ''
+    attachment = media_attachment(reply) if category in ('nsfw', 'spoiler_16') else None
+    if attachment is not None:
+        # Пропущенное медиа — в чёрный список: следующая отправка той же
+        # гифки удаляется сразу, копии за последний час — тоже. Сам автор
+        # этого сообщения наказания не получает: /modmiss — отметка, не санкция.
+        scan = (await _moderation_media_scanner.check(context.bot, reply)
+                if MODERATION_MEDIA_ENABLED else None)
+        entry = chat_moderation.block_media(
+            'miss:' + miss_id, chat.id, category,
+            [getattr(attachment[0], 'file_unique_id', '')], getattr(scan, 'hashes', None) or (),
+            'admin')
+        if entry:
+            swept = await _mod_media_sweep(context.bot, entry, skip=(int(chat.id), message_id))
+            blocked_note = ('\nМедиа в чёрном списке: копии будут удаляться сразу.'
+                            + (f' Убрано копий за последний час: {swept}.' if swept else '')
+                            + ' Снять: ответьте на медиа <code>/modunblock</code>.')
     await update.message.reply_text(
         f'✅ Пропуск записан: <b>{html.escape(str(human))}</b>.\n'
-        'Никакая санкция пользователю не применена. Статистика: /modquality',
+        'Никакая санкция пользователю не применена. Статистика: /modquality'
+        + blocked_note,
         parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def modunblock_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Убрать медиа из чёрного списка: ответом на сообщение с ним."""
+    if chat_moderation is None:
+        await update.message.reply_text('Хранилище модерации не готово.')
+        return
+    reply = getattr(update.message, 'reply_to_message', None)
+    attachment = media_attachment(reply) if reply is not None else None
+    if attachment is None:
+        await update.message.reply_text(
+            f'В чёрном списке медиа: {chat_moderation.blocked_media_count()}.\n'
+            'Чтобы убрать медиа, ответьте на сообщение с ним командой /modunblock. '
+            'Ещё проще — «❌ Ошибка» или «↩️ Снять» на отчёте об удалении.')
+        return
+    scan = (await _moderation_media_scanner.check(context.bot, reply)
+            if MODERATION_MEDIA_ENABLED else None)
+    removed = chat_moderation.unblock_media(
+        '', [getattr(attachment[0], 'file_unique_id', '')], getattr(scan, 'hashes', None) or ())
+    await update.message.reply_text(
+        f'Убрано из чёрного списка записей: {removed}.' if removed
+        else 'Этого медиа нет в чёрном списке.')
 
 
 @admin_only
@@ -27375,6 +27859,7 @@ def _moderation_stats_text() -> str:
     engines = ('Проверка администрации: ' + ('включена' if chat_moderation.moderate_admins else 'выключена') + '\n'
                + 'Локальные текстовые правила: включены\n'
                + f'Проверка медиа: {"включена" if MODERATION_MEDIA_ENABLED else "отключена"}\n'
+               + f'Чёрный список медиа: {chat_moderation.blocked_media_count()}\n'
                + html.escape(_moderation_llm_status()))
     if not total:
         return ('🛡 Решений пока не было.\n'
@@ -27604,9 +28089,20 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not chat_moderation.record_review_feedback(reference_id, verdict):
             await query.answer('Оценка уже сохранена или не записалась', show_alert=True)
             return True
+        # Ответить на нажатие сразу: удаление и поиск копий ходят в Telegram,
+        # и ответ после них мог опоздать — кнопки оставались, а повторное
+        # нажатие говорило «уже сохранена».
         await query.answer('Записал: решение верное' if verdict == 'correct'
                            else 'Записал: ложное срабатывание')
         await query.edit_message_reply_markup(reply_markup=None)
+        if verdict == 'wrong':
+            # Ложное срабатывание не должно размножаться через чёрный список.
+            extra = (' Медиа убрано из чёрного списка.'
+                     if _mod_unblock_for_review(reference_id, review) else '')
+        else:
+            extra = await _mod_confirm_review(context.bot, chat_id, reference_id, review)
+        if extra:
+            await _mod_tell_admin_result(context.bot, query, extra.strip())
         return True
     incident_id = reference_id
     async with _moderation_action_lock:
@@ -27647,6 +28143,7 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             if not chat_moderation.undo_incident(incident_id):
                 await query.answer('Не удалось сохранить отмену; проверьте /modlog', show_alert=True)
                 return True
+            _mod_unblock_for_review(incident_id, chat_moderation.review(incident_id))
             # Undo is also a strong human label that the original decision was
             # wrong. If feedback was already recorded, the method is idempotent.
             chat_moderation.record_review_feedback(incident_id, 'wrong')
@@ -29338,6 +29835,7 @@ def main():
     app.add_handler(CommandHandler("modstats", modstats_command))
     app.add_handler(CommandHandler("modquality", modquality_command))
     app.add_handler(CommandHandler("modmiss", modmiss_command))
+    app.add_handler(CommandHandler("modunblock", modunblock_command))
     app.add_handler(CommandHandler("modllmping", modllmping_command))
     app.add_handler(CommandHandler("modtest", modtest_command))
     app.add_handler(CommandHandler("modlog", modlog_command))
