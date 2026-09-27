@@ -5,7 +5,7 @@ proof that every video frame is safe. Errors are explicitly 'unchecked'.
 """
 import asyncio
 from collections import OrderedDict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import gzip
 import json
 import math
@@ -61,6 +61,14 @@ class Scan:
     # считались тремя отказами детектора и ставили его на паузу на 10 минут —
     # всё, что присылали в это время, оставалось непроверенным.
     bad_input: bool = False
+    # Сколько проверенных кадров показали 16+, и на скольких рядом был
+    # откровенный признак чуть ниже порога 18+. Оценка детектора — это
+    # максимум по одному кадру, и по ней гифка, где ягодицы видны в каждом
+    # кадре, выглядела так же, как случайный кадр на пороге: 0.85 при
+    # автопороге 0.92, санкции нет. Повторяемость — другое свидетельство,
+    # и без этих счётчиков оно терялось.
+    hits: int = 0
+    near_explicit: int = 0
 
 
 def _address_space_peak_mb():
@@ -92,6 +100,48 @@ def classify_detections(detections, explicit_threshold=.80, suggestive_threshold
         elif label in SUGGESTIVE and score >= suggestive_threshold and result.category != 'nsfw':
             result = Scan('checked', 'spoiler_16', 'Откровенный контент требует спойлера: ' + label, score=score)
     return result
+
+
+# Уверенность вердикта 16+ по гифке или видео. Автопорог для 16+ — 0.92,
+# а NudeNet почти никогда не даёт ягодицам больше 0.9: по одному кадру
+# категория фактически не доходила до санкции никогда. Ложные срабатывания,
+# из-за которых порог подняли, были одиночными кадрами на самом пороге. Когда
+# та же находка держится на четверти кадров и не меньше чем на трёх, или
+# дважды подкреплена откровенным признаком чуть ниже порога 18+, — это уже
+# не случайный кадр.
+MEDIA_REPEAT_MIN_FRAMES = 3
+MEDIA_REPEAT_SHARE = .25
+MEDIA_REPEAT_CONFIDENCE = .93
+
+
+def media_confidence(scan) -> float:
+    """Уверенность вердикта: оценка лучшего кадра, поднятая повторяемостью."""
+    # getattr: в тестах и старых воркерах результат может прийти без счётчиков.
+    try:
+        score = float(getattr(scan, 'score', 0.0) or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    score = max(0.0, min(1.0, score)) if math.isfinite(score) else 0.0
+    if getattr(scan, 'category', '') != 'spoiler_16' or getattr(scan, 'status', '') != 'checked':
+        return score
+    hits = int(getattr(scan, 'hits', 0) or 0)
+    repeated = hits >= max(MEDIA_REPEAT_MIN_FRAMES,
+                           math.ceil(int(getattr(scan, 'frames', 0) or 0) * MEDIA_REPEAT_SHARE))
+    backed = hits >= 2 and int(getattr(scan, 'near_explicit', 0) or 0) >= 2
+    return max(score, MEDIA_REPEAT_CONFIDENCE) if repeated or backed else score
+
+
+def media_evidence(scan) -> str:
+    """Сколько кадров показали находку — чтобы админ видел, на чём вердикт."""
+    frames = int(getattr(scan, 'frames', 0) or 0)
+    hits = int(getattr(scan, 'hits', 0) or 0)
+    if frames < 2 or not hits:
+        return ''
+    text = f'16+ на {hits} из {frames} кадров'
+    near = int(getattr(scan, 'near_explicit', 0) or 0)
+    if near:
+        text += f', признаки 18+ чуть ниже порога на {near}'
+    return text
 
 
 # Документы, которые Telegram не показывает картинкой: субтитры, тексты,
@@ -264,6 +314,7 @@ def scan_frame(detector, frame, explicit_threshold=.80, suggestive_threshold=.85
     import numpy as np
     best = Scan('checked')
     suspicious = False
+    near_explicit = False
     for variant in detection_variants(frame):
         # NudeNet expects OpenCV BGR, Pillow yields RGB. Keep the thresholds:
         # transforming an image does not make the detector infallible.
@@ -279,12 +330,16 @@ def scan_frame(detector, frame, explicit_threshold=.80, suggestive_threshold=.85
             except (ValueError, TypeError):
                 continue
             label = item.get('class')
-            if math.isfinite(score) and ((label in EXPLICIT and score >= explicit_threshold - .15)
-                                         or (label in SUGGESTIVE and score >= suggestive_threshold - .15)):
+            if not math.isfinite(score):
+                continue
+            if label in EXPLICIT and score >= explicit_threshold - .15:
+                suspicious = near_explicit = True
+            elif label in SUGGESTIVE and score >= suggestive_threshold - .15:
                 suspicious = True
     if not best.category and suspicious:
-        return Scan('unchecked', reason='Пограничная оценка наготы; нужна ручная проверка')
-    return best
+        return Scan('unchecked', reason='Пограничная оценка наготы; нужна ручная проверка',
+                    near_explicit=int(near_explicit))
+    return replace(best, near_explicit=int(near_explicit)) if near_explicit else best
 
 
 def build_detector():
@@ -344,6 +399,7 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
     best, count = Scan('checked'), 0
     uncertain = None
     suggestive_frames = 0
+    near_explicit_frames = 0
     frame_iter = iter(frames)
     while True:
         # Ошибка разбора кадра — это битый файл, его может прислать кто угодно;
@@ -360,8 +416,10 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
                         frames=count, bad_input=True)
         detection = scan_frame(detector, frame, explicit_threshold, suggestive_threshold)
         count += 1
+        near_explicit_frames += int(bool(detection.near_explicit))
         if detection.category == 'nsfw':
-            return Scan('checked', detection.category, detection.reason, count, detection.score)
+            return Scan('checked', detection.category, detection.reason, count, detection.score,
+                        hits=1)
         if detection.category == 'spoiler_16':
             suggestive_frames += 1
             if not best.category or detection.score > best.score:
@@ -382,10 +440,14 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
                 'unchecked',
                 reason=(f'Один пограничный кадр 16+ ({best.score:.2f}); '
                         'нужна ручная проверка'),
-                frames=count, score=best.score)
+                frames=count, score=best.score, hits=suggestive_frames,
+                near_explicit=near_explicit_frames)
     if not best.category and uncertain is not None:
-        return Scan('unchecked', reason=uncertain.reason, frames=count)
-    return Scan('checked', best.category, best.reason, count, best.score)
+        return Scan('unchecked', reason=uncertain.reason, frames=count,
+                    near_explicit=near_explicit_frames)
+    return Scan('checked', best.category, best.reason, count, best.score,
+                hits=suggestive_frames if best.category == 'spoiler_16' else 0,
+                near_explicit=near_explicit_frames)
 
 
 def clamp_worker_memory(memory_mb):

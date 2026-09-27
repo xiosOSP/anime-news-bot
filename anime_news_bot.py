@@ -112,7 +112,8 @@ from news_stories import (
     _story_update_anchor,
     normalize_title,
 )
-from moderation_media import (MediaScanner, media_attachment, probe as media_probe,
+from moderation_media import (MediaScanner, media_attachment, media_confidence,
+                              media_evidence, probe as media_probe,
                               WORKER_MEMORY_MB_DEFAULT, WORKER_MEMORY_MB_MIN)
 from moderation_llm import ChatModelClient
 from news_deferral import NewsDeferralStore
@@ -26753,9 +26754,11 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
                                     getattr(message, 'has_media_spoiler', False)):
             # Ban-level text takes priority over media; both require deletion.
             if not (local and local.get('confident') and local.get('category') in MODERATION_HUMAN_ONLY):
+                evidence = media_evidence(media)
                 local = dict(category=media.category, confident=True, severity=2,
-                             confidence=float(media.score or 0.0), needs_review=False,
-                             reason=f'{media.reason}; оценка детектора {media.score:.2f}; кадров {media.frames}')
+                             confidence=media_confidence(media), needs_review=False,
+                             reason=(f'{media.reason}; оценка детектора {media.score:.2f}; '
+                                     + (evidence if evidence else f'кадров {media.frames}')))
                 source = 'локальный детектор медиа'
                 if album_key is not None:
                     _moderation_album_verdicts[album_key] = dict(local)
@@ -27004,8 +27007,14 @@ async def modtest_command(update, context: ContextTypes.DEFAULT_TYPE):
             detail = 'Откровенный контент уже под спойлером — нарушения по этому признаку нет.'
         else:
             decision = _mod_decide(scan.category, 2, 0)
-            detail = (f'{scan.reason}. Оценка детектора: {scan.score:.2f}, кадров: {scan.frames}. '
-                      f'Первое нарушение: {decision["action"]}; удаление сообщения.')
+            state, confidence, threshold = _mod_decision_state(
+                scan.category, 'локальный детектор медиа', confidence=media_confidence(scan))
+            evidence = media_evidence(scan)
+            verdict = (f'первое нарушение: {decision["action"]}, сообщение удаляется'
+                       if state == 'auto' else 'уйдёт админу на ручную оценку, санкции нет')
+            detail = (f'{scan.reason}. Оценка детектора: {scan.score:.2f}, кадров: {scan.frames}'
+                      + (f' ({evidence})' if evidence else '') + '. '
+                      f'Уверенность {confidence:.2f} при автопороге {threshold:.2f}: {verdict}.')
         await update.message.reply_text('🧪 Локальная проверка медиа (без наказания):\n' + detail)
         return
     if not text and update.message.reply_to_message is not None:

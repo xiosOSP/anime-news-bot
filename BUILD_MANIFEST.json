@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "f9907b00731aabf210e4b0fc80543268f84f76d3",
-  "generated_at_utc": "2026-09-25T20:21:16.550701+00:00",
+  "git_commit": "bb9bdcffb9206be0429f5e1d91e1b53e7889c433",
+  "generated_at_utc": "2026-09-27T17:25:05.272951+00:00",
   "files": {
     ".env.example": {
       "sha256": "1d45114ec32deffad57d13ba2928bab66cf9fc248bb0e9bcb2f959028479257a",
@@ -30,12 +30,12 @@
       "bytes": 18874
     },
     "anime_news_bot.py": {
-      "sha256": "516463ee66938cafa090f65c4212cda23d30d7b1ca14f000aeb2a2ee20e8da18",
-      "bytes": 1591946
+      "sha256": "6910d8323240650a1af85bc2e6d65414596e95e3d089720cd00344b77d7d4e9f",
+      "bytes": 1592673
     },
     "docs/chat-moderation.md": {
-      "sha256": "73bb7daef18afe0b31744e5900cc30fbdc1ca32075b1a7ae3e0171d65c42263a",
-      "bytes": 50618
+      "sha256": "a3b2d79c4bbb5c527e621a9433fa4a2bf2d2b9850b74fa2e85bf947508e8484f",
+      "bytes": 51955
     },
     "docs/env-reference.md": {
       "sha256": "a3a67497e734767ae2d21c37e09aa80056b56403a6b92a66b05258f067638594",
@@ -70,8 +70,8 @@
       "bytes": 10699
     },
     "moderation_media.py": {
-      "sha256": "f70c89a5fd0825a006e568c9b627a241a106122f899e4dcd553297634c951b2e",
-      "bytes": 41950
+      "sha256": "59c47cbd3869da9649e60d480c0e162cc17ad1a9f3ab7a5d0561ae9bee87fec8",
+      "bytes": 45710
     },
     "moderation_rules.py": {
       "sha256": "76d98c87d3d33a033eaff066aaecd13e1a9efa7a2c0f9fd467b57588859c7d25",
@@ -476,6 +476,10 @@
     "tests/test_moderation_media_pr60.py": {
       "sha256": "31877aee04d320827fac16bcfedbc1ecbac9bd185706bbf4255c235d972a24f8",
       "bytes": 5208
+    },
+    "tests/test_moderation_media_repeat.py": {
+      "sha256": "f184ea0237f39857ae50b8e478eac88f18ae44ff61c2150b2d22e1ad7aa7de05",
+      "bytes": 8344
     },
     "tests/test_moderation_menu.py": {
       "sha256": "a2cfb83413a5784f7eae9a60e7f618ef04e737b8a6d979e1d05a21fbe2409aee",
