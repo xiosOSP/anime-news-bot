@@ -489,7 +489,8 @@ async def test_confirming_a_copy_report_upgrades_the_same_entry(chat):
 
 
 @pytest.mark.asyncio
-async def test_every_pending_review_gets_buttons_even_from_the_same_sender(chat):
+async def test_every_pending_review_gets_buttons_even_from_the_same_sender(chat, monkeypatch):
+    monkeypatch.setattr(bot, 'MODERATION_RATE_MESSAGES', 0)  # пять гифок подряд — не про темп
     chat.scanner.return_value = borderline()
     for number in range(1, 6):
         chat.scanner.return_value = borderline(tuple(hashes_of(

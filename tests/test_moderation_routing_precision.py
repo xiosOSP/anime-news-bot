@@ -87,6 +87,7 @@ async def test_sticker_file_identifier_cannot_trigger_text_rules(state, monkeypa
 @pytest.mark.asyncio
 async def test_repeated_media_still_counts_as_spam(state, monkeypatch):
     monkeypatch.setattr(bot, 'MODERATION_REPEAT_LIMIT', 3)
+    monkeypatch.setattr(bot, 'MODERATION_RATE_MESSAGES', 0)  # правило повторов, не темп
     monkeypatch.setattr(bot, 'MODERATION_FLOOD_MESSAGES', 20)
     tg = telegram_bot()
     for number in range(1, 4):

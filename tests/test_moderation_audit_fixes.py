@@ -189,6 +189,9 @@ async def test_repeated_link_is_deleted_but_repeated_sticker_is_not(state, monke
 @pytest.mark.asyncio
 async def test_repeated_sticker_is_warned_not_deleted(state, monkeypatch):
     """Три одинаковых стикера — предупреждение без удаления (решение PR #59)."""
+    # Здесь проверяется правило повторов, а не темп: залп стикеров без пауз
+    # раньше поймал бы антифлуд-темп (он проверен в test_moderation_rate.py).
+    monkeypatch.setattr(bot, 'MODERATION_RATE_MESSAGES', 0)
     monkeypatch.setattr(bot, 'MODERATION_REPEAT_LIMIT', 3)
     monkeypatch.setattr(bot, 'MODERATION_FLOOD_MESSAGES', 20)
     tg = telegram()
@@ -199,8 +202,9 @@ async def test_repeated_sticker_is_warned_not_deleted(state, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_one_flood_burst_is_one_warning(state):
+async def test_one_flood_burst_is_one_warning(state, monkeypatch):
     """11 сообщений за секунду давали предупреждение, мут на час и мут на сутки."""
+    monkeypatch.setattr(bot, 'MODERATION_RATE_MESSAGES', 0)  # прежние пороги флуда
     tg = telegram()
     await asyncio.gather(*(handle(tg, message(n, text=f'реплика номер {n}')) for n in range(1, 12)))
     assert state.warn_count(CHAT, 7) == 1

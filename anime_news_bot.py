@@ -1590,6 +1590,24 @@ MODERATION_FLOOD_SUSTAINED_MESSAGES = max(
 MODERATION_FLOOD_SUSTAINED_WINDOW_SEC = max(
     MODERATION_FLOOD_WINDOW_SEC + 5,
     min(300, _env_int('MODERATION_FLOOD_SUSTAINED_WINDOW_SEC', 45)))
+# Антифлуд-темп: в среднем не больше MODERATION_RATE_MESSAGES сообщений за
+# MODERATION_RATE_WINDOW_SEC секунд, но с запасом на короткую очередь до
+# MODERATION_RATE_BURST. Жёсткое «третье за 5 секунд — нарушение» било бы
+# по живому разговору: на 5057 комментариях из аниме-обсуждений два сообщения
+# за 5 с встречались 125 раз, а три — дважды, и одно из них — человек, который
+# в сердцах разбил мысль на три реплики. «Ведро» с запасом 4 и пополнением 2
+# за 5 с не задело там никого, а третий стикер подряд (стикер и медиа без
+# подписи стоят двух сообщений) уже ловит. Превышение — не предупреждение, а
+# пауза: лишнее сообщение удаляется, человек молчит минуту. Нарушением «флуд»
+# становится только третья пауза за 10 минут. 0 в MODERATION_RATE_MESSAGES
+# выключает темп, остаются прежние пороги флуда ниже.
+MODERATION_RATE_MESSAGES = max(0, min(20, _env_int('MODERATION_RATE_MESSAGES', 2)))
+MODERATION_RATE_WINDOW_SEC = max(1, min(60, _env_int('MODERATION_RATE_WINDOW_SEC', 5)))
+MODERATION_RATE_BURST = max(2, min(30, _env_int('MODERATION_RATE_BURST', 4)))
+# Telegram считает ограничение короче 30 секунд вечным — отсюда нижняя граница.
+MODERATION_RATE_PAUSE_SEC = max(35, min(3600, _env_int('MODERATION_RATE_PAUSE_SEC', 60)))
+MODERATION_RATE_ESCALATE = max(2, min(20, _env_int('MODERATION_RATE_ESCALATE', 3)))
+MODERATION_RATE_ESCALATE_WINDOW_SEC = 600
 MODERATION_REPEAT_LIMIT = max(2, min(20, _env_int('MODERATION_REPEAT_LIMIT', 3)))
 # Короткие живые ответы ("нет", "да", "ок") естественно повторяются в чате.
 # Для них нужен заметно более высокий порог, чем для рекламы или стикера.
@@ -1741,6 +1759,7 @@ MODERATION_MEDIA_BLOCKLIST_MAX = max(50, min(20000, _env_int('MODERATION_MEDIA_B
 # целиком в цикле событий — лишние килобайты в каждой записи стоят времени.
 MODERATION_MEDIA_HASHES_MAX = 16
 _moderation_recent: dict[str, deque] = {}      # (chat,user) -> времена сообщений
+_moderation_rate: dict[str, dict] = {}          # (chat,user) -> ведро антифлуд-темпа
 
 # Ссылки и приглашения — типовой спам. Списки намеренно короткие: задача
 # первого уровня не судить, а отобрать кандидатов для второго.
@@ -2005,6 +2024,178 @@ def _mod_note_message(chat_id: int, user_id: int, name: str, text: str,
     if len(_moderation_recent) > 2000:        # чат живёт, словарь расти не должен
         for stale in list(_moderation_recent)[:500]:
             _moderation_recent.pop(stale, None)
+
+
+def _mod_rate_cost(message) -> int:
+    """Сколько «сообщений» стоит это: стикер, гифка, медиа без подписи — два.
+
+    Флуд в аниме-чатах — это чаще всего стикеры и гифки подряд; строка текста
+    хотя бы что-то говорит.
+    """
+    caption = str(getattr(message, 'text', None) or getattr(message, 'caption', None) or '').strip()
+    if getattr(message, 'sticker', None) is not None or getattr(message, 'animation', None) is not None:
+        return 2
+    if not caption and media_attachment(message) is not None:
+        return 2
+    return 1
+
+
+def _mod_rate_charge(chat_id: int, user_id: int, cost: int, *, album=None,
+                     now: Optional[float] = None) -> str:
+    """Списать сообщение из «ведра»: '' — в темпе, 'over' — превышение,
+    'inflight' — сообщение из того же залпа, отправленное до паузы.
+
+    Ведро на MODERATION_RATE_BURST сообщений пополняется со скоростью
+    MODERATION_RATE_MESSAGES за MODERATION_RATE_WINDOW_SEC. Альбом — одно
+    сообщение: Telegram присылает его снимки отдельными обновлениями.
+    """
+    if MODERATION_RATE_MESSAGES <= 0:
+        return ''
+    now = time.time() if now is None else now
+    key = f'{chat_id}:{user_id}'
+    state = _moderation_rate.get(key)
+    if state is None:
+        while len(_moderation_rate) >= 4000:
+            _moderation_rate.pop(next(iter(_moderation_rate)))
+        state = _moderation_rate[key] = {'tokens': float(MODERATION_RATE_BURST), 'at': now,
+                                         'albums': deque(maxlen=8), 'pauses': deque(maxlen=20)}
+    if album is not None:
+        if album in state['albums']:
+            return ''
+        state['albums'].append(album)
+    if now < state.get('paused_until', 0.0):
+        # Пауза уже выдана, а Telegram досылает сообщения, отправленные до
+        # неё: это тот же залп — удалить, но не считать новой паузой.
+        return 'inflight'
+    rate = MODERATION_RATE_MESSAGES / MODERATION_RATE_WINDOW_SEC
+    state['tokens'] = min(float(MODERATION_RATE_BURST),
+                          state['tokens'] + max(0.0, now - state['at']) * rate)
+    state['at'] = now
+    if state['tokens'] >= cost:
+        state['tokens'] -= cost
+        return ''
+    return 'over'
+
+
+def _mod_rate_note_pause(chat_id: int, user_id: int, now: Optional[float] = None) -> int:
+    """Запомнить паузу; вернуть, сколько пауз за последние 10 минут."""
+    now = time.time() if now is None else now
+    state = _moderation_rate.setdefault(
+        f'{chat_id}:{user_id}', {'tokens': 0.0, 'at': now, 'albums': deque(maxlen=8),
+                                 'pauses': deque(maxlen=20)})
+    pauses = state['pauses']
+    while pauses and now - pauses[0] > MODERATION_RATE_ESCALATE_WINDOW_SEC:
+        pauses.popleft()
+    pauses.append(now)
+    return len(pauses)
+
+
+def _mod_rate_after_pause(chat_id: int, user_id: int, now: Optional[float] = None) -> None:
+    """Пауза и так закрывает рот на минуту: после неё ведро полное.
+
+    Иначе первое же сообщение после паузы снова «превышало» бы темп. Если
+    паузу выдать не удалось (аноним, админ, чужой мут), ведро не трогаем:
+    каждое следующее лишнее сообщение так и удаляется.
+    """
+    now = time.time() if now is None else now
+    state = _moderation_rate.get(f'{chat_id}:{user_id}')
+    if state is not None:
+        state['tokens'] = float(MODERATION_RATE_BURST)
+        state['at'] = state['paused_until'] = now + MODERATION_RATE_PAUSE_SEC
+
+
+async def _mod_rate_pause(bot: Bot, message, user_id: int, name: str, text: str,
+                          state: str = 'over') -> str:
+    """Темп превышен: удалить лишнее, минута тишины; третья пауза — флуд."""
+    chat_id = int(message.chat_id)
+    if chat_moderation is None or await _mod_admin_exempt(bot, message):
+        return ''
+    if state == 'inflight':
+        if chat_moderation.mode != 'active':
+            return ''
+        try:
+            await bot.delete_message(chat_id, message.message_id)
+        except TelegramError:
+            pass
+        chat_moderation.log_decision(chat_id, user_id, name, 'flood', 'удалено: тот же залп',
+                                     'антифлуд', 'сообщение отправлено до паузы', text)
+        return 'удалено: тот же залп'
+    pauses = _mod_rate_note_pause(chat_id, user_id)
+    reason = (f'темп выше {MODERATION_RATE_MESSAGES} сообщений за '
+              f'{MODERATION_RATE_WINDOW_SEC} с (запас {MODERATION_RATE_BURST})')
+    if pauses >= MODERATION_RATE_ESCALATE:
+        # Паузы не помогли: это уже нарушение, и дальше — обычная лестница
+        # предупреждение → мут с письмом админам.
+        _moderation_rate[f'{chat_id}:{user_id}']['pauses'].clear()
+        return await _mod_enforce(
+            bot, message, 'flood',
+            f'{reason}; {pauses}-я пауза за {MODERATION_RATE_ESCALATE_WINDOW_SEC // 60} минут',
+            'антифлуд')
+    if chat_moderation.mode != 'active':
+        chat_moderation.log_decision(chat_id, user_id, name, 'flood', 'observe:пауза',
+                                     'антифлуд', reason, text)
+        return 'режим наблюдения: пауза не выдана'
+    done = []
+    try:
+        if await bot.delete_message(chat_id, message.message_id) is not False:
+            done.append('лишнее сообщение удалено')
+    except TelegramError as exc:
+        done.append(f'удаление не подтверждено ({type(exc).__name__})')
+    paused = False
+    if getattr(message, 'sender_chat', None) is None:
+        try:
+            member = await _mod_get_member(bot, chat_id, user_id)
+            # Чужое ограничение (мут от админа или от бота) не трогаем: пауза
+            # на минуту сняла бы его раньше срока.
+            if getattr(member, 'status', '') in ('member',):
+                until = datetime.now(timezone.utc) + timedelta(seconds=MODERATION_RATE_PAUSE_SEC)
+                result = await bot.restrict_chat_member(
+                    chat_id, user_id, permissions=ChatPermissions.no_permissions(),
+                    until_date=until, use_independent_chat_permissions=True)
+                paused = result is not False
+        except TelegramError as exc:
+            done.append(f'пауза не выдана ({type(exc).__name__})')
+    if paused:
+        _mod_rate_after_pause(chat_id, user_id)
+        done.append(f'пауза {MODERATION_RATE_PAUSE_SEC} с')
+        await _mod_rate_notice(bot, message, user_id, name)
+    chat_moderation.log_decision(chat_id, user_id, name, 'flood',
+                                 'пауза' if paused else 'удалено', 'антифлуд', reason, text)
+    metrics.inc('anime_bot_moderation_actions_total',
+                labels={'action': 'pause' if paused else 'delete', 'category': 'flood'})
+    return ', '.join(done)
+
+
+async def _mod_rate_notice(bot: Bot, message, user_id: int, name: str) -> None:
+    """Короткое объяснение в чате; само исчезает вместе с паузой."""
+    mention = f'<a href="tg://user?id={int(user_id)}">{html.escape(str(name)[:48])}</a>'
+    minutes = MODERATION_RATE_PAUSE_SEC // 60
+    duration = f'{minutes} мин' if minutes and MODERATION_RATE_PAUSE_SEC % 60 == 0 else \
+        f'{MODERATION_RATE_PAUSE_SEC} с'
+    topic = getattr(message, 'message_thread_id', None)
+    try:
+        sent = await bot.send_message(
+            message.chat_id,
+            f'⏸ {mention}, слишком быстро — пауза на {duration}. Это не предупреждение: '
+            f'дальше можно писать в обычном темпе.',
+            parse_mode=ParseMode.HTML, disable_notification=True,
+            **({'message_thread_id': topic} if topic is not None else {}))
+    except TelegramError:
+        return
+    notice_id = getattr(sent, 'message_id', None)
+    if isinstance(notice_id, int):
+        async def _cleanup():
+            await asyncio.sleep(MODERATION_RATE_PAUSE_SEC)
+            try:
+                await bot.delete_message(message.chat_id, notice_id)
+            except TelegramError:
+                pass
+        task = asyncio.get_running_loop().create_task(_cleanup())
+        _moderation_rate_tasks.add(task)
+        task.add_done_callback(_moderation_rate_tasks.discard)
+
+
+_moderation_rate_tasks: set = set()
 
 
 # Нейтральные названия групп. Само упоминание — не нарушение, и почти всегда
@@ -27080,6 +27271,10 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
         message_id = getattr(message, 'message_id', None)
         checked_row = next((row for row in reversed(_moderation_windows.get(int(chat.id), ()))
                             if row.get('message_id') == message_id), None) if message_id is not None else None
+        # Правка — не новое сообщение и темп не тратит.
+        rate_over = getattr(update, 'edited_message', None) is None and _mod_rate_charge(
+            chat.id, user_id, _mod_rate_cost(message),
+            album=getattr(message, 'media_group_id', None))
 
     replied = getattr(message, 'reply_to_message', None)
     target = (getattr(getattr(replied, 'from_user', None), 'id', 0) or 0) if getattr(replied, 'sender_chat', None) is None else 0
@@ -27094,6 +27289,12 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
         if target_admin or target in _all_admin_ids():
             local = _mod_local_check(chat.id, user_id, content_text, reply_to_user=True,
                                      reply_to_admin=True, repeat_key=repeat_key)
+    if rate_over and not (local and local.get('confident') and local.get('category') != 'flood'
+                          and int(local.get('severity') or 1) >= 2):
+        # Явное нарушение текста (оскорбление, реклама) идёт своим путём даже
+        # внутри флуда — его должны увидеть админы. Остальное — пауза.
+        await _mod_rate_pause(context.bot, message, user_id, actor_name, text, rate_over)
+        return
     if local is None and attachment is None:
         return
     if await _mod_admin_exempt(context.bot, message):
