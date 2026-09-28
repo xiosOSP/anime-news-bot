@@ -76,6 +76,20 @@ class Scan:
     # Отпечатки проверенных кадров (frame_hash). По ним чёрный список узнаёт
     # ту же гифку, пересжатую или загруженную заново под другим file_id.
     hashes: tuple = ()
+    # Второе мнение — классификаторы рисунка (safe / r15 / r18). NudeNet
+    # обучен на фото людей: рисованную грудь в бикини он не видит вовсе
+    # (ноль находок на живом примере из чата). rating — наибольшая доля «не
+    # safe» у большой модели по проверенным кадрам, rating_small — у малой;
+    # rated — сколько кадров оценено, rating_hits — сколько из них обе модели
+    # сочли 16+. agreed — находку NudeNet подтвердил классификатор рисунка.
+    rating: float = 0.0
+    rating_small: float = 0.0
+    rated: int = 0
+    rating_hits: int = 0
+    agreed: bool = False
+    # Кадры, где крупным планом грудь в одежде (FEMALE_BREAST_COVERED, рамка
+    # от пятой части кадра): так выглядит фото «декольте на весь экран».
+    covered: int = 0
 
 
 def _address_space_peak_mb():
@@ -131,6 +145,10 @@ def media_confidence(scan) -> float:
     score = max(0.0, min(1.0, score)) if math.isfinite(score) else 0.0
     if getattr(scan, 'category', '') != 'spoiler_16' or getattr(scan, 'status', '') != 'checked':
         return score
+    if getattr(scan, 'agreed', False):
+        # Два независимых детектора — NudeNet и классификатор рисунка —
+        # согласны: это уже не случайный кадр на пороге.
+        return max(score, MEDIA_REPEAT_CONFIDENCE)
     hits = int(getattr(scan, 'hits', 0) or 0)
     repeated = hits >= max(MEDIA_REPEAT_MIN_FRAMES,
                            math.ceil(int(getattr(scan, 'frames', 0) or 0) * MEDIA_REPEAT_SHARE))
@@ -142,13 +160,19 @@ def media_evidence(scan) -> str:
     """Сколько кадров показали находку — чтобы админ видел, на чём вердикт."""
     frames = int(getattr(scan, 'frames', 0) or 0)
     hits = int(getattr(scan, 'hits', 0) or 0)
-    if frames < 2 or not hits:
-        return ''
-    text = f'16+ на {hits} из {frames} кадров'
-    near = int(getattr(scan, 'near_explicit', 0) or 0)
-    if near:
-        text += f', признаки 18+ чуть ниже порога на {near}'
-    return text
+    parts = []
+    if frames >= 2 and hits:
+        text = f'16+ на {hits} из {frames} кадров'
+        near = int(getattr(scan, 'near_explicit', 0) or 0)
+        if near:
+            text += f', признаки 18+ чуть ниже порога на {near}'
+        parts.append(text)
+    rated = int(getattr(scan, 'rated', 0) or 0)
+    if rated:
+        parts.append(f'классификатор рисунка: 16+ на {int(getattr(scan, "rating_hits", 0) or 0)} '
+                     f'из {rated} кадров (оценки {float(getattr(scan, "rating", 0) or 0):.2f}/'
+                     f'{float(getattr(scan, "rating_small", 0) or 0):.2f})')
+    return '; '.join(parts)
 
 
 # Отпечаток кадра — разностный хэш 16×16 (256 бит). Замерено на кадре живой
@@ -219,6 +243,136 @@ def hashes_match(candidate, known) -> bool:
             if close >= need:
                 return True
     return False
+
+
+# Классификаторы рисунка deepghs/anime_rating (MIT, бесплатные, ONNX): три
+# класса safe / r15 / r18. Проверено на 687 обычных картинках из аниме-каналов
+# (постеры, кадры, новости): у большой модели «не safe» от 0.99 — у 24 картинок,
+# и среди них голый торс мужчины, одетый персонаж, съёмочная площадка. Даже
+# вместе с малой моделью (от 0.75) ошибок около 0.7%. Поэтому одни
+# классификаторы санкцию не дают — только отчёт на ручную оценку. Санкция —
+# когда они подтверждают находку NudeNet: такой пары на 687 картинках не
+# было ни разу, а все три живых примера из чата она ловит.
+RATING_MODELS = {
+    'caformer': dict(
+        url='https://huggingface.co/deepghs/anime_rating/resolve/'
+            '46be80bfe01a415efa5aa7c025528cac82a8b88a/caformer_s36_plus/model.onnx',
+        sha256='fd5fdea9a8b610aa26a513df7e2e588a3fa0f641ba3408e5c67501663f501287',
+        size=149582900, file='anime_rating_caformer_s36_plus.onnx'),
+    'mobilenet': dict(
+        url='https://huggingface.co/deepghs/anime_rating/resolve/'
+            '46be80bfe01a415efa5aa7c025528cac82a8b88a/mobilenetv3_v1_pruned_ls0.1/model.onnx',
+        sha256='76e5c44704421e2b6431a2dbb395f8943e205e59f415a5614b16f0601b55544d',
+        size=16827558, file='anime_rating_mobilenetv3.onnx'),
+}
+RATING_ENV = 'MEDIA_RATING_MODELS'
+RATING_SIZE = 384
+RATING_FRAMES = 3
+RATING_MIN = .99        # большая модель: доля «не safe»
+RATING_SMALL_MIN = .75  # малая модель
+COVERED_CLOSEUP_SCORE = .70
+COVERED_CLOSEUP_SHARE = .20
+
+
+def ensure_rating_models(directory, *, timeout=600, opener=None):
+    """Скачать классификаторы рисунка один раз; вернуть пути или текст ошибки.
+
+    Файлы фиксированы по ревизии и SHA-256: подменённая или недокачанная
+    модель не запустится — проверка работает без второго мнения, как раньше.
+    """
+    import hashlib
+    import urllib.request
+    directory = Path(directory)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return f'папка моделей недоступна: {exc}'
+    opener = opener or urllib.request.urlopen
+    paths = []
+    for name, spec in RATING_MODELS.items():
+        target = directory / spec['file']
+        if target.is_file() and target.stat().st_size == spec['size']:
+            paths.append(target)
+            continue
+        partial = target.with_name(target.name + '.part')
+        digest = hashlib.sha256()
+        received = 0
+        try:
+            request = urllib.request.Request(spec['url'], headers={'User-Agent': 'anime-news-bot'})
+            with opener(request, timeout=60) as response, open(partial, 'wb') as out:
+                started = time.monotonic()
+                while True:
+                    chunk = response.read(1 << 20)
+                    if not chunk:
+                        break
+                    received += len(chunk)
+                    if received > spec['size'] or time.monotonic() - started > timeout:
+                        raise ValueError('размер или время загрузки вне ожидаемого')
+                    digest.update(chunk)
+                    out.write(chunk)
+            if received != spec['size'] or digest.hexdigest() != spec['sha256']:
+                raise ValueError('контрольная сумма не совпала')
+            partial.replace(target)
+        except Exception as exc:  # сеть, диск, подмена — второе мнение просто не включится
+            try:
+                partial.unlink()
+            except OSError:
+                pass
+            return f'{name}: {type(exc).__name__}: {exc}'[:200]
+        paths.append(target)
+    return tuple(paths)
+
+
+def rating_model_paths():
+    """Пути к моделям из окружения воркера; пусто — второго мнения нет."""
+    raw = os.environ.get(RATING_ENV, '')
+    paths = [Path(part) for part in raw.split(os.pathsep) if part]
+    if len(paths) != 2 or not all(path.is_file() for path in paths):
+        return ()
+    return tuple(paths)
+
+
+def _rating_session(path):
+    import onnxruntime
+    options = onnxruntime.SessionOptions()
+    options.enable_cpu_mem_arena = False
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    return onnxruntime.InferenceSession(str(path), options, providers=['CPUExecutionProvider'])
+
+
+def rate_frame(session, frame) -> float:
+    """Доля «не safe» (r15 + r18) у классификатора рисунка."""
+    import numpy as np
+    from PIL import Image
+    image = frame.convert('RGB').resize((RATING_SIZE, RATING_SIZE), Image.BILINEAR)
+    data = ((np.asarray(image, dtype=np.float32).transpose(2, 0, 1) / 255.0 - .5) / .5)[None]
+    output = np.asarray(session.run(None, {session.get_inputs()[0].name: data})[0][0],
+                        dtype=np.float64)
+    if not (output.min() >= 0 and abs(output.sum() - 1) < 1e-3):
+        output = np.exp(output - output.max())
+        output /= output.sum()
+    return float(max(0.0, min(1.0, 1.0 - output[0])))
+
+
+def rate_frames(frames, paths):
+    """(rating, rating_small, rated, hits) по нескольким кадрам из выборки."""
+    if not frames or not paths:
+        return 0.0, 0.0, 0, 0
+    picked = [frames[index] for index in sample_indices(len(frames), RATING_FRAMES)]
+    big, small = (_rating_session(path) for path in paths)
+    best = best_small = 0.0
+    hits = 0
+    for frame in picked:
+        value, value_small = rate_frame(big, frame), rate_frame(small, frame)
+        best, best_small = max(best, value), max(best_small, value_small)
+        hits += int(value >= RATING_MIN and value_small >= RATING_SMALL_MIN)
+    return best, best_small, len(picked), hits
+
+
+def rating_flag(rated: int, hits: int) -> bool:
+    """Классификаторы сочли 16+ хотя бы половину оценённых кадров."""
+    return rated > 0 and hits * 2 >= rated
 
 
 # Документы, которые Telegram не показывает картинкой: субтитры, тексты,
@@ -392,6 +546,8 @@ def scan_frame(detector, frame, explicit_threshold=.80, suggestive_threshold=.85
     best = Scan('checked')
     suspicious = 0.0
     near_explicit = False
+    covered = False
+    area = max(1, frame.width * frame.height)
     for variant in detection_variants(frame):
         # NudeNet expects OpenCV BGR, Pillow yields RGB. Keep the thresholds:
         # transforming an image does not make the detector infallible.
@@ -413,10 +569,20 @@ def scan_frame(detector, frame, explicit_threshold=.80, suggestive_threshold=.85
                 suspicious, near_explicit = max(suspicious, score), True
             elif label in SUGGESTIVE and score >= suggestive_threshold - .15:
                 suspicious = max(suspicious, score)
+            elif label == 'FEMALE_BREAST_COVERED' and score >= COVERED_CLOSEUP_SCORE:
+                box = item.get('box') or ()
+                try:
+                    share = float(box[2]) * float(box[3]) / area
+                except (IndexError, TypeError, ValueError):
+                    share = 0.0
+                covered = covered or share >= COVERED_CLOSEUP_SHARE
     if not best.category and suspicious:
         return Scan('unchecked', reason='Пограничная оценка наготы; нужна ручная проверка',
-                    score=suspicious, near_explicit=int(near_explicit), borderline=True)
-    return replace(best, near_explicit=int(near_explicit)) if near_explicit else best
+                    score=suspicious, near_explicit=int(near_explicit), borderline=True,
+                    covered=int(covered))
+    if near_explicit or covered:
+        return replace(best, near_explicit=int(near_explicit), covered=int(covered))
+    return best
 
 
 def build_detector():
@@ -477,7 +643,9 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
     uncertain = None
     suggestive_frames = 0
     near_explicit_frames = 0
+    covered_frames = 0
     hashes = []
+    rating_pool = []
     frame_iter = iter(frames)
     while True:
         # Ошибка разбора кадра — это битый файл, его может прислать кто угодно;
@@ -495,9 +663,11 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
         fingerprint = frame_hash(frame)
         if fingerprint:
             hashes.append(fingerprint)
+        rating_pool.append(frame.convert('RGB').resize((RATING_SIZE, RATING_SIZE)))
         detection = scan_frame(detector, frame, explicit_threshold, suggestive_threshold)
         count += 1
         near_explicit_frames += int(bool(detection.near_explicit))
+        covered_frames += int(bool(detection.covered))
         if detection.category == 'nsfw':
             return Scan('checked', detection.category, detection.reason, count, detection.score,
                         hits=1, hashes=tuple(hashes))
@@ -511,25 +681,56 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
             uncertain = detection
     if not count:
         return Scan('unchecked', reason='Нет декодированных кадров', bad_input=True)
-    if best.category == 'spoiler_16':
+    if best.category == 'spoiler_16' and suggestive_frames < 2 and best.score < min(
+            .99, suggestive_threshold + .10):
         # A single frame exactly on the NudeNet threshold caused real false
         # positives (e.g. BUTTOCKS_EXPOSED=0.85). Require either repeated
         # evidence across sampled frames or one clearly stronger detection.
-        strong_score = min(.99, suggestive_threshold + .10)
-        if suggestive_frames < 2 and best.score < strong_score:
-            return Scan(
-                'unchecked',
-                reason=(f'Один пограничный кадр 16+ ({best.score:.2f}); '
-                        'нужна ручная проверка'),
-                frames=count, score=best.score, hits=suggestive_frames,
-                near_explicit=near_explicit_frames, borderline=True, hashes=tuple(hashes))
-    if not best.category and uncertain is not None:
-        return Scan('unchecked', reason=uncertain.reason, frames=count, score=uncertain.score,
-                    near_explicit=near_explicit_frames, borderline=uncertain.borderline,
-                    hashes=tuple(hashes))
-    return Scan('checked', best.category, best.reason, count, best.score,
-                hits=suggestive_frames if best.category == 'spoiler_16' else 0,
-                near_explicit=near_explicit_frames, hashes=tuple(hashes))
+        result = Scan(
+            'unchecked',
+            reason=(f'Один пограничный кадр 16+ ({best.score:.2f}); '
+                    'нужна ручная проверка'),
+            frames=count, score=best.score, hits=suggestive_frames,
+            near_explicit=near_explicit_frames, borderline=True, hashes=tuple(hashes))
+    elif not best.category and uncertain is not None:
+        result = Scan('unchecked', reason=uncertain.reason, frames=count, score=uncertain.score,
+                      near_explicit=near_explicit_frames, borderline=uncertain.borderline,
+                      hashes=tuple(hashes))
+    else:
+        result = Scan('checked', best.category, best.reason, count, best.score,
+                      hits=suggestive_frames if best.category == 'spoiler_16' else 0,
+                      near_explicit=near_explicit_frames, hashes=tuple(hashes))
+    return second_opinion(result, rating_pool, covered_frames)
+
+
+def second_opinion(result, frames, covered_frames=0, paths=None):
+    """Проверка классификаторами рисунка поверх ответа NudeNet.
+
+    Санкция — только когда оба детектора согласны: находку NudeNet (16+,
+    пограничную или «грудь в одежде крупным планом») подтвердили оба
+    классификатора. Одни классификаторы — отчёт на ручную оценку.
+    """
+    result = replace(result, covered=covered_frames)
+    paths = rating_model_paths() if paths is None else paths
+    if not paths or not frames or result.category == 'nsfw':
+        return result
+    rating, small, rated, hits = rate_frames(frames, paths)
+    result = replace(result, rating=rating, rating_small=small, rated=rated, rating_hits=hits)
+    if not rating_flag(rated, hits):
+        return result
+    if result.status == 'checked' and result.category == 'spoiler_16':
+        return replace(result, agreed=True)
+    note = f'классификатор рисунка: 16+ ({rating:.2f}/{small:.2f})'
+    if result.borderline:
+        return replace(result, status='checked', category='spoiler_16', borderline=False,
+                       agreed=True,
+                       reason=f'Пограничная находка NudeNet ({result.score:.2f}) подтверждена; {note}')
+    if covered_frames and (result.frames <= 1 or covered_frames >= 2):
+        return replace(result, status='checked', category='spoiler_16', agreed=True,
+                       score=max(result.score, COVERED_CLOSEUP_SCORE),
+                       reason=f'Грудь в одежде крупным планом; {note}')
+    return replace(result, status='unchecked', category='', borderline=True, score=rating,
+                   reason=f'Похоже на 16+ ({note}); нужна ручная проверка')
 
 
 def clamp_worker_memory(memory_mb):
@@ -542,7 +743,7 @@ def clamp_worker_memory(memory_mb):
 
 
 def _invoke_worker(path, kind, timeout, explicit_threshold, suggestive_threshold,
-                   memory_mb=WORKER_MEMORY_MB_DEFAULT):
+                   memory_mb=WORKER_MEMORY_MB_DEFAULT, rating_paths=()):
     env = dict(os.environ, OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1',
                MKL_NUM_THREADS='1', OPENCV_FFMPEG_CAPTURE_OPTIONS='protocol_whitelist;file',
                # glibc заводит под каждый поток свою арену — до 8 на ядро, по 64 МБ
@@ -555,6 +756,9 @@ def _invoke_worker(path, kind, timeout, explicit_threshold, suggestive_threshold
                # тянет за собой свою арену.
                OPENCV_NUM_THREADS='1')
     env[WORKER_MEMORY_ENV] = str(clamp_worker_memory(memory_mb))
+    env.pop(RATING_ENV, None)
+    if rating_paths:
+        env[RATING_ENV] = os.pathsep.join(str(item) for item in rating_paths)
     # Classifier never needs bot tokens, provider keys or cloud credentials.
     for name in list(env):
         if any(part in name.upper() for part in ('TOKEN', 'SECRET', 'PASSWORD', 'KEY', 'CREDENTIAL')):
@@ -597,10 +801,10 @@ def worker_failure_reason(returncode, stderr):
 
 
 def run_worker(path, kind, timeout, explicit_threshold, suggestive_threshold,
-               memory_mb=WORKER_MEMORY_MB_DEFAULT):
+               memory_mb=WORKER_MEMORY_MB_DEFAULT, rating_paths=()):
     try:
         result = _invoke_worker(path, kind, timeout, explicit_threshold,
-                                suggestive_threshold, memory_mb)
+                                suggestive_threshold, memory_mb, rating_paths)
     except subprocess.TimeoutExpired:
         # subprocess.run kills and reaps the worker before returning.
         return Scan('unchecked', reason='Превышено время локальной проверки')
@@ -620,7 +824,7 @@ def run_worker(path, kind, timeout, explicit_threshold, suggestive_threshold,
                                         + (f': {tail}' if tail else ''))
 
 
-def _measure_address_space(directory, timeout):
+def _measure_address_space(directory, timeout, rating_paths=()):
     """Сколько адресного пространства детектор берёт без тесного потолка.
 
     Число, а не догадка: подбирать лимит перезапусками — это часы на то, что
@@ -630,7 +834,7 @@ def _measure_address_space(directory, timeout):
     if not path.exists():
         return 0
     try:
-        result = _invoke_worker(path, 'image', timeout, .80, .85, 8192)
+        result = _invoke_worker(path, 'image', timeout, .80, .85, 8192, rating_paths)
         if result.returncode:
             return 0
         return int(Scan(**json.loads(result.stdout)).address_space_mb or 0)
@@ -638,7 +842,7 @@ def _measure_address_space(directory, timeout):
         return 0
 
 
-def probe(timeout=60, memory_mb=WORKER_MEMORY_MB_DEFAULT):
+def probe(timeout=60, memory_mb=WORKER_MEMORY_MB_DEFAULT, rating_paths=()):
     """Самопроверка детектора на сгенерированной картинке.
 
     Отчёт из чата говорит только, что медиа не проверено. Чинить хостинг по
@@ -659,7 +863,7 @@ def probe(timeout=60, memory_mb=WORKER_MEMORY_MB_DEFAULT):
         path = Path(directory) / 'probe.png'
         try:
             Image.new('RGB', (64, 64), 'slategray').save(path)
-            result = _invoke_worker(path, 'image', timeout, .80, .85, memory_mb)
+            result = _invoke_worker(path, 'image', timeout, .80, .85, memory_mb, rating_paths)
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
             return (Scan('unchecked', reason=f'{type(exc).__name__}: {exc}'), '',
                     time.monotonic() - started)
@@ -677,7 +881,7 @@ def probe(timeout=60, memory_mb=WORKER_MEMORY_MB_DEFAULT):
         # сломанной установке число не поможет и собьёт с толку.
         if 'памяти' not in scan.reason:
             return scan, details, spent
-        needed = _measure_address_space(directory, timeout)
+        needed = _measure_address_space(directory, timeout, rating_paths)
         if needed:
             scan = Scan(scan.status,
                         reason=f'{scan.reason}. На этой машине детектору нужно '
@@ -710,6 +914,9 @@ class MediaScanner:
         self._gate_loop = None
         self._in_flight = 0
         self._cache = OrderedDict()
+        # Классификаторы рисунка: пути появляются, когда модели скачаны.
+        self.rating_paths = ()
+        self.rating_status = 'не загружены'
 
     def _slot(self):
         """Замок детектора, привязанный к текущему циклу событий.
@@ -787,7 +994,7 @@ class MediaScanner:
                         task = asyncio.create_task(asyncio.to_thread(
                             run_worker, path, kind, self.timeout,
                             self.explicit_threshold, self.suggestive_threshold,
-                            self.memory_mb))
+                            self.memory_mb, self.rating_paths))
                         try:
                             result = await asyncio.shield(task)
                         except asyncio.CancelledError:
