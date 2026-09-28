@@ -648,7 +648,7 @@ async def test_mediaping_shows_the_reason_and_punishes_nobody(monkeypatch):
     monkeypatch.setattr(bot, 'is_admin', lambda update: True)
     monkeypatch.setattr(bot, 'MODERATION_MEDIA_ENABLED', True)
     monkeypatch.setattr(bot, 'media_probe',
-                        lambda timeout, memory_mb: (
+                        lambda timeout, memory_mb, rating_paths=(): (
                             media.Scan('unchecked', reason='Детектор убит (SIGKILL)'),
                             'onnxruntime: cannot allocate memory', 1.5))
     edit = AsyncMock()
@@ -672,7 +672,7 @@ async def test_mediaping_names_the_number_the_machine_asked_for(monkeypatch):
     monkeypatch.setattr(bot, 'is_admin', lambda update: True)
     monkeypatch.setattr(bot, 'MODERATION_MEDIA_ENABLED', True)
     monkeypatch.setattr(bot, 'media_probe',
-                        lambda timeout, memory_mb: (
+                        lambda timeout, memory_mb, rating_paths=(): (
                             media.Scan('checked', address_space_mb=1408), '', 2.0))
     edit = AsyncMock()
     msg = NS(reply_text=AsyncMock(return_value=NS(edit_text=edit)))

@@ -112,7 +112,8 @@ from news_stories import (
     _story_update_anchor,
     normalize_title,
 )
-from moderation_media import (MediaScanner, hashes_match, media_attachment, media_confidence,
+from moderation_media import (MediaScanner, ensure_rating_models, hashes_match,
+                              media_attachment, media_confidence,
                               parse_hashes,
                               media_evidence, probe as media_probe,
                               WORKER_MEMORY_MB_DEFAULT, WORKER_MEMORY_MB_MIN)
@@ -1654,6 +1655,11 @@ _moderation_media_scanner = MediaScanner(
     # лимит здесь не экономит память, а выключает проверку целиком — сколько
     # нужно этой машине, показывает /mediaping.
     memory_mb=_env_int('MODERATION_MEDIA_MEMORY_MB', WORKER_MEMORY_MB_DEFAULT))
+# Второе мнение для рисованного — классификаторы deepghs/anime_rating (MIT).
+# NudeNet обучен на фото людей и рисованную грудь в бикини не видит вовсе.
+# Модели (~160 МБ) скачиваются один раз в DATA_DIR/models; без них проверка
+# работает как раньше. Выключить: MODERATION_MEDIA_RATING=false.
+MODERATION_MEDIA_RATING = _env_bool('MODERATION_MEDIA_RATING', True)
 _moderation_action_lock = asyncio.Lock()
 _moderation_update_lock = asyncio.Lock()
 _moderation_seen_updates = {}
@@ -27373,6 +27379,22 @@ async def moderation_command(update, context: ContextTypes.DEFAULT_TYPE):
                              + (f'. Режим: {chat_moderation.mode}.' if enabled else '.'))
 
 
+async def media_rating_models_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Скачать классификаторы рисунка, если их ещё нет."""
+    scanner = _moderation_media_scanner
+    if scanner.rating_paths or not MODERATION_MEDIA_RATING:
+        return
+    scanner.rating_status = 'загружаются'
+    result = await asyncio.to_thread(ensure_rating_models, DATA_DIR / 'models')
+    if isinstance(result, tuple):
+        scanner.rating_paths = result
+        scanner.rating_status = 'включены'
+        logger.info('Модерация: классификаторы рисунка готовы')
+    else:
+        scanner.rating_status = f'не загружены ({result}); повтор через 6 ч'
+        logger.warning('Модерация: классификаторы рисунка не загружены: %s', result)
+
+
 @admin_only
 async def mediaping_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Самопроверка локального детектора медиа: /mediaping.
@@ -27391,7 +27413,7 @@ async def mediaping_command(update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text('🧪 Запускаю детектор на тестовой картинке…')
     scan, details, spent = await asyncio.to_thread(
         media_probe, _moderation_media_scanner.timeout * 2 + 20,
-        _moderation_media_scanner.memory_mb)
+        _moderation_media_scanner.memory_mb, _moderation_media_scanner.rating_paths)
     ok = scan.status == 'checked'
     lines = ['🧪 <b>Локальный детектор медиа</b>', '']
     lines.append(('✅ работает' if ok else '❌ не работает') + f' · {spent:.1f} с')
@@ -27415,6 +27437,9 @@ async def mediaping_command(update, context: ContextTypes.DEFAULT_TYPE):
                  f'сейчас {_moderation_media_scanner.queue_depth()}')
     lines.append(f'Пороги: явное {_moderation_media_scanner.explicit_threshold:.2f}, '
                  f'откровенное {_moderation_media_scanner.suggestive_threshold:.2f}')
+    rating_state = (_moderation_media_scanner.rating_status if MODERATION_MEDIA_RATING
+                    else 'выключены (MODERATION_MEDIA_RATING=false)')
+    lines.append(f'Классификаторы рисунка (второе мнение для аниме): {html.escape(rating_state)}')
     if not ok:
         lines.append('')
         lines.append('Пока детектор молчит, бот не наказывает за медиа сам — '
@@ -29509,6 +29534,13 @@ async def setup_bot_commands(app: Application) -> None:
         daily_backup_job, interval=3600, first=120, name='daily_backup',
         job_kwargs=JOB_KWARGS,
     )
+    # Классификаторы рисунка для модерации медиа: скачать при старте, при
+    # неудаче (сеть, диск) — повторить через 6 часов.
+    if MODERATION_MEDIA_ENABLED and MODERATION_MEDIA_RATING:
+        app.job_queue.run_repeating(
+            media_rating_models_job, interval=6 * 3600, first=45, name='media_rating_models',
+            job_kwargs=JOB_KWARGS,
+        )
     # Readiness не должен навсегда хранить результат единственной проверки на старте.
     app.job_queue.run_repeating(
         health_probe_job, interval=300, first=300, name='health_probe',
