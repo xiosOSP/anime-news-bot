@@ -284,3 +284,33 @@ async def test_job_is_registered_at_start(monkeypatch, tmp_path):
     await bot.setup_bot_commands(app)
     jobs = {kwargs['name']: callback for callback, kwargs in calls}
     assert jobs['episodes_digest'] is bot.episodes_digest_job
+
+
+@pytest.mark.asyncio
+async def test_failed_state_write_does_not_repeat_the_post(job, monkeypatch):
+    # Telegram принял рубрику, а отметка на диск не записалась: следующий тик
+    # раньше считал день неотправленным и слал рубрику второй раз.
+    def broken(*_args, **_kwargs):
+        raise OSError('диск переполнен')
+    monkeypatch.setattr(bot, '_atomic_write_json', broken)
+    await job.run()
+    await job.run()
+    assert job.send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_mark_is_written_before_the_send(job):
+    # Процесс может упасть между «Telegram принял» и записью результата:
+    # после рестарта адрес должен числиться «неизвестно», а не «не отправлено».
+    import json
+    seen = {}
+
+    async def send(chat_id, text, **_kw):
+        seen['state'] = json.loads(bot.EPISODES_DIGEST_FILE.read_text(encoding='utf-8'))
+        return NS(message_id=5)
+    job.send.side_effect = send
+    await job.run()
+    row = seen['state']['targets'][str(bot.DISCUSSION_CHAT_ID)]
+    assert row['status'] == 'uncertain'
+    assert json.loads(bot.EPISODES_DIGEST_FILE.read_text(encoding='utf-8'))[
+        'targets'][str(bot.DISCUSSION_CHAT_ID)]['status'] == 'sent'

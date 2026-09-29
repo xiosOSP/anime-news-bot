@@ -203,10 +203,10 @@ def gif(number, user, file_id, spoiler=False):
               animation=NS(file_unique_id=file_id, file_id='f' + file_id, mime_type='video/mp4'))
 
 
-async def send(chat, message):
+async def send(chat, message, edited=False):
     await bot.moderation_message_handler(
         NS(effective_message=message, effective_user=message.from_user,
-           effective_chat=NS(id=-100), edited_message=None), NS(bot=chat.tg))
+           effective_chat=NS(id=-100), edited_message=message if edited else None), NS(bot=chat.tg))
 
 
 def deleted(chat):
@@ -322,7 +322,9 @@ async def test_confirming_a_review_removes_the_gif_its_copies_and_future_copies(
 
     query = await press(chat, review_ids(chat)[0])
     assert sorted(deleted(chat)) == [1, 2]
-    assert chat.store.warn_count(-100, 51) == 1 and chat.store.warn_count(-100, 52) == 1
+    # Подтверждённое сообщение получает санкцию; копия, найденная только по
+    # сходству кадров, — лишь удаляется (у похожих шаблонов отпечаток общий).
+    assert chat.store.warn_count(-100, 51) == 1 and chat.store.warn_count(-100, 52) == 0
     assert chat.store.warn_count(-100, 53) == 0
     assert query.answer.await_args.args[0] == 'Записал: решение верное'
     assert 'чёрном списке' in query.result
@@ -338,7 +340,9 @@ async def test_confirming_a_review_removes_the_gif_its_copies_and_future_copies(
     chat.scanner.return_value = media.Scan('checked', frames=4, hashes=COPY_HASHES)
     await send(chat, gif(5, 55, 'g5'))
     assert deleted(chat)[-1] == 5
-    assert chat.store.find_blocked_media('g5')  # и запомнена по file_id
+    # Найдена только по сходству кадров: file_id в записи не добавляется, а
+    # автор не получает санкции — у похожего шаблона отпечаток общий.
+    assert not chat.store.find_blocked_media('g5') and chat.store.warn_count(-100, 55) == 0
 
 
 @pytest.mark.asyncio
@@ -426,7 +430,7 @@ async def test_second_confirmation_does_not_touch_already_removed_copies(chat):
     assert sorted(deleted(chat)) == [1, 2]
     await press(chat, second)
     assert sorted(deleted(chat)) == [1, 2]
-    assert chat.store.warn_count(-100, 52) == 1
+    assert chat.store.warn_count(-100, 52) == 0
 
 
 @pytest.mark.asyncio
@@ -543,13 +547,37 @@ async def test_copy_condemned_while_waiting_for_the_detector_is_still_removed(ch
 
 
 @pytest.mark.asyncio
-async def test_confirmation_after_an_edit_does_not_punish_the_new_version(chat):
+async def test_confirmation_after_the_file_was_replaced_does_not_punish_the_new_one(chat):
     chat.scanner.return_value = borderline()
     await send(chat, gif(1, 51, 'g1'))
-    bot._moderation_latest[(-100, 1)] = {'repeat_key': 'другая версия'}
-    query = await press(chat, review_ids(chat)[0])
+    # Автор подменил файл в том же сообщении.
+    chat.scanner.return_value = media.Scan('checked', frames=4, hashes=tuple(hashes_of(
+        *(picture(seed) for seed in (90, 91, 92, 93)))))
+    await send(chat, gif(1, 51, 'gNEW'), edited=True)
+    await press(chat, review_ids(chat)[0])
     assert deleted(chat) == [] and chat.store.warn_count(-100, 51) == 0
-    assert 'изменено после отчёта' in query.result
+    # Осуждённый файл при этом всё равно в чёрном списке.
+    assert chat.store.find_blocked_media('g1')['source'] == 'admin'
+    assert not chat.store.find_blocked_media('gNEW')
+
+
+@pytest.mark.asyncio
+async def test_confirmation_after_a_caption_only_edit_still_acts_on_the_file(chat):
+    chat.scanner.return_value = borderline()
+    await send(chat, gif(1, 51, 'g1'))
+    edited = gif(1, 51, 'g1')
+    edited.caption = 'исправил подпись'
+    await send(chat, edited, edited=True)
+    await press(chat, review_ids(chat)[0])
+    assert deleted(chat) == [1] and chat.store.warn_count(-100, 51) == 1
+    assert chat.store.find_blocked_media('g1')['source'] == 'admin'
+
+    # Отчёт о тексте после правки текста по-прежнему не наказывает.
+    chat.store.ensure_review('t9', -100, 61, 'toxic', 'warn', 'модель', 'x', 'текст', media=dict(
+        message_id=9, pending=True, version='старая-версия', severity=2))
+    bot._moderation_latest[(-100, 9)] = {'repeat_key': 'другая-версия'}
+    query = await press(chat, 'mod:ok:-100:61:t9')
+    assert 'изменено после отчёта' in query.result and chat.store.warn_count(-100, 61) == 0
 
 
 @pytest.mark.asyncio
@@ -587,7 +615,7 @@ async def test_modmiss_on_media_blocklists_it_without_punishing_the_author(chat,
     # Копия, уже висящая в чате, убрана; само отмеченное сообщение и его
     # автор не тронуты: /modmiss — отметка, а не санкция.
     assert deleted(chat) == [1]
-    assert chat.store.warn_count(-100, 52) == 0 and chat.store.warn_count(-100, 51) == 1
+    assert chat.store.warn_count(-100, 52) == 0 and chat.store.warn_count(-100, 51) == 0
     assert 'чёрном списке' in update.message.reply_text.await_args.args[0]
 
 

@@ -73,6 +73,11 @@ class Scan:
     # результат идёт админу отчётом с кнопками, а не техническим письмом,
     # которое прячется на 15 минут после первого.
     borderline: bool = False
+    # Через сколько секунд проверку стоит повторить: очередь была занята,
+    # детектор на паузе, файл не успели скачать. Без повтора альбом из десяти
+    # снимков получал пять проверок, а остальные пять оставались в чате
+    # непроверенными.
+    retry_after: int = 0
     # Отпечатки проверенных кадров (frame_hash). По ним чёрный список узнаёт
     # ту же гифку, пересжатую или загруженную заново под другим file_id.
     hashes: tuple = ()
@@ -844,7 +849,7 @@ def run_worker(path, kind, timeout, explicit_threshold, suggestive_threshold,
                                 suggestive_threshold, memory_mb, rating_paths)
     except subprocess.TimeoutExpired:
         # subprocess.run kills and reaps the worker before returning.
-        return Scan('unchecked', reason='Превышено время локальной проверки')
+        return Scan('unchecked', reason='Превышено время локальной проверки', retry_after=90)
     except (OSError, ValueError, TypeError) as exc:
         return Scan('unchecked', reason=f'Не удалось запустить детектор: {type(exc).__name__}')
     if result.returncode:
@@ -1007,16 +1012,18 @@ class MediaScanner:
         paused = self.paused_for()
         if paused > 0:
             return Scan('unchecked', reason=f'Детектор не отвечает {self._failures} раз подряд; '
-                                            f'пауза ещё {paused / 60:.0f} мин (/mediaping)')
+                                            f'пауза ещё {paused / 60:.0f} мин (/mediaping)',
+                        retry_after=int(paused) + 5)
         gate = self._slot()
         if self._in_flight > self.max_waiting:
-            return Scan('unchecked', reason='Очередь локальной проверки переполнена')
+            return Scan('unchecked', reason='Очередь локальной проверки переполнена', retry_after=25)
         self._in_flight += 1
         try:
             try:
                 await asyncio.wait_for(gate.acquire(), timeout=self.timeout * 2 + 20)
             except asyncio.TimeoutError:
-                return Scan('unchecked', reason='Локальная проверка не дождалась очереди')
+                return Scan('unchecked', reason='Локальная проверка не дождалась очереди',
+                            retry_after=40)
             try:
                 try:
                     file = await asyncio.wait_for(bot.get_file(item.file_id), timeout=15)
@@ -1038,7 +1045,8 @@ class MediaScanner:
                             await task
                             raise
                 except Exception:
-                    return Scan('unchecked', reason='Не удалось скачать или проверить медиа')
+                    return Scan('unchecked', reason='Не удалось скачать или проверить медиа',
+                                retry_after=45)
                 self._note_worker_result(result)
                 if key and result.status == 'checked':
                     self._cache[key] = (time.monotonic() + 86400, result)

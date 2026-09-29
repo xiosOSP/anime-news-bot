@@ -29,6 +29,11 @@ _SEPARATED = re.compile(r'(?<!\w)[а-яa-z0-9](?:[.\-_*|\s]+[а-яa-z0-9]){2,}(?
 _PUNCTUATED = re.compile(r'(?<!\w)[а-яa-z0-9]+(?:[.\-_*|]+[а-яa-z0-9]+)+(?!\w)')
 
 
+# Символы, которые выглядят пустотой, но не «форматирующие» для Unicode: хангыльный
+# и брайлевский пробелы. «п⠀идор» с таким знаком внутри проходил все правила.
+_INVISIBLE_FILLERS = frozenset('\u3164\uffa0\u115f\u1160\u2800\u180e\u2062\u2063')
+
+
 def normalize(text: str) -> str:
     text = str(text or '')
 
@@ -41,7 +46,8 @@ def normalize(text: str) -> str:
         part = unicodedata.normalize('NFKC', part).casefold().replace('ё', 'е')
         # Ударения и прочие надстрочные знаки: «пи́дор» с ударением проходило
         # мимо всех правил. «Й» после NFKC — одна буква, её это не задевает.
-        part = ''.join(c for c in part if unicodedata.category(c) not in ('Cf', 'Mn'))
+        part = ''.join(c for c in part if unicodedata.category(c) not in ('Cf', 'Mn')
+                       and c not in _INVISIBLE_FILLERS)
 
         def unmask(match):
             original = match.group()

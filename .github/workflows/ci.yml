@@ -3,6 +3,10 @@ name: CI
 # Прогон на каждый push и PR. Отсутствие CI уже однажды стоило дорого:
 # tools/check_invariants.py пропал из репозитория, весь тестовый набор падал
 # на импорте, и заметить это было некому.
+# Токену CI нужно только чтение репозитория.
+permissions:
+  contents: read
+
 on:
   push:
     branches: ['**']
@@ -35,12 +39,13 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: Синтаксис и мёртвый код
-        run: python -m pyflakes anime_news_bot.py safe_http.py translation.py moderation_rules.py moderation_media.py moderation_llm.py news_parser.py news_stories.py post_text.py llm_protocol.py news_deferral.py publication_delivery.py tools/*.py test_invariants.py tests/*.py tests/e2e/*.py
+        # Шаблон *.py, а не список: новый модуль иначе молча остаётся без проверки.
+        run: python -m pyflakes *.py tools/*.py tests/*.py tests/e2e/*.py
 
       # F821 — обращение к несуществующему имени. Именно этот класс ошибок уже
       # ронял бота в проде, и тест на него есть; без инструмента он не работал.
       - name: Несуществующие имена
-        run: python -m ruff check --select F821 anime_news_bot.py safe_http.py translation.py moderation_rules.py moderation_media.py moderation_llm.py news_parser.py news_stories.py post_text.py llm_protocol.py news_deferral.py publication_delivery.py tools/*.py
+        run: python -m ruff check --select F821 *.py tools/*.py
 
       - name: Тесты
         # BOT_TOKEN нужен только чтобы модуль импортировался; сеть не трогаем.
