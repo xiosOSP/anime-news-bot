@@ -86,6 +86,9 @@ class Scan:
     rating_small: float = 0.0
     rated: int = 0
     rating_hits: int = 0
+    # Кадры, где хотя бы одна модель уверена (review_hit): повод позвать
+    # человека, но не для санкции.
+    rating_review_hits: int = 0
     agreed: bool = False
     # Кадры, где крупным планом грудь в одежде (FEMALE_BREAST_COVERED, рамка
     # от пятой части кадра): так выглядит фото «декольте на весь экран».
@@ -270,6 +273,17 @@ RATING_SIZE = 384
 RATING_FRAMES = 3
 RATING_MIN = .99        # большая модель: доля «не safe»
 RATING_SMALL_MIN = .75  # малая модель
+# Порог «позвать человека» шире порога санкции. Модели расходятся по типу
+# картинки: на стикерах из чата (обнажённая со спины, топлес с руками на
+# груди) малая модель уверена (0.85–0.94 «не safe»), а большая колеблется
+# около 0.45; на косплей-гифке в белье — наоборот (большая 0.997, малая 0.44).
+# Строгое правило «обе уверены» пропускало их молча. Широкое правило ловит все
+# семь живых примеров и отправляет на ручную оценку 31 из 687 (4.5%) обычных
+# картинок из аниме-каналов (из них примерно половина — фансервис).
+REVIEW_SMALL_MIN = .80      # малая уверена, большая хотя бы сомневается
+REVIEW_SMALL_WITH_BIG = .30
+REVIEW_BIG_MIN = .99        # большая уверена, малая хотя бы сомневается
+REVIEW_BIG_WITH_SMALL = .40
 COVERED_CLOSEUP_SCORE = .70
 COVERED_CLOSEUP_SHARE = .20
 
@@ -355,19 +369,31 @@ def rate_frame(session, frame) -> float:
     return float(max(0.0, min(1.0, 1.0 - output[0])))
 
 
+def review_hit(value: float, value_small: float) -> bool:
+    """Хотя бы одна модель уверена, что кадр 16+, и другая не против."""
+    return ((value >= RATING_MIN and value_small >= RATING_SMALL_MIN)
+            or (value_small >= REVIEW_SMALL_MIN and value >= REVIEW_SMALL_WITH_BIG)
+            or (value >= REVIEW_BIG_MIN and value_small >= REVIEW_BIG_WITH_SMALL))
+
+
 def rate_frames(frames, paths):
-    """(rating, rating_small, rated, hits) по нескольким кадрам из выборки."""
+    """(rating, rating_small, rated, hits, review_hits) по кадрам из выборки.
+
+    hits — кадры, где уверены обе модели (санкция только вместе с NudeNet);
+    review_hits — кадры, где уверена хотя бы одна (ручная оценка).
+    """
     if not frames or not paths:
-        return 0.0, 0.0, 0, 0
+        return 0.0, 0.0, 0, 0, 0
     picked = [frames[index] for index in sample_indices(len(frames), RATING_FRAMES)]
     big, small = (_rating_session(path) for path in paths)
     best = best_small = 0.0
-    hits = 0
+    hits = review_hits = 0
     for frame in picked:
         value, value_small = rate_frame(big, frame), rate_frame(small, frame)
         best, best_small = max(best, value), max(best_small, value_small)
         hits += int(value >= RATING_MIN and value_small >= RATING_SMALL_MIN)
-    return best, best_small, len(picked), hits
+        review_hits += int(review_hit(value, value_small))
+    return best, best_small, len(picked), hits, review_hits
 
 
 def rating_flag(rated: int, hits: int) -> bool:
@@ -663,7 +689,10 @@ def scan_file(path, kind, explicit_threshold=.80, suggestive_threshold=.85):
         fingerprint = frame_hash(frame)
         if fingerprint:
             hashes.append(fingerprint)
-        rating_pool.append(frame.convert('RGB').resize((RATING_SIZE, RATING_SIZE)))
+        # BILINEAR — как при обучении моделей (imgutils). Resize по умолчанию
+        # (бикубический) сдвигал оценки: малая модель на стикере из чата давала
+        # 0.849 вместо 0.851, большая — 0.34 вместо 0.48.
+        rating_pool.append(frame.convert('RGB').resize((RATING_SIZE, RATING_SIZE), Image.BILINEAR))
         detection = scan_frame(detector, frame, explicit_threshold, suggestive_threshold)
         count += 1
         near_explicit_frames += int(bool(detection.near_explicit))
@@ -714,9 +743,17 @@ def second_opinion(result, frames, covered_frames=0, paths=None):
     paths = rating_model_paths() if paths is None else paths
     if not paths or not frames or result.category == 'nsfw':
         return result
-    rating, small, rated, hits = rate_frames(frames, paths)
-    result = replace(result, rating=rating, rating_small=small, rated=rated, rating_hits=hits)
+    rating, small, rated, hits, review_hits = rate_frames(frames, paths)
+    result = replace(result, rating=rating, rating_small=small, rated=rated, rating_hits=hits,
+                     rating_review_hits=review_hits)
     if not rating_flag(rated, hits):
+        if rating_flag(rated, review_hits) and not result.category:
+            # Уверена одна модель: не санкция, но и не молчание — вопрос к
+            # человеку. Вердикт NudeNet (если он есть) остаётся как был.
+            return replace(result, status='unchecked', borderline=True,
+                           score=max(rating, small),
+                           reason=(f'Похоже на 16+ по одной из моделей рисунка '
+                                   f'({rating:.2f}/{small:.2f}); нужна ручная проверка'))
         return result
     if result.status == 'checked' and result.category == 'spoiler_16':
         return replace(result, agreed=True)

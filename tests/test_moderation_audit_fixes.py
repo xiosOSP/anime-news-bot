@@ -13,6 +13,7 @@ import pytest
 from telegram.error import RetryAfter
 
 import anime_news_bot as bot
+from conftest import with_media_senders
 import moderation_media as media
 import moderation_rules as rules
 
@@ -51,10 +52,11 @@ def message(number=1, text='обычная реплика', uid=7, **kw):
 
 
 def telegram(status='member'):
-    return NS(get_chat_member=AsyncMock(return_value=NS(status=status, until_date=None)),
-              delete_message=AsyncMock(return_value=True), restrict_chat_member=AsyncMock(return_value=True),
-              ban_chat_member=AsyncMock(), send_message=AsyncMock(return_value=NS(message_id=900)),
-              edit_message_text=AsyncMock())
+    return with_media_senders(NS(
+        get_chat_member=AsyncMock(return_value=NS(status=status, until_date=None)),
+        delete_message=AsyncMock(return_value=True), restrict_chat_member=AsyncMock(return_value=True),
+        ban_chat_member=AsyncMock(), send_message=AsyncMock(return_value=NS(message_id=900)),
+        edit_message_text=AsyncMock()))
 
 
 async def handle(tg, msg):

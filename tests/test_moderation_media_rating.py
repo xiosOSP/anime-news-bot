@@ -24,12 +24,14 @@ PATHS = ('big.onnx', 'small.onnx')
 FRAMES = [Image.new('RGB', (8, 8))] * 3
 
 
-def opinion(monkeypatch, result, flag, covered=0, frames=FRAMES):
+def opinion(monkeypatch, result, flag, covered=0, frames=FRAMES, review=None):
     calls = []
 
     def fake_rate(pool, paths):
         calls.append(len(pool))
-        return (.999, .9, 3, 3) if flag else (.4, .2, 3, 0)
+        if review is not None:
+            return (.45, .9, 3, 0, review)
+        return (.999, .9, 3, 3, 3) if flag else (.4, .2, 3, 0, 0)
     monkeypatch.setattr(media, 'rate_frames', fake_rate)
     return media.second_opinion(result, frames, covered, paths=PATHS), calls
 
@@ -132,11 +134,14 @@ def test_rate_frames_counts_frames_where_both_models_agree(monkeypatch):
     small = Session([[.25, .7, .05], [.1, .9, 0], [.26, .7, .04]])
     sessions = iter([big, small])
     monkeypatch.setattr(media, '_rating_session', lambda path: next(sessions))
-    rating, small_rating, rated, hits = media.rate_frames(
+    rating, small_rating, rated, hits, review_hits = media.rate_frames(
         [Image.new('RGB', (8, 8))] * 10, PATHS)
     assert rated == 3 and hits == 1  # .995/.75 да; .989 мало; .991/.74 мало
+    # Для ручной оценки: .989/.9 (малая уверена) — да; .991/.74 — большая
+    # от .99 при малой от .4 — тоже да.
+    assert review_hits == 3
     assert rating == pytest.approx(.995) and small_rating == pytest.approx(.9)
-    assert media.rate_frames([], PATHS) == (0.0, 0.0, 0, 0)
+    assert media.rate_frames([], PATHS) == (0.0, 0.0, 0, 0, 0)
 
 
 def detector_with(*items):
@@ -159,17 +164,20 @@ def test_scan_file_passes_frames_and_covered_count(tmp_path, monkeypatch):
     path = tmp_path / 'a.gif'
     Image.new('RGB', (8, 8)).save(path)
     monkeypatch.setattr(media, 'build_detector', lambda: object())
-    monkeypatch.setattr(media, '_pillow_frames', lambda _p: [Image.new('RGB', (40, 20))] * 4)
+    pattern = Image.effect_mandelbrot((40, 20), (-2, -1, 1, 1), 60).convert('RGB')
+    monkeypatch.setattr(media, '_pillow_frames', lambda _p: [pattern] * 4)
     marks = iter([1, 0, 1, 0])
     monkeypatch.setattr(media, 'scan_frame', lambda *a: media.Scan('checked', covered=next(marks)))
     seen = {}
 
     def fake_opinion(result, frames, covered):
-        seen.update(frames=len(frames), size=frames[0].size, covered=covered)
+        seen.update(frames=len(frames), size=frames[0].size, covered=covered,
+                    bilinear=frames[0].tobytes() == pattern.resize((384, 384), Image.BILINEAR).tobytes())
         return result
     monkeypatch.setattr(media, 'second_opinion', fake_opinion)
     media.scan_file(path, 'animation', .8, .85)
-    assert seen == dict(frames=4, size=(384, 384), covered=2)
+    # Уменьшение — как при обучении моделей (BILINEAR), иначе оценки плывут.
+    assert seen == dict(frames=4, size=(384, 384), covered=2, bilinear=True)
 
 
 def test_model_paths_come_from_the_worker_environment(tmp_path, monkeypatch):
@@ -280,3 +288,30 @@ async def test_mediaping_probes_with_the_models_and_shows_their_state(monkeypatc
     await bot.mediaping_command.__wrapped__(NS(message=message), NS(args=[]))
     assert probed == [('a', 'b')]
     assert 'Классификаторы рисунка (второе мнение для аниме): включены' in edit.await_args.args[0]
+
+
+
+@pytest.mark.parametrize('big, small, hit', [
+    (.999, .76, True),    # обе уверены
+    (.48, .851, True),    # стикер из чата: малая уверена, большая сомневается
+    (.34, .93, True),     # тот же стикер при другом сжатии
+    (.29, .95, False),    # большая уверена, что безопасно
+    (.997, .44, True),    # косплей в белье: большая уверена, малая сомневается
+    (.997, .39, False),
+    (.98, .79, False),    # ни одна не уверена
+])
+def test_review_hit_needs_one_confident_model(big, small, hit):
+    assert media.review_hit(big, small) is hit
+
+
+def test_one_confident_model_asks_a_human_but_never_punishes(monkeypatch):
+    scan, _ = opinion(monkeypatch, media.Scan('checked', frames=1), False, review=2)
+    assert (scan.status, scan.category, scan.borderline, scan.agreed) == ('unchecked', '', True, False)
+    assert 'одной из моделей' in scan.reason and scan.rating_review_hits == 2
+    # Вердикт NudeNet при этом не трогаем: он решает по своим правилам.
+    nudenet = media.Scan('checked', 'spoiler_16', 'x', 16, .86, hits=1)
+    scan, _ = opinion(monkeypatch, nudenet, False, review=3)
+    assert scan.category == 'spoiler_16' and not scan.agreed and scan.status == 'checked'
+    # Меньше половины кадров — не повод.
+    scan, _ = opinion(monkeypatch, media.Scan('checked', frames=16), False, review=1)
+    assert scan.status == 'checked'
