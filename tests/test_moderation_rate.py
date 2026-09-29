@@ -21,9 +21,10 @@ def charge(n, *, at=0.0, cost=1, album=None, user=1):
 def test_burst_of_four_passes_fifth_is_over():
     assert charge(4) == ['', '', '', '']
     assert charge(1) == ['over']
-    # Через 2.5 с набегает ровно одно сообщение.
-    assert charge(1, at=2.5) == ['']
-    assert charge(1, at=2.5) == ['over']
+    # Пауза открыта сразу: остальное из залпа — то же нарушение, а не новое.
+    assert charge(1, at=2.5) == ['inflight']
+    # После паузы ведро снова полное.
+    assert charge(1, at=bot.MODERATION_RATE_PAUSE_SEC + 1) == ['']
 
 
 def test_steady_two_per_five_seconds_is_never_over():
@@ -210,10 +211,11 @@ async def test_someone_elses_restriction_is_left_alone(chat):
 
 
 @pytest.mark.asyncio
-async def test_anonymous_sender_is_never_restricted(chat):
-    for number in range(1, 6):
+async def test_anonymous_senders_are_not_paced_at_all(chat):
+    # У анонимных администраторов общее «ведро» на всех: считать их нельзя.
+    for number in range(1, 9):
         await send(chat, text(number, from_user=None, sender_chat=NS(id=-555, title='Канал')))
-    assert deleted(chat) == [5]
+    assert deleted(chat) == []
     chat.tg.restrict_chat_member.assert_not_awaited()
 
 

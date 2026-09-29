@@ -259,7 +259,7 @@
 | `MODERATION_MEDIA_QUEUE` | `4` | anime_news_bot.py |
 | `MODERATION_MEDIA_RATING` | `True` | anime_news_bot.py |
 | `MODERATION_MEDIA_SUGGESTIVE_THRESHOLD` | `0.85` | anime_news_bot.py |
-| `MODERATION_MEDIA_SWEEP_SEC` | `3600` | anime_news_bot.py |
+| `MODERATION_MEDIA_SWEEP_SEC` | `43200` | anime_news_bot.py |
 | `MODERATION_MEDIA_TIMEOUT_SEC` | `25` | anime_news_bot.py |
 | `MODERATION_MODE` | — | anime_news_bot.py |
 | `MODERATION_RATE_BURST` | `4` | anime_news_bot.py |

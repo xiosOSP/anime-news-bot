@@ -363,10 +363,28 @@ def _injected_call_to_action(source: str, output: str) -> bool:
     return False
 
 
+def _not_russian(text: str) -> bool:
+    """Модель проигнорировала «пиши по-русски» и вернула английский пересказ.
+
+    Пересказ модели считался уже проверенным, и корректный JSON с английским
+    заголовком уходил в канал: защита от непереведённого текста его пропускала.
+    Названия тайтлов и имена латиницей в русском тексте обычны, поэтому смотрим
+    долю кириллицы среди всех букв (у русских постов — от ~0.45, у английских
+    около нуля) и не судим слишком короткие тексты.
+    """
+    letters = [ch for ch in text if ch.isalpha()]
+    if len(letters) < 40:
+        return False
+    cyrillic = sum(1 for ch in letters if 'а' <= ch.lower() <= 'я' or ch in 'ёЁ')
+    return cyrillic / len(letters) < 0.2
+
+
 def _editorial_rejection(source: str, title: str, summary: str) -> str:
     """Cheap structural/factual checks shared by cached, batch and single replies."""
     if _injected_call_to_action(source, f'{title}\n{summary}'):
         return 'injected_call_to_action'
+    if _not_russian(f'{title}\n{summary}'):
+        return 'not_russian'
     mismatch = _facts_supported(source, f'{title}\n{summary}')
     if mismatch:
         return mismatch

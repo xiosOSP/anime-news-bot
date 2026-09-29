@@ -497,6 +497,48 @@ def _check_bot_never_bans_on_its_own(tree) -> tuple[bool, str]:
     return True, f'единственный бан — по кнопке в {name}'
 
 
+_BAN_NAMES = {'ban_chat_member', 'kick_chat_member', 'ban_chat_sender_chat'}
+
+
+def _check_no_hidden_ban_paths(main_tree) -> tuple[bool, str]:
+    """Бан не спрятан там, где проверка выше его не увидит.
+
+    Предыдущая проверка ловила только вызов ``.ban_chat_member(`` в главном
+    файле. Обход её не требовал усилий: вызов в соседнем модуле, ``getattr(bot,
+    'ban_chat_member')`` или ``ban_chat_sender_chat``. Здесь смотрим любые
+    упоминания этих методов (атрибут, имя, строка) во всех модулях проекта.
+    """
+    def mentions(tree) -> list[str]:
+        found = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in _BAN_NAMES:
+                found.append(node.attr)
+            elif isinstance(node, ast.Name) and node.id in _BAN_NAMES:
+                found.append(node.id)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                    and node.value in _BAN_NAMES:
+                found.append(node.value)
+        return found
+
+    extra = []
+    for path in sorted(list(ROOT.glob('*.py')) + list((ROOT / 'tools').glob('*.py'))):
+        if path.name in ('anime_news_bot.py', 'check_invariants.py'):
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding='utf-8'))
+        except (OSError, SyntaxError):
+            continue
+        if mentions(tree):
+            extra.append(path.name)
+    if extra:
+        return False, f'упоминание бана вне главного файла: {", ".join(extra)}'
+    found = mentions(main_tree)
+    # Ровно один разрешённый — тот самый вызов в обработчике кнопок.
+    if len(found) > 1 or any(name != 'ban_chat_member' for name in found):
+        return False, f'упоминаний методов бана в главном файле: {found}, ожидался один вызов'
+    return True, 'других путей к бану нет'
+
+
 def _check_every_store_has_a_lock(tree) -> tuple[bool, str]:
     """Хранилище с ``_data`` и ``_save`` обязано иметь замок.
 
@@ -897,6 +939,7 @@ def checks(bot, tree) -> list[tuple[str, bool, str]]:
     add('кеш картинок ограничен по объёму', _check_image_cache_is_capped_in_bytes(bot))
     add('потоковые хранилища под блокировкой', _check_threaded_stores_are_locked(tree))
     add('бан только по кнопке человека', _check_bot_never_bans_on_its_own(tree))
+    add('нет скрытых путей к бану', _check_no_hidden_ban_paths(tree))
     add('у всех хранилищ есть замок', _check_every_store_has_a_lock(tree))
     add('разбор пачки не путает новости', _check_llm_batch_never_mixes_news(bot))
     add('кеш разборов модели ограничен', _check_llm_editorial_cache_is_bounded(bot))

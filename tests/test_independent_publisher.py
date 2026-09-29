@@ -92,13 +92,34 @@ class TestPublisherNeverDuplicates:
         assert len(wired.sent) == 1
         assert len(wired.sent) == len(set(wired.sent)), 'дубль в канале'
 
-    async def test_publisher_stands_down_during_a_cycle(self, wired):
-        """Цикл сам публикует в конце — двое из одной очереди тянуть не должны."""
+    async def test_publisher_works_while_a_cycle_is_collecting(self, wired):
+        """Долгий сбор не держит готовые посты: публикатор не ждёт его конца."""
         await _fill(wired.queue, 3)
         bot.settings.last_publish_at = _overdue()
         async with bot._check_news_lock:
             await bot.publisher_tick(wired.ctx)
-        assert wired.sent == [], 'publisher влез в очередь во время цикла'
+        assert len(wired.sent) == 1
+
+    async def test_publisher_waits_for_a_send_in_progress(self, wired):
+        """Пока цикл отправляет пост, публикатор ждёт замок отправки и потом
+        видит, что срок уже съеден: второго поста подряд нет."""
+        await _fill(wired.queue, 3)
+        bot.settings.last_publish_at = _overdue()
+        async with bot._queue_send_lock:
+            tick = asyncio.ensure_future(bot.publisher_tick(wired.ctx))
+            await asyncio.sleep(0.05)
+            assert wired.sent == [], 'публикатор влез в чужую отправку'
+            bot._mark_published_now()      # цикл отправил и отметил срок
+        await tick
+        assert wired.sent == []
+
+    async def test_cycle_send_moves_the_deadline(self, wired):
+        await _fill(wired.queue, 3)
+        bot.settings.last_publish_at = _overdue()
+        result, _post = await bot._publish_one_from_queue(wired.ctx.bot)
+        assert result == 'sent'
+        await bot.publisher_tick(wired.ctx)
+        assert len(wired.sent) == 1, 'после поста цикла публикатор выложил следующий сразу'
 
 
 class TestPublisherGuards:
