@@ -589,3 +589,99 @@ async def test_wrong_frees_the_entry_named_in_the_report_even_without_a_match(ch
                              'x', '[гиф]', media=dict(file_unique_id='g-old', blocked_id='orig'))
     await press(chat, 'mod:wrong:-100:51:rv')
     assert chat.store.blocked_media_count() == 0
+
+
+# ------------------------------------------------------------ наборы стикеров
+
+def sticker(number, user, file_id, pack='lewd_pack'):
+    return NS(chat_id=-100, message_id=number, text=None, caption=None, sender_chat=None,
+              reply_to_message=None, media_group_id=None, has_media_spoiler=False,
+              message_thread_id=None, link=None,
+              from_user=NS(id=user, full_name=f'Участник {user}', is_bot=False),
+              sticker=NS(file_unique_id=file_id, file_id='f' + file_id, set_name=pack,
+                         is_animated=False, is_video=False, emoji='😳'))
+
+
+def buttons(chat, prefix):
+    return [button.callback_data
+            for call in chat.tg.send_message.await_args_list
+            for row in getattr(call.kwargs.get('reply_markup'), 'inline_keyboard', ()) or ()
+            for button in row if button.callback_data.startswith(prefix)]
+
+
+@pytest.mark.asyncio
+async def test_sticker_report_offers_to_block_the_whole_pack(chat):
+    chat.scanner.return_value = borderline(hashes=())
+    await send(chat, sticker(1, 51, 's1'))
+    assert len(buttons(chat, 'mod:pack:')) == 1
+    # У гифки такой кнопки нет: набора у неё нет.
+    await send(chat, gif(2, 52, 'g2'))
+    assert len(buttons(chat, 'mod:pack:')) == 1
+
+
+@pytest.mark.asyncio
+async def test_blocking_the_pack_removes_its_stickers_now_and_later(chat):
+    chat.scanner.return_value = media.Scan('checked', frames=1)
+    await send(chat, sticker(1, 53, 's-earlier'))          # прошёл раньше как «чистый»
+    await send(chat, sticker(2, 54, 's-other', pack='cats'))
+    chat.scanner.return_value = borderline(hashes=())
+    await send(chat, sticker(3, 51, 's1'))
+    query = await press(chat, buttons(chat, 'mod:pack:')[0])
+    assert sorted(deleted(chat)) == [1, 3]                # само сообщение и стикер из пака
+    assert 'Весь набор стикеров «lewd_pack»' in query.result
+    assert chat.store.find_blocked_media(sticker_set='lewd_pack')['source'] == 'admin'
+    chat.scanner.reset_mock()
+    await send(chat, sticker(4, 55, 's-new'))             # новый стикер того же пака
+    chat.scanner.assert_not_awaited()
+    assert deleted(chat)[-1] == 4
+    await send(chat, sticker(5, 56, 's-cat', pack='cats'))
+    assert 5 not in deleted(chat) and 2 not in deleted(chat)
+    chat.tg.ban_chat_member.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_wrong_on_a_pack_deletion_frees_the_pack(chat):
+    chat.store.block_media('p', -100, 'spoiler_16', [], (), 'admin', sticker_set='lewd_pack')
+    await send(chat, sticker(1, 51, 's1'))
+    assert deleted(chat) == [1]
+    await press(chat, review_ids(chat)[0].replace('mod:ok:', 'mod:wrong:'))
+    assert chat.store.blocked_media_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_modunblock_on_a_sticker_frees_its_pack(chat, monkeypatch):
+    monkeypatch.setattr(bot, 'is_admin', lambda update: True)
+    chat.store.block_media('p', -100, 'nsfw', [], (), 'admin', sticker_set='lewd_pack')
+    chat.scanner.return_value = media.Scan('checked', frames=1)
+    update = command_update(sticker(9, 59, 'another'))
+    await bot.modunblock_command(update, NS(bot=chat.tg, args=[]))
+    assert chat.store.blocked_media_count() == 0
+
+
+def test_pack_entry_needs_no_file_id_or_fingerprint(tmp_path):
+    store = bot.ChatModerationStore(tmp_path / 'mod.json')
+    assert store.block_media('p', -100, 'nsfw', [], (), 'admin', sticker_set='pack')['sticker_set'] == 'pack'
+    assert store.find_blocked_media('', (), 'pack')['id'] == 'p'
+    assert store.find_blocked_media('', (), 'other') == {}
+    assert store.unblock_media('', sticker_set='pack') == 1
+
+
+
+@pytest.mark.asyncio
+async def test_wrong_frees_the_pack_named_in_the_report(chat):
+    chat.store.block_media('p', -100, 'nsfw', [], (), 'admin', sticker_set='lewd_pack')
+    chat.store.ensure_review('rv', -100, 51, 'nsfw', 'mute', bot.MODERATION_MEDIA_SOURCE,
+                             'x', '[стикер]', media=dict(file_unique_id='zz', sticker_set='lewd_pack'))
+    await press(chat, 'mod:wrong:-100:51:rv')
+    assert chat.store.blocked_media_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_pack_button_only_for_nudity_reports(chat):
+    message = sticker(1, 51, 's1')
+    for category, expected in (('toxic', 0), ('spoiler_16', 1)):
+        chat.tg.send_message.reset_mock()
+        decision = dict(action='warn', media=dict(file_unique_id='s1', sticker_set='lewd_pack'),
+                        decision_state='review')
+        await bot._mod_report(chat.tg, message, category, decision, 'x', 'y', 'модель')
+        assert len(buttons(chat, 'mod:pack:')) == expected, category

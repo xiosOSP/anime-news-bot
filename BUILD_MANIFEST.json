@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "d86ce12dd83b3c3208cbd35ad235d03a41318cd6",
-  "generated_at_utc": "2026-09-28T19:42:42.056171+00:00",
+  "git_commit": "bc05502df97d130eb93a3be5140dad1c20d84e25",
+  "generated_at_utc": "2026-09-29T09:00:10.892640+00:00",
   "files": {
     ".env.example": {
       "sha256": "1d45114ec32deffad57d13ba2928bab66cf9fc248bb0e9bcb2f959028479257a",
@@ -30,12 +30,12 @@
       "bytes": 18874
     },
     "anime_news_bot.py": {
-      "sha256": "6d6dd933f6e74a6bbb95a1d5618b6f0221753c7ccc331514c6ceb0528232b2d1",
-      "bytes": 1639558
+      "sha256": "a0331c639af95a0dd71bfc3e0932cf51dddbffc6dbd739ca36a2439d11b504f1",
+      "bytes": 1641794
     },
     "docs/chat-moderation.md": {
-      "sha256": "b7ae3a5c763179db1ad33a4cc1aaf3eeb8f7a5dffdf390ec9fd2259dfba73be8",
-      "bytes": 63057
+      "sha256": "a596ec8e3636733abd6b7893212714dfe8b00005a0b8e86559fcb23c4398e74b",
+      "bytes": 65252
     },
     "docs/env-reference.md": {
       "sha256": "52d0f7f61501f485d17e3994dc7fc2df723dc8e613718ff9a8857e59cd8b9539",
@@ -70,8 +70,8 @@
       "bytes": 10699
     },
     "moderation_media.py": {
-      "sha256": "af5ba6717f1ce4f4872ce799c84ff5fd9c8b2be0d1c9e8124bc9d0cb50e596ed",
-      "bytes": 62089
+      "sha256": "813ec6b087b06ee0aaec2788a6edf9f8639f1007ff238d788d55948e3a56c806",
+      "bytes": 65262
     },
     "moderation_rules.py": {
       "sha256": "76d98c87d3d33a033eaff066aaecd13e1a9efa7a2c0f9fd467b57588859c7d25",
@@ -474,16 +474,16 @@
       "bytes": 6731
     },
     "tests/test_moderation_media_blocklist.py": {
-      "sha256": "c546c839e74c7ad7638f4ad1cf37df64ccffc9626a6fa1108a97f5944477f897",
-      "bytes": 28904
+      "sha256": "6761cca2a894a56454e9c60f6092d53754d846bc98f6083ccc15e932c62629c1",
+      "bytes": 33659
     },
     "tests/test_moderation_media_pr60.py": {
       "sha256": "31877aee04d320827fac16bcfedbc1ecbac9bd185706bbf4255c235d972a24f8",
       "bytes": 5208
     },
     "tests/test_moderation_media_rating.py": {
-      "sha256": "60eb9fa5130ddea6bef1f81eedfd865a65eff69b795718df03980432c71bf9e0",
-      "bytes": 13591
+      "sha256": "650feb1f18a628be452e3ebf526fd88d089b529913b2e91bcdfb3b6d81ee133c",
+      "bytes": 15819
     },
     "tests/test_moderation_media_repeat.py": {
       "sha256": "999996cf0cf17517bf0a40f05546d4accd61f6ea81c661cc0f358aa17fa60b7e",

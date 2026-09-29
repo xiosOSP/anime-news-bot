@@ -2719,6 +2719,7 @@ class ChatModerationStore:
                                   if isinstance(media.get('thread_id'), int) else None),
                     'pending': bool(media.get('pending')),
                     'name': str(media.get('name') or '')[:64],
+                    'sticker_set': str(media.get('sticker_set') or '')[:64],
                 }
             if not self._save():
                 self._data = before
@@ -2737,7 +2738,7 @@ class ChatModerationStore:
                 self._save()
 
     def block_media(self, entry_id: str, chat_id: int, category: str, file_ids,
-                    hashes, source: str) -> dict:
+                    hashes, source: str, *, sticker_set: str = '') -> dict:
         """Внести медиа в чёрный список; вернуть запись (пустую — если не вышло).
 
         Ключ — отчёт, по которому медиа осуждено: «❌ Ошибка» или «↩️ Снять»
@@ -2747,7 +2748,8 @@ class ChatModerationStore:
         """
         file_ids = [str(x)[:64] for x in (file_ids or ()) if x]
         hashes = [str(h)[:64] for h in (hashes or ()) if h]
-        if not entry_id or (not file_ids and not hashes):
+        sticker_set = str(sticker_set or '')[:64]
+        if not entry_id or (not file_ids and not hashes and not sticker_set):
             return {}
         with self._lock:
             before = copy.deepcopy(self._data)
@@ -2767,6 +2769,10 @@ class ChatModerationStore:
                 # Подтверждение человека сильнее автоматического вердикта.
                 row['source'] = 'admin'
             row['file_ids'] = list(dict.fromkeys(row.get('file_ids', []) + file_ids))[-20:]
+            if sticker_set:
+                # Весь набор стикеров: такие приходят паками, и одно
+                # подтверждение админа закрывает сразу весь пак.
+                row['sticker_set'] = sticker_set
             if not row.get('hashes'):
                 row['hashes'] = list(dict.fromkeys(hashes))[:MODERATION_MEDIA_HASHES_MAX]
             self._blocked_index = None
@@ -2775,7 +2781,7 @@ class ChatModerationStore:
                 return {}
             return dict(copy.deepcopy(row), id=entry_id)
 
-    def unblock_media(self, entry_id: str, file_ids=(), hashes=()) -> int:
+    def unblock_media(self, entry_id: str, file_ids=(), hashes=(), sticker_set: str = '') -> int:
         """Убрать запись и всё, что узнаёт это же медиа. Вернуть число записей.
 
         Копию удаляет запись, заведённая по другому отчёту, — «❌ Ошибка» на
@@ -2786,6 +2792,7 @@ class ChatModerationStore:
             blocklist = self._data.get('media_blocklist', {})
             doomed = [key for key, row in blocklist.items()
                       if key == entry_id or file_ids & set(row.get('file_ids') or ())
+                      or (sticker_set and row.get('sticker_set') == sticker_set)
                       or (hashes and hashes_match(hashes, row.get('hashes') or ()))]
             if not doomed:
                 return 0
@@ -2798,13 +2805,14 @@ class ChatModerationStore:
                 return 0
             return len(doomed)
 
-    def find_blocked_media(self, file_unique_id: str = '', hashes=()) -> dict:
-        """Запись чёрного списка для этого медиа: по file_id или по отпечаткам."""
+    def find_blocked_media(self, file_unique_id: str = '', hashes=(), sticker_set: str = '') -> dict:
+        """Запись чёрного списка для этого медиа: по file_id, паку стикеров или отпечаткам."""
         with self._lock:
             blocklist = self._data.get('media_blocklist', {})
-            if file_unique_id:
+            if file_unique_id or sticker_set:
                 for entry_id, row in reversed(list(blocklist.items())):
-                    if file_unique_id in (row.get('file_ids') or ()):
+                    if ((file_unique_id and file_unique_id in (row.get('file_ids') or ()))
+                            or (sticker_set and row.get('sticker_set') == sticker_set)):
                         return dict(copy.deepcopy(row), id=entry_id)
             if not hashes:
                 return {}
@@ -26631,7 +26639,8 @@ async def _mod_media_unchecked(bot: Bot, message, reason: str, *, notify: bool =
             logger.info('Модерация: отчёт о непроверенном медиа не доставлен')
 
 
-def _mod_remember_media(chat_id: int, message, file_unique_id: str, hashes) -> None:
+def _mod_remember_media(chat_id: int, message, file_unique_id: str, hashes,
+                        sticker_set: str = '') -> None:
     """Запомнить медиа на час: вдруг его осудят позже — тогда удалим и эту копию."""
     rows = _moderation_recent_media.setdefault(int(chat_id), deque(maxlen=300))
     now = time.monotonic()
@@ -26639,7 +26648,7 @@ def _mod_remember_media(chat_id: int, message, file_unique_id: str, hashes) -> N
         rows.popleft()
     rows.append(dict(message=message, message_id=getattr(message, 'message_id', None),
                      file_unique_id=str(file_unique_id or ''), hashes=list(hashes or ()),
-                     at=now, handled=False))
+                     sticker_set=str(sticker_set or ''), at=now, handled=False))
     while len(_moderation_recent_media) > 200:
         _moderation_recent_media.pop(next(iter(_moderation_recent_media)))
 
@@ -26694,7 +26703,8 @@ def _mod_unblock_for_review(review_id: str, review: dict) -> int:
     target = review.get('media') if isinstance(review.get('media'), dict) else {}
     extra_ids = [str(target.get('blocked_id') or '')]
     removed = chat_moderation.unblock_media(
-        review_id, [target.get('file_unique_id')], target.get('hashes') or ())
+        review_id, [target.get('file_unique_id')], target.get('hashes') or (),
+        str(target.get('sticker_set') or ''))
     for entry_id in extra_ids:
         if entry_id and entry_id != review_id:
             removed += chat_moderation.unblock_media(entry_id)
@@ -26730,7 +26740,8 @@ def _mod_message_stub(chat_id: int, user_id: int, message_id: int, *, name: str 
         media_group_id=None, has_media_spoiler=False, text=None, caption=None, link=None)
 
 
-async def _mod_confirm_review(bot: Bot, chat_id: int, review_id: str, review: dict) -> str:
+async def _mod_confirm_review(bot: Bot, chat_id: int, review_id: str, review: dict,
+                              *, whole_pack: bool = False) -> str:
     """«✅ Верно»: подтверждение админа доводит вердикт до конца.
 
     Раньше кнопка только записывала оценку. Вердикт «на ручную оценку»
@@ -26752,14 +26763,22 @@ async def _mod_confirm_review(bot: Bot, chat_id: int, review_id: str, review: di
         # Наказывать за новую нельзя — обработчик и сам отбрасывает такие
         # вердикты. Оценка записана, новая версия проверяется как обычно.
         return ' Сообщение изменено после отчёта: санкция не применена.'
-    if category in ('nsfw', 'spoiler_16') and (target_row.get('file_unique_id') or target_row.get('hashes')):
+    pack = str(target_row.get('sticker_set') or '') if whole_pack else ''
+    if category in ('nsfw', 'spoiler_16') and (target_row.get('file_unique_id') or target_row.get('hashes')
+                                                or pack):
         # Отчёт о копии из чёрного списка: подтверждаем ту же запись, а не
         # заводим вторую.
         entry = chat_moderation.block_media(
             str(target_row.get('blocked_id') or review_id), chat_id, category,
-            [target_row.get('file_unique_id')], target_row.get('hashes'), 'admin')
-        parts.append(' Медиа в чёрном списке: копии будут удаляться сразу.' if entry
-                     else ' Медиа в чёрный список не записалось.')
+            [target_row.get('file_unique_id')], target_row.get('hashes'), 'admin',
+            sticker_set=pack)
+        if not entry:
+            parts.append(' Медиа в чёрный список не записалось.')
+        elif pack:
+            parts.append(f' Весь набор стикеров «{pack}» в чёрном списке: '
+                         'любой его стикер будет удаляться сразу.')
+        else:
+            parts.append(' Медиа в чёрном списке: копии будут удаляться сразу.')
     if target_row.get('pending') and message_id:
         row = _mod_recent_media_row(chat_id, message_id)
         handled = row is not None and row.get('handled')
@@ -26808,7 +26827,9 @@ async def _mod_media_sweep(bot: Bot, entry: dict, *, skip=None) -> int:
                 continue
             if skip is not None and (chat_id, row.get('message_id')) == skip:
                 continue
-            if row['file_unique_id'] in file_ids or hashes_match(row.get('hashes'), hashes):
+            pack = entry.get('sticker_set')
+            if (row['file_unique_id'] in file_ids or (pack and row.get('sticker_set') == pack)
+                    or hashes_match(row.get('hashes'), hashes)):
                 row['handled'] = True
                 found.append(row)
     for row in found:
@@ -27116,7 +27137,8 @@ def _mod_review_id(message, decision: dict, category: str, source: str) -> str:
 
 
 def _mod_report_markup(chat_id: int, user_id: int, review_id: str = '',
-                       incident_id: str = '', *, allow_ban: bool = True) -> InlineKeyboardMarkup:
+                       incident_id: str = '', *, allow_ban: bool = True,
+                       sticker_pack: bool = False) -> InlineKeyboardMarkup:
     """Feedback is always available; destructive controls require an incident."""
     rows = []
     if review_id:
@@ -27125,6 +27147,9 @@ def _mod_report_markup(chat_id: int, user_id: int, review_id: str = '',
             InlineKeyboardButton('✅ Верно', callback_data=f'mod:ok:{chat_id}:{user_id}{suffix}'),
             InlineKeyboardButton('❌ Ошибка', callback_data=f'mod:wrong:{chat_id}:{user_id}{suffix}'),
         ])
+        if sticker_pack:
+            rows.append([InlineKeyboardButton(
+                '⛔ Весь набор стикеров', callback_data=f'mod:pack:{chat_id}:{user_id}{suffix}')])
     if incident_id:
         suffix = f':{incident_id}'
         actions = [InlineKeyboardButton(
@@ -27214,7 +27239,9 @@ async def _mod_report(bot: Bot, message, category: str, decision: dict,
                 admin_id, text, parse_mode=ParseMode.HTML, disable_notification=silent,
                 reply_markup=_mod_report_markup(
                     message.chat_id, user_id, review_id, incident_id,
-                    allow_ban=not decision.get('restriction_blocked')))
+                    allow_ban=not decision.get('restriction_blocked'),
+                    sticker_pack=bool(isinstance(media, dict) and media.get('sticker_set')
+                                      and category in ('nsfw', 'spoiler_16'))))
         except TelegramError:
             logger.debug('Модерация: отчёт админу %s не доставлен', admin_id)
 
@@ -27316,7 +27343,9 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
     elif attachment is not None and not remove_locally:
         # Сначала чёрный список по file_id: копия уже осуждённого медиа
         # удаляется сразу, без очереди детектора и без его пограничных оценок.
-        blocked = chat_moderation.find_blocked_media(attachment_key) if attachment_key else {}
+        sticker_set = str(getattr(getattr(message, 'sticker', None), 'set_name', None) or '')
+        blocked = (chat_moderation.find_blocked_media(attachment_key, sticker_set=sticker_set)
+                   if attachment_key or sticker_set else {})
         if not blocked and MODERATION_MEDIA_ENABLED:
             media = await _moderation_media_scanner.check(context.bot, message)
             if media is not None and not (media.status == 'checked' and media.category == 'nsfw'):
@@ -27327,13 +27356,13 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
                 # в цикле событий это пауза для всех чатов, поэтому в потоке.
                 blocked = await asyncio.to_thread(
                     chat_moderation.find_blocked_media,
-                    attachment_key, getattr(media, 'hashes', None) or ())
+                    attachment_key, getattr(media, 'hashes', None) or (), sticker_set)
         hashes = [str(h) for h in (getattr(media, 'hashes', None) or ())]
         media_meta = dict(file_unique_id=attachment_key, hashes=hashes,
                           message_id=getattr(message, 'message_id', 0) or 0,
                           thread_id=getattr(message, 'message_thread_id', None), name=actor_name,
-                          version=repeat_key)
-        _mod_remember_media(chat.id, message, attachment_key, hashes)
+                          version=repeat_key, sticker_set=sticker_set)
+        _mod_remember_media(chat.id, message, attachment_key, hashes, sticker_set)
         if blocked:
             if not human_only_text and not (blocked.get('category') == 'spoiler_16' and has_spoiler):
                 chat_moderation.note_blocked_hit(blocked['id'], attachment_key)
@@ -28008,7 +28037,8 @@ async def modunblock_command(update, context: ContextTypes.DEFAULT_TYPE):
     scan = (await _moderation_media_scanner.check(context.bot, reply)
             if MODERATION_MEDIA_ENABLED else None)
     removed = chat_moderation.unblock_media(
-        '', [getattr(attachment[0], 'file_unique_id', '')], getattr(scan, 'hashes', None) or ())
+        '', [getattr(attachment[0], 'file_unique_id', '')], getattr(scan, 'hashes', None) or (),
+        str(getattr(getattr(reply, 'sticker', None), 'set_name', None) or ''))
     await update.message.reply_text(
         f'Убрано из чёрного списка записей: {removed}.' if removed
         else 'Этого медиа нет в чёрном списке.')
@@ -28302,7 +28332,7 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer()
         return True
     reference_id = parts[4] if len(parts) == 5 else ''
-    if verb in ('ok', 'wrong'):
+    if verb in ('ok', 'wrong', 'pack'):
         if not reference_id or chat_moderation is None:
             await query.answer('У этого старого отчёта нет ID для оценки', show_alert=True)
             return True
@@ -28311,7 +28341,7 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 or review.get('user_id') != user_id):
             await query.answer('Отчёт устарел или не найден', show_alert=True)
             return True
-        verdict = 'correct' if verb == 'ok' else 'wrong'
+        verdict = 'wrong' if verb == 'wrong' else 'correct'
         if not chat_moderation.record_review_feedback(reference_id, verdict):
             await query.answer('Оценка уже сохранена или не записалась', show_alert=True)
             return True
@@ -28326,7 +28356,8 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             extra = (' Медиа убрано из чёрного списка.'
                      if _mod_unblock_for_review(reference_id, review) else '')
         else:
-            extra = await _mod_confirm_review(context.bot, chat_id, reference_id, review)
+            extra = await _mod_confirm_review(context.bot, chat_id, reference_id, review,
+                                              whole_pack=verb == 'pack')
         if extra:
             await _mod_tell_admin_result(context.bot, query, extra.strip())
         return True
