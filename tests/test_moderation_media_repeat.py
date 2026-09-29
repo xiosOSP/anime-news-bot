@@ -13,6 +13,7 @@ from PIL import Image
 
 import anime_news_bot as bot
 import moderation_media as media
+from conftest import with_media_senders
 
 
 def _scan_with_hits(tmp_path, monkeypatch, total, hit_frames, near_frames=()):
@@ -135,11 +136,12 @@ async def test_handler_deletes_repeated_16_plus_gif(tmp_path, monkeypatch):
         monkeypatch.setattr(bot, name, {})
 
     async def run(scan, number):
-        tg = NS(get_chat_member=AsyncMock(return_value=NS(status='member')),
-                delete_message=AsyncMock(return_value=True), restrict_chat_member=AsyncMock(),
-                ban_chat_member=AsyncMock(), promote_chat_member=AsyncMock(),
-                send_message=AsyncMock(return_value=NS(message_id=900)),
-                edit_message_text=AsyncMock())
+        tg = with_media_senders(NS(
+            get_chat_member=AsyncMock(return_value=NS(status='member')),
+            delete_message=AsyncMock(return_value=True), restrict_chat_member=AsyncMock(),
+            ban_chat_member=AsyncMock(), promote_chat_member=AsyncMock(),
+            send_message=AsyncMock(return_value=NS(message_id=900)),
+            edit_message_text=AsyncMock()))
         monkeypatch.setattr(bot, '_moderation_media_scanner', NS(check=AsyncMock(return_value=scan)))
         msg = NS(chat_id=-100, message_id=number, text=None, caption=None, sender_chat=None,
                  reply_to_message=None, media_group_id=None, has_media_spoiler=False,

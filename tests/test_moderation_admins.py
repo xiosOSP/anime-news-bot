@@ -7,6 +7,7 @@ import pytest
 from telegram.error import BadRequest, TimedOut
 
 import anime_news_bot as bot
+from conftest import with_media_senders
 
 
 @pytest.fixture
@@ -38,10 +39,11 @@ def message(number=1, text='Я тебя убью', **kw):
 
 
 def telegram(status='administrator'):
-    return NS(get_chat_member=AsyncMock(return_value=NS(status=status)),
-              delete_message=AsyncMock(return_value=True), restrict_chat_member=AsyncMock(),
-              ban_chat_member=AsyncMock(), promote_chat_member=AsyncMock(),
-              send_message=AsyncMock(return_value=NS(message_id=900)), edit_message_text=AsyncMock())
+    return with_media_senders(NS(
+        get_chat_member=AsyncMock(return_value=NS(status=status)),
+        delete_message=AsyncMock(return_value=True), restrict_chat_member=AsyncMock(),
+        ban_chat_member=AsyncMock(), promote_chat_member=AsyncMock(),
+        send_message=AsyncMock(return_value=NS(message_id=900)), edit_message_text=AsyncMock()))
 
 
 async def handle(tg, msg, edited=False):

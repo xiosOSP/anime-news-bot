@@ -163,3 +163,27 @@ class FakeHTTPResponse:
 def http_response():
     """Фабрика потоковых ответов для тестов загрузки."""
     return FakeHTTPResponse
+
+
+def with_media_senders(tg):
+    """Добавить поддельному Telegram отправку медиа админу.
+
+    Отчёт модерации о медиа уходит вместе с самой картинкой (send_photo,
+    send_animation…), подпись — это текст отчёта. Подделка пересылает такой
+    вызов в send_message, чтобы тесты читали отчёты в одном месте.
+    """
+    from unittest.mock import AsyncMock
+
+    def forward(method):
+        async def send(chat_id, file_id, caption=None, reply_markup=None, **kwargs):
+            tg.media_sent.append((method, chat_id, file_id, kwargs.get('has_spoiler')))
+            if caption is None:
+                return type('Sent', (), {'message_id': 901})()
+            return await tg.send_message(chat_id, caption, reply_markup=reply_markup)
+        return AsyncMock(side_effect=send)
+
+    tg.media_sent = []
+    for method in ('send_photo', 'send_animation', 'send_video', 'send_sticker',
+                   'send_video_note', 'send_document'):
+        setattr(tg, method, forward(method))
+    return tg

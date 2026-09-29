@@ -16,6 +16,7 @@ import pytest
 from PIL import Image, ImageDraw
 
 import anime_news_bot as bot
+from conftest import with_media_senders
 import moderation_media as media
 
 
@@ -181,11 +182,12 @@ def chat(tmp_path, monkeypatch):
                  '_moderation_media_reports', '_moderation_recent_media',
                  '_moderation_report_bursts'):
         monkeypatch.setattr(bot, name, {})
-    tg = NS(get_chat_member=AsyncMock(return_value=NS(status='member')),
-            delete_message=AsyncMock(return_value=True), restrict_chat_member=AsyncMock(),
-            ban_chat_member=AsyncMock(), promote_chat_member=AsyncMock(),
-            send_message=AsyncMock(return_value=NS(message_id=900)),
-            edit_message_text=AsyncMock())
+    tg = with_media_senders(NS(
+        get_chat_member=AsyncMock(return_value=NS(status='member')),
+        delete_message=AsyncMock(return_value=True), restrict_chat_member=AsyncMock(),
+        ban_chat_member=AsyncMock(), promote_chat_member=AsyncMock(),
+        send_message=AsyncMock(return_value=NS(message_id=900)),
+        edit_message_text=AsyncMock()))
     scanner = AsyncMock()
     monkeypatch.setattr(bot, '_moderation_media_scanner', NS(check=scanner))
     unchecked = AsyncMock()
@@ -248,12 +250,63 @@ def borderline(hashes=GIF_HASHES):
 async def test_borderline_gif_gets_a_report_with_buttons_not_a_hidden_notice(chat):
     chat.scanner.return_value = borderline()
     await send(chat, gif(1, 51, 'g1'))
-    await send(chat, gif(2, 52, 'g2'))
     chat.unchecked.assert_not_awaited()
     assert deleted(chat) == []
-    assert len(review_ids(chat)) == 2
+    assert len(review_ids(chat)) == 1
     report = chat.tg.send_message.await_args_list[0].args[1]
     assert 'ручная оценка' in report and '0.80' in report
+    # В отчёте — сама гифка под спойлером, а не только её ID.
+    assert chat.tg.media_sent == [('send_animation', 7, 'fg1', True)]
+
+
+@pytest.mark.asyncio
+async def test_copies_of_media_awaiting_review_do_not_bring_new_letters(chat):
+    chat.scanner.return_value = borderline()
+    await send(chat, gif(1, 51, 'g1'))
+    chat.scanner.return_value = borderline(COPY_HASHES)   # пересжатая копия
+    await send(chat, gif(2, 52, 'g2'))
+    await send(chat, gif(3, 53, 'g1'))                     # та же гифка ещё раз
+    assert len(review_ids(chat)) == 1
+    assert [row['action'] for row in chat.store.recent_log(2)] == ['ждёт оценки (копия)'] * 2
+    # Другая гифка — отдельный отчёт.
+    chat.scanner.return_value = borderline(tuple(hashes_of(*(picture(s) for s in range(80, 84)))))
+    await send(chat, gif(4, 54, 'g4'))
+    assert len(review_ids(chat)) == 2
+    # «✅ Верно» на первом отчёте убирает и копии.
+    await press(chat, review_ids(chat)[0])
+    assert sorted(deleted(chat)) == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_after_wrong_the_same_media_is_not_asked_about_again(chat):
+    chat.scanner.return_value = borderline()
+    await send(chat, gif(1, 51, 'g1'))
+    data = review_ids(chat)[0]
+    assert data.rsplit(':', 1)[1] in bot._moderation_pending_media
+    query = await press(chat, data.replace('mod:ok:', 'mod:wrong:'))
+    assert 'больше спрашивать не буду' in query.result
+    assert data.rsplit(':', 1)[1] not in bot._moderation_pending_media
+    chat.scanner.return_value = borderline(COPY_HASHES)
+    await send(chat, gif(2, 52, 'g2'))
+    assert len(review_ids(chat)) == 1
+    assert chat.store.recent_log(1)[0]['action'] == 'разрешено админом'
+    # Разрешение переживает перезапуск.
+    chat.store.flush()
+    assert bot.ChatModerationStore(chat.store.path).is_allowed_media('g1')
+
+
+@pytest.mark.asyncio
+async def test_copies_from_the_blocklist_are_removed_silently(chat):
+    chat.store.block_media('orig', -100, 'spoiler_16', ['g1'], GIF_HASHES, 'admin')
+    await send(chat, gif(1, 51, 'g1'))
+    chat.scanner.return_value = media.Scan('checked', frames=4, hashes=COPY_HASHES)
+    await send(chat, gif(2, 52, 'g2'))
+    assert deleted(chat) == [1, 2]
+    admin_letters = [c for c in chat.tg.send_message.await_args_list if c.args[0] == 7]
+    assert admin_letters == [] and chat.tg.media_sent == []
+    assert chat.store.find_blocked_media('g1')['hits'] == 2
+    assert chat.store.blocked_media_hits() == 2
+    assert 'Чёрный список медиа: 1 (копий удалено молча: 2)' in bot._moderation_stats_text()
 
 
 @pytest.mark.asyncio
@@ -366,6 +419,7 @@ async def test_second_confirmation_does_not_touch_already_removed_copies(chat):
     chat.scanner.return_value = borderline()
     await send(chat, gif(1, 51, 'g1'))
     chat.scanner.return_value = borderline(COPY_HASHES)
+    bot._moderation_pending_media.clear()   # второй отчёт: будто первый уже устарел
     await send(chat, gif(2, 52, 'g2'))
     first, second = review_ids(chat)
     await press(chat, first)
@@ -463,29 +517,6 @@ def test_unblock_removes_every_entry_that_recognises_the_media(tmp_path):
     store.block_media('c', -100, 'nsfw', ['other'], (), 'auto')
     assert store.unblock_media('nope', ['g9'], GIF_HASHES) == 2
     assert store.blocked_media_count() == 1 and store.find_blocked_media('other')
-
-
-@pytest.mark.asyncio
-async def test_wrong_on_a_copy_report_frees_the_original_entry(chat):
-    chat.store.block_media('orig', -100, 'spoiler_16', ['g1'], GIF_HASHES, 'auto')
-    chat.scanner.return_value = media.Scan('checked', frames=4, hashes=COPY_HASHES)
-    await send(chat, gif(1, 51, 'g2'))
-    assert deleted(chat) == [1]
-    query = await press(chat, review_ids(chat)[0].replace('mod:ok:', 'mod:wrong:'))
-    assert chat.store.blocked_media_count() == 0
-    assert 'убрано из чёрного списка' in query.result
-    await send(chat, gif(2, 52, 'g1'))
-    assert deleted(chat) == [1]
-
-
-@pytest.mark.asyncio
-async def test_confirming_a_copy_report_upgrades_the_same_entry(chat):
-    chat.store.block_media('orig', -100, 'spoiler_16', ['g1'], GIF_HASHES, 'auto')
-    await send(chat, gif(1, 51, 'g1'))
-    await press(chat, review_ids(chat)[0])
-    assert chat.store.blocked_media_count() == 1
-    assert chat.store.find_blocked_media('g1') == dict(
-        chat.store.find_blocked_media('g1'), id='orig', source='admin')
 
 
 @pytest.mark.asyncio
@@ -640,15 +671,6 @@ async def test_blocking_the_pack_removes_its_stickers_now_and_later(chat):
 
 
 @pytest.mark.asyncio
-async def test_wrong_on_a_pack_deletion_frees_the_pack(chat):
-    chat.store.block_media('p', -100, 'spoiler_16', [], (), 'admin', sticker_set='lewd_pack')
-    await send(chat, sticker(1, 51, 's1'))
-    assert deleted(chat) == [1]
-    await press(chat, review_ids(chat)[0].replace('mod:ok:', 'mod:wrong:'))
-    assert chat.store.blocked_media_count() == 0
-
-
-@pytest.mark.asyncio
 async def test_modunblock_on_a_sticker_frees_its_pack(chat, monkeypatch):
     monkeypatch.setattr(bot, 'is_admin', lambda update: True)
     chat.store.block_media('p', -100, 'nsfw', [], (), 'admin', sticker_set='lewd_pack')
@@ -681,7 +703,59 @@ async def test_pack_button_only_for_nudity_reports(chat):
     message = sticker(1, 51, 's1')
     for category, expected in (('toxic', 0), ('spoiler_16', 1)):
         chat.tg.send_message.reset_mock()
+        bot._moderation_pending_media.clear()
         decision = dict(action='warn', media=dict(file_unique_id='s1', sticker_set='lewd_pack'),
                         decision_state='review')
         await bot._mod_report(chat.tg, message, category, decision, 'x', 'y', 'модель')
         assert len(buttons(chat, 'mod:pack:')) == expected, category
+
+
+# ------------------------------------------------------ медиа в отчёте админу
+
+def plain_tg():
+    return with_media_senders(NS(send_message=AsyncMock(return_value=NS(message_id=900))))
+
+
+@pytest.mark.asyncio
+async def test_sticker_report_is_the_sticker_then_the_text_under_it():
+    tg = plain_tg()
+    await bot._mod_send_report(tg, 7, '<b>отчёт</b>', 'markup', sticker(1, 51, 's1'), True)
+    assert tg.media_sent == [('send_sticker', 7, 'fs1', None)]
+    call = tg.send_message.await_args
+    assert call.args == (7, '<b>отчёт</b>')
+    assert call.kwargs['reply_to_message_id'] == 901 and call.kwargs['reply_markup'] == 'markup'
+
+
+@pytest.mark.asyncio
+async def test_long_report_goes_under_the_media_not_in_its_caption():
+    tg = plain_tg()
+    photo = NS(photo=[NS(file_id='small'), NS(file_id='big')])
+    await bot._mod_send_report(tg, 7, 'x' * 1001, None, photo, False)
+    assert tg.media_sent == [('send_photo', 7, 'big', True)]
+    assert tg.send_message.await_args.args == (7, 'x' * 1001)
+    # Теги не считаются в лимит подписи: видимого текста 1000 — влезает.
+    tg = plain_tg()
+    await bot._mod_send_report(tg, 7, '<b>' + 'x' * 1000 + '</b>', None, photo, False)
+    assert tg.send_message.await_args.args == (7, '<b>' + 'x' * 1000 + '</b>')
+    assert tg.send_message.await_args.kwargs.get('reply_to_message_id') is None
+
+
+@pytest.mark.asyncio
+async def test_report_survives_a_media_that_cannot_be_sent():
+    from telegram.error import BadRequest
+    tg = plain_tg()
+    tg.send_animation = AsyncMock(side_effect=BadRequest('wrong file identifier'))
+    await bot._mod_send_report(tg, 7, 'отчёт', 'm', gif(1, 51, 'g1'), False)
+    assert tg.send_message.await_args.args == (7, 'отчёт')
+    assert tg.send_message.await_args.kwargs['reply_markup'] == 'm'
+
+
+@pytest.mark.asyncio
+async def test_text_report_and_documents():
+    tg = plain_tg()
+    await bot._mod_send_report(tg, 7, 'отчёт', None, bot._mod_message_stub(-100, 51, 9), False)
+    assert tg.media_sent == [] and tg.send_message.await_count == 1
+    await bot._mod_send_report(tg, 7, 'отчёт', None, NS(document=NS(file_id='doc')), False)
+    assert tg.media_sent[-1] == ('send_document', 7, 'doc', None)  # у документа нет спойлера
+    await bot._mod_send_report(tg, 7, 'x' * 1500, None, NS(document=NS(file_id='doc')), False)
+    assert tg.media_sent[-1] == ('send_document', 7, 'doc', None)
