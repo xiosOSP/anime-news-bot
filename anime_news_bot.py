@@ -2873,6 +2873,19 @@ class ChatModerationStore:
         with self._lock:
             return len(self._data.get('media_blocklist', {}))
 
+    def blocked_media_entries(self, limit: int = 10) -> list:
+        """Последние записи чёрного списка, новые первыми: [(id, запись)]."""
+        with self._lock:
+            rows = list(self._data.get('media_blocklist', {}).items())
+        return [(key, copy.deepcopy(row)) for key, row in reversed(rows)][:max(0, limit)]
+
+    def blocked_media_by_digest(self, digest: str) -> str:
+        """id записи по короткому отпечатку из кнопки (в callback_data нет места
+        для id вида «miss:…» с двоеточием)."""
+        with self._lock:
+            keys = list(self._data.get('media_blocklist', {}))
+        return next((key for key in keys if _mod_blocked_digest(key) == digest), '')
+
     def blocked_media_hits(self) -> int:
         """Сколько копий удалено по чёрному списку — о них бот не пишет в личку."""
         with self._lock:
@@ -26741,7 +26754,7 @@ def _mod_unblock_for_review(review_id: str, review: dict) -> int:
     return removed
 
 
-async def _mod_tell_admin_result(bot: Bot, query, text: str) -> None:
+async def _mod_tell_admin_result(bot: Bot, query, text: str, markup=None) -> None:
     """Итог подтверждения — отдельным сообщением: ответ на кнопку уже ушёл."""
     chat = getattr(getattr(query, 'message', None), 'chat_id', None)
     if chat is None:
@@ -26749,9 +26762,31 @@ async def _mod_tell_admin_result(bot: Bot, query, text: str) -> None:
     if chat is None:
         return
     try:
-        await bot.send_message(chat, '🛡 ' + text)
+        await bot.send_message(chat, '🛡 ' + text,
+                               **({'reply_markup': markup} if markup is not None else {}))
     except TelegramError:
         logger.info('Модерация: итог подтверждения не доставлен')
+
+
+def _mod_blocked_digest(entry_id: str) -> str:
+    return hashlib.sha256(str(entry_id).encode()).hexdigest()[:16]
+
+
+def _mod_unblock_button(entry_id: str, label: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(label, callback_data=f'mod:unblk:0:0:{_mod_blocked_digest(entry_id)}')
+
+
+def _mod_blocked_label(entry_id: str, row: dict) -> str:
+    """Человеческое описание записи чёрного списка для списка /modunblock."""
+    if row.get('sticker_set'):
+        what = f'набор стикеров «{row["sticker_set"]}»'
+    else:
+        human = MODERATION_RULES.get(row.get('category'), {}).get('human', row.get('category') or 'медиа')
+        what = f'медиа: {human}'
+    who = 'подтвердил админ' if row.get('source') == 'admin' else 'удалял бот'
+    when = datetime.fromtimestamp(float(row.get('at') or 0), timezone.utc).astimezone(
+        _admin_tz()).strftime('%d.%m %H:%M') if row.get('at') else '—'
+    return f'{what} · {who} · {when} · удалено копий: {int(row.get("hits") or 0)}'
 
 
 def _mod_message_stub(chat_id: int, user_id: int, message_id: int, *, name: str = '',
@@ -28166,10 +28201,28 @@ async def modunblock_command(update, context: ContextTypes.DEFAULT_TYPE):
     reply = getattr(update.message, 'reply_to_message', None)
     attachment = media_attachment(reply) if reply is not None else None
     if attachment is None:
-        await update.message.reply_text(
-            f'В чёрном списке медиа: {chat_moderation.blocked_media_count()}.\n'
-            'Чтобы убрать медиа, ответьте на сообщение с ним командой /modunblock. '
-            'Ещё проще — «❌ Ошибка» или «↩️ Снять» на отчёте об удалении.')
+        pack = ' '.join(context.args or []).strip()
+        if pack:
+            # /modunblock имя_набора — снять пак, не отправляя его стикер: стикер
+            # из заблокированного пака в чате удалится раньше, чем на него ответят.
+            removed = chat_moderation.unblock_media('', sticker_set=pack)
+            await update.message.reply_text(
+                f'Набор «{pack}» убран из чёрного списка.' if removed
+                else f'Набора «{pack}» в чёрном списке нет.')
+            return
+        entries = chat_moderation.blocked_media_entries(10)
+        if not entries:
+            await update.message.reply_text('Чёрный список медиа пуст.')
+            return
+        lines = [f'В чёрном списке медиа: {chat_moderation.blocked_media_count()}. Последние:']
+        buttons = []
+        for number, (entry_id, row) in enumerate(entries, 1):
+            lines.append(f'{number}. {_mod_blocked_label(entry_id, row)}')
+            buttons.append([_mod_unblock_button(entry_id, f'🗑 Убрать {number}')])
+        lines.append('\nЕщё способы: ответить /modunblock на медиа (можно переслать его '
+                     'боту в личку) или /modunblock имя_набора.')
+        await update.message.reply_text('\n'.join(lines),
+                                        reply_markup=InlineKeyboardMarkup(buttons))
         return
     scan = (await _moderation_media_scanner.check(context.bot, reply)
             if MODERATION_MEDIA_ENABLED else None)
@@ -28470,6 +28523,12 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer()
         return True
     reference_id = parts[4] if len(parts) == 5 else ''
+    if verb == 'unblk':
+        entry_id = chat_moderation.blocked_media_by_digest(reference_id) if chat_moderation else ''
+        removed = chat_moderation.unblock_media(entry_id) if entry_id else 0
+        await query.answer('Убрано из чёрного списка' if removed else 'Этой записи уже нет в списке')
+        await query.edit_message_reply_markup(reply_markup=None)
+        return True
     if verb in ('ok', 'wrong', 'pack'):
         if not reference_id or chat_moderation is None:
             await query.answer('У этого старого отчёта нет ID для оценки', show_alert=True)
@@ -28501,8 +28560,15 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             extra = await _mod_confirm_review(context.bot, chat_id, reference_id, review,
                                               whole_pack=verb == 'pack')
+        markup = None
+        target = review.get('media') if isinstance(review.get('media'), dict) else {}
+        if verb == 'pack' and target.get('sticker_set'):
+            # Пак целиком — решение крупное; ошибку исправить одним нажатием.
+            entry = chat_moderation.find_blocked_media(sticker_set=str(target['sticker_set']))
+            if entry:
+                markup = InlineKeyboardMarkup([[_mod_unblock_button(entry['id'], '↩️ Вернуть набор')]])
         if extra:
-            await _mod_tell_admin_result(context.bot, query, extra.strip())
+            await _mod_tell_admin_result(context.bot, query, extra.strip(), markup)
         return True
     incident_id = reference_id
     async with _moderation_action_lock:

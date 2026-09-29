@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "83afaa113b87723b53dc41cd8351c9dc26c796e8",
-  "generated_at_utc": "2026-09-29T09:40:18.598416+00:00",
+  "git_commit": "7be7cbd27fd29a63425ae697aa52f32e930b801b",
+  "generated_at_utc": "2026-09-29T15:25:07.242557+00:00",
   "files": {
     ".env.example": {
       "sha256": "1d45114ec32deffad57d13ba2928bab66cf9fc248bb0e9bcb2f959028479257a",
@@ -30,12 +30,12 @@
       "bytes": 18874
     },
     "anime_news_bot.py": {
-      "sha256": "3b2c7b841fbb4dd2b409c0afa9dfa3ae31d55a321c110bc7dad43411262248f8",
-      "bytes": 1649872
+      "sha256": "ed3e65e2dafa9bd9f74019474c2b429cd58e882395eb1260a133670a031c12b8",
+      "bytes": 1654043
     },
     "docs/chat-moderation.md": {
-      "sha256": "44a4022c60c5615c78931e3ff75a8392242500a497a0c605356361370aa93a80",
-      "bytes": 67060
+      "sha256": "fe989d5f154e94dee80b919b6d9c6e218be99bd4910bc5a8ca58bb1c672c5e9c",
+      "bytes": 68136
     },
     "docs/env-reference.md": {
       "sha256": "52d0f7f61501f485d17e3994dc7fc2df723dc8e613718ff9a8857e59cd8b9539",
@@ -474,8 +474,8 @@
       "bytes": 6731
     },
     "tests/test_moderation_media_blocklist.py": {
-      "sha256": "cb4cd4ef142583b25dc25b990b2592b8cc5775f0694ec7b36283ad2aa811d8d8",
-      "bytes": 37698
+      "sha256": "74b89fc7eac9f3d7e4af04aa650728da889efd5270b4d6d19cecbfa12b707dc0",
+      "bytes": 40381
     },
     "tests/test_moderation_media_pr60.py": {
       "sha256": "31877aee04d320827fac16bcfedbc1ecbac9bd185706bbf4255c235d972a24f8",

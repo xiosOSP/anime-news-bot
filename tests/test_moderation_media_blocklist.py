@@ -602,7 +602,7 @@ async def test_modunblock_command(chat, monkeypatch):
     assert 'записей: 1' in update.message.reply_text.await_args.args[0]
     update = command_update(None)
     await bot.modunblock_command(update, NS(bot=chat.tg, args=[]))
-    assert 'В чёрном списке медиа: 0' in update.message.reply_text.await_args.args[0]
+    assert update.message.reply_text.await_args.args[0] == 'Чёрный список медиа пуст.'
 
 
 def test_unblock_by_file_id_alone(tmp_path):
@@ -759,3 +759,53 @@ async def test_text_report_and_documents():
     assert tg.media_sent[-1] == ('send_document', 7, 'doc', None)  # у документа нет спойлера
     await bot._mod_send_report(tg, 7, 'x' * 1500, None, NS(document=NS(file_id='doc')), False)
     assert tg.media_sent[-1] == ('send_document', 7, 'doc', None)
+
+
+# ------------------------------------------- снять запись без стикера под рукой
+
+@pytest.mark.asyncio
+async def test_modunblock_lists_entries_with_remove_buttons(chat, monkeypatch):
+    monkeypatch.setattr(bot, 'is_admin', lambda update: True)
+    chat.store.block_media('p', -100, 'spoiler_16', [], (), 'admin', sticker_set='cute_pack')
+    chat.store.block_media('miss:abc', -100, 'nsfw', ['g1'], (), 'auto')
+    update = command_update(None)
+    await bot.modunblock_command(update, NS(bot=chat.tg, args=[]))
+    text = update.message.reply_text.await_args.args[0]
+    markup = update.message.reply_text.await_args.kwargs['reply_markup']
+    assert '1. медиа: контент 18+ · удалял бот' in text
+    assert '2. набор стикеров «cute_pack» · подтвердил админ' in text
+    data = [row[0].callback_data for row in markup.inline_keyboard]
+    assert all(len(d) <= 64 for d in data)
+    # Кнопка первой записи снимает именно её (id с двоеточием), пак остаётся.
+    await press(chat, data[0])
+    assert not chat.store.find_blocked_media('g1')
+    assert chat.store.find_blocked_media(sticker_set='cute_pack')['id'] == 'p'
+    await press(chat, data[1])
+    assert chat.store.blocked_media_count() == 0
+    query = await press(chat, data[0])
+    assert query.answer.await_args.args[0] == 'Этой записи уже нет в списке'
+
+
+@pytest.mark.asyncio
+async def test_modunblock_by_pack_name(chat, monkeypatch):
+    monkeypatch.setattr(bot, 'is_admin', lambda update: True)
+    chat.store.block_media('p', -100, 'spoiler_16', [], (), 'admin', sticker_set='cute_pack')
+    update = command_update(None)
+    await bot.modunblock_command(update, NS(bot=chat.tg, args=['cute_pack']))
+    assert 'убран' in update.message.reply_text.await_args.args[0]
+    assert chat.store.blocked_media_count() == 0
+    await bot.modunblock_command(update, NS(bot=chat.tg, args=['cute_pack']))
+    assert 'нет' in update.message.reply_text.await_args.args[0]
+    await bot.modunblock_command(update, NS(bot=chat.tg, args=[]))
+    assert update.message.reply_text.await_args.args[0] == 'Чёрный список медиа пуст.'
+
+
+@pytest.mark.asyncio
+async def test_pack_block_comes_with_an_undo_button(chat):
+    chat.scanner.return_value = borderline(hashes=())
+    await send(chat, sticker(1, 51, 's1'))
+    await press(chat, buttons(chat, 'mod:pack:')[0])
+    undo = [b for b in buttons(chat, 'mod:unblk:')]
+    assert len(undo) == 1
+    await press(chat, undo[0])
+    assert not chat.store.find_blocked_media(sticker_set='lewd_pack')
