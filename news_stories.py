@@ -160,6 +160,9 @@ _STORY_MARKER_CANON = {
     'teasers': 'teaser', 'visuals': 'visual', 'posters': 'poster', 'seasons': 'season',
     'episodes': 'episode', 'movies': 'movie', 'film': 'movie', 'films': 'movie',
     'games': 'game', 'novels': 'novel', 'adaptations': 'adaptation',
+    # PV — это японское название трейлера: «Season 3 PV» и «Season 3 Trailer»
+    # одна новость, а не два разных события.
+    'pv': 'trailer', 'pvs': 'trailer', 'пв': 'trailer',
     'отложен': 'перенос', 'отложена': 'перенос', 'перенесли': 'перенос',
     'отменён': 'отменен', 'отменили': 'отменен',
 }
@@ -274,9 +277,21 @@ def _ordinal_numbers(title: str) -> set[str]:
     return out
 
 
+_ROMAN_VALUES = {'II': '2', 'III': '3', 'IV': '4', 'VI': '6', 'VII': '7', 'VIII': '8', 'IX': '9'}
+# «Mob Psycho 100 III» и «Mob Psycho 100 II» — разные сезоны, а число в них
+# одно и то же (100): римскую цифру раньше никто не читал, и обе новости
+# склеивались в одну. Одиночные I, V, X не берём: «X» — это и «Hunter x
+# Hunter», и «Final Fantasy X», а «I» — местоимение.
+_ROMAN_NUMBER = re.compile(r'(?<![\w-])(II|III|IV|VI|VII|VIII|IX)(?![\w-])')
+_ORDINAL_SUFFIX = re.compile(r'(?<!\w)(\d{1,2})(?:st|nd|rd|th)(?!\w)', re.IGNORECASE)
+
+
 @lru_cache(maxsize=4096)
 def _story_numbers_cached(title: str) -> frozenset:
-    return frozenset(re.findall(r'(?<!\w)\d{1,4}(?!\w)', title)) | frozenset(_ordinal_numbers(title))
+    return (frozenset(re.findall(r'(?<!\w)\d{1,4}(?!\w)', title))
+            | frozenset(_ordinal_numbers(title))
+            | frozenset(_ORDINAL_SUFFIX.findall(title))
+            | frozenset(_ROMAN_VALUES[m] for m in _ROMAN_NUMBER.findall(title)))
 
 
 def _story_numbers(news_or_title) -> set[str]:

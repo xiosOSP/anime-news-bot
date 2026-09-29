@@ -13,6 +13,8 @@ import pytest
 import anime_news_bot as bot
 
 NOISE = [
+    ('Реклама. Подписывайтесь на наш канал erid: 2VtzqvXYZ', 'реклама'),
+    ('Розыгрыш призов от партнёра', 'реклама'),
     ('10 Best Anime of 2026 You Must Watch', 'подборка'),
     ('Top 10 Isekai Series, Ranked', 'подборка'),
     ('Every Studio Ghibli Film, Ranked', 'подборка'),

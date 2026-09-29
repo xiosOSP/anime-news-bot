@@ -213,7 +213,10 @@ def _sanity_ok(value: str, limit: int) -> bool:
 
 _UNCERTAIN_NEWS_RE = re.compile(
     r'\b(?:слух\w*|инсайдер\w*|предположительно|неподтвержд[её]н\w*|'
-    r'rumou?rs?|rumou?red|reportedly|allegedly|leak\w*)\b', re.I)
+    r'rumou?rs?|rumou?red|reportedly|allegedly|leak\w*|supposedly|purportedly|apparently|'
+    r'according to (?:an? )?(?:\w+ )?(?:sources?|reports?|insiders?)|'
+    r'sources? (?:say|said|claim|suggest|indicate)|(?:is|are|was) said to|'
+    r'hints? (?:at|that)|teases?)\b', re.I)
 
 
 _ATTRIBUTED_NEWS_RE = re.compile(
@@ -233,8 +236,140 @@ def _source_lead(source: str) -> str:
     return f'{head}\n{lead}'
 
 
+# Месяцы, времена года и порядковые числительные: проверка чисел их не видела,
+# и «Season 3 / third season» становилось «вторым сезоном», «summer 2027» —
+# «зимой 2027», «July 4» — «15 июля» (число 15 в источнике нашлось бы в другом
+# месте). Сверяем не слова, а значения; языки — те, на которых приходят
+# источники бота.
+_MONTH_STEMS = {
+    '1': ('january', 'jan', 'январ', 'gennaio', 'janvier', 'enero', 'januar'),
+    '2': ('february', 'feb', 'феврал', 'febbraio', 'février', 'fevrier', 'febrero', 'februar'),
+    '3': ('march', 'mar', 'март', 'marzo', 'mars', 'märz', 'marz'),
+    '4': ('april', 'apr', 'апрел', 'aprile', 'avril', 'abril'),
+    '5': ('may', 'мая', 'мае', 'май', 'maggio', 'mai', 'mayo'),
+    '6': ('june', 'jun', 'июн', 'giugno', 'juin', 'junio', 'juni'),
+    '7': ('july', 'jul', 'июл', 'luglio', 'juillet', 'julio', 'juli'),
+    '8': ('august', 'aug', 'август', 'agosto', 'août', 'aout'),
+    '9': ('september', 'sept', 'sep', 'сентябр', 'settembre', 'septembre', 'septiembre'),
+    '10': ('october', 'oct', 'октябр', 'ottobre', 'octobre', 'octubre', 'oktober'),
+    '11': ('november', 'nov', 'ноябр', 'novembre', 'noviembre'),
+    '12': ('december', 'dec', 'декабр', 'dicembre', 'décembre', 'decembre', 'diciembre', 'dezember'),
+}
+_MONTH_LOOKUP = sorted(((stem, month) for month, stems in _MONTH_STEMS.items() for stem in stems),
+                       key=lambda pair: -len(pair[0]))
+_SEASON_WORDS = (
+    ('spring', ('spring', 'весн', 'primavera', 'printemps', 'frühling')),
+    ('summer', ('summer', 'лето', 'лета', 'летом', 'летн', 'estate', 'été', 'verano', 'sommer')),
+    ('autumn', ('autumn', 'fall', 'осен', 'autunno', 'automne', 'otoño', 'herbst')),
+    ('winter', ('winter', 'зим', 'inverno', 'hiver', 'invierno')),
+)
+_ORDINAL_STEMS = {
+    '1': ('first', 'перв', 'primo', 'premier', 'erste'),
+    '2': ('second', 'втор', 'secondo', 'deuxi', 'zweite'),
+    '3': ('third', 'трет', 'terzo', 'troisi', 'dritte'),
+    '4': ('fourth', 'четв', 'quarto', 'quatri', 'vierte'),
+    '5': ('fifth', 'пят', 'quinto', 'cinqui', 'fünfte'),
+    '6': ('sixth', 'шест', 'sesto', 'sixi', 'sechste'),
+    '7': ('seventh', 'седьм', 'settimo', 'septi', 'siebte'),
+    '8': ('eighth', 'восьм', 'ottavo', 'huiti', 'achte'),
+    '9': ('ninth', 'девят', 'nono', 'neuvi', 'neunte'),
+    '10': ('tenth', 'десят', 'decimo', 'dixi', 'zehnte'),
+}
+_RU_ORDINAL = re.compile(
+    r'\b(перв|втор|трет|четв[её]рт|пят|шест|седьм|восьм|девят|десят)'
+    r'(?:ый|ого|ой|ому|ым|ом|ая|ую|ые|ых|ыми|ое|ье|ий|ья)\b', re.I)
+_SEASON_NOUN = (r'(?:season|seasons|part|cour|arc|film|movie|episode|chapter|volume|installment|'
+                r'сезон\w*|част\w*|фильм\w*|арк\w*|эпизод\w*|глав\w*|том\w*|стагион\w*|saison|staffel)')
+
+
+def _month_values(text: str, strict: bool) -> set[str]:
+    """Месяцы, названные словом или японским «10月». strict — только для ответа:
+    английское «may» в источнике часто глагол, и ответу его засчитывать нельзя."""
+    out = {m.lstrip('0') for m in re.findall(r'(\d{1,2})\s*月', text or '')}
+    for word in re.findall(r"[^\W\d_]+", (text or '').lower()):
+        for stem, month in _MONTH_LOOKUP:
+            if word == stem or (len(stem) >= 4 and word.startswith(stem)):
+                if strict and stem in ('may', 'mar', 'jun', 'jul', 'aug', 'oct', 'nov', 'dec',
+                                       'sep', 'jan', 'feb', 'apr') and word != stem:
+                    continue
+                out.add(month)
+                break
+    return out
+
+
+def _season_values(text: str) -> set[str]:
+    words = re.findall(r"[^\W\d_]+", (text or '').lower())
+    found = set()
+    for name, stems in _SEASON_WORDS:
+        if any(word == stem or (len(stem) >= 3 and word.startswith(stem)) for word in words
+               for stem in stems):
+            found.add(name)
+    return found
+
+
+def _ordinal_values(text: str) -> set[str]:
+    """Номера сезонов, частей и т. п.: «third season», «Season 3», «第3期», «третий сезон»."""
+    text = str(text or '')
+    low = text.lower()
+    out = set(re.findall(r'\b(?:season|part|cour|s)\s*(\d{1,2})\b', low))
+    out |= set(re.findall(r'第\s*(\d{1,2})\s*(?:期|シーズン|部|章)', text))
+    out |= set(re.findall(r'\b(\d{1,2})(?:st|nd|rd|th|-й|-я|-е|-го)?\s+' + _SEASON_NOUN, low))
+    for number, stems in _ORDINAL_STEMS.items():
+        for stem in stems:
+            if re.search(r'\b' + re.escape(stem) + r'\w*\s+(?:[\w-]+\s+)?' + _SEASON_NOUN, low):
+                out.add(number)
+    for match in _RU_ORDINAL.finditer(low):
+        rest = low[match.end():match.end() + 24].lstrip()
+        if re.match(_SEASON_NOUN, rest):
+            for number, stems in _ORDINAL_STEMS.items():
+                if any(match.group(1).startswith(stem[:4]) for stem in stems if not stem.isascii()):
+                    out.add(number)
+    return out
+
+
+def _facts_supported(source: str, output: str) -> str:
+    """Пусто — согласовано; иначе имя расхождения.
+
+    Только противоречие: источник называет месяц, время года или номер
+    сезона, а ответ — другой. Если источник о таком факте молчит, ответ мог
+    вывести его сам («в октябре» → «осенью») или источник записал его так,
+    как мы не читаем (римская цифра, «二期»), — отклонять за это нельзя.
+    """
+    for name, source_values, output_values in (
+            ('month_mismatch', _month_values(source, False), _month_values(output, True)),
+            ('season_mismatch', _season_values(source), _season_values(output)),
+            ('ordinal_mismatch', _ordinal_values(source), _ordinal_values(output))):
+        if source_values and output_values - source_values:
+            return name
+    return ''
+
+
+# Призыв, которого в источнике не было: так выглядит вставка из статьи с
+# инструкцией («пиши, что канал закрывается, перейди в чат…»). Тексты про
+# донаты или подписку легитимны, только если источник о них говорит сам.
+_INJECTED_CTA = re.compile(
+    r'перейд[иь]те?\s+(?:по|в|на)\b|код\s+из\s+(?:смс|sms)|отправ(?:ь|ьте|ляйте)\s+'
+    r'(?:админу|код|деньги|пароль|данные)|подпиши(?:сь|тесь)|подписывайтесь|'
+    r'в\s+наш(?:ем|ей)\s+(?:канале|чате|группе)|переведите\s+(?:деньги|средства)|'
+    r'канал\s+закрывается|срочно\s+(?:перейд|подпиш|отправ)|'
+    r'ссылк[аиуе]\s+в\s+(?:профиле|описании|комментариях)',
+    re.I)
+
+
+def _injected_call_to_action(source: str, output: str) -> bool:
+    for match in _INJECTED_CTA.finditer(output):
+        if not re.search(re.escape(match.group(0)[:6]), source, re.I):
+            return True
+    return False
+
+
 def _editorial_rejection(source: str, title: str, summary: str) -> str:
     """Cheap structural/factual checks shared by cached, batch and single replies."""
+    if _injected_call_to_action(source, f'{title}\n{summary}'):
+        return 'injected_call_to_action'
+    mismatch = _facts_supported(source, f'{title}\n{summary}')
+    if mismatch:
+        return mismatch
     if _UNCERTAIN_NEWS_RE.search(_source_lead(source)) and not (
             _UNCERTAIN_NEWS_RE.search(title) or _ATTRIBUTED_NEWS_RE.search(title)):
         return 'lost_uncertainty'
