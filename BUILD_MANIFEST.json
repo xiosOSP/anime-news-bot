@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "66e94c0d71ee71e4f024538dc46a30e48c50ce00",
-  "generated_at_utc": "2026-10-02T21:18:20.455396+00:00",
+  "git_commit": "9d3417327a9caf659ae0dfa9b2732710da79bcdc",
+  "generated_at_utc": "2026-10-02T21:23:46.973138+00:00",
   "files": {
     ".env.example": {
       "sha256": "1d45114ec32deffad57d13ba2928bab66cf9fc248bb0e9bcb2f959028479257a",
@@ -26,12 +26,12 @@
       "bytes": 33
     },
     "README.md": {
-      "sha256": "f5cd9ed8acb214bf7ff19d6c627952aa99cff75995c8cee58c52f34bfbab69cd",
-      "bytes": 20980
+      "sha256": "32fd865c657e99932d46c91d925fa830cc9dbfe2cab27a99b6a84594443aa839",
+      "bytes": 22158
     },
     "anime_news_bot.py": {
-      "sha256": "4f830cbc018b2d3977f32f38fc8101f3e4789d7fd8b27ddf4c957f269352e733",
-      "bytes": 1702815
+      "sha256": "2f42632193d6c5a8a45496ccf91bfbbea5472d991371ce8260c6c8781ebc87df",
+      "bytes": 1710120
     },
     "constraints.txt": {
       "sha256": "fe5e29d7db2182e0e5926013f81a450ef7a2a948cecc36d23765b2154f176212",
@@ -42,8 +42,8 @@
       "bytes": 70452
     },
     "docs/env-reference.md": {
-      "sha256": "8347cd9ab0ec77daee0fcf03d132237d436744e10fe34f5b634743201569df82",
-      "bytes": 20804
+      "sha256": "be807cd19718940f81cc270c4db6a02959960e635e6910bc0c20c42f7cfcfc07",
+      "bytes": 21079
     },
     "docs/llm-providers.md": {
       "sha256": "7c213406ffcb83385b71f07a2b34296df4cc8d1ba78215fd55f92d9532923c95",
@@ -592,6 +592,10 @@
     "tests/test_operations_governance_stage6.py": {
       "sha256": "b344b503343fca86267fa7f90521f549c7e0c5a7ce9096328f7ab7f6c7993fc2",
       "bytes": 6351
+    },
+    "tests/test_ops_alerts.py": {
+      "sha256": "1d20cb91f9a5f419b8ebbe595df94f0c0291ffa74c519d38eb17ef73b165aae9",
+      "bytes": 9458
     },
     "tests/test_optimizations.py": {
       "sha256": "ad706d593d629f0350113b5ffb02b2b6a6a76e5157ff34528dde2f56db27d375",

@@ -362,20 +362,36 @@ def _atomic_write_json(path: Path, data, *, indent: Optional[int] = None) -> Non
     целая версия.
     """
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f'.{path.name}.', suffix='.tmp', dir=str(path.parent))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=f'.{path.name}.', suffix='.tmp', dir=str(path.parent))
+    except Exception as e:
+        _note_write_failure(path, e)
+        raise
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=indent)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_name, path)
-    except Exception:
+    except Exception as e:
+        _note_write_failure(path, e)
         try:
             os.unlink(tmp_name)
         except OSError:
             pass
         raise
+
+
+# Сбои записи на диск: каждое хранилище пишет об отказе только в лог, и
+# «диск заполнен» выглядел как десятки разрозненных строк. Сторож (ops_watch_job)
+# считает их вместе и пишет владельцу один раз.
+_disk_write_failures: deque = deque(maxlen=200)
+
+
+def _note_write_failure(path: Path, error: BaseException) -> None:
+    _disk_write_failures.append((time.monotonic(), Path(path).name,
+                                 f'{type(error).__name__}: {error}'[:160]))
 
 
 def _sweep_orphan_temp_files(directory: Path, *, max_age_sec: int = 3600) -> int:
@@ -4504,6 +4520,11 @@ class PostQueue:
                 self._items = old_items
                 return 0
             return added
+
+    def oldest(self) -> Optional[dict]:
+        """Запись в голове очереди (или отправляемая сейчас) — для сторожа."""
+        head = self._inflight or (self._items[0] if self._items else None)
+        return dict(head) if isinstance(head, dict) else None
 
     async def pop_next(self) -> Optional[dict]:
         """Достаёт следующий пост из очереди (FIFO). Возвращает news dict или None.
@@ -24958,6 +24979,95 @@ def _silence_hours() -> Optional[float]:
     return (datetime.now(timezone.utc) - last).total_seconds() / 3600
 
 
+# Сторож эксплуатации: признаки поломки, которые раньше видны были только в
+# логах или в /health, куда смотрят, когда уже что-то заметили. Порог 0 —
+# сигнал выключен. Каждый сигнал приходит один раз и повторяется не чаще
+# OPS_ALERT_REPEAT_HOURS, пока не пройдёт; прошёл — снова «взведён».
+OPS_QUEUE_STALE_HOURS = max(0, min(72, _env_int('OPS_QUEUE_STALE_HOURS', 6)))
+OPS_WRITE_FAILURES = max(0, min(100, _env_int('OPS_WRITE_FAILURES', 3)))
+OPS_WRITE_FAILURES_WINDOW_SEC = 900
+OPS_UNCERTAIN_GROWTH = max(0, min(100, _env_int('OPS_UNCERTAIN_GROWTH', 3)))
+OPS_UNCHECKED_MEDIA_PER_HOUR = max(0, min(1000, _env_int('OPS_UNCHECKED_MEDIA_PER_HOUR', 15)))
+OPS_ALERT_REPEAT_HOURS = max(1, min(72, _env_int('OPS_ALERT_REPEAT_HOURS', 6)))
+_ops_alerted: dict = {}
+_ops_uncertain_samples: deque = deque(maxlen=400)
+
+
+def _ops_uncertain_total() -> int:
+    return sum(store.uncertain_count() for store in (sent_links, pending_posts, scheduled_posts)
+               if store is not None and hasattr(store, 'uncertain_count'))
+
+
+def _ops_signals(now: Optional[float] = None) -> dict:
+    """Действующие сигналы: ключ → текст письма. Пусто — всё в порядке."""
+    now = time.monotonic() if now is None else now
+    found = {}
+    # Очередь стоит: голова ждёт давно, а публикаций нет уже два интервала.
+    if (OPS_QUEUE_STALE_HOURS and post_queue is not None and settings is not None
+            and settings.auto_enabled and not settings.thread_mode):
+        head = post_queue.oldest()
+        try:
+            queued = datetime.fromisoformat(str((head or {}).get('queued_at') or ''))
+        except ValueError:
+            queued = None
+        if queued is not None:
+            if queued.tzinfo is None:
+                queued = queued.replace(tzinfo=timezone.utc)
+            waited = (datetime.now(timezone.utc) - queued).total_seconds() / 3600
+            silent = _silence_hours()
+            stuck = silent is None or silent * 3600 >= 2 * settings.check_interval_sec
+            if waited >= OPS_QUEUE_STALE_HOURS and stuck:
+                title = str((head.get('news') or {}).get('title') or '')[:80]
+                since = f'{silent:.0f} ч назад' if silent is not None else 'ещё не было'
+                found['queue_stale'] = (
+                    f'⏳ Очередь стоит: первый пост ждёт {waited:.0f} ч («{title}»), '
+                    f'последняя публикация — {since}. Постов в очереди: '
+                    f'{len(getattr(post_queue, "_items", []))}. Причина обычно в /health '
+                    '(отправка, модель, хранилище).')
+    if OPS_WRITE_FAILURES:
+        recent = [row for row in _disk_write_failures if now - row[0] <= OPS_WRITE_FAILURES_WINDOW_SEC]
+        if len(recent) >= OPS_WRITE_FAILURES:
+            files = ', '.join(sorted({row[1] for row in recent}))[:200]
+            found['disk_writes'] = (
+                f'💾 Запись на диск не проходит: {len(recent)} сбоев за '
+                f'{OPS_WRITE_FAILURES_WINDOW_SEC // 60} мин ({files}). Последний: '
+                f'{recent[-1][2]}. Изменения действуют до перезапуска и потом пропадут — '
+                'проверьте место и права на DATA_DIR.')
+    if OPS_UNCERTAIN_GROWTH:
+        total = _ops_uncertain_total()
+        _ops_uncertain_samples.append((now, total))
+        base = min((value for at, value in _ops_uncertain_samples if now - at <= 86400),
+                   default=total)
+        if total - base >= OPS_UNCERTAIN_GROWTH:
+            found['uncertain'] = (
+                f'❓ За сутки прибавилось {total - base} публикаций с неизвестным '
+                f'результатом (всего {total}). Telegram не подтверждает отправку — '
+                'проверьте канал и /health; автоповтор их не трогает.')
+    if OPS_UNCHECKED_MEDIA_PER_HOUR:
+        hour = sum(1 for at in _moderation_unchecked_times if now - at <= 3600)
+        if hour >= OPS_UNCHECKED_MEDIA_PER_HOUR:
+            found['unchecked_media'] = (
+                f'🖼 За час {hour} медиа в чате остались непроверенными: детектор, '
+                'похоже, не справляется или лёг. Картинки и гифки сейчас проходят без '
+                'проверки — смотрите /modlog и /logs.')
+    return found
+
+
+async def ops_watch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    now = time.monotonic()
+    signals = _ops_signals(now)
+    for key in list(_ops_alerted):
+        if key not in signals:
+            _ops_alerted.pop(key, None)          # прошло — снова взведён
+    for key, text in signals.items():
+        last = _ops_alerted.get(key)
+        if last is not None and now - last < OPS_ALERT_REPEAT_HOURS * 3600:
+            continue
+        metrics.inc('anime_bot_ops_alerts_total', labels={'signal': key})
+        if await notify_admin(context.bot, text):
+            _ops_alerted[key] = now
+
+
 async def _check_silence(bot: Bot) -> None:
     """Сторож: если бот давно ничего не опубликовал, значит что-то тихо сломалось.
     Ровно этот сценарий повторялся раньше — отложка, видео и картинки отваливались
@@ -27148,6 +27258,11 @@ def _mod_member_permissions(member) -> dict:
             for name in ChatPermissions.no_permissions().to_dict()}
 
 
+# Когда медиа осталось непроверенным — для сторожа: одно такое — пустяк, серия
+# значит, что детектор лёг, и чат остался без проверки картинок.
+_moderation_unchecked_times: deque = deque(maxlen=2000)
+
+
 async def _mod_media_unchecked(bot: Bot, message, reason: str, *, notify: bool = True) -> None:
     """Queue technical media failures for review without flooding admin DMs.
 
@@ -27164,6 +27279,7 @@ async def _mod_media_unchecked(bot: Bot, message, reason: str, *, notify: bool =
                                     'media', 'не проверено', 'локальный детектор', reason,
                                     _mod_message_text(message))
     metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'media_unchecked'})
+    _moderation_unchecked_times.append(time.monotonic())
     if not notify or MODERATION_MEDIA_NOTICE_SEC <= 0:
         return
 
@@ -30699,6 +30815,12 @@ async def setup_bot_commands(app: Application) -> None:
     # Readiness не должен навсегда хранить результат единственной проверки на старте.
     app.job_queue.run_repeating(
         health_probe_job, interval=300, first=300, name='health_probe',
+        job_kwargs=JOB_KWARGS,
+    )
+    # Сторож эксплуатации: очередь стоит, диск не пишет, неизвестные отправки,
+    # непроверенные медиа.
+    app.job_queue.run_repeating(
+        ops_watch_job, interval=600, first=180, name='ops_watch',
         job_kwargs=JOB_KWARGS,
     )
     # «Серии дня»: раз в 10 минут проверяем, не пора ли; публикуем раз в сутки.
