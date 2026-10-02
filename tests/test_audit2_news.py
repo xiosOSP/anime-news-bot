@@ -189,7 +189,12 @@ def test_angle_brackets_cannot_break_out_of_the_prompt_markup():
 # --------------------------------------------- здоровье источников
 
 def rss(*links, old=False):
-    date = 'Mon, 01 Jan 2001 00:00:00 GMT' if old else 'Mon, 29 Sep 2026 10:00:00 GMT'
+    # Свежая дата — от текущего момента: прописанная руками через пару дней
+    # сама становилась «старой», и тест падал без единой правки кода.
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+    date = ('Mon, 01 Jan 2001 00:00:00 GMT' if old else
+            format_datetime(datetime.now(timezone.utc) - timedelta(hours=1), usegmt=True))
     items = ''.join(f'<item><title>T {i}</title><link>{link}</link><pubDate>{date}</pubDate>'
                     f'</item>' for i, link in enumerate(links))
     return f'<?xml version="1.0"?><rss version="2.0"><channel><title>x</title>{items}</channel></rss>'

@@ -205,7 +205,9 @@ def test_prepare_video_records_probe_and_normalized_path(monkeypatch, tmp_path):
     dst = tmp_path / 'download.telegram.mp4'; dst.write_bytes(b'y')
     monkeypatch.setattr(bot, 'settings', MagicMock(video_enabled=True))
     monkeypatch.setattr(bot, 'YT_DLP_AVAILABLE', True)
-    monkeypatch.setattr(bot, 'download_video', lambda *_: src)
+    async def fake_download(*_a):
+        return src
+    monkeypatch.setattr(bot, '_download_video_bounded', fake_download)
     monkeypatch.setattr(bot, '_probe_video_file', lambda p: {
         'container': p.suffix, 'video_codec': 'h264', 'audio_codec': 'aac',
         'width': 640, 'height': 360, 'pix_fmt': 'yuv420p', 'duration': 2.0,

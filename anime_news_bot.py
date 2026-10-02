@@ -7,7 +7,6 @@
 import asyncio
 import base64
 import hashlib
-import uuid
 import hmac
 import html
 import ipaddress
@@ -113,6 +112,7 @@ from news_stories import (
     _story_update_anchor,
     normalize_title,
 )
+import video_download
 from moderation_media import (MediaScanner, ensure_rating_models, hashes_match,
                               media_attachment, media_confidence,
                               parse_hashes,
@@ -324,7 +324,7 @@ def _bounded_bytes_cache_put(cache: dict, key, value, max_items: int, max_bytes:
     cache[key] = value
 
 
-def _quarantine_unreadable_file(path: Path, reason: str, what: str) -> str:
+def _quarantine_unreadable_file(path: Path, reason: str, what: str, *, alert: bool = True) -> str:
     """Битый JSON — в сторону и предупреждение владельцу, а не молча затереть.
 
     Раньше оборванный файл превращался в пустое состояние, а следующая запись
@@ -340,6 +340,8 @@ def _quarantine_unreadable_file(path: Path, reason: str, what: str) -> str:
     except OSError:
         name = ''
     logger.error(f'{what}: файл не прочитан ({reason}); копия: {name or "нет"}')
+    if not alert:
+        return name
     try:
         _queue_admin_alert(
             f'⚠️ {what}: файл {path.name} повреждён и не прочитан ({str(reason)[:120]}). '
@@ -3797,7 +3799,72 @@ class SentLinksStore:
         # commit() уже после успешной отправки. Теперь чтение ничего не меняет,
         # а изменения и снимок для записи идут под этим замком.
         self._state_lock = threading.RLock()
+        # Битый файл истории без копии — это повторная публикация всего, что
+        # уже выходило. Тогда автопубликация стоит до решения владельца.
+        self.history_lost = False
+        self.restored_from = ''
+        self._lastgood_at = 0.0
         self._load()
+        if (self.path.exists() and not self.history_lost
+                and not getattr(self, '_read_failed', False)):
+            self._snapshot_lastgood()
+
+    # Проверенная копия истории: снимается после успешного чтения и не чаще
+    # раза в час после записи. Ежедневный бэкап уходит в личку админу, а не
+    # лежит на диске, поэтому восстановиться автоматически было не из чего.
+    LASTGOOD_EVERY_SEC = 3600
+
+    def accept_lost_history(self) -> bool:
+        """Владелец решил продолжить с тем, что есть: пауза снимается."""
+        with self._state_lock:
+            self.history_lost = False
+        return self._save()
+
+    def _lastgood_path(self) -> Path:
+        return self.path.with_name(self.path.name + '.lastgood')
+
+    def _snapshot_lastgood(self) -> None:
+        target = self._lastgood_path()
+        tmp = target.with_name(target.name + '.tmp')
+        try:
+            shutil.copyfile(self.path, tmp)
+            os.replace(tmp, target)
+            self._lastgood_at = time.time()
+        except OSError as e:
+            logger.warning(f'Копия истории публикаций не обновлена: {e}')
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+
+    def _recover_from_lastgood(self, reason: str) -> None:
+        """Основной файл не читается: поднимаем проверенную копию или встаём на паузу."""
+        _quarantine_unreadable_file(self.path, reason, 'История публикаций', alert=False)
+        lastgood = self._lastgood_path()
+        if lastgood.exists():
+            try:
+                taken = datetime.fromtimestamp(lastgood.stat().st_mtime).strftime('%d.%m %H:%M')
+                shutil.copyfile(lastgood, self.path)
+                self._load(restoring=True)
+            except OSError as e:
+                logger.error(f'Копия истории не поднялась: {e}')
+            else:
+                if not self.history_lost:
+                    self.restored_from = taken
+                    logger.warning(f'История публикаций восстановлена из копии от {taken}')
+                    _queue_admin_alert(
+                        f'⚠️ История публикаций: файл {self.path.name} был повреждён '
+                        f'({str(reason)[:100]}). '
+                        f'Восстановлена проверенная копия от {taken}: новости, вышедшие '
+                        'после неё, могут повториться — остальные защиты от повторов '
+                        '(картинки, тексты) работают. Битый файл сохранён рядом.')
+                    return
+        self.history_lost = True
+        _queue_admin_alert(
+            f'⛔ История публикаций: файл {self.path.name} повреждён, проверенной копии '
+            'нет. Автопубликация '
+            'ПРИОСТАНОВЛЕНА: с пустой историей бот выложил бы заново уже вышедшие '
+            'новости. Варианты: вернуть файл sent_links.json из бэкапа и перезапустить '
+            'бота или отправить /historyok — продолжить с пустой историей (возможны '
+            'повторы). Битый файл сохранён рядом.')
 
     @contextlib.asynccontextmanager
     async def _locked(self):
@@ -3806,7 +3873,7 @@ class SentLinksStore:
             with self._state_lock:
                 yield
 
-    def _load(self) -> None:
+    def _load(self, restoring: bool = False) -> None:
         if not self.path.exists():
             return
         dropped_claims: list[tuple[str, str]] = []
@@ -3821,6 +3888,7 @@ class SentLinksStore:
                 return
             if not isinstance(data, dict):
                 return
+            self.history_lost = bool(data.get('history_lost'))
             self._urls = list(dict.fromkeys(
                 normalize_url(str(u)) for u in data.get('urls', []) if u))
             self._url_set = set(self._urls)
@@ -3870,7 +3938,13 @@ class SentLinksStore:
             if self._purge_transient_unlocked() or dropped_claims:
                 self._save()
         except json.JSONDecodeError as e:
-            _quarantine_unreadable_file(self.path, f'{type(e).__name__}: {e}', 'История публикаций')
+            if restoring:
+                # Испорчена и копия: второй раз не восстанавливаем, встаём на паузу.
+                _quarantine_unreadable_file(self.path, f'{type(e).__name__}: {e}',
+                                            'Копия истории публикаций', alert=False)
+                self.history_lost = True
+                return
+            self._recover_from_lastgood(f'{type(e).__name__}: {e}')
         except OSError as e:
             # Файл есть, но прочесть его не вышло (права, сбой диска): затирать
             # его пустой историей нельзя — запись отключена до перезапуска.
@@ -3896,8 +3970,15 @@ class SentLinksStore:
                 'reservations': {k: dict(v) for k, v in self._reservations.items()},
                 'rejected': {k: dict(v) for k, v in self._rejected.items()},
             }
+            if self.history_lost:
+                # Пауза переживает рестарт: иначе пустая, но уже читаемая
+                # история молча снимала бы её при следующем запуске.
+                snapshot['history_lost'] = True
         try:
             _atomic_write_json(self.path, snapshot)
+            if (not self.history_lost
+                    and time.time() - self._lastgood_at >= self.LASTGOOD_EVERY_SEC):
+                self._snapshot_lastgood()
             return True
         except Exception as e:
             # Не только OSError: любое исключение отсюда вылетало из commit()
@@ -9917,84 +9998,69 @@ def _video_thumbnail_kwargs(video_file: Optional[Path]) -> dict:
     return {'thumbnail': data} if data else {}
 
 def download_video(url: str, note: Optional[list] = None) -> Optional[Path]:
-    """Скачивает видео через yt-dlp с лимитами по длине и размеру.
-    Возвращает путь к файлу или None.
+    """Скачивает видео через yt-dlp в этом же процессе (блокирующе).
 
+    Для публикации — только _download_video_bounded: там отдельный процесс с
+    общим сроком. Эта версия осталась для разовых проверок и тестов логики.
     В note (если передан) кладём причину провала: без неё «видео не пришло»
     выглядит одинаково и когда yt-dlp не установлен, и когда ролик слишком
-    большой, и когда хостинг закрыл доступ.
-    Эту функцию нужно вызывать через asyncio.to_thread, она блокирующая."""
-    def say(reason: str):
-        if note is not None:
-            note.append(reason)
-        return None
-
+    большой, и когда хостинг закрыл доступ."""
     if not YT_DLP_AVAILABLE:
         logger.warning("yt-dlp не установлен — видео с внешних хостингов недоступны")
-        return say('yt-dlp не установлен')
+        if note is not None:
+            note.append('yt-dlp не установлен')
+        return None
+    path, reason = video_download.download(
+        url, VIDEO_DOWNLOAD_DIR, video_download.file_stem(url), fmt=VIDEO_FORMAT,
+        max_mb=VIDEO_MAX_FILE_SIZE_MB, max_duration=VIDEO_MAX_DURATION_SEC,
+        extensions=DIRECT_VIDEO_EXTENSIONS, ydl_module=yt_dlp)
+    return _video_download_result(url, path, reason, note)
 
-    # Имя файла: читаемый хвост URL + случайный суффикс на КАЖДУЮ загрузку.
-    # Раньше имя было последними 80 символами URL: у двух длинных ссылок с
-    # одинаковым концом файл общий, а публикация и диагностика одной и той же
-    # ссылки одновременно читали и удаляли один и тот же путь.
-    tail = re.sub(r'[^\w\-]', '_', url)[-60:]
-    safe_name = f'{tail}_{uuid.uuid4().hex[:10]}'
-    output_template = str(VIDEO_DOWNLOAD_DIR / f'{safe_name}.%(ext)s')
 
-    ydl_opts = {
-        'format': VIDEO_FORMAT,
-        'outtmpl': output_template,
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'max_filesize': VIDEO_MAX_FILE_SIZE_MB * 1024 * 1024,
-        'socket_timeout': 30,
-        'retries': 2,
-        'fragment_retries': 2,
-    }
+def _video_download_result(url: str, path: Optional[Path], reason: str,
+                           note: Optional[list]) -> Optional[Path]:
+    if note is not None and reason:
+        note.append(reason)
+    if path:
+        logger.info(f"🎬 Скачано видео: {path.name} ({reason})")
+    else:
+        logger.warning(f"Видео не скачалось: {reason[:160]} — {url[:60]}")
+    return path
 
+
+# Общий срок на всю загрузку ролика и число одновременных загрузок. Срок
+# считается вместе с ожиданием свободного места: публикация не должна стоять
+# дольше него, даже если оба места заняты чужими роликами.
+VIDEO_DOWNLOAD_TIMEOUT_SEC = max(30, min(1800, _env_int('VIDEO_DOWNLOAD_TIMEOUT_SEC', 300)))
+VIDEO_DOWNLOAD_CONCURRENCY = max(1, min(4, _env_int('VIDEO_DOWNLOAD_CONCURRENCY', 2)))
+_video_download_slots = asyncio.Semaphore(VIDEO_DOWNLOAD_CONCURRENCY)
+
+
+async def _download_video_bounded(url: str, note: Optional[list] = None) -> Optional[Path]:
+    """Загрузка ролика в отдельном процессе: не дольше срока, не больше N сразу."""
+    if not YT_DLP_AVAILABLE:
+        return download_video(url, note)
+    started = time.monotonic()
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Сначала extract_info без скачивания — проверяем длину
-            info = ydl.extract_info(url, download=False)
-
-            duration = info.get('duration', 0)
-            if VIDEO_MAX_DURATION_SEC > 0 and duration and duration > VIDEO_MAX_DURATION_SEC:
-                logger.info(f"Видео слишком длинное ({duration}с): {url[:60]}")
-                return say(f'ролик длиннее лимита ({duration}с)')
-
-            # Скачиваем
-            info = ydl.extract_info(url, download=True)
-            file_path = Path(ydl.prepare_filename(info))
-
-            if not file_path.exists():
-                # yt-dlp иногда меняет расширение после конвертации
-                stem = file_path.stem
-                for candidate in VIDEO_DOWNLOAD_DIR.glob(f'{stem}.*'):
-                    if candidate.suffix.lower() in DIRECT_VIDEO_EXTENSIONS:
-                        file_path = candidate
-                        break
-
-            if not file_path.exists():
-                logger.warning(f"yt-dlp скачал, но файл не найден: {file_path}")
-                return say('файл после скачивания не найден '
-                           '(возможно, нужна склейка дорожек и ffmpeg)')
-
-            size_mb = file_path.stat().st_size / (1024 * 1024)
-            if size_mb > VIDEO_MAX_FILE_SIZE_MB:
-                logger.info(f"Видео слишком большое ({size_mb:.1f} МБ): {url[:60]}")
-                file_path.unlink(missing_ok=True)
-                return say(f'файл {size_mb:.0f} МБ больше лимита '
-                           f'{VIDEO_MAX_FILE_SIZE_MB} МБ')
-
-            logger.info(f"🎬 Скачано видео: {file_path.name} ({size_mb:.1f} МБ)")
-            if note is not None:
-                note.append(f'скачано через yt-dlp, {size_mb:.1f} МБ')
-            return file_path
-    except Exception as e:
-        text = str(e)[:120]
-        logger.warning(f"Видео не скачалось ({type(e).__name__}): {text}")
-        return say(f'{type(e).__name__}: {text}')
+        await asyncio.wait_for(_video_download_slots.acquire(), VIDEO_DOWNLOAD_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        metrics.inc('anime_bot_video_download_total', labels={'result': 'no_slot'})
+        return _video_download_result(
+            url, None, f'все {VIDEO_DOWNLOAD_CONCURRENCY} места для загрузки заняты дольше '
+                       f'{VIDEO_DOWNLOAD_TIMEOUT_SEC} с', note)
+    try:
+        left = max(5.0, VIDEO_DOWNLOAD_TIMEOUT_SEC - (time.monotonic() - started))
+        path, reason = await video_download.download_isolated(
+            url, VIDEO_DOWNLOAD_DIR, fmt=VIDEO_FORMAT, max_mb=VIDEO_MAX_FILE_SIZE_MB,
+            max_duration=VIDEO_MAX_DURATION_SEC, extensions=DIRECT_VIDEO_EXTENSIONS,
+            timeout=left)
+    except OSError as e:
+        path, reason = None, f'процесс загрузки не запустился: {type(e).__name__}'
+    finally:
+        _video_download_slots.release()
+    metrics.inc('anime_bot_video_download_total',
+                labels={'result': 'ok' if path else ('timeout' if 'прервана' in reason else 'fail')})
+    return _video_download_result(url, path, reason, note)
 
 
 def cleanup_video_dir(max_age_hours: int = 1) -> None:
@@ -12203,7 +12269,7 @@ async def _prepare_video_file(news: dict, *, record_failures: bool = True) -> Op
             _record_media_failure(news, 'dependency_missing')
         return None
     note: list = []
-    path = await asyncio.to_thread(download_video, video_url, note)
+    path = await _download_video_bounded(video_url, note)
     if note:
         news['_video_note'] = note[0]
     if path:
@@ -19997,7 +20063,16 @@ async def _maybe_send_daily_summary(bot: Bot) -> None:
         settings.last_daily_summary = today
 
 
+def _history_paused() -> bool:
+    """Автопубликация стоит: история публикаций потеряна, копии не было."""
+    return sent_links is not None and bool(getattr(sent_links, 'history_lost', False))
+
+
 async def check_news(context: ContextTypes.DEFAULT_TYPE):
+    if _history_paused():
+        _runtime_health['last_check_result'] = 'paused: история публикаций потеряна (/historyok)'
+        metrics.inc('anime_bot_check_skipped_total', labels={'reason': 'history_lost'})
+        return
     if _check_news_lock.locked():
         logger.info("⏭ Пропускаю автопроверку — предыдущая ещё идёт")
         metrics.inc('anime_bot_check_skipped_total', labels={'reason': 'overlap'})
@@ -20467,7 +20542,7 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
     и этот автопубликатор не могут отправить один пост дважды: кто первым
     занял состояние, тот и публикует.
     """
-    if pending_posts is None or not await _channel_autopost_due():
+    if pending_posts is None or _history_paused() or not await _channel_autopost_due():
         return None
     row = pending_posts.next_for_autopost()
     if row is None:
@@ -20533,7 +20608,7 @@ async def publisher_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     прошлой публикации прошёл настроенный интервал. Решение о времени берётся
     из того же ``settings.last_publish_at``, что и раньше.
     """
-    if (settings is None or post_queue is None
+    if (settings is None or post_queue is None or _history_paused()
             or not settings.auto_enabled or not feature_enabled('independent_publisher')):
         return
     if settings.publish_mode == 'both':
@@ -24769,6 +24844,25 @@ async def addadmin_command(update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f'{label} уже админ.', parse_mode=ParseMode.HTML)
 
 
+async def historyok_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Снять паузу после потери истории публикаций — решение только владельца."""
+    if update.effective_user.id != ADMIN_ID:
+        await deny_access(update)
+        return
+    if not _history_paused():
+        await update.message.reply_text('История публикаций в порядке, пауза не стоит.')
+        return
+    if not sent_links.accept_lost_history():
+        await update.message.reply_text(
+            '⚠️ Пауза НЕ снята: история не записалась на диск (проверьте место и '
+            'права на DATA_DIR).')
+        return
+    logger.warning('История публикаций: владелец продолжил без истории')
+    await update.message.reply_text(
+        '▶️ Автопубликация продолжена с пустой историей. Уже выходившие новости '
+        'могут повториться — повторы картинок и текстов бот по-прежнему ловит.')
+
+
 async def deladmin_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Забирает права админа. Ответом на сообщение, по @имени или по id."""
     if update.effective_user.id != ADMIN_ID:
@@ -25568,6 +25662,9 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
     lines = ['🩺 <b>Состояние бота</b>', '', '<b>Фоновые задачи</b>']
     if chat_moderation is not None and getattr(chat_moderation, 'load_error', ''):
         lines[1:1] = [f'❌ Модерация: файл состояния не прочитан — {html.escape(chat_moderation.load_error)}', '']
+    if _history_paused():
+        lines[1:1] = ['⛔ Автопубликация на паузе: история публикаций потеряна, копии нет. '
+                      'Верните sent_links.json из бэкапа или /historyok — продолжить без неё.', '']
     lines.append(_job_line(context, 'anime_news_check', 'Автопроверка новостей'))
     lines.append(_job_line(context, 'scheduled_publish', 'Публикация отложки'))
     lines.append(_job_line(context, 'daily_backup', 'Ежедневный бэкап'))
@@ -30879,6 +30976,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("deepl", deepl_command))
     app.add_handler(CommandHandler("backup", backup_command))
+    app.add_handler(CommandHandler("historyok", historyok_command))
     app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("doctor", doctor_command))
     app.add_handler(CommandHandler("features", features_command))

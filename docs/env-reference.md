@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 299 переменных. Почти все — точная настройка со значением
+Бот читает 301 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -338,6 +338,8 @@
 | Переменная | По умолчанию | Где читается |
 | --- | --- | --- |
 | `VIDEO_DIR` | — | anime_news_bot.py |
+| `VIDEO_DOWNLOAD_CONCURRENCY` | `2` | anime_news_bot.py |
+| `VIDEO_DOWNLOAD_TIMEOUT_SEC` | `300` | anime_news_bot.py |
 | `VIDEO_NORMALIZE_CRF` | `27` | anime_news_bot.py |
 | `VIDEO_NORMALIZE_MAX_WIDTH` | `1280` | anime_news_bot.py |
 | `VIDEO_PROBE_TIMEOUT_SEC` | `8` | anime_news_bot.py |
