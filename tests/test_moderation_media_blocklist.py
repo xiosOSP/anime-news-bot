@@ -583,11 +583,23 @@ async def test_confirmation_after_a_caption_only_edit_still_acts_on_the_file(cha
 @pytest.mark.asyncio
 async def test_failed_deletion_does_not_feed_the_blocklist(chat):
     from telegram.error import BadRequest
-    chat.tg.delete_message.side_effect = BadRequest('message to delete not found')
+    chat.tg.delete_message.side_effect = BadRequest("Message can't be deleted")
     chat.scanner.return_value = media.Scan('checked', 'spoiler_16', 'x', 4, .85, hits=4,
                                            hashes=GIF_HASHES)
     await send(chat, gif(1, 51, 'g1'))
     assert chat.store.blocked_media_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_media_already_gone_is_still_blocklisted(chat):
+    # «Запостил и удалил» во время налёта: сообщения уже нет, но вердикт
+    # уверенный — копии того же медиа должны удаляться сразу.
+    from telegram.error import BadRequest
+    chat.tg.delete_message.side_effect = BadRequest('Message to delete not found')
+    chat.scanner.return_value = media.Scan('checked', 'spoiler_16', 'x', 4, .85, hits=4,
+                                           hashes=GIF_HASHES)
+    await send(chat, gif(1, 51, 'g1'))
+    assert chat.store.blocked_media_count() == 1
 
 
 @pytest.mark.asyncio

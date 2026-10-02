@@ -2182,9 +2182,47 @@ def _mod_rate_after_pause(chat_id: int, user_id: int, now: Optional[float] = Non
         state['at'] = state['paused_until'] = now + MODERATION_RATE_PAUSE_SEC
 
 
+# Часы Telegram. Ограничение со сроком меньше 30 секунд Telegram считает
+# БЕССРОЧНЫМ: если часы контейнера отстают от Telegram на полминуты, минутная
+# пауза антифлуда превращалась в вечный мут. Сдвиг оцениваем по времени
+# отправки входящих сообщений (его ставит сам Telegram): максимум по выборке,
+# потому что задержка доставки только уменьшает разницу.
+_tg_clock_samples: deque = deque(maxlen=50)
+TG_RESTRICT_MIN_SEC = 45          # с запасом от порога Telegram в 30 секунд
+
+
+def _note_tg_clock(message) -> None:
+    sent = getattr(message, 'date', None)
+    if not isinstance(sent, datetime) or getattr(message, 'edit_date', None):
+        return
+    if sent.tzinfo is None:
+        sent = sent.replace(tzinfo=timezone.utc)
+    offset = (sent - datetime.now(timezone.utc)).total_seconds()
+    if abs(offset) < 86400:
+        _tg_clock_samples.append(offset)
+
+
+def _tg_now() -> datetime:
+    """Текущее время по часам Telegram (оценка)."""
+    offset = max(_tg_clock_samples) if _tg_clock_samples else 0.0
+    return datetime.now(timezone.utc) + timedelta(seconds=offset)
+
+
+def _tg_until(seconds: float) -> datetime:
+    """Срок ограничения: не короче TG_RESTRICT_MIN_SEC по часам Telegram."""
+    return _tg_now() + timedelta(seconds=max(float(seconds), TG_RESTRICT_MIN_SEC))
+
+
 async def _mod_rate_pause(bot: Bot, message, user_id: int, name: str, text: str,
-                          state: str = 'over') -> str:
-    """Темп превышен: удалить лишнее, минута тишины; третья пауза — флуд."""
+                          state: str = 'over', outcome: Optional[dict] = None) -> str:
+    """Темп превышен: удалить лишнее, минута тишины; третья пауза — флуд.
+
+    В ``outcome['removed']`` — удалилось ли сообщение. False означает, что оно
+    осталось в чате (Telegram отказал), и обычные проверки — 18+, чёрный список,
+    правила — должны его всё-таки посмотреть: раньше флуд-сообщение не
+    проверялось ничем, даже если удалить его не вышло.
+    """
+    outcome = outcome if outcome is not None else {}
     chat_id = int(message.chat_id)
     if chat_moderation is None or await _mod_admin_exempt(bot, message):
         return ''
@@ -2197,7 +2235,8 @@ async def _mod_rate_pause(bot: Bot, message, user_id: int, name: str, text: str,
             ok = await bot.delete_message(chat_id, message.message_id) is not False
             verdict = 'удалено: тот же залп' if ok else 'не удалено: Telegram отказал'
         except TelegramError as exc:
-            verdict = f'не удалено: {type(exc).__name__}'
+            ok, verdict = False, f'не удалено: {type(exc).__name__}'
+        outcome['removed'] = ok
         chat_moderation.log_decision(chat_id, user_id, name, 'flood', verdict,
                                      'антифлуд', 'сообщение отправлено до паузы', text)
         return verdict
@@ -2217,9 +2256,11 @@ async def _mod_rate_pause(bot: Bot, message, user_id: int, name: str, text: str,
                                      'антифлуд', reason, text)
         return 'режим наблюдения: пауза не выдана'
     done = []
+    outcome['removed'] = False
     try:
         if await bot.delete_message(chat_id, message.message_id) is not False:
             done.append('лишнее сообщение удалено')
+            outcome['removed'] = True
     except TelegramError as exc:
         done.append(f'удаление не подтверждено ({type(exc).__name__})')
     paused = False
@@ -2229,7 +2270,7 @@ async def _mod_rate_pause(bot: Bot, message, user_id: int, name: str, text: str,
             # Чужое ограничение (мут от админа или от бота) не трогаем: пауза
             # на минуту сняла бы его раньше срока.
             if getattr(member, 'status', '') in ('member',):
-                until = datetime.now(timezone.utc) + timedelta(seconds=MODERATION_RATE_PAUSE_SEC)
+                until = _tg_until(MODERATION_RATE_PAUSE_SEC)
                 result = await bot.restrict_chat_member(
                     chat_id, user_id, permissions=ChatPermissions.no_permissions(),
                     until_date=until, use_independent_chat_permissions=True)
@@ -2266,7 +2307,12 @@ async def _mod_rate_notice(bot: Bot, message, user_id: int, name: str) -> None:
     notice_id = getattr(sent, 'message_id', None)
     if isinstance(notice_id, int):
         async def _cleanup():
-            await asyncio.sleep(MODERATION_RATE_PAUSE_SEC)
+            try:
+                await asyncio.sleep(MODERATION_RATE_PAUSE_SEC)
+            except asyncio.CancelledError:
+                # Бот останавливается: убираем уведомление сейчас. Раньше задача
+                # просто пропадала, и «пауза на 1 мин» висела в чате навсегда.
+                pass
             try:
                 await bot.delete_message(message.chat_id, notice_id)
             except TelegramError:
@@ -2277,6 +2323,27 @@ async def _mod_rate_notice(bot: Bot, message, user_id: int, name: str) -> None:
 
 
 _moderation_rate_tasks: set = set()
+
+
+async def _cancel_moderation_tasks(timeout: float = 5.0) -> int:
+    """При остановке: уведомления о паузе убрать, отложенные перепроверки отменить."""
+    tasks = [task for task in list(_moderation_rate_tasks) if not task.done()]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.wait(tasks, timeout=timeout)
+    return len(tasks)
+
+
+async def _post_stop(app: Application) -> None:
+    # post_stop, а не post_shutdown: здесь бот ещё подключён к Telegram и может
+    # удалить уведомления; после shutdown запросы уже не уходят.
+    try:
+        cancelled = await _cancel_moderation_tasks()
+        if cancelled:
+            logger.info('Остановка: завершено фоновых задач модерации: %d', cancelled)
+    except Exception:
+        logger.exception('Остановка: фоновые задачи модерации не завершены')
 
 
 # Нейтральные названия групп. Само упоминание — не нарушение, и почти всегда
@@ -2635,6 +2702,27 @@ def _mod_local_check(chat_id: int, user_id: int, text: str, *, reply_to_user=Fal
     return None
 
 
+# Записи чёрного списка медиа: сколько file_id осуждённых файлов хранится
+# всегда и сколько — найденных копий. Раньше общий потолок в 20 вытеснял
+# первыми как раз осуждённый файл: после двадцати копий его точная пересылка
+# узнавалась только по кадрам — удаление без предупреждения или пропуск.
+MODERATION_MEDIA_PINNED_IDS = 20
+MODERATION_MEDIA_COPY_IDS = 20
+
+
+def _media_pinned_ids(row: dict) -> list:
+    """file_id, осуждённые напрямую (а не найденные копии). Старые записи — первый."""
+    ids = list(dict.fromkeys(row.get('file_ids') or []))
+    return ids[:int(row.get('pinned', 1) or 0)]
+
+
+def _cap_media_ids(ids, pinned: int) -> list:
+    ids = list(dict.fromkeys(str(x) for x in ids if x))
+    head = ids[:min(pinned, MODERATION_MEDIA_PINNED_IDS)]
+    tail = [x for x in ids[len(head):] if x not in head]
+    return head + tail[-MODERATION_MEDIA_COPY_IDS:]
+
+
 class ChatModerationStore:
     """Предупреждения, муты и включённые чаты. Переживает перезапуск.
 
@@ -2878,7 +2966,9 @@ class ChatModerationStore:
             elif source == 'admin':
                 # Подтверждение человека сильнее автоматического вердикта.
                 row['source'] = 'admin'
-            row['file_ids'] = list(dict.fromkeys(row.get('file_ids', []) + file_ids))[-20:]
+            pinned = _media_pinned_ids(row) + file_ids
+            row['file_ids'] = _cap_media_ids(pinned + list(row.get('file_ids', [])), len(pinned))
+            row['pinned'] = min(len(dict.fromkeys(pinned)), MODERATION_MEDIA_PINNED_IDS)
             if sticker_set:
                 # Весь набор стикеров: такие приходят паками, и одно
                 # подтверждение админа закрывает сразу весь пак.
@@ -2966,8 +3056,9 @@ class ChatModerationStore:
                 return
             row['hits'] = int(row.get('hits') or 0) + 1
             if file_unique_id:
-                row['file_ids'] = list(dict.fromkeys(
-                    (row.get('file_ids') or []) + [str(file_unique_id)[:64]]))[-20:]
+                row['file_ids'] = _cap_media_ids(
+                    (row.get('file_ids') or []) + [str(file_unique_id)[:64]],
+                    len(_media_pinned_ids(row)))
         self._save_soon()
 
     def allow_media(self, entry_id: str, file_ids, hashes, chat_id=None) -> bool:
@@ -12840,6 +12931,14 @@ async def _prepare_news_for_send(news: dict, source: str,
             await stats.record_skipped('duplicate', source)
         return 'skipped_dup'
 
+    dup_title = await _video_duplicate(news)
+    if dup_title:
+        logger.info(f"⊘ Ролик уже публиковался («{dup_title[:40]}»): "
+                    f"{news.get('title', '')[:60]}")
+        if count_stats:
+            await stats.record_skipped('duplicate', source)
+        return 'skipped_dup'
+
     # Последняя проверка — на готовом тексте. Все предыдущие сравнивают исходные
     # заголовки, а одна новость с двух сайтов приходит разными формулировками
     # и совпадает только после перевода.
@@ -15042,7 +15141,8 @@ def _hash_distance(a: str, b: str) -> Optional[int]:
     """Расстояние между отпечатками. None — если типы разные (несравнимы)."""
     if not a or not b or a[:2] != b[:2]:
         return None
-    if a.startswith('m:'):
+    if a.startswith(('m:', 'v:')):
+        # md5 файла и id ролика сравниваются только на точное совпадение.
         return 0 if a == b else 64
     try:
         pa = a.split(':')
@@ -15283,13 +15383,45 @@ async def _image_duplicate(news: dict) -> Optional[str]:
     return None
 
 
+_YOUTUBE_ID_RE = re.compile(
+    r'(?:youtube(?:-nocookie)?\.com/(?:watch\?(?:[^#\s]*&)?v=|embed/|shorts/|live/|v/)'
+    r'|youtu\.be/)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])', re.I)
+
+
+def _youtube_id(url: str) -> str:
+    match = _YOUTUBE_ID_RE.search(str(url or ''))
+    return match.group(1) if match else ''
+
+
+async def _video_duplicate(news: dict) -> Optional[str]:
+    """Тот же ролик YouTube уже выходил — заголовок той новости, иначе None.
+
+    Один трейлер разносят несколько сайтов под разными заголовками, а превью у
+    них разные (кадр, обложка сайта), поэтому дедуп по картинке их пропускал.
+    Id ролика — точный признак. Как и у картинок: другое событие в заголовке
+    («трейлер» и «дата премьеры» со старым трейлером внутри) — не повтор.
+    """
+    if settings is None or not getattr(settings, 'image_dedup', True) or image_hashes is None:
+        return None
+    video_id = _youtube_id(news.get('video') or '')
+    if not video_id:
+        return None
+    fingerprint = f'v:{video_id}'
+    dup = image_hashes.reserve(fingerprint, news.get('title', ''))
+    if dup:
+        return dup.get('t') or 'без заголовка'
+    news['_video_fp'] = fingerprint
+    return None
+
+
 def _commit_image_fingerprint(news: dict) -> None:
     """Фиксирует отпечаток картинки и предмет новости после того, как пост
     реально ушёл. До отправки не запоминаем: сорвавшаяся публикация не должна
     закрывать дорогу той же новости из другого источника."""
-    fingerprint = news.pop('_img_fp', None)
-    if fingerprint and image_hashes is not None:
-        image_hashes.add(fingerprint, news.get('title', ''))
+    for key in ('_img_fp', '_video_fp'):
+        fingerprint = news.pop(key, None)
+        if fingerprint and image_hashes is not None:
+            image_hashes.add(fingerprint, news.get('title', ''))
     subject = news.get('_llm_subject')
     if subject and recent_subjects is not None:
         recent_subjects.commit(subject, news.get('_llm_kind', 'новость'),
@@ -15301,9 +15433,10 @@ def _commit_image_fingerprint(news: dict) -> None:
 
 def _release_publish_reservations(news: dict) -> None:
     """Освобождает in-flight дедупы после любой неуспешной отправки/фильтра."""
-    fingerprint = news.pop('_img_fp', None)
-    if fingerprint and image_hashes is not None:
-        image_hashes.release(fingerprint)
+    for key in ('_img_fp', '_video_fp'):
+        fingerprint = news.pop(key, None)
+        if fingerprint and image_hashes is not None:
+            image_hashes.release(fingerprint)
     final_text = news.pop('_final_text', None)
     if final_text and published_texts is not None:
         published_texts.release(final_text)
@@ -27632,6 +27765,11 @@ async def _mod_get_member(bot: Bot, chat_id: int, user_id: int):
         return await bot.get_chat_member(chat_id, user_id)
 
 
+def _tg_message_gone(exc: BaseException) -> bool:
+    """Telegram ответил, что удалять уже нечего: сообщения в чате нет."""
+    return isinstance(exc, BadRequest) and 'message to delete not found' in str(exc).lower()
+
+
 async def _mod_apply(bot: Bot, message, decision: dict, category: str,
                      reason: str) -> str:
     """Apply a durable incident, recording only confirmed Telegram outcomes."""
@@ -27712,8 +27850,16 @@ async def _mod_apply(bot: Bot, message, decision: dict, category: str,
             decision['applied_action'] = 'delete'
             decision['deleted'] = True
         except TelegramError as exc:
-            deletion_status = 'failed' if isinstance(exc, BadRequest) else 'unknown'
-            done.append(f'удаление не подтверждено ({type(exc).__name__})')
+            if _tg_message_gone(exc):
+                # Автор или другой админ уже убрал его (частый случай для «✅ Верно»
+                # спустя время). Цель достигнута; раньше отчёт говорил «удаление
+                # не подтверждено», а у анонима решение записывалось как сбой.
+                done.append('сообщение уже удалено')
+                decision['applied_action'] = 'delete'
+                decision['deleted'] = True
+            else:
+                deletion_status = 'failed' if isinstance(exc, BadRequest) else 'unknown'
+                done.append(f'удаление не подтверждено ({type(exc).__name__})')
     if existing:
         return ', '.join(done + ['санкция за это сообщение/альбом уже учтена'])
     if cooldown and action in ('warn', 'mute'):
@@ -27729,7 +27875,7 @@ async def _mod_apply(bot: Bot, message, decision: dict, category: str,
     until = None
     if action == 'mute':
         minutes = int(decision.get('minutes') or MODERATION_MUTE_LADDER[0])
-        until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+        until = _tg_until(minutes * 60)
         try:
             previous = _mod_member_permissions(member)
             previous_until = _mod_until_timestamp(getattr(member, 'until_date', None))
@@ -27748,7 +27894,7 @@ async def _mod_apply(bot: Bot, message, decision: dict, category: str,
                 if minutes <= old_minutes and next_step is not None:
                     minutes = next_step
                     decision['minutes'] = minutes
-                    until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+                    until = _tg_until(minutes * 60)
                 if minutes <= old_minutes:
                     chat_moderation.update_incident(incident_id, action='delete', status='confirmed', reason=reason)
                     decision['applied_action'] = 'delete'
@@ -28153,6 +28299,8 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
     chat = getattr(update, 'effective_chat', None)
     if message is None or chat is None:
         return
+    if getattr(update, 'edited_message', None) is None and not getattr(update, 'mod_retry', False):
+        _note_tg_clock(message)
     sender_chat = getattr(message, 'sender_chat', None)
     if not chat_moderation.is_enabled(chat.id):
         return
@@ -28218,8 +28366,12 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
                           and int(local.get('severity') or 1) >= 2):
         # Явное нарушение текста (оскорбление, реклама) идёт своим путём даже
         # внутри флуда — его должны увидеть админы. Остальное — пауза.
-        await _mod_rate_pause(context.bot, message, user_id, actor_name, text, rate_over)
-        return
+        rate_outcome: dict = {}
+        await _mod_rate_pause(context.bot, message, user_id, actor_name, text, rate_over,
+                              outcome=rate_outcome)
+        if rate_outcome.get('removed') is not False:
+            return
+        # Удалить не вышло — сообщение в чате, и его содержимое проверяем как обычно.
     if local is None and attachment is None:
         return
     if await _mod_admin_exempt(context.bot, message):
@@ -29335,7 +29487,10 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                             raise BadRequest('chat permissions unavailable')
                         previous = chat_moderation.incident(incident.get('previous_mute_id', ''))
                         restore_until = 0
-                        if previous.get('status') == 'confirmed' and previous.get('mute_until', 0) > time.time():
+                        # Остаток прежнего мута короче минуты не восстанавливаем:
+                        # срок меньше 30 с Telegram сделал бы вечным.
+                        if (previous.get('status') == 'confirmed'
+                                and previous.get('mute_until', 0) > _tg_now().timestamp() + 60):
                             permissions = ChatPermissions.no_permissions()
                             restore_until = previous['mute_until']
                         result = await context.bot.restrict_chat_member(
@@ -31083,7 +31238,8 @@ def main():
 
     print("Создаю Application...", flush=True)
     app = (Application.builder().token(TOKEN).job_queue(JobQueue())
-           .post_init(setup_bot_commands).post_shutdown(_post_shutdown).build())
+           .post_init(setup_bot_commands).post_stop(_post_stop)
+           .post_shutdown(_post_shutdown).build())
 
     app.add_error_handler(_global_error_handler)
 

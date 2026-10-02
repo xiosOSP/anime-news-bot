@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "9d3417327a9caf659ae0dfa9b2732710da79bcdc",
-  "generated_at_utc": "2026-10-02T21:23:46.973138+00:00",
+  "git_commit": "69662c540f438e73d41ff7eb4127d10d88333a09",
+  "generated_at_utc": "2026-10-02T21:34:17.141029+00:00",
   "files": {
     ".env.example": {
       "sha256": "1d45114ec32deffad57d13ba2928bab66cf9fc248bb0e9bcb2f959028479257a",
@@ -26,20 +26,20 @@
       "bytes": 33
     },
     "README.md": {
-      "sha256": "32fd865c657e99932d46c91d925fa830cc9dbfe2cab27a99b6a84594443aa839",
-      "bytes": 22158
+      "sha256": "2430b5f71845878648c5a5c8a4cc23a644c1dbcebe3fc60c3ddfec723c726ec4",
+      "bytes": 22572
     },
     "anime_news_bot.py": {
-      "sha256": "2f42632193d6c5a8a45496ccf91bfbbea5472d991371ce8260c6c8781ebc87df",
-      "bytes": 1710120
+      "sha256": "dd5eabb97ec989eb915f39f64bd6568c16a8529b80c16673c4b37c5ef80f0398",
+      "bytes": 1718704
     },
     "constraints.txt": {
       "sha256": "fe5e29d7db2182e0e5926013f81a450ef7a2a948cecc36d23765b2154f176212",
       "bytes": 1216
     },
     "docs/chat-moderation.md": {
-      "sha256": "7c5464c04bdc793907ed725cdabc11475af41419c3f06cf8d8a75833a7fcefa4",
-      "bytes": 70452
+      "sha256": "1bd41c70e2028f54fca1626aeafb186b4a7f6f823a82e1172d42284c79d92151",
+      "bytes": 72590
     },
     "docs/env-reference.md": {
       "sha256": "be807cd19718940f81cc270c4db6a02959960e635e6910bc0c20c42f7cfcfc07",
@@ -437,6 +437,10 @@
       "sha256": "aedd9f18e3a0abe6104971ebd0a2f4f6e8e08a5a1313a8ac691b6336fb903fd1",
       "bytes": 2718
     },
+    "tests/test_low_risk_items.py": {
+      "sha256": "e78d32900623ea202ebfd0a13932f074c982c78af083d2d8d870b44ad9ca4f9e",
+      "bytes": 17469
+    },
     "tests/test_main_bot_polish.py": {
       "sha256": "204d7ddf533695a5d2c0fff29deabc5d8c13eb20549a490f1b6a2b4dd06b5069",
       "bytes": 10062
@@ -498,8 +502,8 @@
       "bytes": 6731
     },
     "tests/test_moderation_media_blocklist.py": {
-      "sha256": "380b7430c1c063f33a4b0559224e92a7fe5182a2cec15b7f3343cadfefb896ed",
-      "bytes": 42357
+      "sha256": "8e1c985a5a1a21ec2b60275498c09d9cce4877981710c32506112e4db86c08d7",
+      "bytes": 43039
     },
     "tests/test_moderation_media_pr60.py": {
       "sha256": "31877aee04d320827fac16bcfedbc1ecbac9bd185706bbf4255c235d972a24f8",
