@@ -80,7 +80,7 @@ def test_failed_writes_are_counted_by_the_writer(tmp_path, monkeypatch):
 def test_failure_while_writing_is_counted_too(tmp_path, monkeypatch):
     def boom(*_a, **_k):
         raise OSError(28, 'No space left on device')
-    monkeypatch.setattr(bot.json, 'dump', boom)
+    monkeypatch.setattr(bot.json, 'dumps', boom)
     with pytest.raises(OSError):
         bot._atomic_write_json(tmp_path / 'stats.json', {})
     assert bot._disk_write_failures[-1][1] == 'stats.json'

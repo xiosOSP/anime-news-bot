@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover - Windows fallback: polling сам ко�
 from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+import functools
 from functools import wraps
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -108,7 +109,9 @@ from news_stories import (
     _story_media,
     _story_numbers,
     _story_similarity,
+    _story_title_of,
     _story_tokens,
+    _story_tokens_cached,
     _story_update_anchor,
     normalize_title,
 )
@@ -158,14 +161,22 @@ try:
 except ImportError:
     Image = None
 
-# Опциональная зависимость — если yt-dlp нет, скачивание видео отключится
+# Опциональная зависимость — если yt-dlp нет, скачивание видео отключится.
+# Импорт ленивый: ролики качает отдельный процесс (video_download.py), а в
+# самом боте yt-dlp нужен в двух редких путях. Загрузка при старте стоила
+# ~60 мс и ~6 МБ памяти на всё время работы.
+import importlib.util as _importlib_util
 yt_dlp = None
-try:
-    import yt_dlp as _yt_dlp
-    yt_dlp = _yt_dlp
-    YT_DLP_AVAILABLE = True
-except ImportError:
-    YT_DLP_AVAILABLE = False
+YT_DLP_AVAILABLE = _importlib_util.find_spec('yt_dlp') is not None
+
+
+def _yt_dlp_module():
+    """yt-dlp по первому требованию (тесты подменяют модульный yt_dlp)."""
+    global yt_dlp
+    if yt_dlp is None:
+        import yt_dlp as _yt_dlp
+        yt_dlp = _yt_dlp
+    return yt_dlp
 
 # ============== НАСТРОЙКИ ==============
 # Чувствительные значения читаются из переменных окружения (env).
@@ -353,6 +364,42 @@ def _quarantine_unreadable_file(path: Path, reason: str, what: str, *, alert: bo
     return name
 
 
+# Отступы — только для маленьких файлов, которые читают глазами (настройки,
+# правила). Большие хранилища с indent=2 писались медленным кодировщиком на
+# чистом Python и были в 1,5–3 раза крупнее.
+JSON_PRETTY_MAX_CHARS = 64 * 1024
+
+
+def _write_json(f, data, indent: Optional[int] = None) -> None:
+    """JSON быстрым C-кодировщиком.
+
+    json.dump(..., f) всегда идёт через кодировщик на чистом Python — C-версию
+    использует только json.dumps. На заполненном хранилище модерации это сотни
+    миллисекунд, в которые цикл событий стоит. Словарь пишется по разделам:
+    пик памяти — самый крупный раздел, а не весь файл целиком.
+    """
+    if isinstance(data, dict) and data:
+        chunks = [json.dumps({key: value}, ensure_ascii=False)[1:-1] for key, value in data.items()] \
+            if indent is not None else None
+        if chunks is not None:
+            if sum(len(c) for c in chunks) <= JSON_PRETTY_MAX_CHARS:
+                f.write(json.dumps(data, ensure_ascii=False, indent=indent))
+            else:
+                f.write('{' + ','.join(chunks) + '}')
+            return
+        f.write('{')
+        for index, (key, value) in enumerate(data.items()):
+            if index:
+                f.write(',')
+            f.write(json.dumps({key: value}, ensure_ascii=False)[1:-1])
+        f.write('}')
+        return
+    text = json.dumps(data, ensure_ascii=False)
+    if indent is not None and len(text) <= JSON_PRETTY_MAX_CHARS:
+        text = json.dumps(data, ensure_ascii=False, indent=indent)
+    f.write(text)
+
+
 def _atomic_write_json(path: Path, data, *, indent: Optional[int] = None) -> None:
     """Атомарно сохраняет JSON рядом с целевым файлом.
 
@@ -370,7 +417,7 @@ def _atomic_write_json(path: Path, data, *, indent: Optional[int] = None) -> Non
         raise
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=indent)
+            _write_json(f, data, indent)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_name, path)
@@ -2817,13 +2864,34 @@ class ChatModerationStore:
         except (ValueError, TypeError) as e:
             self._set_aside_corrupt(f'{type(e).__name__}: {e}')
 
+    _ABSENT = object()
+
+    def _checkpoint(self, *sections) -> dict:
+        """Копия только тех разделов, что метод меняет, — для отката при сбое записи.
+
+        Раньше откат копировал всё хранилище (на пределах — 20 МБ, ~200 мс) ради
+        одного предупреждения. И заодно откатывал ещё не записанные строки
+        журнала, которые к этому методу отношения не имели.
+        """
+        return {name: copy.deepcopy(self._data[name]) if name in self._data else self._ABSENT
+                for name in sections}
+
+    def _rollback(self, saved: dict) -> None:
+        for name, value in saved.items():
+            if value is self._ABSENT:
+                self._data.pop(name, None)
+            else:
+                self._data[name] = value
+
     def _save(self) -> bool:
         if getattr(self, '_read_failed', False):
             return False
         with self._lock:
-            snapshot = copy.deepcopy(self._data)
+            # Без копии: замок держится до конца записи, и менять данные во
+            # время сериализации некому. Копия заполненного хранилища стоила
+            # ~200 мс и десятки МБ на каждую запись.
             try:
-                _atomic_write_json(self.path, snapshot)
+                _atomic_write_json(self.path, self._data)
             except OSError as e:
                 logger.error(f'Модерация: состояние не сохранено: {e}')
                 return False
@@ -2876,7 +2944,7 @@ class ChatModerationStore:
         if not review_id:
             return False
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('reviews')
             reviews = self._data.setdefault('reviews', {})
             if review_id in reviews:
                 return True
@@ -2920,7 +2988,7 @@ class ChatModerationStore:
                     'sticker_set': str(media.get('sticker_set') or '')[:64],
                 }
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
@@ -2950,7 +3018,7 @@ class ChatModerationStore:
         if not entry_id or (not file_ids and not hashes and not sticker_set):
             return {}
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('media_blocklist')
             blocklist = self._data.setdefault('media_blocklist', {})
             row = blocklist.get(entry_id)
             if row is None:
@@ -2977,7 +3045,7 @@ class ChatModerationStore:
                 row['hashes'] = list(dict.fromkeys(hashes))[:MODERATION_MEDIA_HASHES_MAX]
             self._blocked_index = None
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return {}
             return dict(copy.deepcopy(row), id=entry_id)
 
@@ -2996,12 +3064,12 @@ class ChatModerationStore:
                       or (hashes and hashes_match(hashes, row.get('hashes') or ()))]
             if not doomed:
                 return 0
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('media_blocklist')
             for key in doomed:
                 blocklist.pop(key, None)
             self._blocked_index = None
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return 0
             return len(doomed)
 
@@ -3118,7 +3186,7 @@ class ChatModerationStore:
         if verdict not in ('correct', 'wrong'):
             return False
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('reviews', 'stats')
             row = self._data.get('reviews', {}).get(review_id)
             if not row:
                 return False
@@ -3150,7 +3218,7 @@ class ChatModerationStore:
                 int(src.get('correct' if verdict == 'correct' else 'wrong', 0)) + 1
             )
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
@@ -3161,7 +3229,7 @@ class ChatModerationStore:
         if not miss_id or category not in MODERATION_RULES:
             return False
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('misses', 'stats')
             misses = self._data.setdefault('misses', {})
             if miss_id in misses:
                 return True
@@ -3181,7 +3249,7 @@ class ChatModerationStore:
                 category, {'total': 0, 'overturned': 0})
             cat['missed_total'] = int(cat.get('missed_total', 0)) + 1
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
@@ -3214,7 +3282,7 @@ class ChatModerationStore:
     def reserve_incident(self, incident_id: str, chat_id, user_id, category, action) -> bool:
         """Persist intent before Telegram writes; replay never repeats a sanction."""
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('incidents')
             incidents = self._data.setdefault('incidents', {})
             if incident_id in incidents:
                 return False
@@ -3228,13 +3296,13 @@ class ChatModerationStore:
                                          user_id=int(user_id), category=category,
                                          action=action, status='pending')
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
     def update_incident(self, incident_id: str, *, add_warning=False, **changes) -> bool:
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('incidents', 'users')
             incident = self._data.get('incidents', {}).get(incident_id)
             if not incident:
                 return False
@@ -3247,7 +3315,7 @@ class ChatModerationStore:
                                              note=str(incident.get('reason', ''))[:200], incident=incident_id))
                 self._prune_locked()
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
@@ -3257,7 +3325,7 @@ class ChatModerationStore:
             incident = self._data.get('incidents', {}).get(incident_id)
             if not incident or incident.get('status') == 'undone':
                 return False
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('incidents', 'users', 'stats')
             row = self._data.get('users', {}).get(self._key(incident['chat_id'], incident['user_id']), {})
             row['warns'] = [w for w in row.get('warns', []) if w.get('incident') != incident_id]
             incident['status'] = 'undone'
@@ -3267,7 +3335,7 @@ class ChatModerationStore:
                 incident['category'], {'total': 0, 'overturned': 0})
             category['overturned'] = int(category.get('overturned', 0)) + 1
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
@@ -3283,10 +3351,10 @@ class ChatModerationStore:
         if mode not in MODERATION_MODES:
             raise ValueError(f'неизвестный режим модерации: {mode!r}')
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('mode')
             self._data['mode'] = mode
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
@@ -3300,10 +3368,10 @@ class ChatModerationStore:
         if type(enabled) is not bool:
             raise ValueError('moderate_admins must be bool')
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('moderate_admins')
             self._data['moderate_admins'] = enabled
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
@@ -3340,7 +3408,7 @@ class ChatModerationStore:
 
     def set_chat(self, chat_id: int, enabled: bool) -> bool:
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('chats', 'disabled_chats')
             chats = [int(x) for x in (self._data.get('chats') or [])]
             if enabled and int(chat_id) not in chats:
                 chats.append(int(chat_id))
@@ -3354,7 +3422,7 @@ class ChatModerationStore:
                 disabled.add(int(chat_id))
             self._data['disabled_chats'] = sorted(disabled)
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
@@ -3389,7 +3457,7 @@ class ChatModerationStore:
     def add_warn(self, chat_id, user_id, category: str, note: str = '') -> int:
         """Записывает предупреждение и возвращает их суммарное число."""
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('users')
             users = self._data.setdefault('users', {})
             row = users.setdefault(self._key(chat_id, user_id), {'warns': []})
             row.setdefault('warns', []).append({
@@ -3401,17 +3469,17 @@ class ChatModerationStore:
             total = len(((self._data.get('users') or {}).get(
                 self._key(chat_id, user_id)) or {}).get('warns') or [])
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 raise OSError('Предупреждение не удалось сохранить')
             return total
 
     def clear_warns(self, chat_id, user_id) -> bool:
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('users')
             users = self._data.get('users') or {}
             existed = users.pop(self._key(chat_id, user_id), None) is not None
             if existed and not self._save():
-                self._data = before
+                self._rollback(before)
                 raise OSError('Предупреждения не удалось сохранить')
             return existed
 
@@ -5700,7 +5768,7 @@ class BotStats:
         return self._data['by_source'][source]
 
     # === Методы для записи событий ===
-    async def record_collected(self, source: str, count: int) -> None:
+    async def record_collected(self, source: str, count: int, *, save: bool = True) -> None:
         """Собрали N постов из источника (после всех фильтров)."""
         if count <= 0:
             return
@@ -5710,7 +5778,23 @@ class BotStats:
             entry['collected'] += count
             entry['last_success_at'] = datetime.now().isoformat()
             self._add_event_unlocked('collected', source)
+            await self._save_or_mark(save)
+
+    async def _save_or_mark(self, save: bool) -> None:
+        # Сбор пишет статистику по каждому источнику — до трёх записей файла
+        # на источник подряд. С save=False они копятся и уходят одной записью
+        # за цикл (flush): сбор не ждёт десятки записей на диск.
+        if save:
             await asyncio.to_thread(self._save)
+            self._dirty = False
+        else:
+            self._dirty = True
+
+    async def flush(self) -> None:
+        async with self._lock:
+            if getattr(self, '_dirty', False):
+                await asyncio.to_thread(self._save)
+                self._dirty = False
 
     async def record_source_error(self, source: str) -> None:
         """Источник упал при сборе."""
@@ -5731,7 +5815,7 @@ class BotStats:
             await asyncio.to_thread(self._save)
 
     async def record_skipped(self, reason: str, source: Optional[str] = None,
-                             count: int = 1) -> None:
+                             count: int = 1, *, save: bool = True) -> None:
         """Пост отброшен. reason: no_image / too_old / duplicate / spam / filtered."""
         key = f'skipped_{reason}'
         count = max(0, int(count))
@@ -5741,7 +5825,7 @@ class BotStats:
             if key in self._data['totals']:
                 self._data['totals'][key] += count
             self._add_event_unlocked(key, source, count)
-            await asyncio.to_thread(self._save)
+            await self._save_or_mark(save)
 
     async def record_failed_send(self, source: Optional[str] = None) -> None:
         """Реальная ошибка отправки в Telegram."""
@@ -6752,6 +6836,13 @@ class EditorialGlossary:
         return sorted(self._aliases.items(), key=lambda kv: kv[0].casefold())
 
 
+@functools.lru_cache(maxsize=8192)
+def _entity_key(value: str) -> str:
+    # Кеш: ключ одного и того же предмета считается для каждой строки реестра
+    # историй и истории публикаций — на каждую новость цикла.
+    return re.sub(r'[^0-9a-zа-яё]+', '', value.casefold())[:160]
+
+
 class EntityMemory:
     """Learns a stable preferred spelling for recurring franchise/person names."""
     MAX_ENTITIES = 1200
@@ -6763,8 +6854,8 @@ class EntityMemory:
         self._load()
 
     @staticmethod
-    def _key(value: str) -> str:
-        return re.sub(r'[^0-9a-zа-яё]+', '', str(value or '').casefold())[:160]
+    def _key(value) -> str:
+        return _entity_key(str(value or ''))
 
     def _load(self) -> None:
         try:
@@ -6892,9 +6983,24 @@ class SourceYieldStore:
             logger.warning(f'source yield не загружен: {e}')
 
     def _save(self) -> None:
-        try: _atomic_write_json(self.path, {'schema_version': 1, 'sources': self._rows,
-                                               'story_credits': dict(list(self._story_credits.items())[-5000:])}, indent=2)
+        try:
+            _atomic_write_json(self.path, {'schema_version': 1, 'sources': self._rows,
+                                           'story_credits': dict(list(self._story_credits.items())[-5000:])})
+            self._dirty = False
         except OSError as e: logger.warning(f'source yield не сохранён: {e}')
+
+    def _mark(self) -> None:
+        # Сбор, ошибки и новые истории только помечают хранилище: раньше файл
+        # (сотни КБ) переписывался на каждую новую историю прямо в цикле
+        # событий — около 1,3 с простоя бота на цикл с 60 новыми историями.
+        # На диск — один раз за цикл (flush) и при остановке; это статистика,
+        # сбой процесса теряет не больше одного цикла счётчиков.
+        self._dirty = True
+
+    def flush(self) -> None:
+        with self._lock:
+            if getattr(self, '_dirty', False):
+                self._save()
 
     def _row(self, source: str) -> dict:
         source = str(source or 'unknown')
@@ -6907,12 +7013,12 @@ class SourceYieldStore:
             row['raw'] += max(0, int(raw)); row['fresh'] += max(0, int(fresh))
             row['duplicates'] += max(0, int(duplicates)); row['no_image'] += max(0, int(no_image))
             row['fetch_ms_sum'] += max(0.0, float(duration_sec or 0.0) * 1000.0)
-            row['last_seen'] = datetime.now(timezone.utc).isoformat(); self._save()
+            row['last_seen'] = datetime.now(timezone.utc).isoformat(); self._mark()
 
     def record_error(self, source: str) -> None:
         with self._lock:
             row = self._row(source); row['errors'] += 1
-            row['last_seen'] = datetime.now(timezone.utc).isoformat(); self._save()
+            row['last_seen'] = datetime.now(timezone.utc).isoformat(); self._mark()
 
     def record_story(self, story_key: str, sources: list[str]) -> None:
         story_key = str(story_key or '').strip()[:160]
@@ -6930,7 +7036,7 @@ class SourceYieldStore:
                 self._story_credits[story_key] = sorted(credited)[:50]
                 if len(self._story_credits) > 5000:
                     self._story_credits = dict(list(self._story_credits.items())[-5000:])
-                self._save()
+                self._mark()
 
     def record_moderation_sent(self, source: str) -> None:
         with self._lock: self._row(source)['moderation_sent'] += 1; self._save()
@@ -6988,15 +7094,32 @@ class StoryRegistry:
         if save: self._save()
 
     @staticmethod
-    def _match(news:dict,row:dict)->float:
+    def _match(news:dict,row:dict,*,subject:Optional[str]=None,anchors:Optional[set]=None)->float:
         sim=_story_similarity(news,{'title':row.get('title','')})
         if same_work_event(news, {'_work_key': row.get('work_key'), 'title': row.get('title', '')}):
             sim=max(sim,0.94)
-        subject=EntityMemory._key(news.get('_llm_subject') or ''); old=EntityMemory._key(row.get('subject') or '')
+        if subject is None:
+            subject=EntityMemory._key(news.get('_llm_subject') or '')
+        old=EntityMemory._key(row.get('subject') or '')
         if subject and old and subject==old: sim=max(sim,0.94)
-        a=_story_update_anchor(news); b=set(row.get('anchors') or [])
+        a=_story_update_anchor(news) if anchors is None else anchors; b=set(row.get('anchors') or [])
         if a and b and len(a&b)/max(1,min(len(a),len(b)))>=0.70: sim=max(sim,0.90)
         return sim
+
+    @staticmethod
+    def _cannot_match(news_tokens, news_anchors, news_work, row:dict) -> bool:
+        """Строка заведомо даёт 0 в _match — сравнивать её дорого и незачем.
+
+        Точное условие, а не эвристика: меньше двух общих слов — сходство
+        заголовков 0; same_work_event без равного ключа тайтла — ложь; без
+        общих якорей правило якорей не срабатывает. Предмет новости
+        проверяет вызывающий (при нём фильтр не применяется).
+        """
+        if news_work and news_work == row.get('work_key'):
+            return False
+        if len(news_tokens & _story_tokens_cached(str(row.get('title', '') or ''))) >= 2:
+            return False
+        return not (news_anchors and not news_anchors.isdisjoint(row.get('anchors') or ()))
 
     @staticmethod
     def _delivery_match(news: dict, row: dict) -> bool:
@@ -7057,8 +7180,17 @@ class StoryRegistry:
         links=list(dict.fromkeys(normalize_url(x) for x in links if x))
         with self._lock:
             self._prune(save=False); best=None; score=0.0
+            # Всё, что зависит только от новой новости, — один раз, а не на
+            # каждую из 500 строк реестра: на цикле с десятками новостей это
+            # были десятки тысяч одинаковых вычислений прямо в цикле событий.
+            subject=EntityMemory._key(news.get('_llm_subject') or '')
+            anchors=_story_update_anchor(news)
+            tokens=_story_tokens_cached(_story_title_of(news))
+            work=news.get('_work_key')
             for row in reversed(self._items[-500:]):
-                cur=self._match(news,row)
+                if not subject and self._cannot_match(tokens, anchors, work, row):
+                    continue
+                cur=self._match(news,row,subject=subject,anchors=anchors)
                 if cur>score: best,score=row,cur
             if best is None or score<min(STORY_CLUSTER_SIMILARITY,0.86):
                 best={'registry_id':hashlib.sha1(f"{news.get('title','')}|{now}".encode()).hexdigest()[:16],
@@ -7444,7 +7576,10 @@ story_registry: Optional['StoryRegistry'] = None
 
 class PublishedStoryStore:
     """Small durable memory used to recognize meaningful updates to published stories."""
-    MAX_ITEMS = 1200
+    # Самое дальнее чтение — последние 500 записей (сравнение для обновлений
+    # историй), /posts отдаёт не больше 200. Раньше хранилось 1200: файл
+    # около 9 МБ, ~130 мс на каждую публикацию и десятки МБ памяти впустую.
+    MAX_ITEMS = 500
 
     def __init__(self, path: Path):
         self.path = path
@@ -7519,8 +7654,17 @@ class PublishedStoryStore:
         new_nums = _story_numbers(news)
         best = None
         best_score = 0.0
+        # Всё про новую новость — один раз, а не на каждую из 300 строк.
+        new_anchor = _story_update_anchor(news)
+        new_tokens = _story_tokens_cached(_story_title_of(news))
+        new_story_id = str(news.get('_story_id') or '')
         for old in reversed(items[-300:]):
             if new_link and old.get('link') == new_link:
+                continue
+            # Точный отсев: сходство заголовков и правило якорей требуют двух
+            # общих слов (якоря — часть слов); предмет и id истории — отдельно.
+            if (not new_subject and not (new_story_id and new_story_id == old.get('story_id'))
+                    and len(new_tokens & _story_tokens_cached(str(old.get('title', '') or ''))) < 2):
                 continue
             try:
                 at = datetime.fromisoformat(str(old.get('at') or ''))
@@ -7533,9 +7677,9 @@ class PublishedStoryStore:
             old_subject = EntityMemory._key(old.get('subject') or '')
             sim = _story_similarity(news, {'title': old.get('title', '')})
             nums_old_title = _story_numbers({'title': old.get('title', '')})
-            nums_new_title = _story_numbers(news)
+            nums_new_title = new_nums
             if not (nums_old_title and nums_new_title and nums_old_title != nums_new_title):
-                a_anchor = _story_update_anchor(news)
+                a_anchor = new_anchor
                 b_anchor = _story_update_anchor({'title': old.get('title', '')})
                 common_anchor = a_anchor & b_anchor
                 if len(common_anchor) >= 2:
@@ -7603,7 +7747,8 @@ class ReplayBuffer:
 
     def _save(self) -> None:
         try:
-            _atomic_write_json(self.path, {'schema_version': 1, 'items': self._items[-self.max_items:]}, indent=2)
+            _atomic_write_json(self.path, {'schema_version': 1, 'items': self._items[-self.max_items:]})
+            self._dirty = False
         except OSError as e:
             logger.warning(f'replay buffer не сохранён: {e}')
 
@@ -7628,19 +7773,27 @@ class ReplayBuffer:
     def capture(self, news: dict) -> str:
         return self.capture_many([news])[0]
 
-    def capture_many(self, items: list[dict]) -> list[str]:
-        ids: list[str] = []
-        snapshots = [self._snapshot(news) for news in items]
+    def capture_many(self, items: list[dict], *, save: bool = True) -> list[str]:
+        rows = [self._snapshot(news) for news in items]
+        ids = [row['replay_id'] for row in rows]
+        # Повтор внутри пачки: остаётся последний снимок, как и раньше.
+        snapshots = list({row['replay_id']: row for row in rows}.values())
         with self._lock:
-            for row in snapshots:
-                rid = row['replay_id']
-                ids.append(rid)
-                self._items = [x for x in self._items if x.get('replay_id') != rid]
-                self._items.append(row)
+            fresh = set(ids)
+            # Один проход вместо пересборки всего буфера на каждую новость.
+            self._items = [x for x in self._items if x.get('replay_id') not in fresh] + snapshots
             self._items = self._items[-self.max_items:]
             if snapshots:
-                self._save()
+                if save:
+                    self._save()
+                else:
+                    self._dirty = True
         return ids
+
+    def flush(self) -> None:
+        with self._lock:
+            if getattr(self, '_dirty', False):
+                self._save()
 
     def get(self, replay_id: str) -> Optional[dict]:
         rid = str(replay_id or '').strip().lower()
@@ -8170,9 +8323,20 @@ class AniListClient:
     }
     """
 
+    # Кеш рос без предела и переписывался целиком на каждый промах; поиск
+    # зовут потоки перевода, и запись, обходящая словарь, пока соседний поток
+    # его пополнял, падала RuntimeError (не OSError — мимо обработчика).
+    # Теперь: замок, потолок с вытеснением просроченных и старых, запись не
+    # чаще раза в минуту (кеш — не история: потеря минуты ответов безвредна).
+    MAX_ENTRIES = 5000
+    SAVE_EVERY_SEC = 60
+
     def __init__(self, cache_path: Path):
         self.cache_path = cache_path
         self._cache: dict[str, dict] = {}
+        self._lock = threading.RLock()
+        self._dirty = False
+        self._saved_at = 0.0
         self._load()
 
     def _load(self) -> None:
@@ -8189,10 +8353,32 @@ class AniListClient:
             self._cache = {}
 
     def _save(self) -> None:
-        try:
-            _atomic_write_json(self.cache_path, self._cache)
-        except OSError as e:
-            logger.error(f"Не удалось сохранить AniList кеш: {e}")
+        with self._lock:
+            try:
+                _atomic_write_json(self.cache_path, self._cache)
+                self._dirty = False
+                self._saved_at = time.monotonic()
+            except OSError as e:
+                logger.error(f"Не удалось сохранить AniList кеш: {e}")
+
+    def _remember(self, key: str, entry: dict) -> None:
+        with self._lock:
+            self._cache.pop(key, None)
+            self._cache[key] = entry            # свежая запись — в конец
+            if len(self._cache) > self.MAX_ENTRIES:
+                for stale in [k for k, v in self._cache.items() if not self._is_cache_fresh(v)]:
+                    self._cache.pop(stale, None)
+                while len(self._cache) > self.MAX_ENTRIES:
+                    self._cache.pop(next(iter(self._cache)))
+            self._dirty = True
+            due = time.monotonic() - self._saved_at >= self.SAVE_EVERY_SEC
+        if due:
+            self._save()
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._dirty:
+                self._save()
 
     @staticmethod
     def _norm_key(query: str) -> str:
@@ -8253,7 +8439,8 @@ class AniListClient:
         key = self._norm_key(query)
 
         # Проверка кеша
-        cached = self._cache.get(key)
+        with self._lock:
+            cached = self._cache.get(key)
         if cached and self._is_cache_fresh(cached):
             if cached.get('found'):
                 return {
@@ -8279,15 +8466,13 @@ class AniListClient:
                 'synonyms': list(result.get('synonyms') or []),
                 'checked_at': datetime.now().isoformat(),
             }
-            self._cache[key] = entry
-            self._save()
+            self._remember(key, entry)
             return {field: entry[field] for field in ('romaji', 'english', 'native', 'synonyms')}
         else:
-            self._cache[key] = {
+            self._remember(key, {
                 'found': False,
                 'checked_at': datetime.now().isoformat(),
-            }
-            self._save()
+            })
             return None
 
 
@@ -10125,7 +10310,7 @@ def download_video(url: str, note: Optional[list] = None) -> Optional[Path]:
     path, reason = video_download.download(
         url, VIDEO_DOWNLOAD_DIR, video_download.file_stem(url), fmt=VIDEO_FORMAT,
         max_mb=VIDEO_MAX_FILE_SIZE_MB, max_duration=VIDEO_MAX_DURATION_SEC,
-        extensions=DIRECT_VIDEO_EXTENSIONS, ydl_module=yt_dlp)
+        extensions=DIRECT_VIDEO_EXTENSIONS, ydl_module=_yt_dlp_module())
     return _video_download_result(url, path, reason, note)
 
 
@@ -11240,7 +11425,7 @@ def _ytdlp_telegram_video(post_id: str):
         'extractor_args': {'generic': {'impersonate': ['']}},
     }
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with _yt_dlp_module().YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
         logger.info(f"  {post_id}: yt-dlp — не смог ({type(e).__name__}: {str(e)[:90]})")
@@ -15370,7 +15555,9 @@ async def _image_duplicate(news: dict) -> Optional[str]:
     if not images:
         return None
     data = await asyncio.to_thread(_cached_image_bytes, images[0])
-    fingerprint = _image_fingerprint(data)
+    # Декодирование и уменьшение полноразмерного JPEG — десятки миллисекунд
+    # (65 мс на картинке 2400×1350): в потоке, а не в цикле событий.
+    fingerprint = await asyncio.to_thread(_image_fingerprint, data)
     if not fingerprint:
         return None
     dup = image_hashes.reserve(fingerprint, news.get('title', ''))
@@ -17107,6 +17294,13 @@ def _franchise_key(news: Optional[dict]) -> str:
     return '|'.join(anchors[:4])[:120]
 
 
+@functools.lru_cache(maxsize=4096)
+def _title_franchise_key(title: str) -> str:
+    # Ключ по заголовку прошлой публикации не меняется, а считался для каждой
+    # из 250 строк на каждую новость при каждой сортировке очереди.
+    return _franchise_key({'title': title})
+
+
 def _recent_franchise_penalty(news: dict, now: Optional[datetime] = None) -> float:
     if (not feature_enabled('diversity_scheduler') or FRANCHISE_COOLDOWN_MIN <= 0
             or story_history is None or news.get('_breaking_news')):
@@ -17119,7 +17313,7 @@ def _recent_franchise_penalty(news: dict, now: Optional[datetime] = None) -> flo
     for row in reversed(story_history._items[-250:]):
         old_key = EntityMemory._key(row.get('subject') or '')
         if not old_key:
-            old_key = _franchise_key({'title': row.get('title', '')})
+            old_key = _title_franchise_key(str(row.get('title', '') or ''))
         if old_key != key:
             continue
         try:
@@ -17490,6 +17684,17 @@ def _undated_too_old(item: dict) -> bool:
     return time.time() - first_seen_store.seen_at(link) > max_age * 3600
 
 
+async def _flush_collection_stats() -> None:
+    """Статистика сбора — одной записью за цикл. Сбой записи сбор не роняет."""
+    try:
+        if stats is not None:
+            await stats.flush()
+        if replay_buffer is not None:
+            await asyncio.to_thread(replay_buffer.flush)
+    except Exception as e:
+        logger.warning(f'Статистика сбора не записана: {type(e).__name__}: {e}')
+
+
 async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
     """Собирает свежие новости со всех включённых источников.
     Возвращает (all_news, stats_lines, errors)."""
@@ -17593,7 +17798,7 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
                     _note_source_failure(name, 'вернул 0 постов', save=False)
 
             if feature_enabled('replay') and replay_buffer is not None and unique_items:
-                replay_ids = await asyncio.to_thread(replay_buffer.capture_many, unique_items)
+                replay_ids = await asyncio.to_thread(replay_buffer.capture_many, unique_items, save=False)
                 for replay_item, replay_id in zip(unique_items, replay_ids):
                     replay_item['_replay_id'] = replay_id
             all_news.extend(unique_items)
@@ -17606,12 +17811,13 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
             logger.info(f"{name}: {len(unique_items)} новостей (из {len(items)} собранных, {no_image_skipped} без фото)")
 
             # === Метрики ===
+            # Статистика копится и пишется одной записью за цикл (ниже flush).
             if unique_items:
-                await stats.record_collected(name, len(unique_items))
+                await stats.record_collected(name, len(unique_items), save=False)
             if no_image_skipped:
-                await stats.record_skipped('no_image', name, no_image_skipped)
+                await stats.record_skipped('no_image', name, no_image_skipped, save=False)
             if duplicate_skipped:
-                await stats.record_skipped('duplicate', name, duplicate_skipped)
+                await stats.record_skipped('duplicate', name, duplicate_skipped, save=False)
             if feature_enabled('source_yield') and source_yield is not None:
                 await asyncio.to_thread(source_yield.record_fetch, name, raw=len(items), fresh=len(unique_items),
                                         duplicates=duplicate_skipped, no_image=no_image_skipped, duration_sec=fetch_seconds)
@@ -17668,6 +17874,9 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
     if story_registry is not None:
         # Реестр историй пишется один раз за цикл и вне event loop.
         await asyncio.to_thread(story_registry.flush)
+    if source_yield is not None:
+        await asyncio.to_thread(source_yield.flush)
+    await _flush_collection_stats()
     all_news = await _apply_active_verification(all_news)
     all_news = _annotate_story_updates(all_news)
     all_news = _annotate_editorial_automation(all_news)
@@ -30621,6 +30830,11 @@ async def _post_shutdown(app: Application) -> None:
         if story_registry is not None:
             # observe() только помечает реестр; несброшенное пишем при остановке.
             story_registry.flush()
+        if source_yield is not None:
+            source_yield.flush()
+        if anilist is not None:
+            anilist.flush()
+        await _flush_collection_stats()
     except Exception as e:
         logger.warning(f'Не удалось сбросить runtime-хранилища: {e}')
     await _stop_event_loop_lag_monitor()

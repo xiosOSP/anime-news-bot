@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "69662c540f438e73d41ff7eb4127d10d88333a09",
-  "generated_at_utc": "2026-10-02T21:34:17.141029+00:00",
+  "git_commit": "e5b19b97a7a449bb3ce2a122262a1d0ab1c45afa",
+  "generated_at_utc": "2026-10-02T22:09:12.418405+00:00",
   "files": {
     ".env.example": {
       "sha256": "1d45114ec32deffad57d13ba2928bab66cf9fc248bb0e9bcb2f959028479257a",
@@ -26,12 +26,12 @@
       "bytes": 33
     },
     "README.md": {
-      "sha256": "2430b5f71845878648c5a5c8a4cc23a644c1dbcebe3fc60c3ddfec723c726ec4",
-      "bytes": 22572
+      "sha256": "c0fc756a0fef07857281e13f0c54c753b5c6d0966b690b37efbe7bead6550658",
+      "bytes": 24465
     },
     "anime_news_bot.py": {
-      "sha256": "dd5eabb97ec989eb915f39f64bd6568c16a8529b80c16673c4b37c5ef80f0398",
-      "bytes": 1718704
+      "sha256": "0c8a4fdf80cdd6572822fd12e6cf9063a95e942f447e0fada2043c47f72f88cc",
+      "bytes": 1731354
     },
     "constraints.txt": {
       "sha256": "fe5e29d7db2182e0e5926013f81a450ef7a2a948cecc36d23765b2154f176212",
@@ -598,8 +598,8 @@
       "bytes": 6351
     },
     "tests/test_ops_alerts.py": {
-      "sha256": "1d20cb91f9a5f419b8ebbe595df94f0c0291ffa74c519d38eb17ef73b165aae9",
-      "bytes": 9458
+      "sha256": "633a2d7310124c730ecabdaf62dc09630928b3baa115d508397fe74ac52feede",
+      "bytes": 9459
     },
     "tests/test_optimizations.py": {
       "sha256": "ad706d593d629f0350113b5ffb02b2b6a6a76e5157ff34528dde2f56db27d375",
@@ -608,6 +608,14 @@
     "tests/test_parser_scope_limits.py": {
       "sha256": "fcb927772267d6818ff4ad0c02de4fe51beb42cad79b33cab40364d57972b06d",
       "bytes": 37853
+    },
+    "tests/test_perf_news.py": {
+      "sha256": "ec5462e842178a9c50c5f4197190b28a9470562663a1b57d6e6c09f0cb79533a",
+      "bytes": 4517
+    },
+    "tests/test_perf_storage.py": {
+      "sha256": "da99cd4e8d52a4ca7732ee7e7bd3eb5830e8758a1670e84d69599b5899d68598",
+      "bytes": 12796
     },
     "tests/test_pipeline.py": {
       "sha256": "d86a3f8751af3223b7b832790fd90ac990b16cb156df546343f6fe7eed581052",
