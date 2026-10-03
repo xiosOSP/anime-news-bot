@@ -7552,6 +7552,33 @@ def _annotate_work_keys(items: list[dict], *, budget: int = WORK_LOOKUP_PER_CYCL
             if len(name.split()) >= 2 and len(norm) >= 6:
                 item['_work_key'] = 'name:' + norm
                 break
+    # Русские названия ВСЕХ тайтлов новости, а не только первого: второй
+    # тайтл из текста («показы «ゲゲゲの鬼太郎» и ток-шоу по «悪魔くん»»)
+    # иначе уходил в канал иероглифами. Имена, записанные японским письмом,
+    # стоит поискать и по сети: без русского названия такой пост не выйдет.
+    for item in wanted:
+        if sent_links is not None and item.get('link') in sent_links:
+            continue
+        names = list(story_work_names(item)) + story_explicit_work_names(
+            {'title': str(item.get('summary') or '')[:1500]})
+        pairs: dict = {}
+        for name in names:
+            if name in pairs:
+                continue
+            key = work_titles.cached(name)
+            if (key is None and _CJK_RE.search(name) and budget > 0 and failures < 3
+                    and time.monotonic() < deadline):
+                budget -= 1
+                key = work_titles.lookup(name)
+                if key is None:
+                    failures += 1
+            russian = work_titles.russian(name) if key else ''
+            if russian and russian.casefold() != name.casefold():
+                pairs[name] = russian
+            if len(pairs) >= 6:
+                break
+        if pairs:
+            item['_work_titles_ru'] = pairs
     work_titles.flush()
     return marked
 
@@ -7820,6 +7847,7 @@ replay_buffer: Optional['ReplayBuffer'] = None
 def _apply_editorial_rules(text: str, news: Optional[dict] = None) -> str:
     from news_parser import clean_editorial_source
     out = clean_editorial_source(text)
+    out = _tidy_title_line(_russify_titles(out, news))
     if feature_enabled('editorial_glossary') and editorial_glossary is not None:
         out = editorial_glossary.apply(out)
     if feature_enabled('entity_memory') and entity_memory is not None:
@@ -12317,6 +12345,76 @@ def _russian_titles_on() -> bool:
     return settings is None or bool(getattr(settings, 'russian_titles', True))
 
 
+# Японское и китайское письмо: кана, иероглифы, полуширинная катакана.
+_CJK_RE = re.compile(r'[\u3040-\u30ff\u3400-\u9fff\uff66-\uff9f\u3000-\u303f\uff5e]')
+_CJK_LETTERS_RE = re.compile(r'[\u3040-\u30ff\u3400-\u9fff\uff66-\uff9f]')
+
+
+def _work_title_pairs(news: dict) -> dict:
+    """Оригинал → официальное русское название для всех опознанных тайтлов."""
+    pairs = {str(k): str(v) for k, v in dict(news.get('_work_titles_ru') or {}).items() if k and v}
+    original, russian = str(news.get('_work_name') or ''), str(news.get('_work_russian') or '')
+    if original and russian and original.casefold() != russian.casefold():
+        pairs.setdefault(original, russian)
+    return pairs
+
+
+def _russify_titles(text: str, news: Optional[dict]) -> str:
+    """Названия тайтлов в готовом тексте — официальные русские.
+
+    У живых админов канала тайтлы всегда по-русски («Власть книжного червя»),
+    а бот оставлял «Saikyou Mahoushi no Inton Keikaku» и «葬送のフリーレン»:
+    модели велено не переводить названия, и подсказка с русским названием
+    помогала не всегда. Здесь подстановка детерминированная. Латинский
+    оригинал при первом упоминании остаётся в скобках, если он короткий —
+    по нему тайтл узнают те, кто смотрит с английскими названиями; японское
+    письмо не остаётся нигде.
+    """
+    if not text or news is None or not _russian_titles_on():
+        return text
+    # Японский оригинал в скобках — пояснение, которое читателю ничего не
+    # даёт. Только скобки без кириллицы: «(4-я серия «…»)» несёт факт.
+    text = re.sub(r'\s*[（(][^()（）\n\u0400-\u04ff]*[\u3040-\u30ff\u3400-\u9fff]'
+                  r'[^()（）\n\u0400-\u04ff]*[)）]', '', text)
+    for original, russian in sorted(_work_title_pairs(news).items(), key=lambda kv: -len(kv[0])):
+        cjk = bool(_CJK_LETTERS_RE.search(original))
+        body = re.escape(original) if cjk else r'(?<![\w])' + re.escape(original) + r'(?![\w])'
+        # Кавычки — вместе с названием, но не пробелы вокруг: без кавычек
+        # «сезон Grand Blue выйдет» не должно склеиться в «сезон«…»выйдет».
+        pattern = re.compile(r'(?:[«"“\'『「]\s*)?' + body + r'(?:\s*[»"”\'』」])?',
+                             0 if cjk else re.IGNORECASE)
+        # Русское название уже в тексте (модель сделала как надо): оригинал
+        # в скобках рядом с ним оставляем, остальные упоминания — по-русски.
+        seen = [russian.casefold() in text.casefold()]
+
+        def replace(match, russian=russian, original=original, cjk=cjk, seen=seen):
+            before = match.string[:match.start()].rstrip()
+            if not cjk and before.endswith('(') and match.string[match.end():].lstrip().startswith(')'):
+                return match.group(0)
+            first = not seen[0]
+            seen[0] = True
+            if first and not cjk and len(original) <= 30:
+                return f'«{russian}» ({original})'
+            return f'«{russian}»'
+        text = pattern.sub(replace, text)
+    return text
+
+
+_TITLE_TAG_RE = re.compile(r'\s*(?:\[[^\]\n]{1,25}\]|【[^】\n]{1,25}】)')
+
+
+def _tidy_title_line(text: str) -> str:
+    """Заголовок без меток «[Интервью]» и без «!»: так пишут админы канала.
+
+    Восклицательные заголовки — дословный перевод японских сайтов
+    («Официальный отчёт о … перед премьерой!»), в канале они выглядят криком.
+    """
+    first, sep, rest = text.partition('\n')
+    tidy = _TITLE_TAG_RE.sub('', first).rstrip()
+    tidy = re.sub(r'\s*!+$', '.', tidy)
+    return (tidy or first) + sep + rest
+
+
 def _work_tag(news: dict) -> str:
     """Хэштег тайтла из официального русского названия: #НеобъятныйОкеан.
 
@@ -12333,14 +12431,21 @@ def _work_tag(news: dict) -> str:
 
 
 def _work_title_hint(news: dict) -> str:
-    """Строка для модели: официальное русское название тайтла, если оно известно."""
+    """Строка для модели: официальные русские названия тайтлов, если известны."""
     russian = str(news.get('_work_russian') or '').strip()
-    if not russian or not _russian_titles_on():
+    if not _russian_titles_on():
         return ''
-    original = str(news.get('_work_name') or '').strip()
-    if original and original.casefold() != russian.casefold():
-        return f'Русское название тайтла (Shikimori): «{russian}»; в источнике — {original}'
-    return f'Русское название тайтла (Shikimori): «{russian}»'
+    lines = []
+    if russian:
+        original = str(news.get('_work_name') or '').strip()
+        if original and original.casefold() != russian.casefold():
+            lines.append(f'Русское название тайтла (Shikimori): «{russian}»; в источнике — {original}')
+        else:
+            lines.append(f'Русское название тайтла (Shikimori): «{russian}»')
+    for original, other in _work_title_pairs(news).items():
+        if other != russian:
+            lines.append(f'Русское название тайтла (Shikimori): «{other}»; в источнике — {original}')
+    return '\n'.join(lines[:6])
 
 
 def _with_russian_work_name(title: str, news: dict) -> str:
@@ -12488,10 +12593,17 @@ def _left_untranslated(news: dict) -> bool:
     уже прошёл её проверки, правку админа трогать нельзя, а русские каналы
     не переводятся вовсе.
     """
-    if news.get('_edited_text') or news.get('_llm_text') or news.get('lang') == 'ru':
+    if news.get('_edited_text'):
         return False
+    if news.get('_llm_text') or news.get('lang') == 'ru':
+        # Пересказ модели и русские каналы не переводятся, но японское письмо
+        # в готовом посте — тоже непереведённый текст: админы канала его не
+        # публикуют никогда, а у бота такие посты выходили.
+        return bool(_CJK_LETTERS_RE.search(format_news_short(news)))
     news.pop('_translation_failed', None)
     text = format_news_short(news)
+    if _CJK_LETTERS_RE.search(text):
+        return True
     # Переводчик отказал — пост остался на языке источника. Русский текст без
     # пометки lang (такие ленты есть) от этого хуже не стал, поэтому смотрим,
     # на каком языке был сам источник.
@@ -12527,6 +12639,59 @@ def format_news_text_long(news: dict) -> str:
 def format_news_post(news: dict) -> str:
     """Формат поста для канала — короткий: заголовок + предложение + дата."""
     return format_news_short(news)
+
+
+# Вид поста как у живых админов канала: эмодзи по типу события, жирный
+# заголовок, пустая строка, одна-две фразы. У админов так оформлена половина
+# постов, и реакций на них в пять раз больше, чем на сплошной текст бота.
+# plain — прежний вид без разметки.
+POST_STYLE = (_env('POST_STYLE', 'rich').strip().lower() or 'rich')
+_POST_KIND_EMOJI = (('слух', '👀'), ('трейлер', '🎬'), ('анонс', '🔥'), ('релиз', '📺'))
+_POST_TOPIC_EMOJI = {'манга': '📚', 'игры': '🎮', 'кино': '🎥', 'комиксы': '💥'}
+_POST_TITLE_EMOJI = (
+    (re.compile(r'^(?:слух|по данным|инсайд)', re.I), '👀'),
+    (re.compile(r'трейлер|тизер|промо-?ролик|\bPV\b|опенинг|эндинг', re.I), '🎬'),
+    (re.compile(r'анонс|объявил|объявлен|экранизаци|получит (?:аниме|сериал|фильм)', re.I), '🔥'),
+    (re.compile(r'манг|ранобэ|том[ау]?\b|глав[аы]\b', re.I), '📚'),
+    (re.compile(r'\bигр[аыуе]?\b|видеоигр|Steam|PlayStation|Nintendo|Xbox', re.I), '🎮'),
+    (re.compile(r'премьер|стартует|выйдет|вышел|вышла|релиз', re.I), '📺'),
+)
+_POST_LEADING_EMOJI = re.compile(r'^[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF]')
+
+
+def _post_emoji(title: str, news: Optional[dict] = None) -> str:
+    """Эмодзи перед заголовком: по типу события от модели, иначе по словам."""
+    if title.casefold().startswith(('обновление:', 'update:')):
+        return '🔄'
+    news = news or {}
+    kind = str(news.get('_llm_kind') or '')
+    for name, emoji in _POST_KIND_EMOJI:
+        if kind == name:
+            return emoji
+    for pattern, emoji in _POST_TITLE_EMOJI:
+        if pattern.search(title):
+            return emoji
+    return _POST_TOPIC_EMOJI.get(str(news.get('_llm_topic') or ''), '✨')
+
+
+def _post_html(text: str, limit: int, news: Optional[dict] = None) -> str:
+    """Готовый текст поста в разметке Telegram: эмодзи, жирный заголовок, абзац.
+
+    Лимит Telegram считает символы без тегов, поэтому место под эмодзи и
+    пустую строку вычитается из лимита до обрезки, а теги — нет.
+    """
+    if POST_STYLE != 'rich' or not str(text or '').strip():
+        return _escape_to_limit(text, limit)
+    head = str(text).lstrip().split('\n', 1)[0]
+    emoji = '' if _POST_LEADING_EMOJI.match(head) else _post_emoji(head, news)
+    prefix = f'{emoji} ' if emoji else ''
+    plain = fit_to_limit(str(text).strip(), max(1, limit - len(prefix) - 2))
+    first, _sep, rest = plain.partition('\n')
+    out = prefix + f'<b>{html.escape(first.strip())}</b>'
+    rest = rest.strip('\n')
+    if rest:
+        out += '\n\n' + html.escape(rest)
+    return out
 
 
 def _escape_to_limit(text: str, limit: int) -> str:
@@ -12713,8 +12878,8 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
     video_thumb_kw = await _video_thumbnail_kwargs_async(
         video_file if has_inline_video else None)
 
-    safe_text = _escape_to_limit(text, TG_TEXT_LIMIT)
-    caption = _escape_to_limit(text, TG_CAPTION_LIMIT)
+    safe_text = _post_html(text, TG_TEXT_LIMIT, news)
+    caption = _post_html(text, TG_CAPTION_LIMIT, news)
 
     photos = _dedup_image_variants(news.get('images') or [])
     # Ролик не доехал, а картинок нет — ставим кадр-превью из самого поста,
@@ -12786,7 +12951,7 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
                 try:
                     await bot.send_message(
                         chat_id=target,
-                        text=_escape_to_limit(fallback_text, TG_TEXT_LIMIT),
+                        text=_post_html(fallback_text, TG_TEXT_LIMIT, news),
                         parse_mode=ParseMode.HTML, disable_web_page_preview=False,
                         **thread_kw,
                     )
@@ -16097,7 +16262,7 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
                   else await _resolve_photos_for_album(photos))
 
     # Caption для медиа. Telegram-лимит подписи — 1024 символа.
-    caption = _escape_to_limit(text, TG_CAPTION_LIMIT)
+    caption = _post_html(text, TG_CAPTION_LIMIT, news)
     caption_kw = {'caption': caption, 'parse_mode': ParseMode.HTML}
 
     # Кнопки модерации: 📢 В канал / 📅 В отложку / ✏️ Изменить / ✖ Скрыть
@@ -16352,7 +16517,7 @@ async def _send_thread_media_then_text(bot, news, photos, has_inline_video, vide
         return False
 
     try:
-        safe_text = _escape_to_limit(text, TG_TEXT_LIMIT)
+        safe_text = _post_html(text, TG_TEXT_LIMIT, news)
         await _tg_call_flood_safe(lambda: bot.send_message(
             chat_id=target, text=safe_text, parse_mode=ParseMode.HTML,
             disable_web_page_preview=True, reply_markup=reply_markup, **thread_kw))
@@ -18639,7 +18804,7 @@ async def _update_preview_text(bot: Bot, key: str, new_text: str) -> bool:
     if not prev:
         return False
     chat_id, message_id = prev.get('chat_id'), prev.get('message_id')
-    caption = _escape_to_limit(new_text, TG_CAPTION_LIMIT)
+    caption = _post_html(new_text, TG_CAPTION_LIMIT, pending_posts.get(key))
     markup = _moderation_markup(key)
     attempts = (
         lambda: bot.edit_message_caption(chat_id=chat_id, message_id=message_id,
@@ -18649,7 +18814,7 @@ async def _update_preview_text(bot: Bot, key: str, new_text: str) -> bool:
         lambda: bot.edit_message_caption(chat_id=chat_id, message_id=message_id,
                                          caption=caption, parse_mode=ParseMode.HTML),
         lambda: bot.edit_message_text(chat_id=chat_id, message_id=message_id,
-                                      text=_escape_to_limit(new_text, TG_TEXT_LIMIT),
+                                      text=_post_html(new_text, TG_TEXT_LIMIT, pending_posts.get(key)),
                                       parse_mode=ParseMode.HTML, reply_markup=markup),
     )
     for attempt in attempts:
@@ -19826,7 +19991,7 @@ async def _update_moderation_done(bot: Bot, key: str, suffix: str) -> None:
         return
     chat_id, message_id = prev.get('chat_id'), prev.get('message_id')
     short = await asyncio.to_thread(format_news_short, news)   # может переводить по сети
-    body = _escape_to_limit(short + suffix, TG_CAPTION_LIMIT)
+    body = _post_html(short + suffix, TG_CAPTION_LIMIT, news)
     attempts = (
         lambda: bot.edit_message_caption(chat_id=chat_id, message_id=message_id,
                                          caption=body, parse_mode=ParseMode.HTML,
