@@ -7,7 +7,6 @@
 import asyncio
 import base64
 import hashlib
-import uuid
 import hmac
 import html
 import ipaddress
@@ -37,6 +36,7 @@ except ImportError:  # pragma: no cover - Windows fallback: polling сам ко�
 from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+import functools
 from functools import wraps
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -109,10 +109,13 @@ from news_stories import (
     _story_media,
     _story_numbers,
     _story_similarity,
+    _story_title_of,
     _story_tokens,
+    _story_tokens_cached,
     _story_update_anchor,
     normalize_title,
 )
+import video_download
 from moderation_media import (MediaScanner, ensure_rating_models, hashes_match,
                               media_attachment, media_confidence,
                               parse_hashes,
@@ -158,14 +161,22 @@ try:
 except ImportError:
     Image = None
 
-# Опциональная зависимость — если yt-dlp нет, скачивание видео отключится
+# Опциональная зависимость — если yt-dlp нет, скачивание видео отключится.
+# Импорт ленивый: ролики качает отдельный процесс (video_download.py), а в
+# самом боте yt-dlp нужен в двух редких путях. Загрузка при старте стоила
+# ~60 мс и ~6 МБ памяти на всё время работы.
+import importlib.util as _importlib_util
 yt_dlp = None
-try:
-    import yt_dlp as _yt_dlp
-    yt_dlp = _yt_dlp
-    YT_DLP_AVAILABLE = True
-except ImportError:
-    YT_DLP_AVAILABLE = False
+YT_DLP_AVAILABLE = _importlib_util.find_spec('yt_dlp') is not None
+
+
+def _yt_dlp_module():
+    """yt-dlp по первому требованию (тесты подменяют модульный yt_dlp)."""
+    global yt_dlp
+    if yt_dlp is None:
+        import yt_dlp as _yt_dlp
+        yt_dlp = _yt_dlp
+    return yt_dlp
 
 # ============== НАСТРОЙКИ ==============
 # Чувствительные значения читаются из переменных окружения (env).
@@ -324,7 +335,7 @@ def _bounded_bytes_cache_put(cache: dict, key, value, max_items: int, max_bytes:
     cache[key] = value
 
 
-def _quarantine_unreadable_file(path: Path, reason: str, what: str) -> str:
+def _quarantine_unreadable_file(path: Path, reason: str, what: str, *, alert: bool = True) -> str:
     """Битый JSON — в сторону и предупреждение владельцу, а не молча затереть.
 
     Раньше оборванный файл превращался в пустое состояние, а следующая запись
@@ -340,6 +351,8 @@ def _quarantine_unreadable_file(path: Path, reason: str, what: str) -> str:
     except OSError:
         name = ''
     logger.error(f'{what}: файл не прочитан ({reason}); копия: {name or "нет"}')
+    if not alert:
+        return name
     try:
         _queue_admin_alert(
             f'⚠️ {what}: файл {path.name} повреждён и не прочитан ({str(reason)[:120]}). '
@@ -351,6 +364,42 @@ def _quarantine_unreadable_file(path: Path, reason: str, what: str) -> str:
     return name
 
 
+# Отступы — только для маленьких файлов, которые читают глазами (настройки,
+# правила). Большие хранилища с indent=2 писались медленным кодировщиком на
+# чистом Python и были в 1,5–3 раза крупнее.
+JSON_PRETTY_MAX_CHARS = 64 * 1024
+
+
+def _write_json(f, data, indent: Optional[int] = None) -> None:
+    """JSON быстрым C-кодировщиком.
+
+    json.dump(..., f) всегда идёт через кодировщик на чистом Python — C-версию
+    использует только json.dumps. На заполненном хранилище модерации это сотни
+    миллисекунд, в которые цикл событий стоит. Словарь пишется по разделам:
+    пик памяти — самый крупный раздел, а не весь файл целиком.
+    """
+    if isinstance(data, dict) and data:
+        chunks = [json.dumps({key: value}, ensure_ascii=False)[1:-1] for key, value in data.items()] \
+            if indent is not None else None
+        if chunks is not None:
+            if sum(len(c) for c in chunks) <= JSON_PRETTY_MAX_CHARS:
+                f.write(json.dumps(data, ensure_ascii=False, indent=indent))
+            else:
+                f.write('{' + ','.join(chunks) + '}')
+            return
+        f.write('{')
+        for index, (key, value) in enumerate(data.items()):
+            if index:
+                f.write(',')
+            f.write(json.dumps({key: value}, ensure_ascii=False)[1:-1])
+        f.write('}')
+        return
+    text = json.dumps(data, ensure_ascii=False)
+    if indent is not None and len(text) <= JSON_PRETTY_MAX_CHARS:
+        text = json.dumps(data, ensure_ascii=False, indent=indent)
+    f.write(text)
+
+
 def _atomic_write_json(path: Path, data, *, indent: Optional[int] = None) -> None:
     """Атомарно сохраняет JSON рядом с целевым файлом.
 
@@ -360,20 +409,36 @@ def _atomic_write_json(path: Path, data, *, indent: Optional[int] = None) -> Non
     целая версия.
     """
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f'.{path.name}.', suffix='.tmp', dir=str(path.parent))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=f'.{path.name}.', suffix='.tmp', dir=str(path.parent))
+    except Exception as e:
+        _note_write_failure(path, e)
+        raise
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=indent)
+            _write_json(f, data, indent)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_name, path)
-    except Exception:
+    except Exception as e:
+        _note_write_failure(path, e)
         try:
             os.unlink(tmp_name)
         except OSError:
             pass
         raise
+
+
+# Сбои записи на диск: каждое хранилище пишет об отказе только в лог, и
+# «диск заполнен» выглядел как десятки разрозненных строк. Сторож (ops_watch_job)
+# считает их вместе и пишет владельцу один раз.
+_disk_write_failures: deque = deque(maxlen=200)
+
+
+def _note_write_failure(path: Path, error: BaseException) -> None:
+    _disk_write_failures.append((time.monotonic(), Path(path).name,
+                                 f'{type(error).__name__}: {error}'[:160]))
 
 
 def _sweep_orphan_temp_files(directory: Path, *, max_age_sec: int = 3600) -> int:
@@ -2164,9 +2229,47 @@ def _mod_rate_after_pause(chat_id: int, user_id: int, now: Optional[float] = Non
         state['at'] = state['paused_until'] = now + MODERATION_RATE_PAUSE_SEC
 
 
+# Часы Telegram. Ограничение со сроком меньше 30 секунд Telegram считает
+# БЕССРОЧНЫМ: если часы контейнера отстают от Telegram на полминуты, минутная
+# пауза антифлуда превращалась в вечный мут. Сдвиг оцениваем по времени
+# отправки входящих сообщений (его ставит сам Telegram): максимум по выборке,
+# потому что задержка доставки только уменьшает разницу.
+_tg_clock_samples: deque = deque(maxlen=50)
+TG_RESTRICT_MIN_SEC = 45          # с запасом от порога Telegram в 30 секунд
+
+
+def _note_tg_clock(message) -> None:
+    sent = getattr(message, 'date', None)
+    if not isinstance(sent, datetime) or getattr(message, 'edit_date', None):
+        return
+    if sent.tzinfo is None:
+        sent = sent.replace(tzinfo=timezone.utc)
+    offset = (sent - datetime.now(timezone.utc)).total_seconds()
+    if abs(offset) < 86400:
+        _tg_clock_samples.append(offset)
+
+
+def _tg_now() -> datetime:
+    """Текущее время по часам Telegram (оценка)."""
+    offset = max(_tg_clock_samples) if _tg_clock_samples else 0.0
+    return datetime.now(timezone.utc) + timedelta(seconds=offset)
+
+
+def _tg_until(seconds: float) -> datetime:
+    """Срок ограничения: не короче TG_RESTRICT_MIN_SEC по часам Telegram."""
+    return _tg_now() + timedelta(seconds=max(float(seconds), TG_RESTRICT_MIN_SEC))
+
+
 async def _mod_rate_pause(bot: Bot, message, user_id: int, name: str, text: str,
-                          state: str = 'over') -> str:
-    """Темп превышен: удалить лишнее, минута тишины; третья пауза — флуд."""
+                          state: str = 'over', outcome: Optional[dict] = None) -> str:
+    """Темп превышен: удалить лишнее, минута тишины; третья пауза — флуд.
+
+    В ``outcome['removed']`` — удалилось ли сообщение. False означает, что оно
+    осталось в чате (Telegram отказал), и обычные проверки — 18+, чёрный список,
+    правила — должны его всё-таки посмотреть: раньше флуд-сообщение не
+    проверялось ничем, даже если удалить его не вышло.
+    """
+    outcome = outcome if outcome is not None else {}
     chat_id = int(message.chat_id)
     if chat_moderation is None or await _mod_admin_exempt(bot, message):
         return ''
@@ -2179,7 +2282,8 @@ async def _mod_rate_pause(bot: Bot, message, user_id: int, name: str, text: str,
             ok = await bot.delete_message(chat_id, message.message_id) is not False
             verdict = 'удалено: тот же залп' if ok else 'не удалено: Telegram отказал'
         except TelegramError as exc:
-            verdict = f'не удалено: {type(exc).__name__}'
+            ok, verdict = False, f'не удалено: {type(exc).__name__}'
+        outcome['removed'] = ok
         chat_moderation.log_decision(chat_id, user_id, name, 'flood', verdict,
                                      'антифлуд', 'сообщение отправлено до паузы', text)
         return verdict
@@ -2199,9 +2303,11 @@ async def _mod_rate_pause(bot: Bot, message, user_id: int, name: str, text: str,
                                      'антифлуд', reason, text)
         return 'режим наблюдения: пауза не выдана'
     done = []
+    outcome['removed'] = False
     try:
         if await bot.delete_message(chat_id, message.message_id) is not False:
             done.append('лишнее сообщение удалено')
+            outcome['removed'] = True
     except TelegramError as exc:
         done.append(f'удаление не подтверждено ({type(exc).__name__})')
     paused = False
@@ -2211,7 +2317,7 @@ async def _mod_rate_pause(bot: Bot, message, user_id: int, name: str, text: str,
             # Чужое ограничение (мут от админа или от бота) не трогаем: пауза
             # на минуту сняла бы его раньше срока.
             if getattr(member, 'status', '') in ('member',):
-                until = datetime.now(timezone.utc) + timedelta(seconds=MODERATION_RATE_PAUSE_SEC)
+                until = _tg_until(MODERATION_RATE_PAUSE_SEC)
                 result = await bot.restrict_chat_member(
                     chat_id, user_id, permissions=ChatPermissions.no_permissions(),
                     until_date=until, use_independent_chat_permissions=True)
@@ -2248,7 +2354,12 @@ async def _mod_rate_notice(bot: Bot, message, user_id: int, name: str) -> None:
     notice_id = getattr(sent, 'message_id', None)
     if isinstance(notice_id, int):
         async def _cleanup():
-            await asyncio.sleep(MODERATION_RATE_PAUSE_SEC)
+            try:
+                await asyncio.sleep(MODERATION_RATE_PAUSE_SEC)
+            except asyncio.CancelledError:
+                # Бот останавливается: убираем уведомление сейчас. Раньше задача
+                # просто пропадала, и «пауза на 1 мин» висела в чате навсегда.
+                pass
             try:
                 await bot.delete_message(message.chat_id, notice_id)
             except TelegramError:
@@ -2259,6 +2370,27 @@ async def _mod_rate_notice(bot: Bot, message, user_id: int, name: str) -> None:
 
 
 _moderation_rate_tasks: set = set()
+
+
+async def _cancel_moderation_tasks(timeout: float = 5.0) -> int:
+    """При остановке: уведомления о паузе убрать, отложенные перепроверки отменить."""
+    tasks = [task for task in list(_moderation_rate_tasks) if not task.done()]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.wait(tasks, timeout=timeout)
+    return len(tasks)
+
+
+async def _post_stop(app: Application) -> None:
+    # post_stop, а не post_shutdown: здесь бот ещё подключён к Telegram и может
+    # удалить уведомления; после shutdown запросы уже не уходят.
+    try:
+        cancelled = await _cancel_moderation_tasks()
+        if cancelled:
+            logger.info('Остановка: завершено фоновых задач модерации: %d', cancelled)
+    except Exception:
+        logger.exception('Остановка: фоновые задачи модерации не завершены')
 
 
 # Нейтральные названия групп. Само упоминание — не нарушение, и почти всегда
@@ -2617,6 +2749,27 @@ def _mod_local_check(chat_id: int, user_id: int, text: str, *, reply_to_user=Fal
     return None
 
 
+# Записи чёрного списка медиа: сколько file_id осуждённых файлов хранится
+# всегда и сколько — найденных копий. Раньше общий потолок в 20 вытеснял
+# первыми как раз осуждённый файл: после двадцати копий его точная пересылка
+# узнавалась только по кадрам — удаление без предупреждения или пропуск.
+MODERATION_MEDIA_PINNED_IDS = 20
+MODERATION_MEDIA_COPY_IDS = 20
+
+
+def _media_pinned_ids(row: dict) -> list:
+    """file_id, осуждённые напрямую (а не найденные копии). Старые записи — первый."""
+    ids = list(dict.fromkeys(row.get('file_ids') or []))
+    return ids[:int(row.get('pinned', 1) or 0)]
+
+
+def _cap_media_ids(ids, pinned: int) -> list:
+    ids = list(dict.fromkeys(str(x) for x in ids if x))
+    head = ids[:min(pinned, MODERATION_MEDIA_PINNED_IDS)]
+    tail = [x for x in ids[len(head):] if x not in head]
+    return head + tail[-MODERATION_MEDIA_COPY_IDS:]
+
+
 class ChatModerationStore:
     """Предупреждения, муты и включённые чаты. Переживает перезапуск.
 
@@ -2711,13 +2864,34 @@ class ChatModerationStore:
         except (ValueError, TypeError) as e:
             self._set_aside_corrupt(f'{type(e).__name__}: {e}')
 
+    _ABSENT = object()
+
+    def _checkpoint(self, *sections) -> dict:
+        """Копия только тех разделов, что метод меняет, — для отката при сбое записи.
+
+        Раньше откат копировал всё хранилище (на пределах — 20 МБ, ~200 мс) ради
+        одного предупреждения. И заодно откатывал ещё не записанные строки
+        журнала, которые к этому методу отношения не имели.
+        """
+        return {name: copy.deepcopy(self._data[name]) if name in self._data else self._ABSENT
+                for name in sections}
+
+    def _rollback(self, saved: dict) -> None:
+        for name, value in saved.items():
+            if value is self._ABSENT:
+                self._data.pop(name, None)
+            else:
+                self._data[name] = value
+
     def _save(self) -> bool:
         if getattr(self, '_read_failed', False):
             return False
         with self._lock:
-            snapshot = copy.deepcopy(self._data)
+            # Без копии: замок держится до конца записи, и менять данные во
+            # время сериализации некому. Копия заполненного хранилища стоила
+            # ~200 мс и десятки МБ на каждую запись.
             try:
-                _atomic_write_json(self.path, snapshot)
+                _atomic_write_json(self.path, self._data)
             except OSError as e:
                 logger.error(f'Модерация: состояние не сохранено: {e}')
                 return False
@@ -2770,7 +2944,7 @@ class ChatModerationStore:
         if not review_id:
             return False
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('reviews')
             reviews = self._data.setdefault('reviews', {})
             if review_id in reviews:
                 return True
@@ -2814,7 +2988,7 @@ class ChatModerationStore:
                     'sticker_set': str(media.get('sticker_set') or '')[:64],
                 }
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
@@ -2844,7 +3018,7 @@ class ChatModerationStore:
         if not entry_id or (not file_ids and not hashes and not sticker_set):
             return {}
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('media_blocklist')
             blocklist = self._data.setdefault('media_blocklist', {})
             row = blocklist.get(entry_id)
             if row is None:
@@ -2860,7 +3034,9 @@ class ChatModerationStore:
             elif source == 'admin':
                 # Подтверждение человека сильнее автоматического вердикта.
                 row['source'] = 'admin'
-            row['file_ids'] = list(dict.fromkeys(row.get('file_ids', []) + file_ids))[-20:]
+            pinned = _media_pinned_ids(row) + file_ids
+            row['file_ids'] = _cap_media_ids(pinned + list(row.get('file_ids', [])), len(pinned))
+            row['pinned'] = min(len(dict.fromkeys(pinned)), MODERATION_MEDIA_PINNED_IDS)
             if sticker_set:
                 # Весь набор стикеров: такие приходят паками, и одно
                 # подтверждение админа закрывает сразу весь пак.
@@ -2869,7 +3045,7 @@ class ChatModerationStore:
                 row['hashes'] = list(dict.fromkeys(hashes))[:MODERATION_MEDIA_HASHES_MAX]
             self._blocked_index = None
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return {}
             return dict(copy.deepcopy(row), id=entry_id)
 
@@ -2888,12 +3064,12 @@ class ChatModerationStore:
                       or (hashes and hashes_match(hashes, row.get('hashes') or ()))]
             if not doomed:
                 return 0
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('media_blocklist')
             for key in doomed:
                 blocklist.pop(key, None)
             self._blocked_index = None
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return 0
             return len(doomed)
 
@@ -2948,8 +3124,9 @@ class ChatModerationStore:
                 return
             row['hits'] = int(row.get('hits') or 0) + 1
             if file_unique_id:
-                row['file_ids'] = list(dict.fromkeys(
-                    (row.get('file_ids') or []) + [str(file_unique_id)[:64]]))[-20:]
+                row['file_ids'] = _cap_media_ids(
+                    (row.get('file_ids') or []) + [str(file_unique_id)[:64]],
+                    len(_media_pinned_ids(row)))
         self._save_soon()
 
     def allow_media(self, entry_id: str, file_ids, hashes, chat_id=None) -> bool:
@@ -3009,7 +3186,7 @@ class ChatModerationStore:
         if verdict not in ('correct', 'wrong'):
             return False
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('reviews', 'stats')
             row = self._data.get('reviews', {}).get(review_id)
             if not row:
                 return False
@@ -3041,7 +3218,7 @@ class ChatModerationStore:
                 int(src.get('correct' if verdict == 'correct' else 'wrong', 0)) + 1
             )
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
@@ -3052,7 +3229,7 @@ class ChatModerationStore:
         if not miss_id or category not in MODERATION_RULES:
             return False
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('misses', 'stats')
             misses = self._data.setdefault('misses', {})
             if miss_id in misses:
                 return True
@@ -3072,7 +3249,7 @@ class ChatModerationStore:
                 category, {'total': 0, 'overturned': 0})
             cat['missed_total'] = int(cat.get('missed_total', 0)) + 1
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
@@ -3105,7 +3282,7 @@ class ChatModerationStore:
     def reserve_incident(self, incident_id: str, chat_id, user_id, category, action) -> bool:
         """Persist intent before Telegram writes; replay never repeats a sanction."""
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('incidents')
             incidents = self._data.setdefault('incidents', {})
             if incident_id in incidents:
                 return False
@@ -3119,13 +3296,13 @@ class ChatModerationStore:
                                          user_id=int(user_id), category=category,
                                          action=action, status='pending')
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
     def update_incident(self, incident_id: str, *, add_warning=False, **changes) -> bool:
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('incidents', 'users')
             incident = self._data.get('incidents', {}).get(incident_id)
             if not incident:
                 return False
@@ -3138,7 +3315,7 @@ class ChatModerationStore:
                                              note=str(incident.get('reason', ''))[:200], incident=incident_id))
                 self._prune_locked()
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
@@ -3148,7 +3325,7 @@ class ChatModerationStore:
             incident = self._data.get('incidents', {}).get(incident_id)
             if not incident or incident.get('status') == 'undone':
                 return False
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('incidents', 'users', 'stats')
             row = self._data.get('users', {}).get(self._key(incident['chat_id'], incident['user_id']), {})
             row['warns'] = [w for w in row.get('warns', []) if w.get('incident') != incident_id]
             incident['status'] = 'undone'
@@ -3158,7 +3335,7 @@ class ChatModerationStore:
                 incident['category'], {'total': 0, 'overturned': 0})
             category['overturned'] = int(category.get('overturned', 0)) + 1
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
@@ -3174,10 +3351,10 @@ class ChatModerationStore:
         if mode not in MODERATION_MODES:
             raise ValueError(f'неизвестный режим модерации: {mode!r}')
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('mode')
             self._data['mode'] = mode
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
@@ -3191,10 +3368,10 @@ class ChatModerationStore:
         if type(enabled) is not bool:
             raise ValueError('moderate_admins must be bool')
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('moderate_admins')
             self._data['moderate_admins'] = enabled
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
@@ -3231,7 +3408,7 @@ class ChatModerationStore:
 
     def set_chat(self, chat_id: int, enabled: bool) -> bool:
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('chats', 'disabled_chats')
             chats = [int(x) for x in (self._data.get('chats') or [])]
             if enabled and int(chat_id) not in chats:
                 chats.append(int(chat_id))
@@ -3245,7 +3422,7 @@ class ChatModerationStore:
                 disabled.add(int(chat_id))
             self._data['disabled_chats'] = sorted(disabled)
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 return False
             return True
 
@@ -3280,7 +3457,7 @@ class ChatModerationStore:
     def add_warn(self, chat_id, user_id, category: str, note: str = '') -> int:
         """Записывает предупреждение и возвращает их суммарное число."""
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('users')
             users = self._data.setdefault('users', {})
             row = users.setdefault(self._key(chat_id, user_id), {'warns': []})
             row.setdefault('warns', []).append({
@@ -3292,17 +3469,17 @@ class ChatModerationStore:
             total = len(((self._data.get('users') or {}).get(
                 self._key(chat_id, user_id)) or {}).get('warns') or [])
             if not self._save():
-                self._data = before
+                self._rollback(before)
                 raise OSError('Предупреждение не удалось сохранить')
             return total
 
     def clear_warns(self, chat_id, user_id) -> bool:
         with self._lock:
-            before = copy.deepcopy(self._data)
+            before = self._checkpoint('users')
             users = self._data.get('users') or {}
             existed = users.pop(self._key(chat_id, user_id), None) is not None
             if existed and not self._save():
-                self._data = before
+                self._rollback(before)
                 raise OSError('Предупреждения не удалось сохранить')
             return existed
 
@@ -3797,7 +3974,72 @@ class SentLinksStore:
         # commit() уже после успешной отправки. Теперь чтение ничего не меняет,
         # а изменения и снимок для записи идут под этим замком.
         self._state_lock = threading.RLock()
+        # Битый файл истории без копии — это повторная публикация всего, что
+        # уже выходило. Тогда автопубликация стоит до решения владельца.
+        self.history_lost = False
+        self.restored_from = ''
+        self._lastgood_at = 0.0
         self._load()
+        if (self.path.exists() and not self.history_lost
+                and not getattr(self, '_read_failed', False)):
+            self._snapshot_lastgood()
+
+    # Проверенная копия истории: снимается после успешного чтения и не чаще
+    # раза в час после записи. Ежедневный бэкап уходит в личку админу, а не
+    # лежит на диске, поэтому восстановиться автоматически было не из чего.
+    LASTGOOD_EVERY_SEC = 3600
+
+    def accept_lost_history(self) -> bool:
+        """Владелец решил продолжить с тем, что есть: пауза снимается."""
+        with self._state_lock:
+            self.history_lost = False
+        return self._save()
+
+    def _lastgood_path(self) -> Path:
+        return self.path.with_name(self.path.name + '.lastgood')
+
+    def _snapshot_lastgood(self) -> None:
+        target = self._lastgood_path()
+        tmp = target.with_name(target.name + '.tmp')
+        try:
+            shutil.copyfile(self.path, tmp)
+            os.replace(tmp, target)
+            self._lastgood_at = time.time()
+        except OSError as e:
+            logger.warning(f'Копия истории публикаций не обновлена: {e}')
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+
+    def _recover_from_lastgood(self, reason: str) -> None:
+        """Основной файл не читается: поднимаем проверенную копию или встаём на паузу."""
+        _quarantine_unreadable_file(self.path, reason, 'История публикаций', alert=False)
+        lastgood = self._lastgood_path()
+        if lastgood.exists():
+            try:
+                taken = datetime.fromtimestamp(lastgood.stat().st_mtime).strftime('%d.%m %H:%M')
+                shutil.copyfile(lastgood, self.path)
+                self._load(restoring=True)
+            except OSError as e:
+                logger.error(f'Копия истории не поднялась: {e}')
+            else:
+                if not self.history_lost:
+                    self.restored_from = taken
+                    logger.warning(f'История публикаций восстановлена из копии от {taken}')
+                    _queue_admin_alert(
+                        f'⚠️ История публикаций: файл {self.path.name} был повреждён '
+                        f'({str(reason)[:100]}). '
+                        f'Восстановлена проверенная копия от {taken}: новости, вышедшие '
+                        'после неё, могут повториться — остальные защиты от повторов '
+                        '(картинки, тексты) работают. Битый файл сохранён рядом.')
+                    return
+        self.history_lost = True
+        _queue_admin_alert(
+            f'⛔ История публикаций: файл {self.path.name} повреждён, проверенной копии '
+            'нет. Автопубликация '
+            'ПРИОСТАНОВЛЕНА: с пустой историей бот выложил бы заново уже вышедшие '
+            'новости. Варианты: вернуть файл sent_links.json из бэкапа и перезапустить '
+            'бота или отправить /historyok — продолжить с пустой историей (возможны '
+            'повторы). Битый файл сохранён рядом.')
 
     @contextlib.asynccontextmanager
     async def _locked(self):
@@ -3806,7 +4048,7 @@ class SentLinksStore:
             with self._state_lock:
                 yield
 
-    def _load(self) -> None:
+    def _load(self, restoring: bool = False) -> None:
         if not self.path.exists():
             return
         dropped_claims: list[tuple[str, str]] = []
@@ -3821,6 +4063,7 @@ class SentLinksStore:
                 return
             if not isinstance(data, dict):
                 return
+            self.history_lost = bool(data.get('history_lost'))
             self._urls = list(dict.fromkeys(
                 normalize_url(str(u)) for u in data.get('urls', []) if u))
             self._url_set = set(self._urls)
@@ -3870,7 +4113,13 @@ class SentLinksStore:
             if self._purge_transient_unlocked() or dropped_claims:
                 self._save()
         except json.JSONDecodeError as e:
-            _quarantine_unreadable_file(self.path, f'{type(e).__name__}: {e}', 'История публикаций')
+            if restoring:
+                # Испорчена и копия: второй раз не восстанавливаем, встаём на паузу.
+                _quarantine_unreadable_file(self.path, f'{type(e).__name__}: {e}',
+                                            'Копия истории публикаций', alert=False)
+                self.history_lost = True
+                return
+            self._recover_from_lastgood(f'{type(e).__name__}: {e}')
         except OSError as e:
             # Файл есть, но прочесть его не вышло (права, сбой диска): затирать
             # его пустой историей нельзя — запись отключена до перезапуска.
@@ -3896,8 +4145,15 @@ class SentLinksStore:
                 'reservations': {k: dict(v) for k, v in self._reservations.items()},
                 'rejected': {k: dict(v) for k, v in self._rejected.items()},
             }
+            if self.history_lost:
+                # Пауза переживает рестарт: иначе пустая, но уже читаемая
+                # история молча снимала бы её при следующем запуске.
+                snapshot['history_lost'] = True
         try:
             _atomic_write_json(self.path, snapshot)
+            if (not self.history_lost
+                    and time.time() - self._lastgood_at >= self.LASTGOOD_EVERY_SEC):
+                self._snapshot_lastgood()
             return True
         except Exception as e:
             # Не только OSError: любое исключение отсюда вылетало из commit()
@@ -4423,6 +4679,11 @@ class PostQueue:
                 self._items = old_items
                 return 0
             return added
+
+    def oldest(self) -> Optional[dict]:
+        """Запись в голове очереди (или отправляемая сейчас) — для сторожа."""
+        head = self._inflight or (self._items[0] if self._items else None)
+        return dict(head) if isinstance(head, dict) else None
 
     async def pop_next(self) -> Optional[dict]:
         """Достаёт следующий пост из очереди (FIFO). Возвращает news dict или None.
@@ -5507,7 +5768,7 @@ class BotStats:
         return self._data['by_source'][source]
 
     # === Методы для записи событий ===
-    async def record_collected(self, source: str, count: int) -> None:
+    async def record_collected(self, source: str, count: int, *, save: bool = True) -> None:
         """Собрали N постов из источника (после всех фильтров)."""
         if count <= 0:
             return
@@ -5517,7 +5778,23 @@ class BotStats:
             entry['collected'] += count
             entry['last_success_at'] = datetime.now().isoformat()
             self._add_event_unlocked('collected', source)
+            await self._save_or_mark(save)
+
+    async def _save_or_mark(self, save: bool) -> None:
+        # Сбор пишет статистику по каждому источнику — до трёх записей файла
+        # на источник подряд. С save=False они копятся и уходят одной записью
+        # за цикл (flush): сбор не ждёт десятки записей на диск.
+        if save:
             await asyncio.to_thread(self._save)
+            self._dirty = False
+        else:
+            self._dirty = True
+
+    async def flush(self) -> None:
+        async with self._lock:
+            if getattr(self, '_dirty', False):
+                await asyncio.to_thread(self._save)
+                self._dirty = False
 
     async def record_source_error(self, source: str) -> None:
         """Источник упал при сборе."""
@@ -5538,7 +5815,7 @@ class BotStats:
             await asyncio.to_thread(self._save)
 
     async def record_skipped(self, reason: str, source: Optional[str] = None,
-                             count: int = 1) -> None:
+                             count: int = 1, *, save: bool = True) -> None:
         """Пост отброшен. reason: no_image / too_old / duplicate / spam / filtered."""
         key = f'skipped_{reason}'
         count = max(0, int(count))
@@ -5548,7 +5825,7 @@ class BotStats:
             if key in self._data['totals']:
                 self._data['totals'][key] += count
             self._add_event_unlocked(key, source, count)
-            await asyncio.to_thread(self._save)
+            await self._save_or_mark(save)
 
     async def record_failed_send(self, source: Optional[str] = None) -> None:
         """Реальная ошибка отправки в Telegram."""
@@ -6559,6 +6836,13 @@ class EditorialGlossary:
         return sorted(self._aliases.items(), key=lambda kv: kv[0].casefold())
 
 
+@functools.lru_cache(maxsize=8192)
+def _entity_key(value: str) -> str:
+    # Кеш: ключ одного и того же предмета считается для каждой строки реестра
+    # историй и истории публикаций — на каждую новость цикла.
+    return re.sub(r'[^0-9a-zа-яё]+', '', value.casefold())[:160]
+
+
 class EntityMemory:
     """Learns a stable preferred spelling for recurring franchise/person names."""
     MAX_ENTITIES = 1200
@@ -6570,8 +6854,8 @@ class EntityMemory:
         self._load()
 
     @staticmethod
-    def _key(value: str) -> str:
-        return re.sub(r'[^0-9a-zа-яё]+', '', str(value or '').casefold())[:160]
+    def _key(value) -> str:
+        return _entity_key(str(value or ''))
 
     def _load(self) -> None:
         try:
@@ -6699,9 +6983,24 @@ class SourceYieldStore:
             logger.warning(f'source yield не загружен: {e}')
 
     def _save(self) -> None:
-        try: _atomic_write_json(self.path, {'schema_version': 1, 'sources': self._rows,
-                                               'story_credits': dict(list(self._story_credits.items())[-5000:])}, indent=2)
+        try:
+            _atomic_write_json(self.path, {'schema_version': 1, 'sources': self._rows,
+                                           'story_credits': dict(list(self._story_credits.items())[-5000:])})
+            self._dirty = False
         except OSError as e: logger.warning(f'source yield не сохранён: {e}')
+
+    def _mark(self) -> None:
+        # Сбор, ошибки и новые истории только помечают хранилище: раньше файл
+        # (сотни КБ) переписывался на каждую новую историю прямо в цикле
+        # событий — около 1,3 с простоя бота на цикл с 60 новыми историями.
+        # На диск — один раз за цикл (flush) и при остановке; это статистика,
+        # сбой процесса теряет не больше одного цикла счётчиков.
+        self._dirty = True
+
+    def flush(self) -> None:
+        with self._lock:
+            if getattr(self, '_dirty', False):
+                self._save()
 
     def _row(self, source: str) -> dict:
         source = str(source or 'unknown')
@@ -6714,12 +7013,12 @@ class SourceYieldStore:
             row['raw'] += max(0, int(raw)); row['fresh'] += max(0, int(fresh))
             row['duplicates'] += max(0, int(duplicates)); row['no_image'] += max(0, int(no_image))
             row['fetch_ms_sum'] += max(0.0, float(duration_sec or 0.0) * 1000.0)
-            row['last_seen'] = datetime.now(timezone.utc).isoformat(); self._save()
+            row['last_seen'] = datetime.now(timezone.utc).isoformat(); self._mark()
 
     def record_error(self, source: str) -> None:
         with self._lock:
             row = self._row(source); row['errors'] += 1
-            row['last_seen'] = datetime.now(timezone.utc).isoformat(); self._save()
+            row['last_seen'] = datetime.now(timezone.utc).isoformat(); self._mark()
 
     def record_story(self, story_key: str, sources: list[str]) -> None:
         story_key = str(story_key or '').strip()[:160]
@@ -6737,7 +7036,7 @@ class SourceYieldStore:
                 self._story_credits[story_key] = sorted(credited)[:50]
                 if len(self._story_credits) > 5000:
                     self._story_credits = dict(list(self._story_credits.items())[-5000:])
-                self._save()
+                self._mark()
 
     def record_moderation_sent(self, source: str) -> None:
         with self._lock: self._row(source)['moderation_sent'] += 1; self._save()
@@ -6795,15 +7094,32 @@ class StoryRegistry:
         if save: self._save()
 
     @staticmethod
-    def _match(news:dict,row:dict)->float:
+    def _match(news:dict,row:dict,*,subject:Optional[str]=None,anchors:Optional[set]=None)->float:
         sim=_story_similarity(news,{'title':row.get('title','')})
         if same_work_event(news, {'_work_key': row.get('work_key'), 'title': row.get('title', '')}):
             sim=max(sim,0.94)
-        subject=EntityMemory._key(news.get('_llm_subject') or ''); old=EntityMemory._key(row.get('subject') or '')
+        if subject is None:
+            subject=EntityMemory._key(news.get('_llm_subject') or '')
+        old=EntityMemory._key(row.get('subject') or '')
         if subject and old and subject==old: sim=max(sim,0.94)
-        a=_story_update_anchor(news); b=set(row.get('anchors') or [])
+        a=_story_update_anchor(news) if anchors is None else anchors; b=set(row.get('anchors') or [])
         if a and b and len(a&b)/max(1,min(len(a),len(b)))>=0.70: sim=max(sim,0.90)
         return sim
+
+    @staticmethod
+    def _cannot_match(news_tokens, news_anchors, news_work, row:dict) -> bool:
+        """Строка заведомо даёт 0 в _match — сравнивать её дорого и незачем.
+
+        Точное условие, а не эвристика: меньше двух общих слов — сходство
+        заголовков 0; same_work_event без равного ключа тайтла — ложь; без
+        общих якорей правило якорей не срабатывает. Предмет новости
+        проверяет вызывающий (при нём фильтр не применяется).
+        """
+        if news_work and news_work == row.get('work_key'):
+            return False
+        if len(news_tokens & _story_tokens_cached(str(row.get('title', '') or ''))) >= 2:
+            return False
+        return not (news_anchors and not news_anchors.isdisjoint(row.get('anchors') or ()))
 
     @staticmethod
     def _delivery_match(news: dict, row: dict) -> bool:
@@ -6864,8 +7180,17 @@ class StoryRegistry:
         links=list(dict.fromkeys(normalize_url(x) for x in links if x))
         with self._lock:
             self._prune(save=False); best=None; score=0.0
+            # Всё, что зависит только от новой новости, — один раз, а не на
+            # каждую из 500 строк реестра: на цикле с десятками новостей это
+            # были десятки тысяч одинаковых вычислений прямо в цикле событий.
+            subject=EntityMemory._key(news.get('_llm_subject') or '')
+            anchors=_story_update_anchor(news)
+            tokens=_story_tokens_cached(_story_title_of(news))
+            work=news.get('_work_key')
             for row in reversed(self._items[-500:]):
-                cur=self._match(news,row)
+                if not subject and self._cannot_match(tokens, anchors, work, row):
+                    continue
+                cur=self._match(news,row,subject=subject,anchors=anchors)
                 if cur>score: best,score=row,cur
             if best is None or score<min(STORY_CLUSTER_SIMILARITY,0.86):
                 best={'registry_id':hashlib.sha1(f"{news.get('title','')}|{now}".encode()).hexdigest()[:16],
@@ -7251,7 +7576,10 @@ story_registry: Optional['StoryRegistry'] = None
 
 class PublishedStoryStore:
     """Small durable memory used to recognize meaningful updates to published stories."""
-    MAX_ITEMS = 1200
+    # Самое дальнее чтение — последние 500 записей (сравнение для обновлений
+    # историй), /posts отдаёт не больше 200. Раньше хранилось 1200: файл
+    # около 9 МБ, ~130 мс на каждую публикацию и десятки МБ памяти впустую.
+    MAX_ITEMS = 500
 
     def __init__(self, path: Path):
         self.path = path
@@ -7326,8 +7654,17 @@ class PublishedStoryStore:
         new_nums = _story_numbers(news)
         best = None
         best_score = 0.0
+        # Всё про новую новость — один раз, а не на каждую из 300 строк.
+        new_anchor = _story_update_anchor(news)
+        new_tokens = _story_tokens_cached(_story_title_of(news))
+        new_story_id = str(news.get('_story_id') or '')
         for old in reversed(items[-300:]):
             if new_link and old.get('link') == new_link:
+                continue
+            # Точный отсев: сходство заголовков и правило якорей требуют двух
+            # общих слов (якоря — часть слов); предмет и id истории — отдельно.
+            if (not new_subject and not (new_story_id and new_story_id == old.get('story_id'))
+                    and len(new_tokens & _story_tokens_cached(str(old.get('title', '') or ''))) < 2):
                 continue
             try:
                 at = datetime.fromisoformat(str(old.get('at') or ''))
@@ -7340,9 +7677,9 @@ class PublishedStoryStore:
             old_subject = EntityMemory._key(old.get('subject') or '')
             sim = _story_similarity(news, {'title': old.get('title', '')})
             nums_old_title = _story_numbers({'title': old.get('title', '')})
-            nums_new_title = _story_numbers(news)
+            nums_new_title = new_nums
             if not (nums_old_title and nums_new_title and nums_old_title != nums_new_title):
-                a_anchor = _story_update_anchor(news)
+                a_anchor = new_anchor
                 b_anchor = _story_update_anchor({'title': old.get('title', '')})
                 common_anchor = a_anchor & b_anchor
                 if len(common_anchor) >= 2:
@@ -7410,7 +7747,8 @@ class ReplayBuffer:
 
     def _save(self) -> None:
         try:
-            _atomic_write_json(self.path, {'schema_version': 1, 'items': self._items[-self.max_items:]}, indent=2)
+            _atomic_write_json(self.path, {'schema_version': 1, 'items': self._items[-self.max_items:]})
+            self._dirty = False
         except OSError as e:
             logger.warning(f'replay buffer не сохранён: {e}')
 
@@ -7435,19 +7773,27 @@ class ReplayBuffer:
     def capture(self, news: dict) -> str:
         return self.capture_many([news])[0]
 
-    def capture_many(self, items: list[dict]) -> list[str]:
-        ids: list[str] = []
-        snapshots = [self._snapshot(news) for news in items]
+    def capture_many(self, items: list[dict], *, save: bool = True) -> list[str]:
+        rows = [self._snapshot(news) for news in items]
+        ids = [row['replay_id'] for row in rows]
+        # Повтор внутри пачки: остаётся последний снимок, как и раньше.
+        snapshots = list({row['replay_id']: row for row in rows}.values())
         with self._lock:
-            for row in snapshots:
-                rid = row['replay_id']
-                ids.append(rid)
-                self._items = [x for x in self._items if x.get('replay_id') != rid]
-                self._items.append(row)
+            fresh = set(ids)
+            # Один проход вместо пересборки всего буфера на каждую новость.
+            self._items = [x for x in self._items if x.get('replay_id') not in fresh] + snapshots
             self._items = self._items[-self.max_items:]
             if snapshots:
-                self._save()
+                if save:
+                    self._save()
+                else:
+                    self._dirty = True
         return ids
+
+    def flush(self) -> None:
+        with self._lock:
+            if getattr(self, '_dirty', False):
+                self._save()
 
     def get(self, replay_id: str) -> Optional[dict]:
         rid = str(replay_id or '').strip().lower()
@@ -7977,9 +8323,20 @@ class AniListClient:
     }
     """
 
+    # Кеш рос без предела и переписывался целиком на каждый промах; поиск
+    # зовут потоки перевода, и запись, обходящая словарь, пока соседний поток
+    # его пополнял, падала RuntimeError (не OSError — мимо обработчика).
+    # Теперь: замок, потолок с вытеснением просроченных и старых, запись не
+    # чаще раза в минуту (кеш — не история: потеря минуты ответов безвредна).
+    MAX_ENTRIES = 5000
+    SAVE_EVERY_SEC = 60
+
     def __init__(self, cache_path: Path):
         self.cache_path = cache_path
         self._cache: dict[str, dict] = {}
+        self._lock = threading.RLock()
+        self._dirty = False
+        self._saved_at = 0.0
         self._load()
 
     def _load(self) -> None:
@@ -7996,10 +8353,32 @@ class AniListClient:
             self._cache = {}
 
     def _save(self) -> None:
-        try:
-            _atomic_write_json(self.cache_path, self._cache)
-        except OSError as e:
-            logger.error(f"Не удалось сохранить AniList кеш: {e}")
+        with self._lock:
+            try:
+                _atomic_write_json(self.cache_path, self._cache)
+                self._dirty = False
+                self._saved_at = time.monotonic()
+            except OSError as e:
+                logger.error(f"Не удалось сохранить AniList кеш: {e}")
+
+    def _remember(self, key: str, entry: dict) -> None:
+        with self._lock:
+            self._cache.pop(key, None)
+            self._cache[key] = entry            # свежая запись — в конец
+            if len(self._cache) > self.MAX_ENTRIES:
+                for stale in [k for k, v in self._cache.items() if not self._is_cache_fresh(v)]:
+                    self._cache.pop(stale, None)
+                while len(self._cache) > self.MAX_ENTRIES:
+                    self._cache.pop(next(iter(self._cache)))
+            self._dirty = True
+            due = time.monotonic() - self._saved_at >= self.SAVE_EVERY_SEC
+        if due:
+            self._save()
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._dirty:
+                self._save()
 
     @staticmethod
     def _norm_key(query: str) -> str:
@@ -8060,7 +8439,8 @@ class AniListClient:
         key = self._norm_key(query)
 
         # Проверка кеша
-        cached = self._cache.get(key)
+        with self._lock:
+            cached = self._cache.get(key)
         if cached and self._is_cache_fresh(cached):
             if cached.get('found'):
                 return {
@@ -8086,15 +8466,13 @@ class AniListClient:
                 'synonyms': list(result.get('synonyms') or []),
                 'checked_at': datetime.now().isoformat(),
             }
-            self._cache[key] = entry
-            self._save()
+            self._remember(key, entry)
             return {field: entry[field] for field in ('romaji', 'english', 'native', 'synonyms')}
         else:
-            self._cache[key] = {
+            self._remember(key, {
                 'found': False,
                 'checked_at': datetime.now().isoformat(),
-            }
-            self._save()
+            })
             return None
 
 
@@ -9917,84 +10295,69 @@ def _video_thumbnail_kwargs(video_file: Optional[Path]) -> dict:
     return {'thumbnail': data} if data else {}
 
 def download_video(url: str, note: Optional[list] = None) -> Optional[Path]:
-    """Скачивает видео через yt-dlp с лимитами по длине и размеру.
-    Возвращает путь к файлу или None.
+    """Скачивает видео через yt-dlp в этом же процессе (блокирующе).
 
+    Для публикации — только _download_video_bounded: там отдельный процесс с
+    общим сроком. Эта версия осталась для разовых проверок и тестов логики.
     В note (если передан) кладём причину провала: без неё «видео не пришло»
     выглядит одинаково и когда yt-dlp не установлен, и когда ролик слишком
-    большой, и когда хостинг закрыл доступ.
-    Эту функцию нужно вызывать через asyncio.to_thread, она блокирующая."""
-    def say(reason: str):
-        if note is not None:
-            note.append(reason)
-        return None
-
+    большой, и когда хостинг закрыл доступ."""
     if not YT_DLP_AVAILABLE:
         logger.warning("yt-dlp не установлен — видео с внешних хостингов недоступны")
-        return say('yt-dlp не установлен')
+        if note is not None:
+            note.append('yt-dlp не установлен')
+        return None
+    path, reason = video_download.download(
+        url, VIDEO_DOWNLOAD_DIR, video_download.file_stem(url), fmt=VIDEO_FORMAT,
+        max_mb=VIDEO_MAX_FILE_SIZE_MB, max_duration=VIDEO_MAX_DURATION_SEC,
+        extensions=DIRECT_VIDEO_EXTENSIONS, ydl_module=_yt_dlp_module())
+    return _video_download_result(url, path, reason, note)
 
-    # Имя файла: читаемый хвост URL + случайный суффикс на КАЖДУЮ загрузку.
-    # Раньше имя было последними 80 символами URL: у двух длинных ссылок с
-    # одинаковым концом файл общий, а публикация и диагностика одной и той же
-    # ссылки одновременно читали и удаляли один и тот же путь.
-    tail = re.sub(r'[^\w\-]', '_', url)[-60:]
-    safe_name = f'{tail}_{uuid.uuid4().hex[:10]}'
-    output_template = str(VIDEO_DOWNLOAD_DIR / f'{safe_name}.%(ext)s')
 
-    ydl_opts = {
-        'format': VIDEO_FORMAT,
-        'outtmpl': output_template,
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'max_filesize': VIDEO_MAX_FILE_SIZE_MB * 1024 * 1024,
-        'socket_timeout': 30,
-        'retries': 2,
-        'fragment_retries': 2,
-    }
+def _video_download_result(url: str, path: Optional[Path], reason: str,
+                           note: Optional[list]) -> Optional[Path]:
+    if note is not None and reason:
+        note.append(reason)
+    if path:
+        logger.info(f"🎬 Скачано видео: {path.name} ({reason})")
+    else:
+        logger.warning(f"Видео не скачалось: {reason[:160]} — {url[:60]}")
+    return path
 
+
+# Общий срок на всю загрузку ролика и число одновременных загрузок. Срок
+# считается вместе с ожиданием свободного места: публикация не должна стоять
+# дольше него, даже если оба места заняты чужими роликами.
+VIDEO_DOWNLOAD_TIMEOUT_SEC = max(30, min(1800, _env_int('VIDEO_DOWNLOAD_TIMEOUT_SEC', 300)))
+VIDEO_DOWNLOAD_CONCURRENCY = max(1, min(4, _env_int('VIDEO_DOWNLOAD_CONCURRENCY', 2)))
+_video_download_slots = asyncio.Semaphore(VIDEO_DOWNLOAD_CONCURRENCY)
+
+
+async def _download_video_bounded(url: str, note: Optional[list] = None) -> Optional[Path]:
+    """Загрузка ролика в отдельном процессе: не дольше срока, не больше N сразу."""
+    if not YT_DLP_AVAILABLE:
+        return download_video(url, note)
+    started = time.monotonic()
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Сначала extract_info без скачивания — проверяем длину
-            info = ydl.extract_info(url, download=False)
-
-            duration = info.get('duration', 0)
-            if VIDEO_MAX_DURATION_SEC > 0 and duration and duration > VIDEO_MAX_DURATION_SEC:
-                logger.info(f"Видео слишком длинное ({duration}с): {url[:60]}")
-                return say(f'ролик длиннее лимита ({duration}с)')
-
-            # Скачиваем
-            info = ydl.extract_info(url, download=True)
-            file_path = Path(ydl.prepare_filename(info))
-
-            if not file_path.exists():
-                # yt-dlp иногда меняет расширение после конвертации
-                stem = file_path.stem
-                for candidate in VIDEO_DOWNLOAD_DIR.glob(f'{stem}.*'):
-                    if candidate.suffix.lower() in DIRECT_VIDEO_EXTENSIONS:
-                        file_path = candidate
-                        break
-
-            if not file_path.exists():
-                logger.warning(f"yt-dlp скачал, но файл не найден: {file_path}")
-                return say('файл после скачивания не найден '
-                           '(возможно, нужна склейка дорожек и ffmpeg)')
-
-            size_mb = file_path.stat().st_size / (1024 * 1024)
-            if size_mb > VIDEO_MAX_FILE_SIZE_MB:
-                logger.info(f"Видео слишком большое ({size_mb:.1f} МБ): {url[:60]}")
-                file_path.unlink(missing_ok=True)
-                return say(f'файл {size_mb:.0f} МБ больше лимита '
-                           f'{VIDEO_MAX_FILE_SIZE_MB} МБ')
-
-            logger.info(f"🎬 Скачано видео: {file_path.name} ({size_mb:.1f} МБ)")
-            if note is not None:
-                note.append(f'скачано через yt-dlp, {size_mb:.1f} МБ')
-            return file_path
-    except Exception as e:
-        text = str(e)[:120]
-        logger.warning(f"Видео не скачалось ({type(e).__name__}): {text}")
-        return say(f'{type(e).__name__}: {text}')
+        await asyncio.wait_for(_video_download_slots.acquire(), VIDEO_DOWNLOAD_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        metrics.inc('anime_bot_video_download_total', labels={'result': 'no_slot'})
+        return _video_download_result(
+            url, None, f'все {VIDEO_DOWNLOAD_CONCURRENCY} места для загрузки заняты дольше '
+                       f'{VIDEO_DOWNLOAD_TIMEOUT_SEC} с', note)
+    try:
+        left = max(5.0, VIDEO_DOWNLOAD_TIMEOUT_SEC - (time.monotonic() - started))
+        path, reason = await video_download.download_isolated(
+            url, VIDEO_DOWNLOAD_DIR, fmt=VIDEO_FORMAT, max_mb=VIDEO_MAX_FILE_SIZE_MB,
+            max_duration=VIDEO_MAX_DURATION_SEC, extensions=DIRECT_VIDEO_EXTENSIONS,
+            timeout=left)
+    except OSError as e:
+        path, reason = None, f'процесс загрузки не запустился: {type(e).__name__}'
+    finally:
+        _video_download_slots.release()
+    metrics.inc('anime_bot_video_download_total',
+                labels={'result': 'ok' if path else ('timeout' if 'прервана' in reason else 'fail')})
+    return _video_download_result(url, path, reason, note)
 
 
 def cleanup_video_dir(max_age_hours: int = 1) -> None:
@@ -11062,7 +11425,7 @@ def _ytdlp_telegram_video(post_id: str):
         'extractor_args': {'generic': {'impersonate': ['']}},
     }
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with _yt_dlp_module().YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
         logger.info(f"  {post_id}: yt-dlp — не смог ({type(e).__name__}: {str(e)[:90]})")
@@ -12203,7 +12566,7 @@ async def _prepare_video_file(news: dict, *, record_failures: bool = True) -> Op
             _record_media_failure(news, 'dependency_missing')
         return None
     note: list = []
-    path = await asyncio.to_thread(download_video, video_url, note)
+    path = await _download_video_bounded(video_url, note)
     if note:
         news['_video_note'] = note[0]
     if path:
@@ -12748,6 +13111,14 @@ async def _prepare_news_for_send(news: dict, source: str,
     dup_title = await _image_duplicate(news)
     if dup_title:
         logger.info(f"⊘ Картинка уже публиковалась («{dup_title[:40]}»): "
+                    f"{news.get('title', '')[:60]}")
+        if count_stats:
+            await stats.record_skipped('duplicate', source)
+        return 'skipped_dup'
+
+    dup_title = await _video_duplicate(news)
+    if dup_title:
+        logger.info(f"⊘ Ролик уже публиковался («{dup_title[:40]}»): "
                     f"{news.get('title', '')[:60]}")
         if count_stats:
             await stats.record_skipped('duplicate', source)
@@ -14955,7 +15326,8 @@ def _hash_distance(a: str, b: str) -> Optional[int]:
     """Расстояние между отпечатками. None — если типы разные (несравнимы)."""
     if not a or not b or a[:2] != b[:2]:
         return None
-    if a.startswith('m:'):
+    if a.startswith(('m:', 'v:')):
+        # md5 файла и id ролика сравниваются только на точное совпадение.
         return 0 if a == b else 64
     try:
         pa = a.split(':')
@@ -15183,7 +15555,9 @@ async def _image_duplicate(news: dict) -> Optional[str]:
     if not images:
         return None
     data = await asyncio.to_thread(_cached_image_bytes, images[0])
-    fingerprint = _image_fingerprint(data)
+    # Декодирование и уменьшение полноразмерного JPEG — десятки миллисекунд
+    # (65 мс на картинке 2400×1350): в потоке, а не в цикле событий.
+    fingerprint = await asyncio.to_thread(_image_fingerprint, data)
     if not fingerprint:
         return None
     dup = image_hashes.reserve(fingerprint, news.get('title', ''))
@@ -15196,13 +15570,45 @@ async def _image_duplicate(news: dict) -> Optional[str]:
     return None
 
 
+_YOUTUBE_ID_RE = re.compile(
+    r'(?:youtube(?:-nocookie)?\.com/(?:watch\?(?:[^#\s]*&)?v=|embed/|shorts/|live/|v/)'
+    r'|youtu\.be/)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])', re.I)
+
+
+def _youtube_id(url: str) -> str:
+    match = _YOUTUBE_ID_RE.search(str(url or ''))
+    return match.group(1) if match else ''
+
+
+async def _video_duplicate(news: dict) -> Optional[str]:
+    """Тот же ролик YouTube уже выходил — заголовок той новости, иначе None.
+
+    Один трейлер разносят несколько сайтов под разными заголовками, а превью у
+    них разные (кадр, обложка сайта), поэтому дедуп по картинке их пропускал.
+    Id ролика — точный признак. Как и у картинок: другое событие в заголовке
+    («трейлер» и «дата премьеры» со старым трейлером внутри) — не повтор.
+    """
+    if settings is None or not getattr(settings, 'image_dedup', True) or image_hashes is None:
+        return None
+    video_id = _youtube_id(news.get('video') or '')
+    if not video_id:
+        return None
+    fingerprint = f'v:{video_id}'
+    dup = image_hashes.reserve(fingerprint, news.get('title', ''))
+    if dup:
+        return dup.get('t') or 'без заголовка'
+    news['_video_fp'] = fingerprint
+    return None
+
+
 def _commit_image_fingerprint(news: dict) -> None:
     """Фиксирует отпечаток картинки и предмет новости после того, как пост
     реально ушёл. До отправки не запоминаем: сорвавшаяся публикация не должна
     закрывать дорогу той же новости из другого источника."""
-    fingerprint = news.pop('_img_fp', None)
-    if fingerprint and image_hashes is not None:
-        image_hashes.add(fingerprint, news.get('title', ''))
+    for key in ('_img_fp', '_video_fp'):
+        fingerprint = news.pop(key, None)
+        if fingerprint and image_hashes is not None:
+            image_hashes.add(fingerprint, news.get('title', ''))
     subject = news.get('_llm_subject')
     if subject and recent_subjects is not None:
         recent_subjects.commit(subject, news.get('_llm_kind', 'новость'),
@@ -15214,9 +15620,10 @@ def _commit_image_fingerprint(news: dict) -> None:
 
 def _release_publish_reservations(news: dict) -> None:
     """Освобождает in-flight дедупы после любой неуспешной отправки/фильтра."""
-    fingerprint = news.pop('_img_fp', None)
-    if fingerprint and image_hashes is not None:
-        image_hashes.release(fingerprint)
+    for key in ('_img_fp', '_video_fp'):
+        fingerprint = news.pop(key, None)
+        if fingerprint and image_hashes is not None:
+            image_hashes.release(fingerprint)
     final_text = news.pop('_final_text', None)
     if final_text and published_texts is not None:
         published_texts.release(final_text)
@@ -16887,6 +17294,13 @@ def _franchise_key(news: Optional[dict]) -> str:
     return '|'.join(anchors[:4])[:120]
 
 
+@functools.lru_cache(maxsize=4096)
+def _title_franchise_key(title: str) -> str:
+    # Ключ по заголовку прошлой публикации не меняется, а считался для каждой
+    # из 250 строк на каждую новость при каждой сортировке очереди.
+    return _franchise_key({'title': title})
+
+
 def _recent_franchise_penalty(news: dict, now: Optional[datetime] = None) -> float:
     if (not feature_enabled('diversity_scheduler') or FRANCHISE_COOLDOWN_MIN <= 0
             or story_history is None or news.get('_breaking_news')):
@@ -16899,7 +17313,7 @@ def _recent_franchise_penalty(news: dict, now: Optional[datetime] = None) -> flo
     for row in reversed(story_history._items[-250:]):
         old_key = EntityMemory._key(row.get('subject') or '')
         if not old_key:
-            old_key = _franchise_key({'title': row.get('title', '')})
+            old_key = _title_franchise_key(str(row.get('title', '') or ''))
         if old_key != key:
             continue
         try:
@@ -17270,6 +17684,17 @@ def _undated_too_old(item: dict) -> bool:
     return time.time() - first_seen_store.seen_at(link) > max_age * 3600
 
 
+async def _flush_collection_stats() -> None:
+    """Статистика сбора — одной записью за цикл. Сбой записи сбор не роняет."""
+    try:
+        if stats is not None:
+            await stats.flush()
+        if replay_buffer is not None:
+            await asyncio.to_thread(replay_buffer.flush)
+    except Exception as e:
+        logger.warning(f'Статистика сбора не записана: {type(e).__name__}: {e}')
+
+
 async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
     """Собирает свежие новости со всех включённых источников.
     Возвращает (all_news, stats_lines, errors)."""
@@ -17373,7 +17798,7 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
                     _note_source_failure(name, 'вернул 0 постов', save=False)
 
             if feature_enabled('replay') and replay_buffer is not None and unique_items:
-                replay_ids = await asyncio.to_thread(replay_buffer.capture_many, unique_items)
+                replay_ids = await asyncio.to_thread(replay_buffer.capture_many, unique_items, save=False)
                 for replay_item, replay_id in zip(unique_items, replay_ids):
                     replay_item['_replay_id'] = replay_id
             all_news.extend(unique_items)
@@ -17386,12 +17811,13 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
             logger.info(f"{name}: {len(unique_items)} новостей (из {len(items)} собранных, {no_image_skipped} без фото)")
 
             # === Метрики ===
+            # Статистика копится и пишется одной записью за цикл (ниже flush).
             if unique_items:
-                await stats.record_collected(name, len(unique_items))
+                await stats.record_collected(name, len(unique_items), save=False)
             if no_image_skipped:
-                await stats.record_skipped('no_image', name, no_image_skipped)
+                await stats.record_skipped('no_image', name, no_image_skipped, save=False)
             if duplicate_skipped:
-                await stats.record_skipped('duplicate', name, duplicate_skipped)
+                await stats.record_skipped('duplicate', name, duplicate_skipped, save=False)
             if feature_enabled('source_yield') and source_yield is not None:
                 await asyncio.to_thread(source_yield.record_fetch, name, raw=len(items), fresh=len(unique_items),
                                         duplicates=duplicate_skipped, no_image=no_image_skipped, duration_sec=fetch_seconds)
@@ -17448,6 +17874,9 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
     if story_registry is not None:
         # Реестр историй пишется один раз за цикл и вне event loop.
         await asyncio.to_thread(story_registry.flush)
+    if source_yield is not None:
+        await asyncio.to_thread(source_yield.flush)
+    await _flush_collection_stats()
     all_news = await _apply_active_verification(all_news)
     all_news = _annotate_story_updates(all_news)
     all_news = _annotate_editorial_automation(all_news)
@@ -19997,7 +20426,16 @@ async def _maybe_send_daily_summary(bot: Bot) -> None:
         settings.last_daily_summary = today
 
 
+def _history_paused() -> bool:
+    """Автопубликация стоит: история публикаций потеряна, копии не было."""
+    return sent_links is not None and bool(getattr(sent_links, 'history_lost', False))
+
+
 async def check_news(context: ContextTypes.DEFAULT_TYPE):
+    if _history_paused():
+        _runtime_health['last_check_result'] = 'paused: история публикаций потеряна (/historyok)'
+        metrics.inc('anime_bot_check_skipped_total', labels={'reason': 'history_lost'})
+        return
     if _check_news_lock.locked():
         logger.info("⏭ Пропускаю автопроверку — предыдущая ещё идёт")
         metrics.inc('anime_bot_check_skipped_total', labels={'reason': 'overlap'})
@@ -20467,7 +20905,7 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
     и этот автопубликатор не могут отправить один пост дважды: кто первым
     занял состояние, тот и публикует.
     """
-    if pending_posts is None or not await _channel_autopost_due():
+    if pending_posts is None or _history_paused() or not await _channel_autopost_due():
         return None
     row = pending_posts.next_for_autopost()
     if row is None:
@@ -20533,7 +20971,7 @@ async def publisher_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     прошлой публикации прошёл настроенный интервал. Решение о времени берётся
     из того же ``settings.last_publish_at``, что и раньше.
     """
-    if (settings is None or post_queue is None
+    if (settings is None or post_queue is None or _history_paused()
             or not settings.auto_enabled or not feature_enabled('independent_publisher')):
         return
     if settings.publish_mode == 'both':
@@ -24769,6 +25207,25 @@ async def addadmin_command(update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f'{label} уже админ.', parse_mode=ParseMode.HTML)
 
 
+async def historyok_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Снять паузу после потери истории публикаций — решение только владельца."""
+    if update.effective_user.id != ADMIN_ID:
+        await deny_access(update)
+        return
+    if not _history_paused():
+        await update.message.reply_text('История публикаций в порядке, пауза не стоит.')
+        return
+    if not sent_links.accept_lost_history():
+        await update.message.reply_text(
+            '⚠️ Пауза НЕ снята: история не записалась на диск (проверьте место и '
+            'права на DATA_DIR).')
+        return
+    logger.warning('История публикаций: владелец продолжил без истории')
+    await update.message.reply_text(
+        '▶️ Автопубликация продолжена с пустой историей. Уже выходившие новости '
+        'могут повториться — повторы картинок и текстов бот по-прежнему ловит.')
+
+
 async def deladmin_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Забирает права админа. Ответом на сообщение, по @имени или по id."""
     if update.effective_user.id != ADMIN_ID:
@@ -24862,6 +25319,95 @@ def _silence_hours() -> Optional[float]:
     if last.tzinfo is None:
         last = last.replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - last).total_seconds() / 3600
+
+
+# Сторож эксплуатации: признаки поломки, которые раньше видны были только в
+# логах или в /health, куда смотрят, когда уже что-то заметили. Порог 0 —
+# сигнал выключен. Каждый сигнал приходит один раз и повторяется не чаще
+# OPS_ALERT_REPEAT_HOURS, пока не пройдёт; прошёл — снова «взведён».
+OPS_QUEUE_STALE_HOURS = max(0, min(72, _env_int('OPS_QUEUE_STALE_HOURS', 6)))
+OPS_WRITE_FAILURES = max(0, min(100, _env_int('OPS_WRITE_FAILURES', 3)))
+OPS_WRITE_FAILURES_WINDOW_SEC = 900
+OPS_UNCERTAIN_GROWTH = max(0, min(100, _env_int('OPS_UNCERTAIN_GROWTH', 3)))
+OPS_UNCHECKED_MEDIA_PER_HOUR = max(0, min(1000, _env_int('OPS_UNCHECKED_MEDIA_PER_HOUR', 15)))
+OPS_ALERT_REPEAT_HOURS = max(1, min(72, _env_int('OPS_ALERT_REPEAT_HOURS', 6)))
+_ops_alerted: dict = {}
+_ops_uncertain_samples: deque = deque(maxlen=400)
+
+
+def _ops_uncertain_total() -> int:
+    return sum(store.uncertain_count() for store in (sent_links, pending_posts, scheduled_posts)
+               if store is not None and hasattr(store, 'uncertain_count'))
+
+
+def _ops_signals(now: Optional[float] = None) -> dict:
+    """Действующие сигналы: ключ → текст письма. Пусто — всё в порядке."""
+    now = time.monotonic() if now is None else now
+    found = {}
+    # Очередь стоит: голова ждёт давно, а публикаций нет уже два интервала.
+    if (OPS_QUEUE_STALE_HOURS and post_queue is not None and settings is not None
+            and settings.auto_enabled and not settings.thread_mode):
+        head = post_queue.oldest()
+        try:
+            queued = datetime.fromisoformat(str((head or {}).get('queued_at') or ''))
+        except ValueError:
+            queued = None
+        if queued is not None:
+            if queued.tzinfo is None:
+                queued = queued.replace(tzinfo=timezone.utc)
+            waited = (datetime.now(timezone.utc) - queued).total_seconds() / 3600
+            silent = _silence_hours()
+            stuck = silent is None or silent * 3600 >= 2 * settings.check_interval_sec
+            if waited >= OPS_QUEUE_STALE_HOURS and stuck:
+                title = str((head.get('news') or {}).get('title') or '')[:80]
+                since = f'{silent:.0f} ч назад' if silent is not None else 'ещё не было'
+                found['queue_stale'] = (
+                    f'⏳ Очередь стоит: первый пост ждёт {waited:.0f} ч («{title}»), '
+                    f'последняя публикация — {since}. Постов в очереди: '
+                    f'{len(getattr(post_queue, "_items", []))}. Причина обычно в /health '
+                    '(отправка, модель, хранилище).')
+    if OPS_WRITE_FAILURES:
+        recent = [row for row in _disk_write_failures if now - row[0] <= OPS_WRITE_FAILURES_WINDOW_SEC]
+        if len(recent) >= OPS_WRITE_FAILURES:
+            files = ', '.join(sorted({row[1] for row in recent}))[:200]
+            found['disk_writes'] = (
+                f'💾 Запись на диск не проходит: {len(recent)} сбоев за '
+                f'{OPS_WRITE_FAILURES_WINDOW_SEC // 60} мин ({files}). Последний: '
+                f'{recent[-1][2]}. Изменения действуют до перезапуска и потом пропадут — '
+                'проверьте место и права на DATA_DIR.')
+    if OPS_UNCERTAIN_GROWTH:
+        total = _ops_uncertain_total()
+        _ops_uncertain_samples.append((now, total))
+        base = min((value for at, value in _ops_uncertain_samples if now - at <= 86400),
+                   default=total)
+        if total - base >= OPS_UNCERTAIN_GROWTH:
+            found['uncertain'] = (
+                f'❓ За сутки прибавилось {total - base} публикаций с неизвестным '
+                f'результатом (всего {total}). Telegram не подтверждает отправку — '
+                'проверьте канал и /health; автоповтор их не трогает.')
+    if OPS_UNCHECKED_MEDIA_PER_HOUR:
+        hour = sum(1 for at in _moderation_unchecked_times if now - at <= 3600)
+        if hour >= OPS_UNCHECKED_MEDIA_PER_HOUR:
+            found['unchecked_media'] = (
+                f'🖼 За час {hour} медиа в чате остались непроверенными: детектор, '
+                'похоже, не справляется или лёг. Картинки и гифки сейчас проходят без '
+                'проверки — смотрите /modlog и /logs.')
+    return found
+
+
+async def ops_watch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    now = time.monotonic()
+    signals = _ops_signals(now)
+    for key in list(_ops_alerted):
+        if key not in signals:
+            _ops_alerted.pop(key, None)          # прошло — снова взведён
+    for key, text in signals.items():
+        last = _ops_alerted.get(key)
+        if last is not None and now - last < OPS_ALERT_REPEAT_HOURS * 3600:
+            continue
+        metrics.inc('anime_bot_ops_alerts_total', labels={'signal': key})
+        if await notify_admin(context.bot, text):
+            _ops_alerted[key] = now
 
 
 async def _check_silence(bot: Bot) -> None:
@@ -25568,6 +26114,9 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
     lines = ['🩺 <b>Состояние бота</b>', '', '<b>Фоновые задачи</b>']
     if chat_moderation is not None and getattr(chat_moderation, 'load_error', ''):
         lines[1:1] = [f'❌ Модерация: файл состояния не прочитан — {html.escape(chat_moderation.load_error)}', '']
+    if _history_paused():
+        lines[1:1] = ['⛔ Автопубликация на паузе: история публикаций потеряна, копии нет. '
+                      'Верните sent_links.json из бэкапа или /historyok — продолжить без неё.', '']
     lines.append(_job_line(context, 'anime_news_check', 'Автопроверка новостей'))
     lines.append(_job_line(context, 'scheduled_publish', 'Публикация отложки'))
     lines.append(_job_line(context, 'daily_backup', 'Ежедневный бэкап'))
@@ -27051,6 +27600,11 @@ def _mod_member_permissions(member) -> dict:
             for name in ChatPermissions.no_permissions().to_dict()}
 
 
+# Когда медиа осталось непроверенным — для сторожа: одно такое — пустяк, серия
+# значит, что детектор лёг, и чат остался без проверки картинок.
+_moderation_unchecked_times: deque = deque(maxlen=2000)
+
+
 async def _mod_media_unchecked(bot: Bot, message, reason: str, *, notify: bool = True) -> None:
     """Queue technical media failures for review without flooding admin DMs.
 
@@ -27067,6 +27621,7 @@ async def _mod_media_unchecked(bot: Bot, message, reason: str, *, notify: bool =
                                     'media', 'не проверено', 'локальный детектор', reason,
                                     _mod_message_text(message))
     metrics.inc('anime_bot_moderation_skipped_total', labels={'reason': 'media_unchecked'})
+    _moderation_unchecked_times.append(time.monotonic())
     if not notify or MODERATION_MEDIA_NOTICE_SEC <= 0:
         return
 
@@ -27419,6 +27974,11 @@ async def _mod_get_member(bot: Bot, chat_id: int, user_id: int):
         return await bot.get_chat_member(chat_id, user_id)
 
 
+def _tg_message_gone(exc: BaseException) -> bool:
+    """Telegram ответил, что удалять уже нечего: сообщения в чате нет."""
+    return isinstance(exc, BadRequest) and 'message to delete not found' in str(exc).lower()
+
+
 async def _mod_apply(bot: Bot, message, decision: dict, category: str,
                      reason: str) -> str:
     """Apply a durable incident, recording only confirmed Telegram outcomes."""
@@ -27499,8 +28059,16 @@ async def _mod_apply(bot: Bot, message, decision: dict, category: str,
             decision['applied_action'] = 'delete'
             decision['deleted'] = True
         except TelegramError as exc:
-            deletion_status = 'failed' if isinstance(exc, BadRequest) else 'unknown'
-            done.append(f'удаление не подтверждено ({type(exc).__name__})')
+            if _tg_message_gone(exc):
+                # Автор или другой админ уже убрал его (частый случай для «✅ Верно»
+                # спустя время). Цель достигнута; раньше отчёт говорил «удаление
+                # не подтверждено», а у анонима решение записывалось как сбой.
+                done.append('сообщение уже удалено')
+                decision['applied_action'] = 'delete'
+                decision['deleted'] = True
+            else:
+                deletion_status = 'failed' if isinstance(exc, BadRequest) else 'unknown'
+                done.append(f'удаление не подтверждено ({type(exc).__name__})')
     if existing:
         return ', '.join(done + ['санкция за это сообщение/альбом уже учтена'])
     if cooldown and action in ('warn', 'mute'):
@@ -27516,7 +28084,7 @@ async def _mod_apply(bot: Bot, message, decision: dict, category: str,
     until = None
     if action == 'mute':
         minutes = int(decision.get('minutes') or MODERATION_MUTE_LADDER[0])
-        until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+        until = _tg_until(minutes * 60)
         try:
             previous = _mod_member_permissions(member)
             previous_until = _mod_until_timestamp(getattr(member, 'until_date', None))
@@ -27535,7 +28103,7 @@ async def _mod_apply(bot: Bot, message, decision: dict, category: str,
                 if minutes <= old_minutes and next_step is not None:
                     minutes = next_step
                     decision['minutes'] = minutes
-                    until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+                    until = _tg_until(minutes * 60)
                 if minutes <= old_minutes:
                     chat_moderation.update_incident(incident_id, action='delete', status='confirmed', reason=reason)
                     decision['applied_action'] = 'delete'
@@ -27940,6 +28508,8 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
     chat = getattr(update, 'effective_chat', None)
     if message is None or chat is None:
         return
+    if getattr(update, 'edited_message', None) is None and not getattr(update, 'mod_retry', False):
+        _note_tg_clock(message)
     sender_chat = getattr(message, 'sender_chat', None)
     if not chat_moderation.is_enabled(chat.id):
         return
@@ -28005,8 +28575,12 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
                           and int(local.get('severity') or 1) >= 2):
         # Явное нарушение текста (оскорбление, реклама) идёт своим путём даже
         # внутри флуда — его должны увидеть админы. Остальное — пауза.
-        await _mod_rate_pause(context.bot, message, user_id, actor_name, text, rate_over)
-        return
+        rate_outcome: dict = {}
+        await _mod_rate_pause(context.bot, message, user_id, actor_name, text, rate_over,
+                              outcome=rate_outcome)
+        if rate_outcome.get('removed') is not False:
+            return
+        # Удалить не вышло — сообщение в чате, и его содержимое проверяем как обычно.
     if local is None and attachment is None:
         return
     if await _mod_admin_exempt(context.bot, message):
@@ -29122,7 +29696,10 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                             raise BadRequest('chat permissions unavailable')
                         previous = chat_moderation.incident(incident.get('previous_mute_id', ''))
                         restore_until = 0
-                        if previous.get('status') == 'confirmed' and previous.get('mute_until', 0) > time.time():
+                        # Остаток прежнего мута короче минуты не восстанавливаем:
+                        # срок меньше 30 с Telegram сделал бы вечным.
+                        if (previous.get('status') == 'confirmed'
+                                and previous.get('mute_until', 0) > _tg_now().timestamp() + 60):
                             permissions = ChatPermissions.no_permissions()
                             restore_until = previous['mute_until']
                         result = await context.bot.restrict_chat_member(
@@ -30253,6 +30830,11 @@ async def _post_shutdown(app: Application) -> None:
         if story_registry is not None:
             # observe() только помечает реестр; несброшенное пишем при остановке.
             story_registry.flush()
+        if source_yield is not None:
+            source_yield.flush()
+        if anilist is not None:
+            anilist.flush()
+        await _flush_collection_stats()
     except Exception as e:
         logger.warning(f'Не удалось сбросить runtime-хранилища: {e}')
     await _stop_event_loop_lag_monitor()
@@ -30604,6 +31186,12 @@ async def setup_bot_commands(app: Application) -> None:
         health_probe_job, interval=300, first=300, name='health_probe',
         job_kwargs=JOB_KWARGS,
     )
+    # Сторож эксплуатации: очередь стоит, диск не пишет, неизвестные отправки,
+    # непроверенные медиа.
+    app.job_queue.run_repeating(
+        ops_watch_job, interval=600, first=180, name='ops_watch',
+        job_kwargs=JOB_KWARGS,
+    )
     # «Серии дня»: раз в 10 минут проверяем, не пора ли; публикуем раз в сутки.
     app.job_queue.run_repeating(
         episodes_digest_job, interval=600, first=90, name='episodes_digest',
@@ -30864,7 +31452,8 @@ def main():
 
     print("Создаю Application...", flush=True)
     app = (Application.builder().token(TOKEN).job_queue(JobQueue())
-           .post_init(setup_bot_commands).post_shutdown(_post_shutdown).build())
+           .post_init(setup_bot_commands).post_stop(_post_stop)
+           .post_shutdown(_post_shutdown).build())
 
     app.add_error_handler(_global_error_handler)
 
@@ -30879,6 +31468,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("deepl", deepl_command))
     app.add_handler(CommandHandler("backup", backup_command))
+    app.add_handler(CommandHandler("historyok", historyok_command))
     app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("doctor", doctor_command))
     app.add_handler(CommandHandler("features", features_command))

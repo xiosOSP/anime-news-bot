@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 299 переменных. Почти все — точная настройка со значением
+Бот читает 306 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -338,6 +338,8 @@
 | Переменная | По умолчанию | Где читается |
 | --- | --- | --- |
 | `VIDEO_DIR` | — | anime_news_bot.py |
+| `VIDEO_DOWNLOAD_CONCURRENCY` | `2` | anime_news_bot.py |
+| `VIDEO_DOWNLOAD_TIMEOUT_SEC` | `300` | anime_news_bot.py |
 | `VIDEO_NORMALIZE_CRF` | `27` | anime_news_bot.py |
 | `VIDEO_NORMALIZE_MAX_WIDTH` | `1280` | anime_news_bot.py |
 | `VIDEO_PROBE_TIMEOUT_SEC` | `8` | anime_news_bot.py |
@@ -384,6 +386,11 @@
 | `INSTANCE_LOCK_WAIT_SEC` | `-1` | anime_news_bot.py |
 | `MAX_PHOTOS_PER_POST` | `6` | anime_news_bot.py |
 | `NEWS_PER_SOURCE` | `5` | anime_news_bot.py |
+| `OPS_ALERT_REPEAT_HOURS` | `6` | anime_news_bot.py |
+| `OPS_QUEUE_STALE_HOURS` | `6` | anime_news_bot.py |
+| `OPS_UNCERTAIN_GROWTH` | `3` | anime_news_bot.py |
+| `OPS_UNCHECKED_MEDIA_PER_HOUR` | `15` | anime_news_bot.py |
+| `OPS_WRITE_FAILURES` | `3` | anime_news_bot.py |
 | `PORT` | `0` | anime_news_bot.py |
 | `POST_FORMAT_COMPACT_PERCENT` | `0.0` | anime_news_bot.py |
 | `PUBLISHER_TICK_SEC` | `60` | anime_news_bot.py |

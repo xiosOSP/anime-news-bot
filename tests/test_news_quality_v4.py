@@ -166,7 +166,7 @@ async def test_discovered_trailer_is_sent_as_video_and_file_id_is_reused(monkeyp
     path = tmp_path / 'trailer.mp4'
     path.write_bytes(b'mocked video payload')
     download = Mock(return_value=path)
-    monkeypatch.setattr(bot, 'download_video', download)
+    monkeypatch.setattr(bot, '_download_video_bounded', AsyncMock(side_effect=download))
     monkeypatch.setattr(bot, 'YT_DLP_AVAILABLE', True)
     monkeypatch.setattr(bot, '_probe_video_file', lambda path: None)
     monkeypatch.setattr(bot, '_normalize_video_file', lambda path, info: path)

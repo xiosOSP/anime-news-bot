@@ -1,0 +1,34 @@
+# Проверенный набор версий: на нём прошли тесты и CI. requirements.txt
+# подключает этот файл (-c), поэтому новое развёртывание ставит ровно эти
+# версии, а не «самые свежие на сегодня».
+#
+# Обновление — отдельным PR: поднять версию здесь, дождаться зелёного CI.
+# yt-dlp сознательно НЕ закреплён: YouTube регулярно меняет выдачу, и старый
+# yt-dlp перестаёт качать через несколько недель. Ему нужна свежая версия.
+anyio==4.15.1
+apscheduler==3.11.3
+beautifulsoup4==4.15.0
+certifi==2026.2.25
+charset-normalizer==3.4.6
+deep-translator==1.11.4
+feedparser==6.0.14
+feedparser-sgmllib==2.1.0
+flatbuffers==25.12.19
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.11
+nudenet==3.4.2
+numpy==2.4.6
+onnxruntime==1.29.0
+opencv-python-headless==5.0.0.93
+packaging==24.0
+pillow==12.3.0
+protobuf==7.36.1
+python-telegram-bot==22.8
+requests==2.33.1
+rlottie-python==1.3.8
+soupsieve==2.9.2
+typing-extensions==4.16.0
+tzlocal==5.4.4
+urllib3==2.6.3
