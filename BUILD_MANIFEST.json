@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "e5b19b97a7a449bb3ce2a122262a1d0ab1c45afa",
-  "generated_at_utc": "2026-10-02T22:09:12.418405+00:00",
+  "git_commit": "35186266d9eb1ba198873673f2747790197bfde2",
+  "generated_at_utc": "2026-10-03T10:42:19.892355+00:00",
   "files": {
     ".env.example": {
       "sha256": "1d45114ec32deffad57d13ba2928bab66cf9fc248bb0e9bcb2f959028479257a",
@@ -26,12 +26,12 @@
       "bytes": 33
     },
     "README.md": {
-      "sha256": "c0fc756a0fef07857281e13f0c54c753b5c6d0966b690b37efbe7bead6550658",
-      "bytes": 24465
+      "sha256": "ff1a6f38e09b19da5b0d1d79a2dbddd6bc710ae1ffa8d3a55d1ad0b9675996d4",
+      "bytes": 24753
     },
     "anime_news_bot.py": {
-      "sha256": "0c8a4fdf80cdd6572822fd12e6cf9063a95e942f447e0fada2043c47f72f88cc",
-      "bytes": 1731354
+      "sha256": "1deefda33058a31d0002cd15baa9def226a745fe59eeb82be771d86689e80183",
+      "bytes": 1742219
     },
     "constraints.txt": {
       "sha256": "fe5e29d7db2182e0e5926013f81a450ef7a2a948cecc36d23765b2154f176212",
@@ -336,6 +336,10 @@
     "tests/test_health_hardening.py": {
       "sha256": "f57ce24ae219dfcc9a7ed2edb5cdac8f5f60df22aa5eb57396938ddaa9b8ee5d",
       "bytes": 15098
+    },
+    "tests/test_help_command.py": {
+      "sha256": "fcf5557a59c2c450647143f50af253a1e391fd49c74833f6516ab692f7752d55",
+      "bytes": 4283
     },
     "tests/test_history_recovery.py": {
       "sha256": "deb738c20bbee0ae5f792fd65f85b085ba2f19e41d403bfca78e3e884f310a1c",

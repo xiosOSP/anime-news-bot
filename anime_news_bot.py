@@ -20225,11 +20225,159 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(PAUSE_BETWEEN_SENDS)
 
 
+# ============== СПРАВКА /help ==============
+# Все команды бота по разделам. Справка строится отсюда, и тест сверяет её со
+# всеми зарегистрированными командами: новая команда без строки здесь — это
+# красный CI, а не команда, о которой знает только тот, кто её написал.
+# 👑 и 💬 ставятся сами: по проверке владельца и по списку команд для чата.
+HELP_SECTIONS: tuple = (
+    ('🚀 Начало', (
+        ('start', 'меню с кнопками'),
+        ('help', 'эта справка; /help модерация — один раздел'),
+    )),
+    ('📰 Новости и публикация', (
+        ('news', 'проверить источники сейчас и прислать свежее в личку'),
+        ('preview', 'посты в личку ровно так, как они выйдут в канале'),
+        ('start_auto', 'включить авторассылку'),
+        ('stop_auto', 'выключить авторассылку'),
+        ('settings', 'меню настроек: интервал, ветка, канал, видео, рубрики'),
+        ('scheduled', 'очередь отложенных постов'),
+        ('cancel', 'отменить ввод (время отложки, новый текст поста)'),
+        ('posts', 'последние опубликованные посты файлом: /posts [сколько]'),
+        ('tz', 'часовой пояс: /tz Europe/Moscow'),
+        ('historyok', 'продолжить автопубликацию после потери истории публикаций'),
+    )),
+    ('📡 Источники', (
+        ('sources', 'список источников и их состояние'),
+        ('addsource', 'добавить RSS или канал: /addsource @канал или /addsource ссылка Название'),
+        ('delsource', 'удалить добавленный источник: /delsource Название'),
+        ('discover', 'кандидаты в новые источники: /discover, /discover probe, /discover add ID'),
+        ('sourceintel', 'какие источники пишут первыми, а какие перепечатывают'),
+    )),
+    ('✍️ Текст постов', (
+        ('rules', 'правила редактуры: /rules list | add ВИД ФРАЗА | del ВИД ФРАЗА'),
+        ('glossary', 'замены в тексте: /glossary add A = B, /glossary del A'),
+        ('entity', 'написание имён и названий: /entity remember вариант = как надо'),
+        ('blacklist', 'стоп-слова: новости с ними не публикуются'),
+        ('feedback', 'что админы принимают и скрывают, кандидаты в стоп-слова'),
+        ('replay', 'прогнать сохранённую новость через редактуру заново: /replay ID'),
+        ('golden', 'эталонные примеры редактуры: всё ли проходит'),
+        ('canary', 'пробная публикация в тестовый канал: /canary ID'),
+    )),
+    ('🤖 Модель и перевод', (
+        ('llm', 'состояние модели и проверка связи'),
+        ('llmmodel', 'выбрать провайдера и модель'),
+        ('llmping', 'проверить каждого провайдера по отдельности'),
+        ('llmclean', 'убрать лишние настройки модели'),
+        ('deepl', 'расход месячного лимита DeepL'),
+    )),
+    ('🛡 Модерация чата', (
+        ('modhere', 'включить модерацию в этом чате'),
+        ('modoff', 'выключить модерацию в этом чате'),
+        ('moderation', 'то же для админов группы: /moderation on | off'),
+        ('modmode', 'наблюдение или работа: /modmode observe | active'),
+        ('modstats', 'статистика решений'),
+        ('modquality', 'хватает ли данных, чтобы включить работу'),
+        ('modlog', 'последние решения с причинами: /modlog [сколько]'),
+        ('modtest', 'проверить текст, ничего не делая: /modtest текст'),
+        ('modmiss', 'бот пропустил нарушение: ответом на сообщение, /modmiss категория'),
+        ('modunblock', 'убрать медиа из чёрного списка: ответом на медиа; без ответа — список'),
+        ('modadmins', 'проверять ли администраторов: /modadmins on | off'),
+        ('warns', 'предупреждения участника: ответом на сообщение или /warns id'),
+        ('unwarn', 'снять предупреждения: ответом на сообщение участника'),
+        ('modllmping', 'проверить модель модерации'),
+        ('mediaping', 'проверить детектор картинок и гифок'),
+    )),
+    ('📊 Состояние бота', (
+        ('status', 'что сейчас происходит'),
+        ('health', 'сводка: задачи, источники, данные, память, диск'),
+        ('doctor', 'самодиагностика и проверка прав в Telegram'),
+        ('stats', 'статистика публикаций и источников'),
+        ('logs', 'последние строки лога: /logs [слово]'),
+        ('reliability', 'надёжность: повторы, лимиты, перегрузка'),
+        ('videocheck', 'почему у постов не прикрепляется видео'),
+        ('media', 'картинки и видео: диагностика'),
+        ('analytics', 'отчёт по публикациям: /analytics [дней]'),
+        ('adaptive', 'рекомендации по расписанию и автоподстройка'),
+        ('experiments', 'эксперименты с форматом постов'),
+        ('features', 'включённые функции'),
+        ('lifecycle', 'перезапуски бота и их причины'),
+        ('audit', 'кто из админов что делал: /audit [сколько]'),
+        ('chatinfo', 'id этого чата и темы'),
+        ('selftest', 'локальная самопроверка без публикаций'),
+        ('schema', 'версии файлов данных'),
+    )),
+    ('💾 Данные и настройки', (
+        ('backup', 'архив всех данных в личку'),
+        ('verifybackup', 'проверить, что архив восстанавливается'),
+        ('reloadconfig', 'перечитать настройки и правила без перезапуска'),
+        ('envfile', 'файл .env: имена переменных; /envfile убрать ИМЯ'),
+    )),
+    ('👥 Администраторы', (
+        ('admins', 'список админов бота'),
+        ('addadmin', 'выдать права: ответом на сообщение, @имя или id'),
+        ('deladmin', 'забрать права: ответом на сообщение, @имя или id'),
+    )),
+)
+# Команды, которые работают прямо в чате (остальные — только в личке с ботом:
+# в группе их ответ увидели бы все участники). /moderation — для админов группы.
+HELP_CHAT_COMMANDS = frozenset({'chatinfo', 'modhere', 'modoff', 'modmiss', 'modunblock',
+                                'warns', 'unwarn', 'moderation', 'cancel'})
+HELP_OWNER_COMMANDS = frozenset({'historyok', 'envfile', 'admins', 'addadmin', 'deladmin'})
+HELP_MESSAGE_LIMIT = 3800          # запас от 4096 символов Telegram
+
+
+def _help_section_text(title: str, rows) -> str:
+    lines = [f'<b>{html.escape(title)}</b>']
+    for command, text in rows:
+        marks = ('👑' if command in HELP_OWNER_COMMANDS else '') + \
+                ('💬' if command in HELP_CHAT_COMMANDS else '')
+        lines.append(f'/{command} {marks + " " if marks else ""}— {html.escape(text)}')
+    return '\n'.join(lines)
+
+
+def _help_messages(query: str = '') -> list[str]:
+    """Справка сообщениями не длиннее лимита Telegram; раздел целиком в одном."""
+    query = query.strip().casefold()
+    sections = [(t, rows) for t, rows in HELP_SECTIONS
+                if not query or query in t.casefold()
+                or any(query.lstrip('/') == c for c, _ in rows)]
+    if not sections:
+        names = ', '.join(t.split(' ', 1)[1].lower() for t, _ in HELP_SECTIONS)
+        return [f'Раздела «{html.escape(query)}» нет. Разделы: {html.escape(names)}.']
+    footer = ('👑 — только владелец бота. 💬 — работает прямо в чате; остальные '
+              'команды — в личке с ботом.')
+    blocks = [_help_section_text(t, rows) for t, rows in sections]
+    if not query:
+        blocks.insert(0, '📖 <b>Все команды бота</b>')
+    blocks.append(footer)
+    messages, current = [], ''
+    for block in blocks:
+        candidate = f'{current}\n\n{block}' if current else block
+        if current and len(candidate) > HELP_MESSAGE_LIMIT:
+            messages.append(current)
+            current = block
+        else:
+            current = candidate
+    messages.append(current)
+    return messages
+
+
+@admin_only
+async def help_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Все команды по разделам: /help или /help раздел."""
+    query = ' '.join(getattr(context, 'args', None) or [])
+    for text in _help_messages(query):
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML,
+                                        disable_web_page_preview=True)
+
+
 @admin_only
 async def start(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я аниме-новостной бот.\n\n"
         "Используй кнопки внизу или команды:\n"
+        "/help — все команды по разделам\n"
         "/news — свежие новости\n"
         "/preview — превью постов в личку\n"
         "/start_auto — включить авторассылку\n"
@@ -31238,6 +31386,9 @@ async def setup_bot_commands(app: Application) -> None:
     # (/deepl, /blacklist, /addsource, /delsource, /tz, /preview, /backup)
     # работают по-прежнему, просто не засоряют список из двух десятков строк.
     commands = [
+        # /help — вход ко всем остальным командам, поэтому редкая диагностика
+        # (/reliability) ушла из меню, чтобы оно не разрасталось сверх 12 строк.
+        BotCommand("help", "📖 Все команды"),
         BotCommand("settings", "⚙️ Настройки"),
         BotCommand("scheduled", "📅 Отложенные посты"),
         BotCommand("news", "🔍 Проверить новости сейчас"),
@@ -31251,7 +31402,6 @@ async def setup_bot_commands(app: Application) -> None:
         # пользуются постоянно; когда в нём четырнадцать строк, не находится
         # уже ничего. Обе команды подсказывает /llm, когда они нужны.
         BotCommand("llm", "🤖 Модель: статус и проверка"),
-        BotCommand("reliability", "🛡 Надёжность и лимиты"),
         BotCommand("admins", "👥 Администраторы"),
         BotCommand("logs", "📝 Логи"),
     ]
@@ -31459,6 +31609,7 @@ def main():
 
     # Команды
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("news", news_command))
     app.add_handler(CommandHandler("preview", preview_command))
     app.add_handler(CommandHandler("start_auto", start_auto))
