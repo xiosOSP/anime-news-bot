@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "35186266d9eb1ba198873673f2747790197bfde2",
-  "generated_at_utc": "2026-10-03T10:42:19.892355+00:00",
+  "git_commit": "1ea993ade02e7aee4b21b32da74aadb8dd31775e",
+  "generated_at_utc": "2026-10-03T13:40:14.536078+00:00",
   "files": {
     ".env.example": {
       "sha256": "1d45114ec32deffad57d13ba2928bab66cf9fc248bb0e9bcb2f959028479257a",
@@ -26,12 +26,12 @@
       "bytes": 33
     },
     "README.md": {
-      "sha256": "ff1a6f38e09b19da5b0d1d79a2dbddd6bc710ae1ffa8d3a55d1ad0b9675996d4",
-      "bytes": 24753
+      "sha256": "ebe62204c80a64462f8ebc5f27f3f39ed2ca3952442dbf639e82223313136d75",
+      "bytes": 26422
     },
     "anime_news_bot.py": {
-      "sha256": "1deefda33058a31d0002cd15baa9def226a745fe59eeb82be771d86689e80183",
-      "bytes": 1742219
+      "sha256": "0f9625bc4afffeb42294fe3b0dbc4e6c51027f0a09a19210ee1afc2991e1423a",
+      "bytes": 1752276
     },
     "constraints.txt": {
       "sha256": "fe5e29d7db2182e0e5926013f81a450ef7a2a948cecc36d23765b2154f176212",
@@ -42,8 +42,8 @@
       "bytes": 72590
     },
     "docs/env-reference.md": {
-      "sha256": "be807cd19718940f81cc270c4db6a02959960e635e6910bc0c20c42f7cfcfc07",
-      "bytes": 21079
+      "sha256": "826f3c0e45566f5f0291f23c64f309bb521d01f755c1f85a10beb5d3706b1ba7",
+      "bytes": 21125
     },
     "docs/llm-providers.md": {
       "sha256": "7c213406ffcb83385b71f07a2b34296df4cc8d1ba78215fd55f92d9532923c95",
@@ -66,8 +66,8 @@
       "bytes": 1999
     },
     "llm_protocol.py": {
-      "sha256": "6aac18fd2d7806257dcee047f228dfcf86139e7d88e590bb647ad62dca6cf9e1",
-      "bytes": 38168
+      "sha256": "908324a2c3bd15a006f219a5b210028761fc9af195f2149aec66bc9c5f0da079",
+      "bytes": 40211
     },
     "moderation_llm.py": {
       "sha256": "73a9cb2066a1da2dddabb51fd29bde1d188672d71e0ec64db4557b57ea316f50",
@@ -358,8 +358,8 @@
       "bytes": 18118
     },
     "tests/test_llm.py": {
-      "sha256": "8f5bc25d0d31dd5c7d6903bb6eca724abfe859ebc07356a6a05bc7ddaa0a7cb7",
-      "bytes": 33588
+      "sha256": "4d0d9e8dbb94b23a966cfefa9252ed8dbeb2c4251f542e0a5cf8c2c29cbaeb5f",
+      "bytes": 33862
     },
     "tests/test_llm_attempt_accounting.py": {
       "sha256": "d7f7ccb4d4378c3f1966ca7c20dd4b94549f605978a6f53b3475186f167b8d4c",
@@ -624,6 +624,10 @@
     "tests/test_pipeline.py": {
       "sha256": "d86a3f8751af3223b7b832790fd90ac990b16cb156df546343f6fe7eed581052",
       "bytes": 8335
+    },
+    "tests/test_post_format.py": {
+      "sha256": "54518d9c996a9f0a45954a97ad5bfa49dc2d2f6c10e32a931255eb57542dde62",
+      "bytes": 9164
     },
     "tests/test_post_format_clean.py": {
       "sha256": "db12d66ca2cf4d4dbaaabb891baee16c363130d0208eba54583ec97d196ae445",

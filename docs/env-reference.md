@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 306 переменных. Почти все — точная настройка со значением
+Бот читает 307 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -393,6 +393,7 @@
 | `OPS_WRITE_FAILURES` | `3` | anime_news_bot.py |
 | `PORT` | `0` | anime_news_bot.py |
 | `POST_FORMAT_COMPACT_PERCENT` | `0.0` | anime_news_bot.py |
+| `POST_STYLE` | `rich` | anime_news_bot.py |
 | `PUBLISHER_TICK_SEC` | `60` | anime_news_bot.py |
 | `QUEUE_MAX_SIZE` | `30` | anime_news_bot.py |
 | `REPLAY_BUFFER_MAX` | `300` | anime_news_bot.py |

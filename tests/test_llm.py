@@ -478,7 +478,7 @@ class TestPromptQuality:
 
 class TestParagraphStructure:
     """Пост должен читаться сам по себе: суть → детали → контекст,
-    не больше трёх абзацев."""
+    не больше двух абзацев."""
 
     def test_paragraphs_preserved(self, llm):
         news = {'title': 'Bleach opening', 'summary': 'Out Oct 4.', 'source': 'ANN'}
@@ -519,9 +519,12 @@ class TestParagraphStructure:
 
 
 class TestTrimParagraphs:
-    def test_keeps_three(self):
+    def test_keeps_at_most_two(self):
+        # Посты админов канала — заголовок и одна-две фразы; три абзаца
+        # пересказа статьи выглядели у бота чужеродно.
         text = '\n\n'.join(f'Абзац {i} с содержанием.' for i in range(1, 6))
-        assert len(anime_news_bot._trim_paragraphs(text).split('\n\n')) == 3
+        assert llm_protocol.LLM_MAX_PARAGRAPHS == 2
+        assert len(anime_news_bot._trim_paragraphs(text).split('\n\n')) == 2
 
     def test_keeps_fewer_if_fewer(self):
         assert anime_news_bot._trim_paragraphs('Один абзац.') == 'Один абзац.'
