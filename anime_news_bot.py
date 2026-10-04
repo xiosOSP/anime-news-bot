@@ -2785,7 +2785,9 @@ class ChatModerationStore:
         self._lock = threading.RLock()
         # Журнал и счётчики — справочные записи, см. _save_soon.
         self._dirty = False
-        self._last_save = 0.0
+        # -inf, а не 0: time.monotonic() отсчитывается от загрузки машины, и на
+        # только что поднятом контейнере первая запись иначе ждала бы минуту.
+        self._last_save = float('-inf')
         # Почему состояние не прочиталось. Пусто — всё в порядке.
         self.load_error = ''
         # Разобранные отпечатки чёрного и белого списков; None — пересобрать.
@@ -8365,7 +8367,9 @@ class AniListClient:
         self._cache: dict[str, dict] = {}
         self._lock = threading.RLock()
         self._dirty = False
-        self._saved_at = 0.0
+        # -inf, а не 0: time.monotonic() отсчитывается от загрузки машины, и на
+        # свежем контейнере (меньше минуты аптайма) первый ответ не сохранялся.
+        self._saved_at = float('-inf')
         self._load()
 
     def _load(self) -> None:
