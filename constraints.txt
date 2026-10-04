@@ -5,6 +5,12 @@
 # Обновление — отдельным PR: поднять версию здесь, дождаться зелёного CI.
 # yt-dlp сознательно НЕ закреплён: YouTube регулярно меняет выдачу, и старый
 # yt-dlp перестаёт качать через несколько недель. Ему нужна свежая версия.
+#
+# Часть хостингов запускает бота на Python 3.10, даже если в runtime.txt
+# указан 3.11. numpy 2.4 и onnxruntime 1.29 на 3.10 не ставятся, и тогда не
+# ставилось вообще ничего — развёртывание падало целиком. Поэтому для них две
+# строки с условием на версию Python, а пакеты, которые нужны только на 3.10,
+# закреплены с тем же условием.
 anyio==4.15.1
 apscheduler==3.11.3
 beautifulsoup4==4.15.0
@@ -19,8 +25,10 @@ httpcore==1.0.9
 httpx==0.28.1
 idna==3.11
 nudenet==3.4.2
-numpy==2.4.6
-onnxruntime==1.29.0
+numpy==2.4.6; python_version >= "3.11"
+numpy==2.2.6; python_version < "3.11"
+onnxruntime==1.29.0; python_version >= "3.11"
+onnxruntime==1.23.2; python_version < "3.11"
 opencv-python-headless==5.0.0.93
 packaging==24.0
 pillow==12.3.0
@@ -32,3 +40,9 @@ soupsieve==2.9.2
 typing-extensions==4.16.0
 tzlocal==5.4.4
 urllib3==2.6.3
+# Только для Python 3.10 (их тянут onnxruntime 1.23 и anyio на старом Python).
+coloredlogs==15.0.1; python_version < "3.11"
+exceptiongroup==1.3.1; python_version < "3.11"
+humanfriendly==10.0; python_version < "3.11"
+mpmath==1.3.0; python_version < "3.11"
+sympy==1.14.0; python_version < "3.11"

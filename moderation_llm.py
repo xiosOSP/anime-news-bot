@@ -175,9 +175,11 @@ class ChatModelClient:
     async def complete(self, messages, max_tokens=200):
         # One deadline includes durable reservation, the response body and the
         # optional JSON compatibility attempt. Cancellation reaches HTTPX itself.
+        # wait_for, а не asyncio.timeout: тот появился только в Python 3.11, а
+        # хостинг может запустить бота на 3.10 — там модерация через LLM
+        # падала с AttributeError на каждом сообщении.
         try:
-            async with asyncio.timeout(self.timeout):
-                return await self._complete(messages, max_tokens)
+            return await asyncio.wait_for(self._complete(messages, max_tokens), self.timeout)
         except asyncio.TimeoutError:
             self.last_error = 'timeout'
             self._failures = min(5, self._failures + 1)

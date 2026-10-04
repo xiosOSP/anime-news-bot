@@ -24,14 +24,32 @@ def requirement_lines():
             yield Requirement(line)
 
 
-def pins() -> dict:
-    out = {}
+def pin_lines():
+    """Строки constraints.txt: (имя, версия, условие или None)."""
     for line in (ROOT / 'constraints.txt').read_text(encoding='utf-8').splitlines():
         line = line.split('#', 1)[0].strip()
         if line:
-            name, _, version = line.partition('==')
-            assert version, f'в constraints.txt только точные версии: {line}'
-            out[norm(name)] = version.strip()
+            req = Requirement(line)
+            specs = list(req.specifier)
+            assert len(specs) == 1 and specs[0].operator == '==', (
+                f'в constraints.txt только точные версии: {line}')
+            yield norm(req.name), specs[0].version, req.marker
+
+
+def pins(python_version: str = None) -> dict:
+    """Закреплённые версии для данного Python (по умолчанию — текущего).
+
+    Строки с условием (numpy 2.4 только с 3.11 и т. п.) действуют лишь там,
+    где условие выполняется: иначе проверка на 3.10 требовала бы версий,
+    которые на 3.10 не ставятся.
+    """
+    env = {'python_version': python_version} if python_version else None
+    out = {}
+    for name, version, marker in pin_lines():
+        if marker is None or marker.evaluate(env):
+            # Две строки на один Python — pip не поставит ничего.
+            assert name not in out, f'{name} закреплён дважды для Python {python_version}'
+            out[name] = version
     return out
 
 
@@ -64,6 +82,16 @@ def test_every_dependency_is_pinned_except_yt_dlp():
     assert not FLOATING & set(pinned), 'yt-dlp закреплять нельзя'
     stale = sorted(set(pinned) - closure())
     assert not stale, f'в constraints.txt лишние пакеты: {stale}'
+
+
+def test_each_python_gets_exactly_one_version_of_numpy_and_onnxruntime():
+    # Хостинг может запустить бота на 3.10 при runtime.txt=3.11: на каждой
+    # поддерживаемой версии у пакета ровно одна строка — ни конфликта, ни дыры.
+    for python in ('3.10', '3.11', '3.12', '3.13'):
+        chosen = pins(python)
+        assert {'numpy', 'onnxruntime'} <= set(chosen), python
+    assert pins('3.10')['numpy'].startswith('2.2.')
+    assert pins('3.11')['numpy'] != pins('3.10')['numpy']
 
 
 def test_pins_fit_the_requirement_ranges():
