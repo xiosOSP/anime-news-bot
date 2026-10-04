@@ -57,3 +57,29 @@ jobs:
 
       - name: Опись файлов совпадает с репозиторием
         run: python tools/build_manifest.py --check
+
+  # Хостинг может запустить бота на Python 3.10, даже если в runtime.txt 3.11.
+  # Закреплённые numpy 2.4 и onnxruntime 1.29 на 3.10 не ставились: на сервере
+  # развёртывание падало целиком, а CI на 3.11 оставался зелёным. Отдельная
+  # задача (а не матрица), чтобы проверка «test» сохранила своё имя.
+  test-python310:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+
+      - name: Установка зависимостей так же, как на хостинге
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Тесты
+        env:
+          BOT_TOKEN: '123:ci-test-token'
+          DATA_DIR: ${{ runner.temp }}/bot-data
+        run: python -m pytest -q

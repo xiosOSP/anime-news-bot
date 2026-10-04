@@ -80,14 +80,14 @@ async def test_network_failure_and_cooldown_do_not_block_reserve(pair):
 @pytest.mark.asyncio
 async def test_primary_timeout_reaches_reserve(pair, monkeypatch):
     primary, _, calls = pair
-    original_timeout = asyncio.timeout
+    original_wait_for = asyncio.wait_for
     # Exercise the real timeout handler without a multi-second test delay.
     # Короткий таймаут — только первому (основному) запросу. Раньше 0.01 с
     # получал и резервный: на медленной машине CI его запрос с записью
     # состояния на диск не укладывался в 10 мс, и тест падал через раз.
     budgets = iter([.01])
-    monkeypatch.setattr('moderation_llm.asyncio.timeout',
-                        lambda seconds: original_timeout(next(budgets, seconds)))
+    monkeypatch.setattr('moderation_llm.asyncio.wait_for',
+                        lambda aw, seconds: original_wait_for(aw, next(budgets, seconds)))
 
     async def slow(_):
         await asyncio.sleep(10)

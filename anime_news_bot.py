@@ -23,6 +23,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import zipfile
 import copy
@@ -31728,6 +31729,9 @@ def _validate_runtime_config() -> None:
 def main():
     # Самый первый вывод — чтобы в логах хостинга было видно что процесс стартовал
     print("=== Запуск anime_news_bot ===", flush=True)
+    # Хостинг может выбрать Python не из runtime.txt — версия в первых строках
+    # лога сразу показывает, на чём бот реально работает.
+    print(f"Python: {sys.version.split()[0]}", flush=True)
     print(f"DATA_DIR = {DATA_DIR}", flush=True)
     print(f"TOKEN задан: {'да' if TOKEN else 'НЕТ'}", flush=True)
     print(f"Переводчик: {'DeepL' if DEEPL_API_KEY else 'Google Translate'}", flush=True)
