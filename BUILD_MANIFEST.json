@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "d313c0397569b33da45d81059f29c7eee7be31c2",
-  "generated_at_utc": "2026-10-05T08:57:40.878714+00:00",
+  "git_commit": "591aea5d529632fcd25fc428e9dd57413f93c7ed",
+  "generated_at_utc": "2026-10-05T09:16:24.045999+00:00",
   "files": {
     ".env.example": {
       "sha256": "1d45114ec32deffad57d13ba2928bab66cf9fc248bb0e9bcb2f959028479257a",
@@ -26,8 +26,8 @@
       "bytes": 33
     },
     "README.md": {
-      "sha256": "ef83a787f66273d566cc249150e2bb34984046e98462b0f65f1b09eb9ee782a5",
-      "bytes": 30669
+      "sha256": "fcda5410256c554bb0e18bb88fd6eaf3fae2b02fd7380cae999f570c2362ae75",
+      "bytes": 30789
     },
     "anime_news_bot.py": {
       "sha256": "59139f57e54cab0302418da4d222057757e79622cb6f687556693ee0a959d9b8",
@@ -46,8 +46,8 @@
       "bytes": 15302
     },
     "docs/maintenance-prompt.md": {
-      "sha256": "10f4634eca1d31b86de944c577aeb76502bbe12ef1e50eba8bbec561abc33ce0",
-      "bytes": 5186
+      "sha256": "c47bb19377e7b64daa242799e7c29bc8fb614257bb75a962d1958c756a68d77d",
+      "bytes": 5354
     },
     "docs/post-moderation-quality-20260917.md": {
       "sha256": "702f4385da855e32b88c2981b6eb260e08ef0279dc7b39762603d20acc8a192d",
@@ -126,8 +126,8 @@
       "bytes": 9353
     },
     "tests/e2e/test_cli_contract.py": {
-      "sha256": "8a8e84a04e2f8f2342da5973d5d0266cebc8c728cb91ca8d1ac39f5910ed7730",
-      "bytes": 819
+      "sha256": "d2458cec46557934a4a39383d91b6959ffb1f68793c687533a86b81e0a2b6fc8",
+      "bytes": 3578
     },
     "tests/e2e/test_publish_contract.py": {
       "sha256": "71858a11f642af751f434db8e48f1f42fc14ac2aed29a9e7afec9badd6f98121",
@@ -806,8 +806,8 @@
       "bytes": 7685
     },
     "tools/hosting_smoke.py": {
-      "sha256": "c9ec70ec90e2cc9a95114d5eaa090d2c1879d5ad6585dc1d14795d95e6eff553",
-      "bytes": 3563
+      "sha256": "2c7591bef62975450a7bca1ebfa29db8ac58858d7c7de4ead721d5e3e1f85609",
+      "bytes": 7439
     },
     "translation.py": {
       "sha256": "48411961e504e1f172ffaf7579eca8ea9857e8b1d0e6833963b0916958c3d5b0",

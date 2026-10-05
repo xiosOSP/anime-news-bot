@@ -194,7 +194,8 @@ python anime_news_bot.py
 `runtime.txt` указан 3.11. Для numpy и onnxruntime в `requirements.txt` по две
 строки с условием `python_version`. CI проверяет: тесты на 3.11 и 3.10 и сборку
 в чистых `python:3.11-slim` / `python:3.10-slim` «как на хостинге»
-(`tools/hosting_smoke.py`: NudeNet, rlottie, ffmpeg, deno, импорт бота).
+(`tools/hosting_smoke.py`: NudeNet, rlottie, ffmpeg, deno, импорт бота и запуск
+до опроса Telegram на пустом томе данных с фальшивым токеном).
 
 Что реально запустилось — во второй и третьей строках лога:
 `Python: …` и `Окружение: Python · PTB · yt-dlp · onnxruntime · numpy · ffmpeg · deno`.
