@@ -1,10 +1,12 @@
-"""Ночная тишина канала: с 22:00 до 06:00 автопостинг не публикует.
+"""Ночная тишина канала: с 22:40 до 08:00 автопостинг не публикует.
 
 Ночью подписчики спят: пост уходит вниз ленты без реакций, а уведомление
 будит. Готовые посты при этом не теряются — ждут в очереди до утра.
 """
 import asyncio
+import re
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -27,11 +29,16 @@ def test_window_parsing(raw, window):
 
 
 @pytest.mark.parametrize('hhmm, quiet', [
-    ('21:59', False), ('22:00', True), ('23:45', True), ('00:00', True),
-    ('03:00', True), ('05:59', True), ('06:00', False), ('14:00', False),
+    ('22:39', False), ('22:40', True), ('23:45', True), ('00:00', True),
+    ('03:00', True), ('07:59', True), ('08:00', False), ('14:00', False),
 ])
 def test_default_night_window_crosses_midnight(monkeypatch, hhmm, quiet):
-    monkeypatch.setattr(bot, 'CHANNEL_QUIET_HOURS', '22:00-06:00')
+    # Окно по умолчанию берём из кода бота (conftest выключает тишину для
+    # остальных тестов): владелец просил 22:40–08:00.
+    default = re.search(r"_env\('CHANNEL_QUIET_HOURS', '([^']*)'\)",
+                        Path(bot.__file__).read_text(encoding='utf-8')).group(1)
+    assert bot._quiet_window(default) == (22 * 60 + 40, 8 * 60)
+    monkeypatch.setattr(bot, 'CHANNEL_QUIET_HOURS', default)
     now = datetime.strptime(f'2026-10-05 {hhmm}', '%Y-%m-%d %H:%M')
     assert bot._channel_quiet_now(now) is quiet
 

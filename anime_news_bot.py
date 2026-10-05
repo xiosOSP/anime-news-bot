@@ -848,7 +848,7 @@ PUBLISHER_TICK_SEC = max(15, min(600, _env_int('PUBLISHER_TICK_SEC', 60)))
 # без реакций, а уведомления раздражают. Время — часовой пояс бота (/tz, по
 # умолчанию МСК). «off» — без тишины. Ручные кнопки и посты, отложенные админом
 # на конкретное время, тишина не задерживает: это решение человека.
-CHANNEL_QUIET_HOURS = _env('CHANNEL_QUIET_HOURS', '22:00-06:00').strip()
+CHANNEL_QUIET_HOURS = _env('CHANNEL_QUIET_HOURS', '22:40-08:00').strip()
 # После обрыва цикла ждём короткую растущую паузу, а не полный интервал:
 # иначе при частых перезапусках сбор новостей не случается вовсе.
 AUTO_CYCLE_RETRY_BASE_SEC = max(30, min(1800, _env_int('AUTO_CYCLE_RETRY_BASE_SEC', 120)))
@@ -21804,7 +21804,7 @@ def _channel_quiet_now(now_local: Optional[datetime] = None) -> bool:
     now_local = now_local or _local_now()
     minute = now_local.hour * 60 + now_local.minute
     start, end = window
-    # Окно через полночь (22:00–06:00) — это «после начала ИЛИ до конца».
+    # Окно через полночь (22:40–08:00) — это «после начала ИЛИ до конца».
     return start <= minute < end if start < end else (minute >= start or minute < end)
 
 

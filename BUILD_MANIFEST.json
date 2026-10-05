@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "af16baa401bc0693ce969beb5cdce38e52443d29",
-  "generated_at_utc": "2026-10-05T20:31:18.816941+00:00",
+  "git_commit": "511a818e5348d7c0886fdf97f5860f07e04f030a",
+  "generated_at_utc": "2026-10-05T20:44:40.239308+00:00",
   "files": {
     ".env.example": {
       "sha256": "1d45114ec32deffad57d13ba2928bab66cf9fc248bb0e9bcb2f959028479257a",
@@ -26,11 +26,11 @@
       "bytes": 33
     },
     "README.md": {
-      "sha256": "128a3e7af4ecbf58d3d22e47b32b6f5209702a8e7094979475dcc0ffe222e8ce",
+      "sha256": "07d1155825874bc362cc90b12a4314bbbb31c7654707c911a7d31aaf2db2bc9b",
       "bytes": 31472
     },
     "anime_news_bot.py": {
-      "sha256": "38aea6c9bf15bb6ac0343c63e64685b6fadf9a809d6e39fb42780c78e8895b4f",
+      "sha256": "176c85be55526ca35b7c7ae91769cf25240bdd20e67fe5eda7fc447f836774da",
       "bytes": 1785171
     },
     "docs/chat-moderation.md": {
@@ -38,7 +38,7 @@
       "bytes": 72590
     },
     "docs/env-reference.md": {
-      "sha256": "3022467f3f99e3a186aca9c53b2b7894ca0401ae1ac029332d0004d55201cebe",
+      "sha256": "9f17a8c79a303c296b2c5f5aae98df7473f1a4052cd094b505f43275cf5d0888",
       "bytes": 21187
     },
     "docs/llm-providers.md": {
@@ -122,7 +122,7 @@
       "bytes": 2319
     },
     "tests/conftest.py": {
-      "sha256": "0a2a9bc4818463275d3284e768ff75c938b43fdc63a8094f50eff98910c9b4d0",
+      "sha256": "a054d918626f599673422ba10c0188693dcde929f6db449f75af64c6b1ab7b4f",
       "bytes": 9866
     },
     "tests/e2e/test_cli_contract.py": {
@@ -238,8 +238,8 @@
       "bytes": 6248
     },
     "tests/test_channel_quiet_hours.py": {
-      "sha256": "4ea87dd71839d2694a7dded630b48516878ece354ebb80fe2c0a70613cc44a67",
-      "bytes": 3661
+      "sha256": "2238bc96e88ce585e2b6652df026bbd3161b43a772552619122b27242e0ab6e2",
+      "bytes": 4111
     },
     "tests/test_cohesive_posts.py": {
       "sha256": "7b3b63f0f6312033bd09d794f3088bf94c4cdca7b8e6082c0cb3347c37fb76fe",

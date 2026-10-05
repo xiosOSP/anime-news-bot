@@ -363,7 +363,7 @@
 | `CANARY_CHANNEL_ID` | — | anime_news_bot.py |
 | `CANARY_MIRROR_PERCENT` | `0.0` | anime_news_bot.py |
 | `CHANNEL_ID` | — | anime_news_bot.py |
-| `CHANNEL_QUIET_HOURS` | `22:00-06:00` | anime_news_bot.py |
+| `CHANNEL_QUIET_HOURS` | `22:40-08:00` | anime_news_bot.py |
 | `CHAOS_FUZZ_MAX_CHARS` | `4096` | anime_news_bot.py |
 | `CHAOS_SELFTEST_ROUNDS` | `40` | anime_news_bot.py |
 | `CHECK_INTERVAL_SEC` | `1800` | anime_news_bot.py |
