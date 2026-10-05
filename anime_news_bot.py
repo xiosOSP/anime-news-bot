@@ -6818,6 +6818,36 @@ class EditorialRulesStore:
         }
 
 
+def _compile_alias_replacer(pairs) -> tuple[Optional[re.Pattern], dict]:
+    """Одно выражение на все замены «вариант → правильное написание».
+
+    Раньше на каждый текст шло по отдельному re.sub на каждый вариант: при
+    1200 известных сущностях это 36 мс на пост, а пост форматируется
+    несколько раз. Одно выражение (длинные варианты раньше коротких — так и
+    было) проходит текст один раз, и замена больше не срабатывает внутри уже
+    подставленного имени."""
+    mapping: dict[str, str] = {}
+    for alias, preferred in sorted(pairs, key=lambda pair: len(pair[0]), reverse=True):
+        key = str(alias or '').lower()
+        if key and preferred and key not in mapping:
+            mapping[key] = preferred
+    if not mapping:
+        return None, {}
+    parts = []
+    for alias in mapping:
+        left = r'(?<!\w)' if alias[0].isalnum() else ''
+        right = r'(?!\w)' if alias[-1].isalnum() else ''
+        parts.append(left + re.escape(alias) + right)
+    return re.compile('|'.join(parts), re.IGNORECASE), mapping
+
+
+def _apply_alias_replacer(text: str, replacer: tuple[Optional[re.Pattern], dict]) -> str:
+    pattern, mapping = replacer
+    if not text or pattern is None:
+        return text
+    return pattern.sub(lambda m: mapping.get(m.group(0).lower(), m.group(0)), text)
+
+
 class EditorialGlossary:
     """Persisted alias -> preferred spelling rules for final editorial text."""
     MAX_ALIASES = 1000
@@ -6825,6 +6855,7 @@ class EditorialGlossary:
     def __init__(self, path: Path):
         self.path = path
         self._aliases: dict[str, str] = {}
+        self._replacer: Optional[tuple] = None
         self._load()
 
     def _load(self) -> None:
@@ -6851,20 +6882,10 @@ class EditorialGlossary:
         except OSError as e:
             logger.warning(f'editorial glossary не сохранён: {e}')
 
-    @staticmethod
-    def _replace_alias(text: str, alias: str, preferred: str) -> str:
-        if not text or not alias:
-            return text
-        left = r'(?<!\w)' if alias[0].isalnum() else ''
-        right = r'(?!\w)' if alias[-1].isalnum() else ''
-        return re.sub(left + re.escape(alias) + right, lambda _m: preferred,
-                      text, flags=re.IGNORECASE)
-
     def apply(self, text: str) -> str:
-        out = str(text or '')
-        for alias, preferred in sorted(self._aliases.items(), key=lambda kv: len(kv[0]), reverse=True):
-            out = self._replace_alias(out, alias, preferred)
-        return out
+        if self._replacer is None:
+            self._replacer = _compile_alias_replacer(self._aliases.items())
+        return _apply_alias_replacer(str(text or ''), self._replacer)
 
     def add(self, alias: str, preferred: str) -> bool:
         alias = re.sub(r'\s+', ' ', str(alias or '')).strip()[:160]
@@ -6874,6 +6895,7 @@ class EditorialGlossary:
         if alias not in self._aliases and len(self._aliases) >= self.MAX_ALIASES:
             self._aliases.pop(next(iter(self._aliases)), None)
         self._aliases[alias] = preferred
+        self._replacer = None
         self._save()
         return True
 
@@ -6882,6 +6904,7 @@ class EditorialGlossary:
         if key is None:
             return False
         self._aliases.pop(key, None)
+        self._replacer = None
         self._save()
         return True
 
@@ -6904,6 +6927,7 @@ class EntityMemory:
         self.path = path
         self._items: dict[str, dict] = {}
         self._lock = threading.RLock()
+        self._replacer: Optional[tuple] = None
         self._load()
 
     @staticmethod
@@ -6949,6 +6973,7 @@ class EntityMemory:
                 'source': str(source or 'unknown')[:40],
                 'last_seen': datetime.now(timezone.utc).isoformat(),
             }
+            self._replacer = None
             self._save()
         return True
 
@@ -6968,6 +6993,8 @@ class EntityMemory:
                 row['count'] = _safe_nonnegative_int(row.get('count')) + 1
                 row['last_seen'] = datetime.now(timezone.utc).isoformat()
                 aliases = list(dict.fromkeys([*(row.get('aliases') or []), value]))[-12:]
+                if aliases != row.get('aliases'):
+                    self._replacer = None
                 row['aliases'] = aliases
                 # Save only occasionally to avoid an fsync on every article.
                 if row['count'] <= 3 or row['count'] % 10 == 0:
@@ -6978,19 +7005,19 @@ class EntityMemory:
             return value
 
     def apply(self, text: str) -> str:
-        out = str(text or '')
-        replacements: list[tuple[str, str]] = []
         with self._lock:
-            rows = [dict(row) for row in self._items.values()]
-        for row in rows:
-            preferred = str(row.get('preferred') or '').strip()
-            for alias in row.get('aliases') or []:
-                alias = str(alias or '').strip()
-                if alias and preferred and alias.casefold() != preferred.casefold():
-                    replacements.append((alias, preferred))
-        for alias, preferred in sorted(replacements, key=lambda x: len(x[0]), reverse=True)[:2500]:
-            out = EditorialGlossary._replace_alias(out, alias, preferred)
-        return out
+            replacer = self._replacer
+            if replacer is None:
+                replacements: list[tuple[str, str]] = []
+                for row in self._items.values():
+                    preferred = str(row.get('preferred') or '').strip()
+                    for alias in row.get('aliases') or []:
+                        alias = str(alias or '').strip()
+                        if alias and preferred and alias.casefold() != preferred.casefold():
+                            replacements.append((alias, preferred))
+                replacements = sorted(replacements, key=lambda x: len(x[0]), reverse=True)[:2500]
+                replacer = self._replacer = _compile_alias_replacer(replacements)
+        return _apply_alias_replacer(str(text or ''), replacer)
 
     def list_recent(self, limit: int = 20) -> list[dict]:
         with self._lock:
@@ -15831,7 +15858,9 @@ def _image_fingerprint(data: Optional[bytes]) -> Optional[str]:
                 # LANCZOS усредняет по площади: отпечаток почти не меняется при
                 # смене размера, чего не даёт быстрый bicubic по умолчанию
                 small = im.convert('L').resize((9, 8), Image.LANCZOS)
-                px = list(small.getdata())
+                # tobytes() вместо устаревшего getdata() (уйдёт в Pillow 14): у
+                # картинки в оттенках серого это те же значения пикселей по байту.
+                px = small.tobytes()
                 avg_rgb = tuple(im.convert('RGB').resize((1, 1), Image.LANCZOS).getpixel((0, 0)))
             bits = 0
             pos = 0
