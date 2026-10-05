@@ -13,6 +13,7 @@
 """
 import json
 import re
+import unicodedata
 from typing import Optional
 
 from post_text import smart_truncate
@@ -383,6 +384,70 @@ def _not_russian(text: str) -> bool:
     return cyrillic / len(letters) < 0.2
 
 
+# Латиница, которую пост вправе содержать без опоры на источник: форматы,
+# платформы, служебные сокращения. Остальная латиница в русском посте — имена
+# и названия, и взяться им неоткуда, кроме исходника и подсказки Shikimori.
+_LATIN_ALLOWED = frozenset((
+    'tv', 'pv', 'cm', 'mv', 'ova', 'ona', 'oad', 'ost', 'dlc', 'pc', 'ps4', 'ps5', 'xbox',
+    'switch', 'nintendo', 'steam', 'netflix', 'crunchyroll', 'hidive', 'disney', 'prime',
+    'video', 'amazon', 'youtube', 'imax', 'anime', 'manga', 'rpg', 'mmo', 'mmorpg', 'blu',
+    'ray', 'dvd', 'uhd', 'ver', 'vol', 'feat', 'nsfw', 'usa', 'iii', 'vii', 'viii', 'xii',
+))
+_LATIN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:['’\-][A-Za-z0-9]+)*")
+
+
+def _fold_latin(text: str) -> str:
+    """«Pokémon» и «Pokemon», «Ｇａｍｅ» и «Game» — одно и то же слово."""
+    decomposed = unicodedata.normalize('NFKD', text or '')
+    return ''.join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
+def _latin_forms(text: str) -> set:
+    forms = set()
+    words = _LATIN_WORD_RE.findall(_fold_latin(text))
+    for word in words:
+        key = word.casefold()
+        forms.add(key)
+        # «Frieren's» и «Wakao-kun»: части слова — тоже его формы.
+        forms.update(part for part in re.split(r"['’\-]", key) if part)
+    # Сокращения по первым буквам: «Sword Art Online» → SAO, «Attack on
+    # Titan» → AOT. Так названия и пишут, и это не новое имя.
+    initials = [word[0].casefold() for word in words]
+    for size in range(2, 7):
+        for start in range(len(initials) - size + 1):
+            forms.add(''.join(initials[start:start + size]))
+    return forms
+
+
+def _unsupported_names(source: str, output: str) -> list:
+    """Слова латиницей из ответа, которых нет ни в источнике, ни в подсказке.
+
+    Так выглядели чужие названия в постах: «Game Tengoku: THE GAME
+    PARADISE!», «B Gata H Kei», «Major: Message» посреди новостей о другом —
+    модель переносила их из соседней новости пачки или из памяти, хотя
+    правила это запрещают. Числа и даты сверяются отдельно; имена — здесь."""
+    have = _latin_forms(source)
+    found: list = []
+    seen: set = set()
+    for word in _LATIN_WORD_RE.findall(_fold_latin(output)):
+        key = word.casefold()
+        if key in seen:
+            continue
+        parts = [part for part in re.split(r"['’\-]", key) if part]
+        if all(len(p) < 3 or p in have or p in _LATIN_ALLOWED for p in parts):
+            continue
+        seen.add(key)
+        found.append(word)
+    return found
+
+
+_CJK_SOURCE_RE = re.compile(r'[\u3040-\u30ff\u4e00-\u9fff]')
+# Слово, которое целиком раскладывается на слоги японского (Хэпбёрн): ромадзи.
+_ROMAJI_RE = re.compile(
+    r'^(?:(?:ky|gy|sh|ch|ny|hy|by|py|my|ry|ts|[kgsztdnhbpmyrwjf])?[aiueo]|n)+$',
+    re.IGNORECASE)
+
+
 def _editorial_rejection(source: str, title: str, summary: str) -> str:
     """Cheap structural/factual checks shared by cached, batch and single replies."""
     if _injected_call_to_action(source, f'{title}\n{summary}'):
@@ -404,6 +469,13 @@ def _editorial_rejection(source: str, title: str, summary: str) -> str:
     # Пересказ вместо новости: «В источнике TG: QewbsNews упомянута сцена».
     if re.search(r'\bTG:\s*\S|(?:^|[\s.])[Вв] источнике\b', title + '\n' + summary):
         return 'source_meta'
+    unsupported = _unsupported_names(source, f'{title}\n{summary}')
+    if _CJK_SOURCE_RE.search(source):
+        # Японские названия модель обязана записывать ромадзи — такие слова
+        # в японском источнике не найти. Английские слова всё равно чужие.
+        unsupported = [word for word in unsupported if not _ROMAJI_RE.match(word)]
+    if unsupported:
+        return 'unsupported_names'
     return ''
 
 

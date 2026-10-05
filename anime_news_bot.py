@@ -79,6 +79,7 @@ from llm_protocol import (
     _LLM_FAILURE_HUMAN,
     _LLM_TEMPORARY_MARKERS,
     _editorial_rejection,
+    _unsupported_names,
     _llm_batch_owner,
     _llm_batch_usable,
     _llm_editorial_data,
@@ -12419,6 +12420,20 @@ NOISE_TITLE_RULES = (
         r'^\W*(?:с\s+)?днём рождения\b|^\W*с\s+днем рождения\b',
         r'^\W*календарь\s+на\b',
     )),
+    # Отчёты, интервью и эфиры японских порталов: «オフィシャルレポート»,
+    # «…インタビュー», «Webラジオ». У бота такие посты не набрали ни одной
+    # реакции в 96% случаев: события в них нет, только пересказ мероприятия
+    # или беседы. Новость из интервью («Ода раскрыл, когда кончится ONE
+    # PIECE») заголовок называет событием и сюда не попадает.
+    ('отчёт, интервью, эфир', (
+        r'オフィシャルレポート|公式レポート|イベントレポート|【レポート】|レポート[】」』]?\s*$',
+        r'インタビュー|対談|鼎談|Webラジオ|ラジオ番組|生配信|配信番組',
+        r'\b(?:event|official|panel|screening)\s+report\b',
+        r'^\W*interview\b|\binterview\s*[:\-–—]\s|\[interview\]',
+        r'\bweb[\s-]?radio\b',
+        r'^\W*(?:официальн\w+\s+)?отч[её]т\b|\bфоторепортаж',
+        r'^\W*интервью\b|\[интервью\]|\bвеб-?радио\b',
+    )),
     # Русская реклама и розыгрыши: «Реклама. … erid: …», «На правах рекламы»,
     # «Партнёрский материал». Раньше их отсекали только теги #реклама у
     # телеграм-каналов, а в заголовке они шли в канал как новость.
@@ -17916,6 +17931,49 @@ def _editorial_allowed(news: dict) -> bool:
     return not bool(news.get('_editorial_blocked'))
 
 
+# Что заходит подписчикам — по реакциям на канале (527 постов, бот против
+# админов): кадры серий и арты — около 4 реакций на пост, манга — 3, а
+# голливудская хроника у бота — 0.6, причём 57% постов бота были про
+# западное кино и сериалы (у админов — 16%). Blu-ray, мерч, выставки и
+# спектакли у бота почти никогда не набирали реакций. Это не фильтр — только
+# вес: при выборе между новостями аниме и кассовым прогнозом голливудского
+# фильма в канал уходит первое, а когда аниме нет, кино по-прежнему выходит.
+_AFFINITY_VISUAL_RE = re.compile(
+    r'кадр|ключев\w*\s+визуал|постер|\bарт\b|иллюстрац|\bkey\s*visual|\bposter\b|'
+    r'illustration|artwork|\bstills?\b|\bframes?\b|ビジュアル|場面カット|先行カット|イラスト',
+    re.IGNORECASE)
+_AFFINITY_MERCH_RE = re.compile(
+    r'blu-?ray|\bdvd\b|\bbd\b|\bmerch|фигурк|\bfigures?\b|выставк|exhibition|спектакл|мюзикл|'
+    r'stage play|musical|коллаб\w*[\s-]+кафе|collab\w*\s+cafe|pop-?up|бонус\w*\s+(?:для|в|за)\s+'
+    r'(?:зрител|кинотеатр)|グッズ|特典|舞台|展示|コラボカフェ|ポップアップ',
+    re.IGNORECASE)
+_AFFINITY_GOSSIP_RE = re.compile(
+    r'\bслух|инсайдер|по данным\s+\w+(?:rpk|guy)|\brumou?r|\binsider|\breportedly\b|'
+    r'касс\w*\s+сбор|предпродаж|\bbox office\b|\bpresales?\b|opening weekend|'
+    r'фотосесси|photo\s*shoot|красн\w+\s+дорожк|red carpet',
+    re.IGNORECASE)
+
+
+def _topic_affinity(news: dict) -> float:
+    """Поправка приоритета по теме: что подписчики канала реально смотрят."""
+    text = f"{news.get('title', '')}\n{str(news.get('summary') or '')[:300]}"
+    topic = str(news.get('_llm_topic') or '')
+    source = str(news.get('source') or '')
+    general = source in GENERAL_TOPIC_SOURCES
+    anime = topic in ('аниме', 'манга') or looks_like_anime_news(news) or (
+        not general and not source.startswith('TG:') and topic not in ('кино', 'игры'))
+    score = 2.0 if anime else 0.0
+    if not anime and (general or topic == 'кино'):
+        score -= 3.0                      # западное кино и сериалы без связи с аниме
+    if _AFFINITY_VISUAL_RE.search(text):
+        score += 1.5
+    if _AFFINITY_MERCH_RE.search(text):
+        score -= 4.0
+    if not anime and _AFFINITY_GOSSIP_RE.search(text):
+        score -= 2.0
+    return score
+
+
 def _news_priority_score(news: dict) -> float:
     """Приоритет: свежесть + значимость + медиа + здоровье + quality signals."""
     score = 0.0
@@ -17932,9 +17990,13 @@ def _news_priority_score(news: dict) -> float:
     if news.get('images'):
         score += 2.0
     low = f"{news.get('title','')} {news.get('summary','')}".lower()
+    # «фильм» здесь был: он давал +2 любой голливудской новости и вместе с
+    # кино-лентами перекосил канал в сторону западного кино.
     important = ('premiere', 'release date', 'trailer', 'season 2', 'season 3', 'final season',
-                 'премьера', 'дата выхода', 'трейлер', 'новый сезон', 'экранизац', 'фильм')
+                 'премьера', 'дата выхода', 'трейлер', 'новый сезон', 'экранизац',
+                 'anime film', 'anime movie', 'аниме-фильм', 'полнометражн')
     score += min(6.0, sum(2.0 for word in important if word in low))
+    score += _topic_affinity(news)
     if source_health is not None:
         try:
             fails = int(source_health.info(news.get('source', '')).get('fails', 0))
@@ -24046,7 +24108,13 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
         if rejection:
             news['_editorial_rejection'] = rejection
             metrics.inc('anime_bot_editorial_rejected_total', labels={'reason': rejection})
-            logger.warning('LLM: переписывание отклонено (%s): %s', rejection, title[:55])
+            detail = ''
+            if rejection == 'unsupported_names':
+                # Какие имена модель принесла не из этой новости — по логу
+                # видно, откуда течёт: соседняя новость пачки или память.
+                detail = ' — ' + ', '.join(_unsupported_names(
+                    source_fact_text, proposed_text)[:5])
+            logger.warning('LLM: переписывание отклонено (%s): %s%s', rejection, title[:55], detail)
         elif not (_llm_numbers_supported(source_fact_text, proposed_text)
                 and _llm_dates_supported(source_fact_text, proposed_text)):
             logger.warning(f"LLM: обнаружены новые числа/даты — переписывание отклонено: {title[:55]}")

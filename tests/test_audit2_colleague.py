@@ -118,7 +118,7 @@ def test_english_reply_of_the_model_is_rejected():
 
 
 def test_russian_text_with_latin_titles_passes():
-    source = 'Attack on Titan: The Final Chapters was announced.'
+    source = 'Attack on Titan: The Final Chapters was announced by MAPPA.'
     assert llm._editorial_rejection(
         source, 'Attack on Titan: The Final Chapters анонсировали',
         'Студия MAPPA показала новый ключевой визуал и назвала дату выхода финала.') == ''

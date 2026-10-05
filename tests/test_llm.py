@@ -373,7 +373,8 @@ class TestSummaryRedundancy:
         assert anime_news_bot._too_similar('что-то', '') is False
 
     def test_release_timing_survives_redundant_summary(self, llm):
-        news = {'title': 'Bleach opening', 'summary': 'Out today.', 'source': 'X'}
+        news = {'title': 'Bleach: Thousand-Year Blood War final opening by jo0ji',
+                'summary': 'Out today.', 'source': 'X'}
         answer = {'topic': 'аниме',
                   'title': 'Последний опенинг Bleach: Thousand-Year Blood War от jo0ji',
                   'summary': 'Последний опенинг аниме Bleach: Thousand-Year Blood War '
@@ -384,7 +385,8 @@ class TestSummaryRedundancy:
         assert 'сегодня' in news['_llm_text']  # дата отсутствует в заголовке
 
     def test_useful_summary_kept(self, llm):
-        news = {'title': 'Anime announced', 'summary': 'Netflix premiere is planned for January.', 'source': 'X'}
+        news = {'title': 'MAPPA anime announced', 'summary': 'Netflix premiere is planned for January.',
+                'source': 'X'}
         answer = {'topic': 'аниме', 'title': 'Анонсировано новое аниме от MAPPA',
                   'summary': 'Премьера состоится в январе на Netflix.', 'tags': []}
         with patch.object(llm.requests, 'post', return_value=_reply(answer)):
@@ -481,7 +483,7 @@ class TestParagraphStructure:
     не больше двух абзацев."""
 
     def test_paragraphs_preserved(self, llm):
-        news = {'title': 'Bleach opening', 'summary': 'Out Oct 4.', 'source': 'ANN'}
+        news = {'title': 'Bleach opening by jo0ji', 'summary': 'Out Oct 4.', 'source': 'ANN'}
         answer = {'topic': 'аниме',
                   'title': 'Опенинг финальной части Bleach записал jo0ji',
                   'summary': 'Заключительный кур выходит 4 октября на Disney+.\n\n'
@@ -626,7 +628,8 @@ class TestTautology:
                              'состоится в октябре.\n\n'
                              'Манга рассказывает о девушке-трейдере.',
                   'tags': ['#аниме']}
-        news = {'title': 'T', 'summary': ('Premiere in October. ' + 'x' * 300), 'link': 'https://a/1', 'source': 'X'}
+        news = {'title': 'FX Senshi Kurumi-chan', 'summary': ('Premiere in October. ' + 'x' * 300),
+                'link': 'https://a/1', 'source': 'X'}
         with patch.object(llm.requests, 'post', return_value=_reply(answer)), \
              patch.object(llm, 'fetch_article', return_value={'text': '', 'video': None}):
             asyncio.run(llm._llm_enrich(news))
