@@ -314,12 +314,23 @@ class TestVideoExtractionFallback:
         assert 'не отдал mp4' in posts[0]['_video_note']
 
     def test_long_video_keeps_frame(self, monkeypatch):
+        monkeypatch.setattr(anime_news_bot, '_media_tool', lambda name: None)
         posts = self._parse(self._msg(
             '<video src="https://cdn/long.mp4"></video>' + self.LAZY +
             '<time class="tgme_widget_message_video_duration">7:20</time>'), monkeypatch)
         assert posts[0]['video'] is None
         assert posts[0]['images'] == ['https://cdn/frame.jpg']
         assert 'длиннее лимита' in posts[0]['_video_note']
+
+    def test_long_video_offers_full_size_frame_first(self, monkeypatch):
+        # С ffmpeg первым кандидатом идёт кадр из самого ролика (1280×720),
+        # превью 320×180 остаётся запасным.
+        monkeypatch.setattr(anime_news_bot, '_media_tool', lambda name: '/pkg/ffmpeg')
+        posts = self._parse(self._msg(
+            '<video src="https://cdn/long.mp4"></video>' + self.LAZY +
+            '<time class="tgme_widget_message_video_duration">7:20</time>'), monkeypatch)
+        assert posts[0]['images'] == [
+            'https://cdn/long.mp4' + anime_news_bot.VIDEO_FRAME_SUFFIX, 'https://cdn/frame.jpg']
 
     def test_spare_frame_saved_even_with_video(self, monkeypatch):
         posts = self._parse(self._msg(

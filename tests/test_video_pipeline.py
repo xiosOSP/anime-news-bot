@@ -96,6 +96,7 @@ class TestFetchArticleVideo:
 class TestVideoFormat:
     def test_progressive_without_ffmpeg(self, monkeypatch):
         monkeypatch.setattr(anime_news_bot.shutil, 'which', lambda name: None)
+        monkeypatch.setattr(anime_news_bot, '_bundled_ffmpeg', lambda: None)
         fmt = anime_news_bot._video_format()
         assert 'acodec!=none' in fmt and '+ba' not in fmt   # склейка не нужна
 

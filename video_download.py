@@ -33,9 +33,31 @@ def file_stem(url: str) -> str:
     return f'{tail}_{uuid.uuid4().hex[:10]}'
 
 
+def video_meta(info) -> dict:
+    """Ширина, высота и длительность ролика из ответа yt-dlp.
+
+    Без них Telegram показывает ролик квадратом и без длительности, а ffprobe
+    на хостинге нет — поэтому берём то, что yt-dlp уже знает."""
+    if not isinstance(info, dict):
+        return {}
+    out = {}
+    for key in ('width', 'height'):
+        value = info.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= 8192:
+            out[key] = int(value)
+    duration = info.get('duration')
+    if isinstance(duration, (int, float)) and not isinstance(duration, bool) \
+            and 0 < duration < 24 * 3600:
+        out['duration'] = float(duration)
+    return out
+
+
 def download(url: str, out_dir: Path, stem: str, *, fmt: str, max_mb: int,
-             max_duration: int, extensions, ydl_module) -> tuple[Optional[Path], str]:
-    """Скачивает ролик. (путь, пояснение) — путь None, если не вышло."""
+             max_duration: int, extensions, ydl_module, ffmpeg: Optional[str] = None,
+             meta: Optional[dict] = None) -> tuple[Optional[Path], str]:
+    """Скачивает ролик. (путь, пояснение) — путь None, если не вышло.
+
+    meta, если передан, заполняется шириной/высотой/длительностью."""
     ydl_opts = {
         'format': fmt,
         'outtmpl': str(Path(out_dir) / f'{stem}.%(ext)s'),
@@ -47,6 +69,11 @@ def download(url: str, out_dir: Path, stem: str, *, fmt: str, max_mb: int,
         'retries': 2,
         'fragment_retries': 2,
     }
+    if ffmpeg:
+        # Склейка дорожек: в mp4, если кодеки туда влезают (Telegram играет его
+        # в ленте), иначе в mkv — лучше файл, чем никакого ролика.
+        ydl_opts['ffmpeg_location'] = ffmpeg
+        ydl_opts['merge_output_format'] = 'mp4/mkv'
     try:
         with ydl_module.YoutubeDL(ydl_opts) as ydl:
             # Сначала extract_info без скачивания — проверяем длину
@@ -70,7 +97,11 @@ def download(url: str, out_dir: Path, stem: str, *, fmt: str, max_mb: int,
             if size_mb > max_mb:
                 file_path.unlink(missing_ok=True)
                 return None, f'файл {size_mb:.0f} МБ больше лимита {max_mb} МБ'
-            return file_path, f'скачано через yt-dlp, {size_mb:.1f} МБ'
+            if meta is not None:
+                meta.update(video_meta(info))
+            height = info.get('height') if isinstance(info, dict) else None
+            quality = f', {height}p' if isinstance(height, int) and height > 0 else ''
+            return file_path, f'скачано через yt-dlp, {size_mb:.1f} МБ{quality}'
     except Exception as e:
         return None, f'{type(e).__name__}: {str(e)[:120]}'
 
@@ -93,11 +124,13 @@ def _kill_group(proc) -> None:
 
 async def download_isolated(url: str, out_dir: Path, *, fmt: str, max_mb: int,
                             max_duration: int, extensions, timeout: float,
+                            ffmpeg: Optional[str] = None, meta: Optional[dict] = None,
                             ) -> tuple[Optional[Path], str]:
     """Загрузка в дочернем процессе; по истечении timeout процесс убивается."""
     stem = file_stem(url)
     job = {'url': url, 'out_dir': str(out_dir), 'stem': stem, 'fmt': fmt,
-           'max_mb': max_mb, 'max_duration': max_duration, 'extensions': list(extensions)}
+           'max_mb': max_mb, 'max_duration': max_duration, 'extensions': list(extensions),
+           'ffmpeg': ffmpeg}
     proc = await asyncio.create_subprocess_exec(
         sys.executable, str(Path(__file__).resolve()),
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -134,6 +167,9 @@ async def download_isolated(url: str, out_dir: Path, *, fmt: str, max_mb: int,
     if path.parent != Path(out_dir).resolve() or not path.name.startswith(stem) or not path.is_file():
         remove_partial(out_dir, stem)
         return None, 'процесс загрузки вернул чужой путь'
+    if meta is not None:
+        # Сведения о ролике — тоже лишь подсказка: берём только разумные числа.
+        meta.update(video_meta(result.get('meta')))
     return path, note
 
 
@@ -143,6 +179,7 @@ def _child_main() -> None:
     # ответа. Иначе одна строка прогресса ломала бы разбор результата.
     result_fd = os.dup(1)
     os.dup2(2, 1)
+    meta: dict = {}
     try:
         import yt_dlp
     except ImportError:
@@ -150,9 +187,11 @@ def _child_main() -> None:
     else:
         path, note = download(job['url'], Path(job['out_dir']), job['stem'], fmt=job['fmt'],
                               max_mb=int(job['max_mb']), max_duration=int(job['max_duration']),
-                              extensions=tuple(job['extensions']), ydl_module=yt_dlp)
+                              extensions=tuple(job['extensions']), ydl_module=yt_dlp,
+                              ffmpeg=job.get('ffmpeg'), meta=meta)
     with os.fdopen(result_fd, 'w', encoding='utf-8') as out:
-        out.write(json.dumps({'path': str(path) if path else None, 'note': note}) + '\n')
+        out.write(json.dumps({'path': str(path) if path else None, 'note': note,
+                              'meta': meta}) + '\n')
 
 
 if __name__ == '__main__':
