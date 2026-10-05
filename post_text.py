@@ -172,6 +172,28 @@ def _tg_strip_trailing_tags(line: str) -> str:
     return line[:tail.start('tags')].rstrip() if tail else line
 
 
+# Строка, которая так кончается, — не конец фразы: запятая, тире или
+# предлог/союз, после которого обязано идти продолжение. Двоеточие сюда не
+# входит: после него обычно список, а пункт списка заголовку не нужен.
+_TG_DANGLING_TAIL_RE = re.compile(
+    r'(?:[,;—–-]|(?<!\w)(?:из|в|во|на|с|со|о|об|по|к|ко|для|и|а|но|что|чем|как|от|у|за|'
+    r'под|над|при|про|через|без|до|или|либо|of|and|the|for|to|in|with|from|by))\s*$',
+    re.IGNORECASE)
+
+
+def _tg_line_continues(head: str, nxt: str) -> bool:
+    """Продолжает ли следующая строка фразу, оборванную в первой."""
+    head, nxt = str(head or '').rstrip(), str(nxt or '').lstrip()
+    if not head or not nxt or re.search(r'[.!?…]["»”]?$', head):
+        return False
+    if _tg_is_list_item(nxt):
+        return False
+    if _TG_DANGLING_TAIL_RE.search(head):
+        return True
+    # Строка со строчной буквы или с кавычки-названия — та же фраза.
+    return nxt[0].islower() or nxt[0] in '«"„“'
+
+
 def _tg_title_and_summary(full_text: str, channel: str, label: str,
                           display_name: str = '') -> tuple[str, str]:
     """Делит текст телеграм-поста на заголовок и тело.
@@ -196,8 +218,19 @@ def _tg_title_and_summary(full_text: str, channel: str, label: str,
         if _tg_strip_decoration(kept[0]) in ('слух', 'слухи', 'rumor', 'rumour'):
             kept[1] = 'Слух: ' + kept[1]
         kept = kept[1:]
-    head = _tg_drop_editorial_voice(kept[0])
-    rest = [_tg_drop_editorial_voice(line) for line in kept[1:]]
+    # Каналы рвут фразу переносом прямо в первой строке: «Согласно ранним
+    # прогнозам,» / «третья «Дюна» соберёт…», «Новый кадр мультфильма» /
+    # «„Барашек Шон“». Заголовком уходил обрубок («прогнозам,.»), а название
+    # — в тело поста. Склеиваем до правки регистра: продолжение фразы
+    # заглавной буквы не получает.
+    first, tail_lines = kept[0], kept[1:]
+    joined = 0
+    while (tail_lines and joined < 2 and len(first) < 200
+           and _tg_line_continues(first, tail_lines[0])):
+        first = f'{first} {tail_lines.pop(0)}'
+        joined += 1
+    head = _tg_drop_editorial_voice(first)
+    rest = [_tg_drop_editorial_voice(line) for line in tail_lines]
     # Первая строка бывает целым абзацем. Заголовком тогда служил весь абзац,
     # а тело поста оставалось пустым: читатель получал стену текста вместо
     # заголовка и ничего под ним. Заголовок — первое предложение, остальное

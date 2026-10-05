@@ -79,6 +79,7 @@ from llm_protocol import (
     _LLM_FAILURE_HUMAN,
     _LLM_TEMPORARY_MARKERS,
     _editorial_rejection,
+    _unsupported_names,
     _llm_batch_owner,
     _llm_batch_usable,
     _llm_editorial_data,
@@ -6817,6 +6818,36 @@ class EditorialRulesStore:
         }
 
 
+def _compile_alias_replacer(pairs) -> tuple[Optional[re.Pattern], dict]:
+    """Одно выражение на все замены «вариант → правильное написание».
+
+    Раньше на каждый текст шло по отдельному re.sub на каждый вариант: при
+    1200 известных сущностях это 36 мс на пост, а пост форматируется
+    несколько раз. Одно выражение (длинные варианты раньше коротких — так и
+    было) проходит текст один раз, и замена больше не срабатывает внутри уже
+    подставленного имени."""
+    mapping: dict[str, str] = {}
+    for alias, preferred in sorted(pairs, key=lambda pair: len(pair[0]), reverse=True):
+        key = str(alias or '').lower()
+        if key and preferred and key not in mapping:
+            mapping[key] = preferred
+    if not mapping:
+        return None, {}
+    parts = []
+    for alias in mapping:
+        left = r'(?<!\w)' if alias[0].isalnum() else ''
+        right = r'(?!\w)' if alias[-1].isalnum() else ''
+        parts.append(left + re.escape(alias) + right)
+    return re.compile('|'.join(parts), re.IGNORECASE), mapping
+
+
+def _apply_alias_replacer(text: str, replacer: tuple[Optional[re.Pattern], dict]) -> str:
+    pattern, mapping = replacer
+    if not text or pattern is None:
+        return text
+    return pattern.sub(lambda m: mapping.get(m.group(0).lower(), m.group(0)), text)
+
+
 class EditorialGlossary:
     """Persisted alias -> preferred spelling rules for final editorial text."""
     MAX_ALIASES = 1000
@@ -6824,6 +6855,7 @@ class EditorialGlossary:
     def __init__(self, path: Path):
         self.path = path
         self._aliases: dict[str, str] = {}
+        self._replacer: Optional[tuple] = None
         self._load()
 
     def _load(self) -> None:
@@ -6850,20 +6882,10 @@ class EditorialGlossary:
         except OSError as e:
             logger.warning(f'editorial glossary не сохранён: {e}')
 
-    @staticmethod
-    def _replace_alias(text: str, alias: str, preferred: str) -> str:
-        if not text or not alias:
-            return text
-        left = r'(?<!\w)' if alias[0].isalnum() else ''
-        right = r'(?!\w)' if alias[-1].isalnum() else ''
-        return re.sub(left + re.escape(alias) + right, lambda _m: preferred,
-                      text, flags=re.IGNORECASE)
-
     def apply(self, text: str) -> str:
-        out = str(text or '')
-        for alias, preferred in sorted(self._aliases.items(), key=lambda kv: len(kv[0]), reverse=True):
-            out = self._replace_alias(out, alias, preferred)
-        return out
+        if self._replacer is None:
+            self._replacer = _compile_alias_replacer(self._aliases.items())
+        return _apply_alias_replacer(str(text or ''), self._replacer)
 
     def add(self, alias: str, preferred: str) -> bool:
         alias = re.sub(r'\s+', ' ', str(alias or '')).strip()[:160]
@@ -6873,6 +6895,7 @@ class EditorialGlossary:
         if alias not in self._aliases and len(self._aliases) >= self.MAX_ALIASES:
             self._aliases.pop(next(iter(self._aliases)), None)
         self._aliases[alias] = preferred
+        self._replacer = None
         self._save()
         return True
 
@@ -6881,6 +6904,7 @@ class EditorialGlossary:
         if key is None:
             return False
         self._aliases.pop(key, None)
+        self._replacer = None
         self._save()
         return True
 
@@ -6903,6 +6927,7 @@ class EntityMemory:
         self.path = path
         self._items: dict[str, dict] = {}
         self._lock = threading.RLock()
+        self._replacer: Optional[tuple] = None
         self._load()
 
     @staticmethod
@@ -6948,6 +6973,7 @@ class EntityMemory:
                 'source': str(source or 'unknown')[:40],
                 'last_seen': datetime.now(timezone.utc).isoformat(),
             }
+            self._replacer = None
             self._save()
         return True
 
@@ -6967,6 +6993,8 @@ class EntityMemory:
                 row['count'] = _safe_nonnegative_int(row.get('count')) + 1
                 row['last_seen'] = datetime.now(timezone.utc).isoformat()
                 aliases = list(dict.fromkeys([*(row.get('aliases') or []), value]))[-12:]
+                if aliases != row.get('aliases'):
+                    self._replacer = None
                 row['aliases'] = aliases
                 # Save only occasionally to avoid an fsync on every article.
                 if row['count'] <= 3 or row['count'] % 10 == 0:
@@ -6977,19 +7005,19 @@ class EntityMemory:
             return value
 
     def apply(self, text: str) -> str:
-        out = str(text or '')
-        replacements: list[tuple[str, str]] = []
         with self._lock:
-            rows = [dict(row) for row in self._items.values()]
-        for row in rows:
-            preferred = str(row.get('preferred') or '').strip()
-            for alias in row.get('aliases') or []:
-                alias = str(alias or '').strip()
-                if alias and preferred and alias.casefold() != preferred.casefold():
-                    replacements.append((alias, preferred))
-        for alias, preferred in sorted(replacements, key=lambda x: len(x[0]), reverse=True)[:2500]:
-            out = EditorialGlossary._replace_alias(out, alias, preferred)
-        return out
+            replacer = self._replacer
+            if replacer is None:
+                replacements: list[tuple[str, str]] = []
+                for row in self._items.values():
+                    preferred = str(row.get('preferred') or '').strip()
+                    for alias in row.get('aliases') or []:
+                        alias = str(alias or '').strip()
+                        if alias and preferred and alias.casefold() != preferred.casefold():
+                            replacements.append((alias, preferred))
+                replacements = sorted(replacements, key=lambda x: len(x[0]), reverse=True)[:2500]
+                replacer = self._replacer = _compile_alias_replacer(replacements)
+        return _apply_alias_replacer(str(text or ''), replacer)
 
     def list_recent(self, limit: int = 20) -> list[dict]:
         with self._lock:
@@ -12419,6 +12447,20 @@ NOISE_TITLE_RULES = (
         r'^\W*(?:с\s+)?днём рождения\b|^\W*с\s+днем рождения\b',
         r'^\W*календарь\s+на\b',
     )),
+    # Отчёты, интервью и эфиры японских порталов: «オフィシャルレポート»,
+    # «…インタビュー», «Webラジオ». У бота такие посты не набрали ни одной
+    # реакции в 96% случаев: события в них нет, только пересказ мероприятия
+    # или беседы. Новость из интервью («Ода раскрыл, когда кончится ONE
+    # PIECE») заголовок называет событием и сюда не попадает.
+    ('отчёт, интервью, эфир', (
+        r'オフィシャルレポート|公式レポート|イベントレポート|【レポート】|レポート[】」』]?\s*$',
+        r'インタビュー|対談|鼎談|Webラジオ|ラジオ番組|生配信|配信番組',
+        r'\b(?:event|official|panel|screening)\s+report\b',
+        r'^\W*interview\b|\binterview\s*[:\-–—]\s|\[interview\]',
+        r'\bweb[\s-]?radio\b',
+        r'^\W*(?:официальн\w+\s+)?отч[её]т\b|\bфоторепортаж',
+        r'^\W*интервью\b|\[интервью\]|\bвеб-?радио\b',
+    )),
     # Русская реклама и розыгрыши: «Реклама. … erid: …», «На правах рекламы»,
     # «Партнёрский материал». Раньше их отсекали только теги #реклама у
     # телеграм-каналов, а в заголовке они шли в канал как новость.
@@ -15816,7 +15858,9 @@ def _image_fingerprint(data: Optional[bytes]) -> Optional[str]:
                 # LANCZOS усредняет по площади: отпечаток почти не меняется при
                 # смене размера, чего не даёт быстрый bicubic по умолчанию
                 small = im.convert('L').resize((9, 8), Image.LANCZOS)
-                px = list(small.getdata())
+                # tobytes() вместо устаревшего getdata() (уйдёт в Pillow 14): у
+                # картинки в оттенках серого это те же значения пикселей по байту.
+                px = small.tobytes()
                 avg_rgb = tuple(im.convert('RGB').resize((1, 1), Image.LANCZOS).getpixel((0, 0)))
             bits = 0
             pos = 0
@@ -17916,6 +17960,49 @@ def _editorial_allowed(news: dict) -> bool:
     return not bool(news.get('_editorial_blocked'))
 
 
+# Что заходит подписчикам — по реакциям на канале (527 постов, бот против
+# админов): кадры серий и арты — около 4 реакций на пост, манга — 3, а
+# голливудская хроника у бота — 0.6, причём 57% постов бота были про
+# западное кино и сериалы (у админов — 16%). Blu-ray, мерч, выставки и
+# спектакли у бота почти никогда не набирали реакций. Это не фильтр — только
+# вес: при выборе между новостями аниме и кассовым прогнозом голливудского
+# фильма в канал уходит первое, а когда аниме нет, кино по-прежнему выходит.
+_AFFINITY_VISUAL_RE = re.compile(
+    r'кадр|ключев\w*\s+визуал|постер|\bарт\b|иллюстрац|\bkey\s*visual|\bposter\b|'
+    r'illustration|artwork|\bstills?\b|\bframes?\b|ビジュアル|場面カット|先行カット|イラスト',
+    re.IGNORECASE)
+_AFFINITY_MERCH_RE = re.compile(
+    r'blu-?ray|\bdvd\b|\bbd\b|\bmerch|фигурк|\bfigures?\b|выставк|exhibition|спектакл|мюзикл|'
+    r'stage play|musical|коллаб\w*[\s-]+кафе|collab\w*\s+cafe|pop-?up|бонус\w*\s+(?:для|в|за)\s+'
+    r'(?:зрител|кинотеатр)|グッズ|特典|舞台|展示|コラボカフェ|ポップアップ',
+    re.IGNORECASE)
+_AFFINITY_GOSSIP_RE = re.compile(
+    r'\bслух|инсайдер|по данным\s+\w+(?:rpk|guy)|\brumou?r|\binsider|\breportedly\b|'
+    r'касс\w*\s+сбор|предпродаж|\bbox office\b|\bpresales?\b|opening weekend|'
+    r'фотосесси|photo\s*shoot|красн\w+\s+дорожк|red carpet',
+    re.IGNORECASE)
+
+
+def _topic_affinity(news: dict) -> float:
+    """Поправка приоритета по теме: что подписчики канала реально смотрят."""
+    text = f"{news.get('title', '')}\n{str(news.get('summary') or '')[:300]}"
+    topic = str(news.get('_llm_topic') or '')
+    source = str(news.get('source') or '')
+    general = source in GENERAL_TOPIC_SOURCES
+    anime = topic in ('аниме', 'манга') or looks_like_anime_news(news) or (
+        not general and not source.startswith('TG:') and topic not in ('кино', 'игры'))
+    score = 2.0 if anime else 0.0
+    if not anime and (general or topic == 'кино'):
+        score -= 3.0                      # западное кино и сериалы без связи с аниме
+    if _AFFINITY_VISUAL_RE.search(text):
+        score += 1.5
+    if _AFFINITY_MERCH_RE.search(text):
+        score -= 4.0
+    if not anime and _AFFINITY_GOSSIP_RE.search(text):
+        score -= 2.0
+    return score
+
+
 def _news_priority_score(news: dict) -> float:
     """Приоритет: свежесть + значимость + медиа + здоровье + quality signals."""
     score = 0.0
@@ -17932,9 +18019,13 @@ def _news_priority_score(news: dict) -> float:
     if news.get('images'):
         score += 2.0
     low = f"{news.get('title','')} {news.get('summary','')}".lower()
+    # «фильм» здесь был: он давал +2 любой голливудской новости и вместе с
+    # кино-лентами перекосил канал в сторону западного кино.
     important = ('premiere', 'release date', 'trailer', 'season 2', 'season 3', 'final season',
-                 'премьера', 'дата выхода', 'трейлер', 'новый сезон', 'экранизац', 'фильм')
+                 'премьера', 'дата выхода', 'трейлер', 'новый сезон', 'экранизац',
+                 'anime film', 'anime movie', 'аниме-фильм', 'полнометражн')
     score += min(6.0, sum(2.0 for word in important if word in low))
+    score += _topic_affinity(news)
     if source_health is not None:
         try:
             fails = int(source_health.info(news.get('source', '')).get('fails', 0))
@@ -24046,7 +24137,13 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
         if rejection:
             news['_editorial_rejection'] = rejection
             metrics.inc('anime_bot_editorial_rejected_total', labels={'reason': rejection})
-            logger.warning('LLM: переписывание отклонено (%s): %s', rejection, title[:55])
+            detail = ''
+            if rejection == 'unsupported_names':
+                # Какие имена модель принесла не из этой новости — по логу
+                # видно, откуда течёт: соседняя новость пачки или память.
+                detail = ' — ' + ', '.join(_unsupported_names(
+                    source_fact_text, proposed_text)[:5])
+            logger.warning('LLM: переписывание отклонено (%s): %s%s', rejection, title[:55], detail)
         elif not (_llm_numbers_supported(source_fact_text, proposed_text)
                 and _llm_dates_supported(source_fact_text, proposed_text)):
             logger.warning(f"LLM: обнаружены новые числа/даты — переписывание отклонено: {title[:55]}")

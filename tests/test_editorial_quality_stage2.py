@@ -215,3 +215,43 @@ def test_runtime_golden_runner_passes_shipped_dataset(monkeypatch):
     assert total >= 8
     assert passed == total
     assert failures == []
+
+
+def test_replacement_does_not_cascade_into_the_inserted_name(tmp_path):
+    # Раньше замены шли по очереди: «Shingeki no Kyojin» → «Attack on Titan»,
+    # а следом короткое правило правило уже подставленное имя.
+    g = bot.EditorialGlossary(tmp_path / 'g.json')
+    g.add('Shingeki no Kyojin', 'Attack on Titan')
+    g.add('Titan', 'Титан')
+    assert g.apply('Shingeki no Kyojin и Titan') == 'Attack on Titan и Титан'
+
+
+def test_glossary_changes_apply_immediately(tmp_path):
+    g = bot.EditorialGlossary(tmp_path / 'g.json')
+    assert g.apply('mappa') == 'mappa'
+    g.add('mappa', 'MAPPA')
+    assert g.apply('mappa') == 'MAPPA'
+    g.remove('mappa')
+    assert g.apply('mappa') == 'mappa'
+
+
+def test_entity_memory_new_alias_applies_immediately(tmp_path):
+    mem = bot.EntityMemory(tmp_path / 'entities.json')
+    assert mem.apply('Kusuriya no Hitorigoto') == 'Kusuriya no Hitorigoto'
+    mem.remember('Kusuriya no Hitorigoto', 'Монолог фармацевта', source='admin')
+    assert mem.apply('Kusuriya no Hitorigoto') == 'Монолог фармацевта'
+    # Новое написание из ответа модели — тоже сразу, хотя замены уже собраны.
+    assert mem.apply('Kusuriya no Hitorigoto') == 'Монолог фармацевта'
+    mem.observe('KUSURIYA-NO-HITORIGOTO')
+    assert mem.apply('KUSURIYA-NO-HITORIGOTO') == 'Монолог фармацевта'
+
+
+def test_replacements_compile_once_per_change(tmp_path, monkeypatch):
+    calls = []
+    real = bot._compile_alias_replacer
+    monkeypatch.setattr(bot, '_compile_alias_replacer', lambda pairs: calls.append(1) or real(pairs))
+    mem = bot.EntityMemory(tmp_path / 'entities.json')
+    mem.remember('Shingeki no Kyojin', 'Атака титанов', source='admin')
+    for _ in range(3):
+        mem.apply('Shingeki no Kyojin')
+    assert len(calls) == 1
