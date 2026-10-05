@@ -69,6 +69,16 @@ def _wipe_data_dir() -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_channel_quiet_hours(monkeypatch):
+    """Тесты публикации не должны зависеть от того, ночь ли сейчас.
+
+    Ночная тишина канала по умолчанию 22:40–08:00 по МСК: прогон в CI вечером
+    иначе ронял бы тесты очереди. Тесты самой тишины включают её явно.
+    """
+    monkeypatch.setattr(_bot, 'CHANNEL_QUIET_HOURS', 'off')
+
+
+@pytest.fixture(autouse=True)
 def _isolate_bot_globals():
     """Возвращает состояние модуля бота после каждого теста.
 

@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 307 переменных. Почти все — точная настройка со значением
+Бот читает 308 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -363,6 +363,7 @@
 | `CANARY_CHANNEL_ID` | — | anime_news_bot.py |
 | `CANARY_MIRROR_PERCENT` | `0.0` | anime_news_bot.py |
 | `CHANNEL_ID` | — | anime_news_bot.py |
+| `CHANNEL_QUIET_HOURS` | `22:40-08:00` | anime_news_bot.py |
 | `CHAOS_FUZZ_MAX_CHARS` | `4096` | anime_news_bot.py |
 | `CHAOS_SELFTEST_ROUNDS` | `40` | anime_news_bot.py |
 | `CHECK_INTERVAL_SEC` | `1800` | anime_news_bot.py |

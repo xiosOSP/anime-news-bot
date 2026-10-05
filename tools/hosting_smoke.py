@@ -19,6 +19,8 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -74,6 +76,80 @@ def bot_imports(workdir: Path) -> str:
     return anime_news_bot._runtime_versions_line()
 
 
+POLLING_MARK = 'начинаю polling'
+# Закрытый порт вместо прокси: проверка не ходит в настоящий Telegram и
+# одинаково ведёт себя в CI, у разработчика и без сети.
+DEAD_PROXY = 'http://127.0.0.1:9'
+
+
+def bot_starts(workdir: Path, timeout: float = 90.0, extra_env: dict | None = None) -> str:
+    """Полный запуск, как на свежем хостинге: тома данных ещё нет, токен фальшивый.
+
+    Импорт модуля ещё не значит, что бот запустится. До опроса Telegram main()
+    берёт блокировку, переносит схемы данных, читает настройки и ищет ffmpeg;
+    падение на любом из этих шагов хостинг показывает как «Ошибка», а тесты
+    отдельных функций его не видят. Telegram для проверки не нужен: достаточно
+    дойти до строки перед опросом без единого traceback.
+    """
+    data_dir = workdir / 'fresh-data'
+    env = {key: value for key, value in os.environ.items()
+           if key.lower() not in ('no_proxy', 'all_proxy')}
+    env.update({
+        'BOT_TOKEN': '123456:hosting-smoke', 'DATA_DIR': str(data_dir),
+        'ADMIN_ID': '1', 'CHANNEL_ID': '-1001234567890', 'PYTHONUNBUFFERED': '1',
+        'HTTPS_PROXY': DEAD_PROXY, 'HTTP_PROXY': DEAD_PROXY,
+        'https_proxy': DEAD_PROXY, 'http_proxy': DEAD_PROXY,
+    })
+    env.update(extra_env or {})
+    started = time.monotonic()
+    proc = subprocess.Popen([sys.executable, str(ROOT / 'anime_news_bot.py')], cwd=str(ROOT),
+                            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding='utf-8', errors='replace')
+    lines: list[str] = []
+    reached = threading.Event()
+
+    def read() -> None:
+        for line in proc.stdout:
+            lines.append(line.rstrip('\n'))
+            if POLLING_MARK in line:
+                reached.set()
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    deadline = started + timeout
+    while not reached.is_set() and proc.poll() is None and time.monotonic() < deadline:
+        reached.wait(0.2)
+    elapsed = time.monotonic() - started
+    proc.terminate()
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    # Дочитываем вывод до конца: упавший процесс мог успеть напечатать причину.
+    reader.join(timeout=5)
+    return startup_verdict(lines, elapsed)
+
+
+def startup_verdict(lines: list[str], elapsed: float) -> str:
+    """Решение по выводу запуска; при поломке — RuntimeError с хвостом лога.
+
+    Всё, что после строки опроса, — уже разговор с Telegram: без сети или с
+    фальшивым токеном там законно появляются traceback'и, и к образу хостинга
+    они отношения не имеют.
+    """
+    before = []
+    for line in lines:
+        if POLLING_MARK in line:
+            break
+        before.append(line)
+    else:
+        raise RuntimeError(f'бот не дошёл до polling за {elapsed:.0f} с: {" | ".join(lines[-15:])}')
+    if any('Traceback' in line for line in before):
+        raise RuntimeError(f'traceback до запуска polling: {" | ".join(before[-15:])}')
+    return f'дошёл до polling за {elapsed:.1f} с'
+
+
 def main() -> int:
     print(f'Python {sys.version.split()[0]}')
     with tempfile.TemporaryDirectory() as tmp:
@@ -85,6 +161,7 @@ def main() -> int:
             check('ffmpeg из imageio-ffmpeg', ffmpeg_runs),
             check('deno для yt-dlp', deno_runs),
             check('бот импортируется', lambda: bot_imports(work)),
+            check('бот запускается на пустом томе данных', lambda: bot_starts(work)),
         ]
     return 0 if all(results) else 1
 
