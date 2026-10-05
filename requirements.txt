@@ -1,12 +1,63 @@
--c constraints.txt
-python-telegram-bot[job-queue]>=20.0
-feedparser>=6.0
-requests>=2.32.4
-httpx>=0.27,<0.29
-urllib3>=2.2,<3
-beautifulsoup4>=4.12
-deep-translator>=1.11
-Pillow>=10.3
+# Зависимости бота с точными версиями — проверенный набор, на нём прошли
+# тесты и CI. Новое развёртывание ставит ровно его, а не «самые свежие на
+# сегодня». Обновление — отдельным PR: поднять версию здесь, дождаться
+# зелёного CI.
+#
+# Файл САМОДОСТАТОЧНЫЙ: никаких «-c»/«-r» на другие файлы. Хостинг (Bothost)
+# сначала копирует в образ один requirements.txt и ставит его, а остальной
+# код — потом. Строка «-c constraints.txt» поэтому валила сборку целиком
+# («Could not open requirements file»), и ни одна новая версия не деплоилась.
+#
+# Хостинг может запустить бота на Python 3.10, даже если в runtime.txt 3.11:
+# numpy 2.4 и onnxruntime 1.29 на 3.10 не ставятся, поэтому для них две
+# строки с условием python_version.
+
+# --- Прямые зависимости
+python-telegram-bot[job-queue]==22.8
+feedparser==6.0.14
+requests==2.33.1
+httpx==0.28.1
+urllib3==2.6.3
+beautifulsoup4==4.15.0
+deep-translator==1.11.4
+pillow==12.3.0
 nudenet==3.4.2
 rlottie-python==1.3.8
-yt-dlp>=2025.1.1
+# ffmpeg для склейки дорожек видео (YouTube и др. отдают 720p+ только
+# раздельными дорожками), превью и нормализации. В образе хостинга ffmpeg
+# нет, а свой Dockerfile — лишняя возня: бинарник едет готовым в пакете.
+imageio-ffmpeg==0.6.0
+
+# yt-dlp сознательно НЕ закреплён: YouTube регулярно меняет выдачу, и старый
+# yt-dlp перестаёт качать через несколько недель. [default] приносит EJS —
+# решатель JS-проверок YouTube, [deno] — движок, на котором он работает; без
+# них YouTube отдаёт обрезанный список форматов или не отдаёт ничего. Их
+# версии ведёт сам yt-dlp, поэтому они тоже не закреплены.
+yt-dlp[default,deno]>=2025.11.12
+
+# --- Транзитивные зависимости (точные версии, чтобы сборка не менялась сама)
+anyio==4.15.1
+apscheduler==3.11.3
+certifi==2026.2.25
+charset-normalizer==3.4.6
+feedparser-sgmllib==2.1.0
+flatbuffers==25.12.19
+h11==0.16.0
+httpcore==1.0.9
+idna==3.11
+numpy==2.4.6; python_version >= "3.11"
+numpy==2.2.6; python_version < "3.11"
+onnxruntime==1.29.0; python_version >= "3.11"
+onnxruntime==1.23.2; python_version < "3.11"
+opencv-python-headless==5.0.0.93
+packaging==24.0
+protobuf==7.36.1
+soupsieve==2.9.2
+typing-extensions==4.16.0
+tzlocal==5.4.4
+# Только для Python 3.10 (их тянут onnxruntime 1.23 и anyio на старом Python).
+coloredlogs==15.0.1; python_version < "3.11"
+exceptiongroup==1.3.1; python_version < "3.11"
+humanfriendly==10.0; python_version < "3.11"
+mpmath==1.3.0; python_version < "3.11"
+sympy==1.14.0; python_version < "3.11"

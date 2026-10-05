@@ -24,6 +24,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import zipfile
 import copy
@@ -166,6 +167,7 @@ except ImportError:
 # Импорт ленивый: ролики качает отдельный процесс (video_download.py), а в
 # самом боте yt-dlp нужен в двух редких путях. Загрузка при старте стоила
 # ~60 мс и ~6 МБ памяти на всё время работы.
+import importlib.metadata
 import importlib.util as _importlib_util
 yt_dlp = None
 YT_DLP_AVAILABLE = _importlib_util.find_spec('yt_dlp') is not None
@@ -1073,18 +1075,65 @@ REDDIT_PROXY: Optional[str] = None
 # --- Видео ---
 VIDEO_MAX_DURATION_SEC = 0            # 0 = без ограничения по длине, ограничение только по размеру файла
 VIDEO_MAX_FILE_SIZE_MB = 48           # запас от лимита Telegram (50 МБ)
+
+
+@functools.lru_cache(maxsize=1)
+def _bundled_ffmpeg() -> Optional[str]:
+    """ffmpeg из пакета imageio-ffmpeg (ставится из requirements.txt).
+
+    В образе хостинга системного ffmpeg нет, а без него YouTube, Bilibili и
+    Niconico отдают 720p+ только раздельными дорожками: склеить нечем, и
+    ролик либо не скачивался, либо приезжал в 360p. Пакет везёт готовый
+    бинарник, свой Dockerfile не нужен."""
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:   # пакета нет или нет бинарника под эту платформу
+        return None
+    return exe if exe and os.access(exe, os.X_OK) else None
+
+
+def _deno_path() -> Optional[str]:
+    """JS-движок, на котором yt-dlp решает проверки YouTube.
+
+    Пакет deno из requirements кладёт бинарник в папку скриптов Python — там
+    его ищет и сам yt-dlp; на PATH он может и не попасть."""
+    candidate = os.path.join(sysconfig.get_path('scripts'), 'deno')
+    if os.access(candidate, os.X_OK) and not os.path.isdir(candidate):
+        return candidate
+    return shutil.which('deno')
+
+
+def _media_tool(name: str) -> Optional[str]:
+    """Путь к ffmpeg/ffprobe: системный, а ffmpeg — ещё и из imageio-ffmpeg."""
+    found = shutil.which(name)
+    if found:
+        return found
+    return _bundled_ffmpeg() if name == 'ffmpeg' else None
+
+
 def _video_format() -> str:
     """Строка формата для yt-dlp.
 
     Без ffmpeg склеить отдельные дорожки видео и звука невозможно, поэтому
     берём только «прогрессивные» форматы — где картинка и звук уже в одном
     файле. Раньше формат этого не учитывал, и на хостинге без ffmpeg
-    скачивание молча срывалось."""
-    if shutil.which('ffmpeg'):
-        return ('bv*[height<=720][filesize<45M]+ba/'
-                'b[height<=720][filesize<45M]/'
-                'b[height<=720]/b')
+    скачивание молча срывалось.
+
+    С ffmpeg первыми идут H.264 + AAC: их Telegram играет прямо в ленте на
+    всех клиентах, а VP9/AV1 с YouTube на части телефонов показываются файлом
+    без превью. Размер ограничен заранее (видео ~38 МБ + звук), иначе 1080p
+    скачивался целиком и отбрасывался как «больше 48 МБ» — без запасного
+    варианта и без ролика вовсе."""
     progressive = '[vcodec!=none][acodec!=none]'
+    if _media_tool('ffmpeg'):
+        avc, aac = '[vcodec^=avc1]', '[acodec^=mp4a]'
+        return (f'bv*{avc}[height<=1080][filesize<38M]+ba{aac}/'
+                f'bv*{avc}[height<=1080][filesize_approx<38M]+ba{aac}/'
+                f'bv*{avc}[height<=720][filesize<?40M]+ba{aac}/'
+                f'b[ext=mp4][height<=720]{progressive}[filesize<?45M]/'
+                f'bv*[height<=720][filesize<?40M]+ba/'
+                f'b{progressive}[filesize<?45M]/b')
     return (f'b[ext=mp4]{progressive}[filesize<45M]/'
             f'b{progressive}[filesize<45M]/'
             f'b[ext=mp4]{progressive}/'
@@ -9145,12 +9194,62 @@ def translate_text(text: str, input_limit: int = TRANSLATION_INPUT_LIMIT,
 
 
 # ============== ПОЛУЧЕНИЕ КАРТИНКИ ==============
+_IMAGE_URL_FALLBACKS: 'OrderedDict[str, str]' = OrderedDict()
+IMAGE_URL_FALLBACKS_MAX = 2000
+_YTIMG_RE = re.compile(
+    r'^(https?://(?:i\d?\.ytimg\.com|img\.youtube\.com)/vi(?:_webp)?/([A-Za-z0-9_-]{11})/)'
+    r'(?:default|mqdefault|hqdefault|sddefault|hq720)\.(?:jpg|webp)(?:\?.*)?$', re.I)
+
+
+def _remember_image_fallback(upgraded: str, original: str) -> None:
+    """Запоминает исходный адрес картинки на случай, если «оригинал» не откроется.
+
+    Правила upgrade_image_url угадывают адрес полноразмерной версии. Угадывают
+    не всегда: у ролика YouTube может не быть maxresdefault, у сайта — своей
+    схемы. Раньше неудачная догадка просто заменяла рабочую ссылку, и картинка
+    пропадала из поста целиком."""
+    if not upgraded or not original or upgraded == original:
+        return
+    _IMAGE_URL_FALLBACKS[upgraded] = original
+    _IMAGE_URL_FALLBACKS.move_to_end(upgraded)
+    while len(_IMAGE_URL_FALLBACKS) > IMAGE_URL_FALLBACKS_MAX:
+        _IMAGE_URL_FALLBACKS.popitem(last=False)
+
+
+def _upgraded_image(url: Optional[str]) -> Optional[str]:
+    """upgrade_image_url с запасным путём к исходной ссылке."""
+    if not url:
+        return url
+    upgraded = upgrade_image_url(url)
+    _remember_image_fallback(upgraded, url)
+    return upgraded
+
+
 def upgrade_image_url(url: str) -> str:
     """Пытается превратить URL уменьшенной картинки в URL оригинала.
     Знает популярные паттерны CDN: WordPress, MyAnimeList, Reddit и др."""
     if not url:
         return url
     original = url
+
+    # ANN: /thumbnails/crop600x315…/cms/… — уменьшенная копия (такой og:image
+    # уходил в канал размером 600×315). Оригинал лежит по /images/cms/….
+    # Общее правило «/thumbnails/ → /» ниже давало несуществующий адрес.
+    url = re.sub(r'(animenewsnetwork\.com)/thumbnails/[^/]+/', r'\1/images/', url,
+                 flags=re.IGNORECASE)
+
+    # Превью YouTube: hqdefault — 480×360 с чёрными полями, maxresdefault —
+    # 1280×720. Не у каждого ролика есть maxres: тогда сработает откат.
+    if (m := _YTIMG_RE.match(url)):
+        url = f'{m.group(1)}maxresdefault.jpg'
+
+    # X/Twitter: name=small/medium/… → large (2048 px по длинной стороне).
+    if 'pbs.twimg.com/media/' in url.lower():
+        url = re.sub(r':(?:thumb|small|medium)$', '', url)
+        if re.search(r'[?&]name=', url):
+            url = re.sub(r'([?&]name=)(?:thumb|small|medium|\d+x\d+)\b', r'\1large', url)
+        else:
+            url += ('&' if '?' in url else '?') + 'name=large'
 
     # WordPress: image-150x150.jpg → image.jpg
     # Покрывает Honey's Anime, Anime Corner и большинство WP-сайтов
@@ -9175,8 +9274,10 @@ def upgrade_image_url(url: str) -> str:
     # Yahoo / Tumblr: _250.jpg → _1280.jpg (запросим макс размер)
     url = re.sub(r'_\d{2,3}(\.(?:jpe?g|png|webp))(?=$|\?)', r'_1280\1', url, flags=re.IGNORECASE)
 
-    # Generic: /thumb/ или /thumbs/ в пути → /
-    url = re.sub(r'/(?:thumb|thumbs|thumbnail|thumbnails)/', '/', url, flags=re.IGNORECASE)
+    # Generic: /thumb/ или /thumbs/ в пути → /. Не трогаем, если следом идёт
+    # сегмент-размер (/thumbnails/300x200/…): без него адрес не существует.
+    url = re.sub(r'/(?:thumb|thumbs|thumbnail|thumbnails)/'
+                 r'(?![a-z]*\d+x\d+[a-z0-9]*/)', '/', url, flags=re.IGNORECASE)
 
     # Generic: ?size=small / ?w=300 — убираем
     url = re.sub(r'[?&](size|s|sz)=(?:small|thumb|thumbnail|tiny|sm)', '', url, flags=re.IGNORECASE)
@@ -9667,6 +9768,85 @@ def _download_image_bytes(url: str) -> Optional[bytes]:
             pass
 
 
+def _download_head_bytes(url: str, limit: int) -> Optional[bytes]:
+    """Первые limit байт ответа (запрос Range) — без отказа «файл больше лимита»."""
+    r = None
+    try:
+        r = http_get_public_with_retry(
+            url, headers={'User-Agent': USER_AGENT, 'Range': f'bytes=0-{limit - 1}'},
+            timeout=HTTP_TIMEOUT, stream=True)
+        if not r or r.status_code not in (200, 206):
+            return None
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in r.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= limit:
+                break
+        return b''.join(chunks)[:limit] or None
+    except Exception as e:
+        logger.debug(f'head download fail {url[:80]}: {e}')
+        return None
+    finally:
+        if r is not None:
+            try:
+                r.close()
+            except Exception:
+                pass
+
+
+# Адрес-метка «кадр из ролика»: картинку по нему делает _cached_image_bytes.
+# Строка, а не байты, — новости лежат в JSON-очередях.
+VIDEO_FRAME_SUFFIX = '#video-frame'
+VIDEO_FRAME_HEAD_BYTES = 8 * 1024 * 1024
+VIDEO_FRAME_SEEKS = (1.5, 4.0, 8.0)
+
+
+def _video_frame_bytes(url: str) -> Optional[bytes]:
+    """Кадр ролика в полном разрешении из первых мегабайт файла.
+
+    Когда ролик из Telegram-канала не доезжал (длиннее лимита или больше
+    48 МБ), в пост шло превью из ленты — 320×180, мыло. У роликов Telegram
+    оглавление (moov) в начале файла, и ffmpeg достаёт кадр 1280×720 из первых
+    мегабайт, не качая ролик целиком.
+
+    Только хосты Telegram (адрес из разметки поста) и только mp4: ffmpeg не
+    должен открывать по чужой ссылке плейлисты и прочие форматы, умеющие
+    ссылаться на файлы и адреса."""
+    ffmpeg = _media_tool('ffmpeg')
+    if not ffmpeg or not _download_needed_host(url):
+        return None
+    head = _download_head_bytes(url, VIDEO_FRAME_HEAD_BYTES)
+    if not head or head[4:8] != b'ftyp':
+        return None
+    best, best_entropy = None, -1.0
+    with tempfile.TemporaryDirectory(prefix='anime-frame-', dir=str(VIDEO_DOWNLOAD_DIR)) as tmp:
+        src = Path(tmp) / 'head.mp4'
+        src.write_bytes(head)
+        for seek in VIDEO_FRAME_SEEKS:
+            out = Path(tmp) / f'frame-{seek}.jpg'
+            try:
+                subprocess.run([ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-f', 'mp4',
+                                '-ss', str(seek), '-i', str(src), '-frames:v', '1', '-q:v', '2',
+                                str(out)], capture_output=True, timeout=20, check=False)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if not out.exists() or not 0 < out.stat().st_size <= HTTP_IMAGE_MAX_BYTES:
+                continue
+            data = out.read_bytes()
+            # Ролики часто начинаются с чёрного экрана или логотипа на сплошном
+            # фоне: такой кадр хуже мыльного превью. Берём самый «живой».
+            entropy = float(_image_quality_info(data).get('entropy') or 0.0)
+            if entropy > best_entropy:
+                best, best_entropy = data, entropy
+            if entropy >= 4.0:
+                break
+    return best if best_entropy >= 2.2 else None
+
+
 # Размерные query-параметры: вся разница вариантов картинки часто только в них
 _IMG_SIZE_QUERY_KEYS = {'w', 'h', 'width', 'height', 'size', 'resize', 'fit',
                         'quality', 'q', 'dpr', 'crop', 'auto', 'fm', 'zoom'}
@@ -9917,6 +10097,54 @@ def _media_preview_annotation(info: dict) -> dict:
     return {'state': state, 'aspect': aspect, 'crop_plan': plan}
 
 
+async def _video_cover(news: dict):
+    """Обложка для поста, у которого не доехал ролик: кадр из ролика или превью.
+
+    Кадр из начала ролика (1280×720) достаётся, только если ссылка на файл
+    ролика из Telegram ещё жива; иначе остаётся превью из ленты."""
+    thumb = news.get('_video_thumb')
+    video = str(news.get('video') or '')
+    if video and _download_needed_host(video) and _media_tool('ffmpeg'):
+        frame = video + VIDEO_FRAME_SUFFIX
+        if await asyncio.to_thread(_cached_image_bytes, frame):
+            return frame
+    return thumb
+
+
+async def _probe_image_candidate(url: str) -> tuple[str, Optional[bytes]]:
+    """(адрес, байты) кандидата; не скачался «оригинал» — пробуем исходник."""
+    data = await asyncio.to_thread(_cached_image_bytes, url)
+    if data is None:
+        original = _IMAGE_URL_FALLBACKS.get(url)
+        if original:
+            fallback = await asyncio.to_thread(_cached_image_bytes, original)
+            if fallback is not None:
+                return original, fallback
+    return url, data
+
+
+async def _ensure_youtube_cover(news: dict) -> None:
+    """Заставка ролика YouTube для новости-трейлера без своих картинок.
+
+    Если ролик не скачается (с серверов хостинга YouTube часто требует
+    подтверждения «не бот»), в пост пойдёт его кадр: maxresdefault — 1280×720,
+    а не пустой пост и не мыльное превью со страницы."""
+    video_id = _youtube_id(str(news.get('video') or ''))
+    if not video_id or news.get('images'):
+        return
+    current = news.get('_video_thumb')
+    if current:
+        width = _image_width(await asyncio.to_thread(_cached_image_bytes, current))
+        if width and width >= MEDIA_MIN_WIDTH:
+            return
+    for name in ('maxresdefault', 'hqdefault'):
+        candidate = f'https://i.ytimg.com/vi/{video_id}/{name}.jpg'
+        width = _image_width(await asyncio.to_thread(_cached_image_bytes, candidate))
+        if width and width >= 480:
+            news['_video_thumb'] = candidate
+            return
+
+
 async def _optimize_news_media(news: dict) -> None:
     """Ranks images and removes perceptual duplicates inside one post.
 
@@ -9949,21 +10177,32 @@ async def _optimize_news_media(news: dict) -> None:
         return out
 
     if urls:
-        blobs = await asyncio.gather(
-            *(asyncio.to_thread(_cached_image_bytes, u) for u in urls))
-        rows = await asyncio.to_thread(_score_blocking, list(zip(urls, blobs)))
+        pairs = await asyncio.gather(*(_probe_image_candidate(u) for u in urls))
+        rows = await asyncio.to_thread(_score_blocking, list(pairs))
     else:
         rows = []
-    best_score = max((int(r.get('score', 0)) for r in rows), default=-1)
+    best_score = max((int(r.get('score', 0)) for r in rows if r.get('_data')), default=-1)
     if best_score < MEDIA_PRIMARY_REPLACE_SCORE and news.get('link'):
         try:
             og = await asyncio.to_thread(fetch_og_image, news['link'])
-            og = _normalize_image_url(og, news['link']) if og else None
+            og = _upgraded_image(_normalize_image_url(og, news['link'])) if og else None
         except Exception:
             og = None
         if og and og not in urls:
-            og_data = await asyncio.to_thread(_cached_image_bytes, og)
-            rows.extend(await asyncio.to_thread(_score_blocking, [(og, og_data)]))
+            rows.extend(await asyncio.to_thread(_score_blocking, [await _probe_image_candidate(og)]))
+
+    # Картинка, которая не скачалась, — не кандидат, если есть хоть одна живая:
+    # без данных её оценка (35) выше, чем у реальной мелкой, и в пост уходила
+    # битая ссылка, а Telegram ронял на ней весь альбом.
+    if any(r.get('_data') for r in rows):
+        dead = [r for r in rows if not r.get('_data')]
+        if dead:
+            metrics.inc('anime_bot_media_candidates_dropped_total', len(dead), {'reason': 'unavailable'})
+        rows = [r for r in rows if r.get('_data')]
+    # Удался полноразмерный кадр из ролика — мыльное превью того же ролика лишнее.
+    thumb = news.get('_video_thumb')
+    if thumb and any(str(r['url']).endswith(VIDEO_FRAME_SUFFIX) for r in rows):
+        rows = [r for r in rows if r['url'] != thumb]
 
     # Quality first; stable URL order breaks ties. Perceptual duplicate removal
     # happens after sorting so a thumbnail cannot kick out the full-size variant.
@@ -10069,7 +10308,7 @@ def extract_all_images_from_entry(entry, summary_html: Optional[str] = None,
             return
         url = normalized
         # Пытаемся получить полноразмерную версию
-        url = upgrade_image_url(url)
+        url = _upgraded_image(url)
         if url in seen:
             return
         seen.add(url)
@@ -10170,13 +10409,56 @@ def extract_video_url(entry, summary_html: Optional[str] = None) -> Optional[str
     return _find_video_in_html(summary_html, base_url) if summary_html else None
 
 
+_FFMPEG_DURATION_RE = re.compile(r'Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)')
+_FFMPEG_INPUT_RE = re.compile(r'^Input #0,\s*(.+?),\s*from\b', re.MULTILINE)
+_FFMPEG_VIDEO_RE = re.compile(
+    r'Stream #0:\d+.*?: Video: (\w+)[^,\n]*,\s*(\w+)[^\n]*?\b(\d{2,5})x(\d{2,5})\b')
+_FFMPEG_AUDIO_RE = re.compile(r'Stream #0:\d+.*?: Audio: (\w+)')
+
+
+def _probe_with_ffmpeg(path: Path, ffmpeg: str) -> Optional[dict]:
+    """Те же сведения, что от ffprobe, но из вывода «ffmpeg -i».
+
+    В imageio-ffmpeg есть только ffmpeg, без ffprobe. А без ширины, высоты и
+    длительности Telegram показывает ролик квадратом с чёрными полями и без
+    отметки времени — так выглядело почти любое видео на хостинге."""
+    try:
+        proc = subprocess.run([ffmpeg, '-hide_banner', '-i', str(path)], capture_output=True,
+                              text=True, errors='replace', timeout=VIDEO_PROBE_TIMEOUT_SEC,
+                              check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.debug(f'ffmpeg -i не сработал для {path.name}: {e}')
+        return None
+    out = proc.stderr or ''
+    video = _FFMPEG_VIDEO_RE.search(out)
+    if not video:
+        return None
+    audio = _FFMPEG_AUDIO_RE.search(out)
+    container = _FFMPEG_INPUT_RE.search(out)
+    duration = None
+    if (m := _FFMPEG_DURATION_RE.search(out)):
+        duration = round(int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)), 2)
+    return {
+        'container': (container.group(1) if container else '')[:80],
+        'video_codec': video.group(1)[:40],
+        'audio_codec': (audio.group(1) if audio else '')[:40],
+        'width': _safe_nonnegative_int(video.group(3)),
+        'height': _safe_nonnegative_int(video.group(4)),
+        'pix_fmt': video.group(2)[:40],
+        'duration': duration,
+        'size': path.stat().st_size,
+        'has_audio': bool(audio),
+    }
+
+
 def _probe_video_file(path: Path) -> Optional[dict]:
     """ffprobe metadata used to decide whether Telegram-friendly normalization is needed."""
     if not feature_enabled('video_probe') or not path or not path.exists():
         return None
-    ffprobe = shutil.which('ffprobe')
+    ffprobe = _media_tool('ffprobe')
     if not ffprobe:
-        return None
+        ffmpeg = _media_tool('ffmpeg')
+        return _probe_with_ffmpeg(path, ffmpeg) if ffmpeg else None
     cmd = [ffprobe, '-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', str(path)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=VIDEO_PROBE_TIMEOUT_SEC, check=False)
@@ -10235,7 +10517,7 @@ def _normalize_video_file(path: Path, info: Optional[dict] = None) -> Path:
     """
     if not feature_enabled('video_normalize') or not path or not path.exists():
         return path
-    ffmpeg = shutil.which('ffmpeg')
+    ffmpeg = _media_tool('ffmpeg')
     if not ffmpeg:
         return path
     info = info or _probe_video_file(path)
@@ -10281,7 +10563,7 @@ def _generate_video_thumbnail(path: Optional[Path]) -> Optional[bytes]:
     key = str(path)
     if key in _video_thumbnail_cache:
         return _video_thumbnail_cache[key]
-    ffmpeg = shutil.which('ffmpeg')
+    ffmpeg = _media_tool('ffmpeg')
     if not ffmpeg:
         _bounded_cache_put(_video_thumbnail_cache, key, None, VIDEO_THUMB_CACHE_MAX)
         return None
@@ -10310,24 +10592,73 @@ def _generate_video_thumbnail(path: Optional[Path]) -> Optional[bytes]:
         tmp.unlink(missing_ok=True)
 
 
-async def _video_thumbnail_kwargs_async(video_file: Optional[Path]) -> dict:
-    """То же, что ``_video_thumbnail_kwargs``, но ffprobe/ffmpeg уходят в поток.
+async def _video_thumbnail_kwargs_async(video_file: Optional[Path], news: Optional[dict] = None,
+                                        media=None) -> dict:
+    """Превью и размеры ролика для sendVideo; ffprobe/ffmpeg уходят в поток.
 
     Синхронный вариант запускает два subprocess прямо в корутине отправки.
     Таймауты там 8 и 20 секунд, и всё это время event loop стоит: бот не
     отвечает на команды и не тикают джобы. Вызывать из async-кода только эту
     версию; синхронная остаётся для тестов и не-async путей.
+
+    media — ролик байтами (из Telegram-канала): его тоже нужно измерить, иначе
+    Telegram показывает его квадратом без длительности.
     """
-    if video_file is None:
+    if video_file is None and not isinstance(media, (bytes, bytearray)):
         return {}
-    return await asyncio.to_thread(_video_thumbnail_kwargs, video_file)
+    return await asyncio.to_thread(_video_send_kwargs, video_file, news, media)
 
 
 def _video_thumbnail_kwargs(video_file: Optional[Path]) -> dict:
     data = _generate_video_thumbnail(video_file)
     return {'thumbnail': data} if data else {}
 
-def download_video(url: str, note: Optional[list] = None) -> Optional[Path]:
+
+def _video_dims_kwargs(meta: Optional[dict]) -> dict:
+    """width/height/duration для sendVideo из сведений о ролике.
+
+    Без них Telegram показывает ролик квадратом с чёрными полями и без
+    отметки длительности, пока зритель не нажмёт «играть»."""
+    if not isinstance(meta, dict):
+        return {}
+    out = {}
+    width = _safe_nonnegative_int(meta.get('width'))
+    height = _safe_nonnegative_int(meta.get('height'))
+    if 16 <= width <= 8192 and 16 <= height <= 8192:
+        out.update(width=width, height=height)
+    try:
+        duration = float(meta.get('duration'))
+    except (TypeError, ValueError):
+        duration = 0.0
+    if 0 < duration < 24 * 3600:
+        out['duration'] = max(1, int(round(duration)))
+    return out
+
+
+def _video_send_kwargs(video_file: Optional[Path], news: Optional[dict] = None,
+                       media=None) -> dict:
+    tmp = None
+    try:
+        if video_file is None:
+            fd, name = tempfile.mkstemp(prefix='anime-video-', suffix='.mp4',
+                                        dir=str(VIDEO_DOWNLOAD_DIR))
+            with os.fdopen(fd, 'wb') as fh:
+                fh.write(bytes(media))
+            tmp = video_file = Path(name)
+        kwargs = _video_thumbnail_kwargs(video_file)
+        meta = (news or {}).get('_video_meta') if tmp is None else None
+        kwargs.update(_video_dims_kwargs(meta or _probe_video_file(video_file)))
+        return kwargs
+    except OSError as e:
+        logger.debug(f'размеры ролика не получены: {e}')
+        return {}
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+            _video_thumbnail_cache.pop(str(tmp), None)
+
+def download_video(url: str, note: Optional[list] = None,
+                   meta: Optional[dict] = None) -> Optional[Path]:
     """Скачивает видео через yt-dlp в этом же процессе (блокирующе).
 
     Для публикации — только _download_video_bounded: там отдельный процесс с
@@ -10343,7 +10674,8 @@ def download_video(url: str, note: Optional[list] = None) -> Optional[Path]:
     path, reason = video_download.download(
         url, VIDEO_DOWNLOAD_DIR, video_download.file_stem(url), fmt=VIDEO_FORMAT,
         max_mb=VIDEO_MAX_FILE_SIZE_MB, max_duration=VIDEO_MAX_DURATION_SEC,
-        extensions=DIRECT_VIDEO_EXTENSIONS, ydl_module=_yt_dlp_module())
+        extensions=DIRECT_VIDEO_EXTENSIONS, ydl_module=_yt_dlp_module(),
+        ffmpeg=_media_tool('ffmpeg'), meta=meta)
     return _video_download_result(url, path, reason, note)
 
 
@@ -10366,10 +10698,11 @@ VIDEO_DOWNLOAD_CONCURRENCY = max(1, min(4, _env_int('VIDEO_DOWNLOAD_CONCURRENCY'
 _video_download_slots = asyncio.Semaphore(VIDEO_DOWNLOAD_CONCURRENCY)
 
 
-async def _download_video_bounded(url: str, note: Optional[list] = None) -> Optional[Path]:
+async def _download_video_bounded(url: str, note: Optional[list] = None,
+                                  meta: Optional[dict] = None) -> Optional[Path]:
     """Загрузка ролика в отдельном процессе: не дольше срока, не больше N сразу."""
     if not YT_DLP_AVAILABLE:
-        return download_video(url, note)
+        return download_video(url, note, meta)
     started = time.monotonic()
     try:
         await asyncio.wait_for(_video_download_slots.acquire(), VIDEO_DOWNLOAD_TIMEOUT_SEC)
@@ -10383,7 +10716,7 @@ async def _download_video_bounded(url: str, note: Optional[list] = None) -> Opti
         path, reason = await video_download.download_isolated(
             url, VIDEO_DOWNLOAD_DIR, fmt=VIDEO_FORMAT, max_mb=VIDEO_MAX_FILE_SIZE_MB,
             max_duration=VIDEO_MAX_DURATION_SEC, extensions=DIRECT_VIDEO_EXTENSIONS,
-            timeout=left)
+            timeout=left, ffmpeg=_media_tool('ffmpeg'), meta=meta)
     except OSError as e:
         path, reason = None, f'процесс загрузки не запустился: {type(e).__name__}'
     finally:
@@ -10486,7 +10819,7 @@ def _parse_rss_bytes(
             if need_og:
                 og = fetch_og_image(link)
                 if og:
-                    og = upgrade_image_url(og)
+                    og = _upgraded_image(og)
                     if og not in images:
                         images.insert(0, og)
                         images = images[:MAX_PHOTOS_PER_POST]
@@ -11098,7 +11431,7 @@ def _get_myanimelist_listing():
                 src = img_tag.get('src')
                 if not src:
                     continue
-                src = upgrade_image_url(src)
+                src = _upgraded_image(src)
                 if src not in seen_imgs:
                     seen_imgs.add(src)
                     images.append(src)
@@ -11261,7 +11594,7 @@ def get_reddit_anime():
                     if not url:
                         return
                     url = html.unescape(url)
-                    url = upgrade_image_url(url)
+                    url = _upgraded_image(url)
                     if url not in seen_imgs:
                         seen_imgs.add(url)
                         images.append(url)
@@ -11677,6 +12010,10 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
                     # Ставим кадр первым и убираем размытую заглушку из ленты
                     images = [video_thumb] + [i for i in images if i != video_thumb]
                     thumb_only = True
+                if direct and _media_tool('ffmpeg'):
+                    # Ссылка на ролик есть — полноразмерный кадр из его начала
+                    # лучше превью 320×180. Не достанется — останется превью.
+                    images = [direct + VIDEO_FRAME_SUFFIX] + images
             logger.info(f"TG {post_id}: видео — {video_note}")
         if not video_url and not has_video_marker:
             video_url = _find_video_in_html(str(text_el), f'https://t.me/{post_id}')
@@ -12736,11 +13073,15 @@ async def _prepare_video_file(news: dict, *, record_failures: bool = True) -> Op
             _record_media_failure(news, 'dependency_missing')
         return None
     note: list = []
-    path = await _download_video_bounded(video_url, note)
+    downloaded: dict = {}
+    path = await _download_video_bounded(video_url, note, downloaded)
     if note:
         news['_video_note'] = note[0]
     if path:
         probe = await asyncio.to_thread(_probe_video_file, path)
+        if not probe and downloaded:
+            # ffprobe/ffmpeg не помогли — размеры ролика знает сам yt-dlp.
+            news['_video_meta'] = dict(downloaded, size=path.stat().st_size)
         if probe:
             news['_video_meta'] = probe
             metrics.observe('anime_bot_video_bytes', float(probe.get('size') or 0))
@@ -12878,19 +13219,20 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
     if not has_inline_video:
         text = _video_moderation_notice(text, news, target)
 
-    # Считаем превью один раз и заранее, в потоке: ниже оно нужно в трёх
-    # разных ветках отправки, а генерация — это ffprobe + ffmpeg.
+    # Считаем превью и размеры один раз и заранее, в потоке: ниже они нужны в
+    # трёх разных ветках отправки, а это ffprobe + ffmpeg.
     video_thumb_kw = await _video_thumbnail_kwargs_async(
-        video_file if has_inline_video else None)
+        video_file if has_inline_video else None, news,
+        video_media if has_inline_video else None)
 
     safe_text = _post_html(text, TG_TEXT_LIMIT, news)
     caption = _post_html(text, TG_CAPTION_LIMIT, news)
 
     photos = _dedup_image_variants(news.get('images') or [])
-    # Ролик не доехал, а картинок нет — ставим кадр-превью из самого поста,
+    # Ролик не доехал, а картинок нет — ставим кадр из самого ролика,
     # он всегда лучше, чем случайная og:image со страницы канала.
-    if not photos and video_media is None and news.get('_video_thumb'):
-        photos = [news['_video_thumb']]
+    if not photos and not has_inline_video and news.get('_video_thumb'):
+        photos = [await _video_cover(news)]
         _record_media_failure(news, 'cover_fallback')
         logger.info(f"🎬 Видео не доехало — кадр из поста: {news.get('title', '')[:50]}")
     # Картинки с хостов, которые Bot API не может скачать по URL (cdn-telegram.org
@@ -13024,10 +13366,10 @@ async def _send_post(bot: Bot, news: dict, target, video_file: Optional[Path],
                     supports_streaming=True, **video_thumb_kw,
                 ))
             else:
-                # Прямой видео-URL
+                # Прямой видео-URL или байты из Telegram-канала
                 media.append(InputMediaVideo(
                     media=video_media, caption=caption, parse_mode=ParseMode.HTML,
-                    supports_streaming=True,
+                    supports_streaming=True, **video_thumb_kw,
                 ))
             # Дальше фото без caption
             for photo_url in photos[:9]:  # 1 видео + до 9 фото = 10
@@ -13073,8 +13415,8 @@ async def _send_post_fallback(
     try:
         sent_first = False
         if has_inline_video:
+            video_thumb_kw = await _video_thumbnail_kwargs_async(video_file, news, video_media)
             if video_file:
-                video_thumb_kw = await _video_thumbnail_kwargs_async(video_file)
                 with open(video_file, 'rb') as f:
                     await bot.send_video(
                         chat_id=target, video=f, caption=caption,
@@ -13085,7 +13427,7 @@ async def _send_post_fallback(
                 await bot.send_video(
                     chat_id=target, video=video_media, caption=caption,
                     parse_mode=ParseMode.HTML, supports_streaming=True,
-                    **thread_kw,
+                    **video_thumb_kw, **thread_kw,
                 )
             sent_first = True
             for ph in photos[:9]:
@@ -13223,6 +13565,7 @@ async def _prepare_news_for_send(news: dict, source: str,
     пост можно отправлять."""
     await _improve_thumb(news)
     await _discover_article_video(news)
+    await _ensure_youtube_cover(news)
     await _optimize_news_media(news)
     _assign_format_variant(news)
 
@@ -15656,7 +15999,10 @@ def _cached_image_bytes(url: str) -> Optional[bytes]:
         with _image_bytes_cache_lock:
             if url in _image_bytes_cache:
                 return _image_bytes_cache[url]
-        data = _download_image_bytes(url)
+        if url.endswith(VIDEO_FRAME_SUFFIX):
+            data = _video_frame_bytes(url[:-len(VIDEO_FRAME_SUFFIX)])
+        else:
+            data = _download_image_bytes(url)
         with _image_bytes_cache_lock:
             _bounded_bytes_cache_put(_image_bytes_cache, url, data,
                                      IMAGE_BYTES_CACHE_MAX, IMAGE_BYTES_CACHE_MAX_BYTES)
@@ -15697,11 +16043,11 @@ async def _improve_thumb(news: dict) -> None:
     if not link:
         return
     og = await asyncio.to_thread(fetch_og_image, link)
-    og_norm = _normalize_image_url(og, link) if og else None
+    og_norm = _upgraded_image(_normalize_image_url(og, link)) if og else None
     if not og_norm or og_norm == images[0]:
         logger.debug(f"Превью {width}px, замены не нашлось: {news.get('title', '')[:50]}")
         return
-    candidate = await asyncio.to_thread(_cached_image_bytes, og_norm)
+    og_norm, candidate = await _probe_image_candidate(og_norm)
     cand_width = _image_width(candidate)
     if cand_width and (width is None or cand_width > width):
         news['images'] = [og_norm] + [i for i in images[1:] if i != og_norm]
@@ -16191,6 +16537,10 @@ async def _resolve_photos_for_album(photos: list, primary_crop_plan: Optional[di
                            target_aspect=primary_crop_plan.get('target_aspect'))
         if isinstance(value, str) and _download_needed_host(value):
             data = await asyncio.to_thread(_cached_image_bytes, value)
+            if not data and value.endswith(VIDEO_FRAME_SUFFIX):
+                # Кадр не достался — ссылка на ролик с меткой для Telegram не
+                # картинка: такой элемент ронял бы весь альбом.
+                continue
             value = data if data else value
         resolved.append(value)
     return resolved
@@ -16237,11 +16587,12 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
 
     # Как и в _send_post: одна генерация в потоке на все ветки отправки.
     video_thumb_kw = await _video_thumbnail_kwargs_async(
-        video_file if has_inline_video else None)
+        video_file if has_inline_video else None, news,
+        video_media if has_inline_video else None)
 
     photos = _dedup_image_variants(news.get('images') or [])
-    if not photos and video_media is None and news.get('_video_thumb'):
-        photos = [news['_video_thumb']]
+    if not photos and not has_inline_video and news.get('_video_thumb'):
+        photos = [await _video_cover(news)]
         news['_thumb_only'] = True
         _record_media_failure(news, 'cover_fallback')
         logger.info(f"🎬 Видео не доехало — ставлю кадр из поста: "
@@ -16251,8 +16602,12 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     # Нет медиа — пробуем og:image со страницы, иначе (при require_image) пропуск
     if media_count == 0 and news.get('link'):
         og = await asyncio.to_thread(fetch_og_image, news['link'])
-        og_norm = _normalize_image_url(og, news['link']) if og else None
+        og_norm = _upgraded_image(_normalize_image_url(og, news['link'])) if og else None
         if og_norm:
+            # Полноразмерная версия, если открывается, иначе сама og:image.
+            og_norm, og_data = await _probe_image_candidate(og_norm)
+            if og_data is None and _IMAGE_URL_FALLBACKS.get(og_norm):
+                og_norm = _IMAGE_URL_FALLBACKS[og_norm]
             photos = [og_norm]
             media_count = 1
             logger.info(f"Картинка взята со страницы (og:image): {news['title'][:50]}")
@@ -16328,7 +16683,8 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
                                                **video_thumb_kw, **thread_kw)
             else:
                 msg = await bot.send_video(chat_id=target, video=video_media, supports_streaming=True,
-                                           reply_markup=reply_markup, **caption_kw, **thread_kw)
+                                           reply_markup=reply_markup, **caption_kw,
+                                           **video_thumb_kw, **thread_kw)
             _remember_preview(pending_key, msg)
             _remember_video_file_id(pending_key, msg, news)
             logger.info(f"🧵 {news['source']}: {news['title'][:60]} (видео+подпись)")
@@ -16355,7 +16711,8 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
                                              **video_thumb_kw))
             elif video_media is not None:
                 media.append(InputMediaVideo(media=video_media, supports_streaming=True,
-                                             caption=caption, parse_mode=ParseMode.HTML))
+                                             caption=caption, parse_mode=ParseMode.HTML,
+                                             **video_thumb_kw))
             for ph in (await _resolve_photos_for_album(photos))[:9]:
                 media.append(InputMediaPhoto(media=ph))
         else:
@@ -16479,15 +16836,16 @@ async def _send_thread_media_then_text(bot, news, photos, has_inline_video, vide
 
     if has_inline_video:
         try:
+            video_thumb_kw = await _video_thumbnail_kwargs_async(video_file, news, video_url)
             if video_file:
-                video_thumb_kw = await _video_thumbnail_kwargs_async(video_file)
                 with open(video_file, 'rb') as f:
                     msg = await bot.send_video(chat_id=target, video=f,
                                                supports_streaming=True,
                                                **video_thumb_kw, **thread_kw)
             else:
                 msg = await bot.send_video(chat_id=target, video=video_url,
-                                           supports_streaming=True, **thread_kw)
+                                           supports_streaming=True, **video_thumb_kw,
+                                           **thread_kw)
             _remember_video_file_id(news.get('_pending_key'), msg, news)
             media_sent = True
         except TelegramError as e:
@@ -21484,7 +21842,7 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
         for name, _ in SOURCES
     )
     yt_status = '🟢 готов' if YT_DLP_AVAILABLE else '🔴 не установлен'
-    ffmpeg_status = '🟢 найден' if shutil.which('ffmpeg') else '🟡 не найден'
+    ffmpeg_status = '🟢 найден' if _media_tool('ffmpeg') else '🟡 не найден'
     video_state = '🟢 включено' if settings.video_enabled else '🔴 выключено'
     if settings.translator_engine == 'google':
         translator_name = 'Google Translate (выбран вручную)'
@@ -25823,7 +26181,7 @@ def _deepl_usage_remote() -> Optional[tuple[int, int]]:
 
 def _optional_deps_report() -> list[str]:
     """Что из необязательных зависимостей доступно на этом хостинге."""
-    ffmpeg = shutil.which('ffmpeg') is not None
+    ffmpeg = _media_tool('ffmpeg') is not None
     return [
         f"  {'🟢' if Image is not None else '🟡'} Pillow: "
         + ('есть (перцептивный дедуп картинок)' if Image is not None
@@ -25833,8 +26191,13 @@ def _optional_deps_report() -> list[str]:
            else 'НЕТ — часть видео из Telegram достать не получится'),
         f"  {'🟢' if ffmpeg else '🟡'} ffmpeg: "
         + ('есть (thumbnail/нормализация доступны)' if ffmpeg else 'нет (video normalize/thumbnail отключатся)'),
-        f"  {'🟢' if shutil.which('ffprobe') else '🟡'} ffprobe: "
-        + ('есть (проверка codec/container)' if shutil.which('ffprobe') else 'нет (video probe недоступен)'),
+        f"  {'🟢' if _media_tool('ffprobe') or ffmpeg else '🟡'} ffprobe: "
+        + ('есть (проверка codec/container)' if _media_tool('ffprobe')
+           else 'нет, параметры ролика читаются через ffmpeg' if ffmpeg
+           else 'нет (video probe недоступен)'),
+        f"  {'🟢' if _deno_path() else '🟡'} deno: "
+        + ('есть (yt-dlp решает проверки YouTube)' if _deno_path()
+           else 'нет — YouTube отдаст урезанный список форматов'),
     ]
 
 
@@ -26060,8 +26423,8 @@ async def send_startup_report(app, brief: bool = False) -> None:
 @admin_only
 async def media_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Compact Stage-3 media diagnostics and feature state."""
-    ffmpeg = shutil.which('ffmpeg')
-    ffprobe = shutil.which('ffprobe')
+    ffmpeg = _media_tool('ffmpeg')
+    ffprobe = _media_tool('ffprobe')
     lines = [
         '🎞 <b>Media Quality</b>', '',
         f"Media scoring: {'ВКЛ' if feature_enabled('media_quality') else 'выкл'}",
@@ -26259,9 +26622,9 @@ def _doctor_local_checks() -> list[dict]:
         'перцептивный media-dedup доступен' if Image is not None else 'только exact hash', level='warning')
     add('yt-dlp', YT_DLP_AVAILABLE,
         'доступен' if YT_DLP_AVAILABLE else 'опционально отсутствует', level='warning')
-    ffmpeg = shutil.which('ffmpeg')
+    ffmpeg = _media_tool('ffmpeg')
     add('ffmpeg', bool(ffmpeg), ffmpeg or 'опционально отсутствует', level='warning')
-    ffprobe = shutil.which('ffprobe')
+    ffprobe = _media_tool('ffprobe')
     add('ffprobe', bool(ffprobe), ffprobe or 'опционально отсутствует', level='warning')
     if feature_enabled('video_normalize') and not ffmpeg:
         add('Video normalize', False, 'FEATURE_VIDEO_NORMALIZE=true, но ffmpeg не найден', level='warning')
@@ -31228,15 +31591,42 @@ def check_video_deps():
     else:
         logger.info("✓ yt-dlp найден")
 
-    if shutil.which('ffmpeg'):
-        logger.info("✓ ffmpeg найден (thumbnail/нормализация доступны)")
+    ffmpeg = _media_tool('ffmpeg')
+    if ffmpeg:
+        logger.info(f"✓ ffmpeg найден: {ffmpeg} (склейка дорожек, превью, нормализация)")
     else:
-        logger.warning("⚠️  ffmpeg не найден. Публикация видео останется, но Stage 3 "
-                       "не сможет делать thumbnail/нормализацию.")
-    if shutil.which('ffprobe'):
+        logger.warning("⚠️  ffmpeg не найден. Ролики только «прогрессивные» (YouTube — 360p), "
+                       "без превью и нормализации. Проверь, что поставился imageio-ffmpeg.")
+    if _media_tool('ffprobe'):
         logger.info("✓ ffprobe найден")
+    elif ffmpeg:
+        logger.info("✓ ffprobe нет — параметры роликов читаются через ffmpeg")
     else:
         logger.warning("⚠️  ffprobe не найден — codec/container видео не проверяются.")
+    if _deno_path():
+        logger.info("✓ deno найден (yt-dlp решает JS-проверки YouTube)")
+    else:
+        logger.warning("⚠️  deno не найден — YouTube отдаст урезанный список форматов. "
+                       "Он ставится из requirements.txt (yt-dlp[default,deno]).")
+
+
+def _runtime_versions_line() -> str:
+    """Версии, от которых зависит поведение, — одной строкой в начале лога.
+
+    Хостинг сам выбирает образ Python и ставит пакеты; когда что-то ломается
+    после деплоя, первым делом нужно знать, что именно реально запустилось."""
+    parts = [f'Python {sys.version.split()[0]}']
+    for dist, label in (('python-telegram-bot', 'PTB'), ('yt-dlp', 'yt-dlp'),
+                        ('onnxruntime', 'onnxruntime'), ('numpy', 'numpy')):
+        try:
+            parts.append(f'{label} {importlib.metadata.version(dist)}')
+        except importlib.metadata.PackageNotFoundError:
+            parts.append(f'{label} нет')
+    ffmpeg = _media_tool('ffmpeg')
+    parts.append('ffmpeg ' + ('нет' if not ffmpeg else 'системный' if shutil.which('ffmpeg')
+                              else 'из imageio-ffmpeg'))
+    parts.append('deno ' + ('есть' if _deno_path() else 'нет'))
+    return ' · '.join(parts)
 
 
 _EPISODES_SKIP_KINDS = frozenset({'music', 'pv', 'cm'})
@@ -31736,6 +32126,7 @@ def main():
     # Хостинг может выбрать Python не из runtime.txt — версия в первых строках
     # лога сразу показывает, на чём бот реально работает.
     print(f"Python: {sys.version.split()[0]}", flush=True)
+    print(f"Окружение: {_runtime_versions_line()}", flush=True)
     print(f"DATA_DIR = {DATA_DIR}", flush=True)
     print(f"TOKEN задан: {'да' if TOKEN else 'НЕТ'}", flush=True)
     print(f"Переводчик: {'DeepL' if DEEPL_API_KEY else 'Google Translate'}", flush=True)

@@ -73,9 +73,13 @@ jobs:
           python-version: '3.10'
           cache: pip
 
+      # Хостинг ставит requirements.txt раньше, чем копирует остальной код:
+      # в папке установки нет ничего, кроме него самого.
       - name: Установка зависимостей так же, как на хостинге
         run: |
           python -m pip install --upgrade pip
+          mkdir -p "$RUNNER_TEMP/hostbuild" && cp requirements.txt "$RUNNER_TEMP/hostbuild/"
+          (cd "$RUNNER_TEMP/hostbuild" && pip install -r requirements.txt)
           pip install -r requirements-dev.txt
 
       - name: Тесты
@@ -83,3 +87,28 @@ jobs:
           BOT_TOKEN: '123:ci-test-token'
           DATA_DIR: ${{ runner.temp }}/bot-data
         run: python -m pytest -q
+
+  # Образ как на хостинге (Bothost): чистый python:3.x-slim, сначала только
+  # requirements.txt, потом код. Ловит то, чего не видит ubuntu-раннер:
+  # ссылки requirements.txt на соседние файлы (из-за «-c constraints.txt» не
+  # деплоилась ни одна версия) и нехватку системных библиотек slim-образа для
+  # opencv, onnxruntime, rlottie, ffmpeg и deno.
+  hosting-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['python:3.11-slim', 'python:3.10-slim']
+    name: hosting-image (${{ matrix.image }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Сборка и проверка в образе хостинга
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/src:ro" "$IMAGE" bash -ec '
+            mkdir /build && cp /src/requirements.txt /build/ && cd /build
+            pip install --no-cache-dir -q -r requirements.txt
+            cd /src && python tools/hosting_smoke.py'
