@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "f2973f6305e62c7c01bbaa07fa78055e1f4d4d49",
-  "generated_at_utc": "2026-10-05T20:21:53.446588+00:00",
+  "git_commit": "af16baa401bc0693ce969beb5cdce38e52443d29",
+  "generated_at_utc": "2026-10-05T20:31:18.816941+00:00",
   "files": {
     ".env.example": {
       "sha256": "1d45114ec32deffad57d13ba2928bab66cf9fc248bb0e9bcb2f959028479257a",
@@ -26,20 +26,20 @@
       "bytes": 33
     },
     "README.md": {
-      "sha256": "fcda5410256c554bb0e18bb88fd6eaf3fae2b02fd7380cae999f570c2362ae75",
-      "bytes": 30789
+      "sha256": "128a3e7af4ecbf58d3d22e47b32b6f5209702a8e7094979475dcc0ffe222e8ce",
+      "bytes": 31472
     },
     "anime_news_bot.py": {
-      "sha256": "e5699b973a9f42c3042dacbbd5170494d06661d1f4601724e90848134b643d3e",
-      "bytes": 1782459
+      "sha256": "38aea6c9bf15bb6ac0343c63e64685b6fadf9a809d6e39fb42780c78e8895b4f",
+      "bytes": 1785171
     },
     "docs/chat-moderation.md": {
       "sha256": "1bd41c70e2028f54fca1626aeafb186b4a7f6f823a82e1172d42284c79d92151",
       "bytes": 72590
     },
     "docs/env-reference.md": {
-      "sha256": "826f3c0e45566f5f0291f23c64f309bb521d01f755c1f85a10beb5d3706b1ba7",
-      "bytes": 21125
+      "sha256": "3022467f3f99e3a186aca9c53b2b7894ca0401ae1ac029332d0004d55201cebe",
+      "bytes": 21187
     },
     "docs/llm-providers.md": {
       "sha256": "7c213406ffcb83385b71f07a2b34296df4cc8d1ba78215fd55f92d9532923c95",
@@ -122,8 +122,8 @@
       "bytes": 2319
     },
     "tests/conftest.py": {
-      "sha256": "ad1c69a9c0ff5da4b3401d1b24fb1291a1cf3224dc0597e201bac11417b6cfe1",
-      "bytes": 9353
+      "sha256": "0a2a9bc4818463275d3284e768ff75c938b43fdc63a8094f50eff98910c9b4d0",
+      "bytes": 9866
     },
     "tests/e2e/test_cli_contract.py": {
       "sha256": "d2458cec46557934a4a39383d91b6959ffb1f68793c687533a86b81e0a2b6fc8",
@@ -236,6 +236,10 @@
     "tests/test_channel_mode.py": {
       "sha256": "4a0397b2b5d06006d737145541a57e7718ca812556ed5b1be3b0d6f02f196482",
       "bytes": 6248
+    },
+    "tests/test_channel_quiet_hours.py": {
+      "sha256": "4ea87dd71839d2694a7dded630b48516878ece354ebb80fe2c0a70613cc44a67",
+      "bytes": 3661
     },
     "tests/test_cohesive_posts.py": {
       "sha256": "7b3b63f0f6312033bd09d794f3088bf94c4cdca7b8e6082c0cb3347c37fb76fe",

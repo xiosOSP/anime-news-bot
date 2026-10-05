@@ -843,6 +843,12 @@ POLLING_BOOTSTRAP_RETRIES = max(-1, min(100, _env_int('POLLING_BOOTSTRAP_RETRIES
 # Publisher тикает часто, но публикует только когда пришло время: сам темп
 # публикаций задаётся check_interval, тик лишь проверяет, не пора ли.
 PUBLISHER_TICK_SEC = max(15, min(600, _env_int('PUBLISHER_TICK_SEC', 60)))
+# Ночная тишина канала: в эти часы автопостинг в канал не публикует, готовые
+# посты ждут в очереди до утра. Ночью подписчики спят, пост уходит вниз ленты
+# без реакций, а уведомления раздражают. Время — часовой пояс бота (/tz, по
+# умолчанию МСК). «off» — без тишины. Ручные кнопки и посты, отложенные админом
+# на конкретное время, тишина не задерживает: это решение человека.
+CHANNEL_QUIET_HOURS = _env('CHANNEL_QUIET_HOURS', '22:00-06:00').strip()
 # После обрыва цикла ждём короткую растущую паузу, а не полный интервал:
 # иначе при частых перезапусках сбор новостей не случается вовсе.
 AUTO_CYCLE_RETRY_BASE_SEC = max(30, min(1800, _env_int('AUTO_CYCLE_RETRY_BASE_SEC', 120)))
@@ -21565,8 +21571,8 @@ async def _publish_one_from_queue_locked(bot_api) -> tuple[Optional[str], Option
 
     Возвращает (результат, пост) — результат None, если очередь пуста.
     """
-    if post_queue is None:
-        return None, None
+    if post_queue is None or _channel_quiet_now():
+        return None, None       # ночью пост ждёт в очереди до утра
     # Одна пачка на несколько ближайших постов вместо вызова на каждый: пути
     # сюда ведут и цикл проверки, и независимый публикатор, поэтому подготовка
     # стоит здесь, а не в каждом из них.
@@ -21673,7 +21679,8 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
     и этот автопубликатор не могут отправить один пост дважды: кто первым
     занял состояние, тот и публикует.
     """
-    if pending_posts is None or _history_paused() or not await _channel_autopost_due():
+    if (pending_posts is None or _history_paused() or _channel_quiet_now()
+            or not await _channel_autopost_due()):
         return None
     row = pending_posts.next_for_autopost()
     if row is None:
@@ -21774,6 +21781,42 @@ async def publisher_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
             _mark_published_now()
             logger.info('Publisher: пост отправлен независимо от цикла сбора: %s',
                         str((post or {}).get('title', ''))[:60])
+
+
+def _quiet_window(raw: str) -> Optional[tuple[int, int]]:
+    """«22:00-06:00» или «22-6» → минуты начала и конца; None — тишины нет."""
+    match = re.fullmatch(r'\s*(\d{1,2})(?::(\d{2}))?\s*[-–]\s*(\d{1,2})(?::(\d{2}))?\s*',
+                         str(raw or ''))
+    if not match:
+        return None
+    start_h, start_m, end_h, end_m = (int(group or 0) for group in match.groups())
+    if start_h > 23 or end_h > 23 or start_m > 59 or end_m > 59:
+        return None
+    start, end = start_h * 60 + start_m, end_h * 60 + end_m
+    return (start, end) if start != end else None
+
+
+def _channel_quiet_now(now_local: Optional[datetime] = None) -> bool:
+    """Идут ли сейчас тихие часы канала (по часовому поясу бота)."""
+    window = _quiet_window(CHANNEL_QUIET_HOURS)
+    if window is None:
+        return False
+    now_local = now_local or _local_now()
+    minute = now_local.hour * 60 + now_local.minute
+    start, end = window
+    # Окно через полночь (22:00–06:00) — это «после начала ИЛИ до конца».
+    return start <= minute < end if start < end else (minute >= start or minute < end)
+
+
+def _quiet_status_line() -> str:
+    """Строка /status: без неё ночная пауза выглядит как «бот перестал постить»."""
+    window = _quiet_window(CHANNEL_QUIET_HOURS)
+    if window is None:
+        return ''
+    start, end = window
+    state = 'сейчас тихо, посты ждут утра' if _channel_quiet_now() else 'сейчас посты идут'
+    return (f"🌙 Ночная тишина канала: {start // 60:02d}:{start % 60:02d}–"
+            f"{end // 60:02d}:{end % 60:02d} ({state})\n")
 
 
 def _publish_due(now: Optional[datetime] = None) -> bool:
@@ -21964,6 +22007,7 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
         f"⏰ Свежесть постов: {settings.post_max_age_hours} ч\n"
         f"🖼 Только с картинками: {'ВКЛ' if settings.require_image else 'ВЫКЛ'}\n"
         f"📦 В очереди: {queue_size}\n"
+        f"{_quiet_status_line()}"
         f"{_scheduled_status_block(context)}"
         f"В истории ссылок: {len(sent_links._set)}\n"
         f"Канал: {CHANNEL_ID}\n"
