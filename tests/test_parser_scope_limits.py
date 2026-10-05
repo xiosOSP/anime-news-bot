@@ -104,7 +104,11 @@ class TestVideoDurationLimit:
         ('5:00', True), ('5:01', False), ('12:30', False),
     ])
     def test_five_minute_cap(self, dur, taken, monkeypatch):
-        posts = _parse(NESTED_HTML.replace('1:43', dur), monkeypatch)
+        # Меняем только текст тега длительности: «1:43» бывает и в метке
+        # времени поста (импорт модуля в …:51:43), и замена на «12:30» давала
+        # «07:512:30» — пост без даты отсеивался, тест падал раз в несколько
+        # сотен прогонов.
+        posts = _parse(NESTED_HTML.replace('>1:43<', f'>{dur}<'), monkeypatch)
         assert bool(posts[0]['video']) is taken
 
     def test_constant_is_five_minutes(self):
