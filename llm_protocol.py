@@ -441,11 +441,19 @@ def _unsupported_names(source: str, output: str) -> list:
     return found
 
 
+def _borrowed_names(source: str, neighbours: str, output: str) -> list:
+    """Имена из ответа, которых нет в своей новости, зато есть у соседки по пачке.
+
+    Это перенос, а не перевод: так «Game Tengoku» попала в пост о Professor
+    Layton. В отличие от «нет в источнике вообще», правило годится и для
+    японских новостей — там латиница по памяти законна, а имя соседки нет."""
+    near = _latin_forms(neighbours)
+    return [word for word in _unsupported_names(source, output)
+            if any(len(part) >= 3 and part in near
+                   for part in re.split(r"['’\-]", word.casefold()))]
+
+
 _CJK_SOURCE_RE = re.compile(r'[\u3040-\u30ff\u4e00-\u9fff]')
-# Слово, которое целиком раскладывается на слоги японского (Хэпбёрн): ромадзи.
-_ROMAJI_RE = re.compile(
-    r'^(?:(?:ky|gy|sh|ch|ny|hy|by|py|my|ry|ts|[kgsztdnhbpmyrwjf])?[aiueo]|n)+$',
-    re.IGNORECASE)
 
 
 def _editorial_rejection(source: str, title: str, summary: str) -> str:
@@ -469,12 +477,12 @@ def _editorial_rejection(source: str, title: str, summary: str) -> str:
     # Пересказ вместо новости: «В источнике TG: QewbsNews упомянута сцена».
     if re.search(r'\bTG:\s*\S|(?:^|[\s.])[Вв] источнике\b', title + '\n' + summary):
         return 'source_meta'
-    unsupported = _unsupported_names(source, f'{title}\n{summary}')
-    if _CJK_SOURCE_RE.search(source):
-        # Японские названия модель обязана записывать ромадзи — такие слова
-        # в японском источнике не найти. Английские слова всё равно чужие.
-        unsupported = [word for word in unsupported if not _ROMAJI_RE.match(word)]
-    if unsupported:
+    # Японский источник латиницей не сверить: промпт велит писать названия
+    # ромадзи, а студии и кинотеатры — как принято (Code Geass, Toei
+    # Animation, TOHO Cinemas), и в японском тексте этих слов нет. Строгая
+    # проверка отправляла бы такие пересказы в машинный перевод. Перенос
+    # имени из соседней новости пачки ловит _borrowed_names при разборе пачки.
+    if not _CJK_SOURCE_RE.search(source) and _unsupported_names(source, f'{title}\n{summary}'):
         return 'unsupported_names'
     return ''
 

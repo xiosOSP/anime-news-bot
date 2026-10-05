@@ -55,11 +55,44 @@ def test_abbreviation_possessive_and_accents_are_the_same_names():
         'SPY×FAMILY Code: White sequel', 'Продолжение Spy x Family: Code White', '') == ''
 
 
-def test_japanese_source_may_get_romaji_but_not_english_words():
-    source = '「呪術廻戦」第3期の放送が決定'
-    assert llm._editorial_rejection(source, 'Объявлен третий сезон Jujutsu Kaisen', '') == ''
+def test_japanese_source_may_get_official_latin_names():
+    # Японское название латиницей можно написать только по памяти: ромадзи
+    # или официальное английское. Отказ отправлял бы пост в машинный перевод.
+    source = '「コードギアス」新作、東映アニメーション制作。TOHOシネマズで先行上映'
     assert llm._editorial_rejection(
-        source, 'Объявлен третий сезон Jujutsu Kaisen — Witch Watch', '') == 'unsupported_names'
+        source, 'Анонсирован новый проект Code Geass',
+        'Анимацией займётся Toei Animation, предпоказ в TOHO Cinemas.') == ''
+
+
+def test_name_from_a_neighbour_in_the_batch_is_borrowed():
+    own = '「コードギアス」新作が2027年に放送'
+    neighbours = 'Witch Watch season 2 announced'
+    assert llm._borrowed_names(own, neighbours, 'Новый Code Geass и Witch Watch') == ['Witch', 'Watch']
+    # Имя из памяти, которого нет у соседей, — не перенос.
+    assert llm._borrowed_names(own, neighbours, 'Новый проект Code Geass') == []
+
+
+def _batch_news(title, summary, source):
+    return {'title': title, 'summary': summary, 'source': source}
+
+
+def test_batch_answer_with_a_neighbours_name_goes_to_a_single_call(enrich_env, monkeypatch, caplog):
+    monkeypatch.setattr(bot, 'LLM_BATCH_SIZE', 4)
+    monkeypatch.setattr(bot, '_llm_editorial_cache', {})
+    japanese = _batch_news('「コードギアス」新作が2027年に放送', '詳細は後日発表。', 'Comic Natalie(JP)')
+    english = _batch_news('Witch Watch season 2 announced', 'The sequel premieres in 2027.', 'Crunchyroll')
+    items = [
+        {'id': 1, 'topic': 'аниме', 'kind': 'анонс', 'subject': 'Code Geass',
+         'title': 'Новый Code Geass и Witch Watch выйдут в 2027 году', 'summary': '', 'tags': []},
+        {'id': 2, 'topic': 'аниме', 'kind': 'анонс', 'subject': 'Witch Watch',
+         'title': 'Анонсирован 2 сезон Witch Watch', 'summary': 'Премьера в 2027 году.', 'tags': []},
+    ]
+    with caplog.at_level(logging.WARNING), \
+            patch.object(bot.requests, 'post', return_value=_answer({'items': items})):
+        assert asyncio.run(bot._llm_enrich_batch([japanese, english])) == 1
+    assert bot._llm_editorial_cached(japanese) is None
+    assert bot._llm_editorial_cached(english) is not None
+    assert 'Witch' in caplog.text
 
 
 def test_russian_source_does_not_get_new_latin_names():

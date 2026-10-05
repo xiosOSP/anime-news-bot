@@ -78,6 +78,7 @@ from llm_protocol import (
     LLM_TOPIC_ANY,
     _LLM_FAILURE_HUMAN,
     _LLM_TEMPORARY_MARKERS,
+    _borrowed_names,
     _editorial_rejection,
     _unsupported_names,
     _llm_batch_owner,
@@ -23901,6 +23902,17 @@ def _llm_parse_batch(raw: str) -> dict:
     return found
 
 
+def _llm_batch_borrowed(idx: int, data: dict, chunk: list, texts: list) -> list:
+    """Латинские имена разбора №idx, взятые из других новостей той же пачки."""
+    def facts(news: dict, text: str) -> str:
+        return f"{news.get('title') or ''}\n{text or ''}\n{_work_title_hint(news)}"
+    # Своя новость среди «соседей» ничего не меняет: неподтверждённого слова
+    # в ней нет по определению.
+    pack = '\n'.join(facts(news, text) for news, text in zip(chunk, texts))
+    return _borrowed_names(facts(chunk[idx - 1], texts[idx - 1]), pack,
+                           f"{data.get('title') or ''}\n{data.get('summary') or ''}")
+
+
 async def _llm_enrich_chunk(chunk: list) -> int:
     """Один запрос на несколько новостей. Возвращает число разобранных.
 
@@ -23930,6 +23942,15 @@ async def _llm_enrich_chunk(chunk: list) -> int:
                 logger.warning('LLM: разбор №%s подходит новости №%s, а не '
                                '«%s» — отдаю её одиночным запросом', idx, owner,
                                str(news.get('title', ''))[:50])
+                metrics.inc('anime_bot_llm_batch_mismatch_total')
+                continue
+            borrowed = _llm_batch_borrowed(idx, data, chunk, texts)
+            if borrowed:
+                # Имя пришло из соседней новости пачки. Одиночный запрос
+                # соседей не видит — пусть новость получит разбор там.
+                logger.warning('LLM: в разборе «%s» имена из соседней новости пачки (%s) — '
+                               'отдаю её одиночным запросом',
+                               str(news.get('title', ''))[:50], ', '.join(borrowed[:5]))
                 metrics.inc('anime_bot_llm_batch_mismatch_total')
                 continue
             _llm_editorial_remember(news, {k: v for k, v in data.items() if k != 'src'})
