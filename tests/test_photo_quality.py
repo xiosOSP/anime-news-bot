@@ -236,3 +236,95 @@ async def test_downloaded_video_is_not_doubled_by_its_preview(monkeypatch, tmp_p
     assert await bot._send_post(tg, news, -100123, clip)
     tg.send_video.assert_awaited_once()
     tg.send_media_group.assert_not_awaited()
+
+
+# ------------------------------------------------- чёрное превью вместо ролика
+
+def dark_card(width, height, bright_box, text=False) -> bytes:
+    """Чёрный кадр со светлой областью: надписью (шумная, как буквы) или логотипом."""
+    from PIL import ImageDraw
+    im = Image.new('RGB', (width, height), (0, 0, 0))
+    if text:
+        # Тёмный шум кадра (ярче 31 не бывает) и сглаженные края букв дают
+        # настоящему титру энтропию около 1,8 — светлее он от этого не становится.
+        im = Image.effect_noise((width, height), 64).point(lambda v: v // 8).convert('RGB')
+        left, top, right, bottom = bright_box
+        letters = Image.effect_noise((right - left, bottom - top), 120).convert('RGB')
+        im.paste(letters, (left, top))
+    else:
+        ImageDraw.Draw(im).rectangle(bright_box, fill=(230, 230, 230))
+    out = io.BytesIO()
+    im.save(out, format='JPEG', quality=90)
+    return out.getvalue()
+
+
+# Первый кадр трейлера, который Telegram не отдал («Media is too big»): чёрный
+# фон и мелкая надпись — примерно 3% площади, как в посте о «Красной Шапочке».
+# Надпись не сплошная, поэтому кадр не «однородный» — отсеять его должно
+# именно правило обложки ролика.
+TITLE_CARD = dark_card(320, 180, (60, 84, 260, 94), text=True)
+# Логотип на чёрном фоне: тёмный, но это настоящая иллюстрация (~9% площади).
+LOGO = dark_card(800, 800, (100, 330, 700, 420))
+
+
+async def _optimized(monkeypatch, images, pictures, **news):
+    monkeypatch.setattr(bot, '_download_image_bytes', lambda url: pictures.get(url))
+    monkeypatch.setattr(bot, 'fetch_og_image', lambda link: None)
+    news = {'images': images, 'link': 'https://t.me/ch/1', **news}
+    await bot._optimize_news_media(news)
+    return news
+
+
+@pytest.mark.asyncio
+async def test_black_title_card_of_a_missing_video_is_not_posted(monkeypatch):
+    thumb = 'https://cdn4.cdn-telegram.org/file/thumb.jpg'
+    news = await _optimized(monkeypatch, [thumb], {thumb: TITLE_CARD},
+                            _video_thumb=thumb, _thumb_only=True)
+    assert news['images'] == []
+    # Иначе отправка вернула бы ту же обложку как «кадр из поста».
+    assert news['_video_thumb'] is None
+
+
+def test_title_card_is_not_merely_uniform():
+    info = bot._image_quality_info(TITLE_CARD, 'x')
+    assert info['entropy'] >= 1.0 and info['bright_share'] < 0.05
+
+
+@pytest.mark.asyncio
+async def test_same_dark_picture_stays_when_it_is_not_a_video_cover(monkeypatch):
+    # Тёмная картинка с мелкой деталью у обычной новости — иллюстрация.
+    art = 'https://news.example/night.jpg'
+    news = await _optimized(monkeypatch, [art], {art: TITLE_CARD})
+    assert news['images'] == [art]
+
+
+@pytest.mark.asyncio
+async def test_dark_logo_picture_stays(monkeypatch):
+    logo = 'https://news.example/logo.jpg'
+    news = await _optimized(monkeypatch, [logo], {logo: LOGO})
+    assert news['images'] == [logo]
+
+
+@pytest.mark.asyncio
+async def test_video_thumb_with_a_real_picture_stays(monkeypatch):
+    thumb = 'https://cdn4.cdn-telegram.org/file/thumb.jpg'
+    news = await _optimized(monkeypatch, [thumb], {thumb: jpeg(320, 180)}, _video_thumb=thumb)
+    assert news['images'] == [thumb] and news['_video_thumb'] == thumb
+
+
+@pytest.mark.asyncio
+async def test_solid_fill_is_never_a_picture(monkeypatch):
+    solid = 'https://news.example/placeholder.jpg'
+    real = 'https://news.example/art.jpg'
+    news = await _optimized(monkeypatch, [solid, real],
+                            {solid: jpeg(1280, 720, noisy=False), real: jpeg(600, 315)})
+    assert news['images'] == [real]
+
+
+def test_post_about_an_unavailable_video_yields_to_one_with_the_video():
+    base = {'title': 'Трейлер аниме по новелле', 'source': 'TG: Ch', 'images': ['x']}
+    with_video = dict(base, video='https://cdn4.cdn-telegram.org/file/clip.mp4')
+    cover_only = dict(base, _thumb_only=True)
+    plain = dict(base)
+    assert bot._news_priority_score(cover_only) == pytest.approx(bot._news_priority_score(plain) - 4.0)
+    assert bot._news_priority_score(with_video) > bot._news_priority_score(cover_only)

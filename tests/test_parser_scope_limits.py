@@ -769,3 +769,17 @@ class TestYtDlpFallback:
         monkeypatch.setattr(anime_news_bot, 'yt_dlp',
                             MagicMock(YoutubeDL=lambda opts: Fake()))
         assert anime_news_bot._ytdlp_telegram_video('ch/1')[0] == 'https://cdn/best.mp4'
+
+
+def test_post_links_are_kept_for_ad_detection(monkeypatch):
+    # По ссылкам видна реклама (бот с ?start=) и анонс собственного выпуска
+    # канала (YouTube + ВК Видео): заголовок у таких постов нейтральный.
+    html = f'''
+<div class="tgme_widget_message" data-post="ch/300">
+  <div class="tgme_widget_message_text">Привет! Попробуй новую игру
+    <a href="https://t.me/arcade_robot?start=promo">Играть</a></div>
+  <time datetime="{FRESH}"></time>
+</div>'''
+    posts = _parse(html, monkeypatch)
+    assert posts[0]['_links'] == ['https://t.me/arcade_robot?start=promo']
+    assert anime_news_bot.noise_reason(posts[0]) == 'реклама'
