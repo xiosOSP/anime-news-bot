@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 308 переменных. Почти все — точная настройка со значением
+Бот читает 327 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -188,7 +188,7 @@
 | `LLM_PACE_MAX_SEC` | `60.0` | anime_news_bot.py |
 | `LLM_PRIMARY_RETRY_MAX_SEC` | — | anime_news_bot.py |
 | `LLM_PRIMARY_RETRY_SEC` | `1800` | anime_news_bot.py |
-| `LLM_PROMPT_VERSION` | `editorial-v6-2026-09-25` | anime_news_bot.py |
+| `LLM_PROMPT_VERSION` | `editorial-v7-2026-10-06` | anime_news_bot.py |
 | `LLM_PROVIDER` | — | anime_news_bot.py |
 | `LLM_TIMEOUT` | `30` | anime_news_bot.py |
 
@@ -362,6 +362,8 @@
 | `BREAKING_PRIORITY_BOOST` | `10.0` | anime_news_bot.py |
 | `CANARY_CHANNEL_ID` | — | anime_news_bot.py |
 | `CANARY_MIRROR_PERCENT` | `0.0` | anime_news_bot.py |
+| `CEREBRAS_API_KEY` | — | anime_news_bot.py |
+| `CEREBRAS_MODEL` | — | anime_news_bot.py |
 | `CHANNEL_ID` | — | anime_news_bot.py |
 | `CHANNEL_QUIET_HOURS` | `22:40-08:00` | anime_news_bot.py |
 | `CHAOS_FUZZ_MAX_CHARS` | `4096` | anime_news_bot.py |
@@ -382,16 +384,28 @@
 | `EXPERIMENT_SALT` | `anime-news-bot-v1` | anime_news_bot.py |
 | `FRANCHISE_COOLDOWN_MIN` | `180` | anime_news_bot.py |
 | `FRANCHISE_COOLDOWN_PENALTY` | `7.0` | anime_news_bot.py |
+| `GEMINI_API_KEY` | — | anime_news_bot.py |
+| `GEMINI_MODEL` | — | anime_news_bot.py |
+| `GROQ_API_KEY` | — | anime_news_bot.py |
+| `GROQ_MODEL` | — | anime_news_bot.py |
 | `IMAGE_BYTES_CACHE_MAX_MB` | `48` | anime_news_bot.py |
 | `INSTANCE_LOCK_POLL_SEC` | `2.0` | anime_news_bot.py |
 | `INSTANCE_LOCK_WAIT_SEC` | `-1` | anime_news_bot.py |
 | `MAX_PHOTOS_PER_POST` | `6` | anime_news_bot.py |
+| `MISTRAL_API_KEY` | — | anime_news_bot.py |
+| `MISTRAL_MODEL` | — | anime_news_bot.py |
 | `NEWS_PER_SOURCE` | `5` | anime_news_bot.py |
+| `NVIDIA_API_KEY` | — | anime_news_bot.py |
+| `NVIDIA_MODEL` | — | anime_news_bot.py |
+| `OPENROUTER_API_KEY` | — | anime_news_bot.py |
+| `OPENROUTER_MODEL` | — | anime_news_bot.py |
 | `OPS_ALERT_REPEAT_HOURS` | `6` | anime_news_bot.py |
 | `OPS_QUEUE_STALE_HOURS` | `6` | anime_news_bot.py |
 | `OPS_UNCERTAIN_GROWTH` | `3` | anime_news_bot.py |
 | `OPS_UNCHECKED_MEDIA_PER_HOUR` | `15` | anime_news_bot.py |
 | `OPS_WRITE_FAILURES` | `3` | anime_news_bot.py |
+| `ORCAROUTER_API_KEY` | — | anime_news_bot.py |
+| `ORCAROUTER_MODEL` | — | anime_news_bot.py |
 | `PORT` | `0` | anime_news_bot.py |
 | `POST_FORMAT_COMPACT_PERCENT` | `0.0` | anime_news_bot.py |
 | `POST_STYLE` | `rich` | anime_news_bot.py |
@@ -407,6 +421,11 @@
 | `STARTUP_REPORT_MAX_IN_WINDOW` | `3` | anime_news_bot.py |
 | `STARTUP_REPORT_WINDOW_SEC` | `1800` | anime_news_bot.py |
 | `TELEGRAM_BOT_TOKEN` | — | anime_news_bot.py |
+| `TG_REWRITE_MAX_ATTEMPTS` | `48` | anime_news_bot.py |
+| `TG_REWRITE_REQUIRED` | `True` | anime_news_bot.py |
+| `TG_REWRITE_WAIT_SEC` | — | anime_news_bot.py |
+| `TOKENATOR_API_KEY` | — | anime_news_bot.py |
+| `TOKENATOR_MODEL` | — | anime_news_bot.py |
 | `TRANSLATION_DEFER_MAX_AGE_SEC` | `21600` | anime_news_bot.py |
 | `TRANSLATION_DEFER_MAX_ATTEMPTS` | `6` | anime_news_bot.py |
 | `WORK_LOOKUP_PER_CYCLE` | `40` | anime_news_bot.py |

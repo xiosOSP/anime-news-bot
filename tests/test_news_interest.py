@@ -169,6 +169,13 @@ def test_visuals_are_preferred_and_merch_is_not():
     assert bot._topic_affinity(frames) > bot._topic_affinity(neutral) > bot._topic_affinity(merch)
 
 
+def test_interviews_weigh_less():
+    # Модераторы канала просили поменьше интервью — это вес, а не фильтр.
+    interview = _news('Director talks about the new season in an interview')
+    plain = _news('Director talks about the new season')
+    assert bot._topic_affinity(interview) == bot._topic_affinity(plain) - 3.0
+
+
 def test_gossip_penalty_only_for_non_anime_news():
     rumor_film = _news('Rumor: actor in talks for a superhero sequel', source='Collider')
     film = _news('Actor joins a superhero sequel', source='Collider')
@@ -222,3 +229,15 @@ def test_headline_broken_by_a_line_break_is_joined(post, title):
 ])
 def test_finished_headline_and_lists_stay_apart(post, title):
     assert bot._tg_title_and_summary(post, 'ch', 'TG: Ch')[0] == title
+
+
+# ------------------------------------------- модель узнаёт рекламу и озвучки
+
+@pytest.mark.parametrize('kind', ['реклама', 'озвучка'])
+def test_model_verdict_ad_or_dub_removes_the_post(enrich_env, kind):
+    # Словари ловят не всё: рекламу игры или анонс дубляжа модель узнаёт по смыслу.
+    news = {'title': 'Привет!', 'summary': 'Собери персонажей в новой игре.', 'source': 'TG: Ch'}
+    answer = {'topic': 'аниме', 'kind': kind, 'subject': '', 'title': 'Новая игра',
+              'summary': 'Собери персонажей.', 'tags': ['#аниме']}
+    with patch.object(bot.requests, 'post', return_value=_answer(answer)):
+        assert asyncio.run(bot._llm_enrich(news)) == 'skip'

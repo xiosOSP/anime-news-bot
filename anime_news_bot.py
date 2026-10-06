@@ -729,7 +729,7 @@ GOLDEN_DATASET_FILE = Path(__file__).with_name('golden') / 'editorial_cases.json
 STORY_UPDATE_LOOKBACK_DAYS = max(1, min(90, _env_int('STORY_UPDATE_LOOKBACK_DAYS', 21)))
 STORY_UPDATE_SIMILARITY = max(0.60, min(0.95, _env_float('STORY_UPDATE_SIMILARITY', 0.76)))
 REPLAY_BUFFER_MAX = max(20, min(2000, _env_int('REPLAY_BUFFER_MAX', 300)))
-DEFAULT_LLM_PROMPT_VERSION = 'editorial-v6-2026-09-25'
+DEFAULT_LLM_PROMPT_VERSION = 'editorial-v7-2026-10-06'
 LLM_PROMPT_VERSION = (_env('LLM_PROMPT_VERSION', DEFAULT_LLM_PROMPT_VERSION).strip()
                       or DEFAULT_LLM_PROMPT_VERSION)
 LLM_JUDGE_MAX_TOKENS = max(80, min(500, _env_int('LLM_JUDGE_MAX_TOKENS', 180)))
@@ -10003,8 +10003,12 @@ def _image_quality_info(data: Optional[bytes], url: str = '') -> dict:
             # Entropy catches blank placeholders / near-monochrome tracking GIFs
             # without expensive CV dependencies.
             try:
-                entropy = float(im.convert('L').resize((64, 64), Image.LANCZOS).entropy())
+                small = im.convert('L').resize((64, 64), Image.LANCZOS)
+                entropy = float(small.entropy())
                 info['entropy'] = round(entropy, 2)
+                # Доля заметно светлых пикселей: у чёрного титра трейлера с
+                # мелкой надписью — 3%, у логотипа на чёрном фоне — 9%.
+                info['bright_share'] = round(sum(1 for v in small.tobytes() if v > 40) / (64 * 64), 3)
                 if entropy < 2.2:
                     info['score'] -= 18
                 elif entropy >= 5.0:
@@ -10234,6 +10238,22 @@ async def _optimize_news_media(news: dict) -> None:
         if dead:
             metrics.inc('anime_bot_media_candidates_dropped_total', len(dead), {'reason': 'unavailable'})
         rows = [r for r in rows if r.get('_data')]
+    # Чёрный или пустой кадр хуже, чем пост без картинки: убираем, даже если он
+    # единственный. Сплошная заливка пуста всегда. Тёмный кадр с мелкой
+    # надписью пуст только как обложка ролика: так выглядит первый кадр
+    # трейлера, который Telegram не отдал («Media is too big»), и пост выходил
+    # «с чёрным превью, без картинки и видео». Логотип на чёрном фоне у
+    # обычной картинки по тем же цифрам похож, но это настоящая иллюстрация.
+    video_thumb = news.get('_video_thumb')
+    blank = [r for r in rows if r.get('_data') and (
+        (r.get('entropy') is not None and r['entropy'] < 1.0)
+        or (r['url'] == video_thumb and r.get('bright_share') is not None
+            and r['bright_share'] < 0.05))]
+    if blank:
+        metrics.inc('anime_bot_media_candidates_dropped_total', len(blank), {'reason': 'blank'})
+        rows = [r for r in rows if r not in blank]
+        if any(r['url'] == video_thumb for r in blank):
+            news['_video_thumb'] = None
     # Удался полноразмерный кадр из ролика — мыльное превью того же ролика лишнее.
     thumb = news.get('_video_thumb')
     if thumb and any(str(r['url']).endswith(VIDEO_FRAME_SUFFIX) for r in rows):
@@ -12071,6 +12091,9 @@ def get_telegram_channel(channel: str, label: str) -> list[dict]:
             '_thumb_only': thumb_only,
             '_video_thumb': video_thumb,      # запасной кадр, если ролик не доедет
             '_video_note': video_note,        # что случилось с видео — видно в /logs
+            # Ссылки из текста: по ним видна реклама (бот с ?start=) и анонс
+            # собственного выпуска канала (YouTube + ВК Видео сразу).
+            '_links': [str(a.get('href'))[:300] for a in text_el.select('a[href]')][:20],
         })
         if len(news_list) >= NEWS_PER_SOURCE:
             break
@@ -12497,6 +12520,15 @@ NOISE_TITLE_RULES = (
         # итальянском сервисе, русскому каналу это не новость.
         r'\bdoppiat[oaie]\b',
     )),
+    # Озвучки и дубляж: «Вышла озвучка 5 серии», «AniLibria начала озвучку»,
+    # «Объявлены актёры озвучки», «追加キャスト発表». Модераторы канала просили
+    # их не публиковать (октябрь 2026): реакций на них нет. Некролог актёра
+    # озвучки — новость, поэтому заголовки о смерти правило пропускает.
+    ('озвучка и дубляж', (
+        r'^(?!.*(?:умер|скончал|ушёл из жизни|ушел из жизни|\bdied\b|passed away|死去|逝去))'
+        r'.*(?:\bозвучк\w*|\bдубляж\w*|\bсэйю\b|\bсейю\b|\bvoice\s+cast\b|'
+        r'\b(?:english|russian)\s+dub\b|\bdub\s+cast\b|追加キャスト|キャスト(?:発表|解禁|決定)|声優(?:陣|発表|解禁))',
+    )),
     ('фан-контент', (
         r'\bfan\s?art\b',
         r'\bcosplay of the (?:day|week)\b',
@@ -12542,6 +12574,41 @@ def noise_reason(news: dict) -> str:
         if pattern.search(title):
             return reason
     if _self_promo(title, str(news.get('source') or '')):
+        return 'самореклама источника'
+    return _promo_body_reason(news)
+
+
+# Реклама и самопиар, которые заголовком себя не выдают. «👋 Привет!» и ниже
+# «Попробуй собрать всех персонажей в новой карточной игре ↖ Играть в
+# Telegram» со ссылкой на игрового бота; «Аниме Новости #53 📱 YouTube 📱 ВК
+# Видео» — выпуск собственного шоу канала-источника. Оба ушли в канал как
+# новости, модераторы просили такое не публиковать (октябрь 2026).
+_GAME_AD_RE = re.compile(
+    r'\bиграть в telegram\b|\bиграй(?:те)? в telegram\b|'
+    r'\bпопробуй(?:те)?\s+(?:собрать|сыграть|поиграть)\b|'
+    r'\bв новой (?:карточной|мобильной|браузерной) игре\b',
+    re.IGNORECASE)
+# Ссылка на бота с параметром запуска — рефералка рекламной кампании
+# (t.me/arcanum_robot?start=…), а не ссылка на источник новости.
+_BOT_START_LINK_RE = re.compile(
+    r'(?:t\.me|telegram\.me)/\w+bot(?:/[\w-]+)?\?(?:start|startapp|startgame)=', re.IGNORECASE)
+# Площадки, на которые канал выкладывает свои выпуски. Ссылка на одну —
+# обычный трейлер; на две и больше сразу — анонс собственного выпуска.
+_OWN_SHOW_PLATFORMS = (
+    re.compile(r'youtube\.com|youtu\.be', re.IGNORECASE),
+    re.compile(r'vk(?:video)?\.(?:ru|com)/(?:video|clip)', re.IGNORECASE),
+    re.compile(r'rutube\.ru', re.IGNORECASE),
+    re.compile(r'dzen\.ru', re.IGNORECASE),
+)
+
+
+def _promo_body_reason(news: dict) -> str:
+    """Реклама или самопиар по тексту и ссылкам поста. Пусто — новость."""
+    text = f"{news.get('title') or ''}\n{news.get('summary') or ''}"
+    links = ' '.join(str(link) for link in news.get('_links') or ())
+    if _GAME_AD_RE.search(text) or _BOT_START_LINK_RE.search(links):
+        return 'реклама'
+    if sum(1 for platform in _OWN_SHOW_PLATFORMS if platform.search(links)) >= 2:
         return 'самореклама источника'
     return ''
 
@@ -13665,6 +13732,22 @@ async def _prepare_news_for_send(news: dict, source: str,
         logger.info('⏸ Пост отложен: перевод не удался — %s', str(news.get('title', ''))[:60])
         metrics.inc('anime_bot_untranslated_deferred_total')
         return 'deferred'
+
+    if _tg_copy_without_rewrite(news):
+        rejected = news.get('_editorial_rejection') or news.get('_llm_judge_status') == 'rejected'
+        if not rejected and await asyncio.to_thread(_rewrite_defer_news, news):
+            logger.info('⏸ Пост канала ждёт пересказа модели: %s', str(news.get('title', ''))[:60])
+            metrics.inc('anime_bot_tg_rewrite_deferred_total')
+            return 'deferred'
+        # Модель забраковала свой пересказ или не ответила за всё ожидание:
+        # копию чужого поста не публикуем.
+        logger.info('⊘ Пост канала без пересказа модели не публикую (%s): %s',
+                    'пересказ забракован' if rejected else 'модель так и не ответила',
+                    str(news.get('title', ''))[:60])
+        metrics.inc('anime_bot_tg_copy_dropped_total')
+        if count_stats:
+            await stats.record_skipped('filtered', source)
+        return 'skipped_filter'
 
     if not apply_dedup:
         return None
@@ -15790,15 +15873,15 @@ class LLMBudgetStore:
     def can_charge(self, estimated_tokens: int) -> bool:
         with self._lock:
             self._roll_day()
-            if not feature_enabled('llm_budget') or LLM_DAILY_TOKEN_BUDGET <= 0:
+            if not feature_enabled('llm_budget') or _llm_token_budget() <= 0:
                 return True
-            return self._data['tokens'] + max(0, int(estimated_tokens)) <= LLM_DAILY_TOKEN_BUDGET
+            return self._data['tokens'] + max(0, int(estimated_tokens)) <= _llm_token_budget()
 
     def charge(self, estimated_tokens: int) -> int:
         with self._lock:
             self._roll_day()
             amount = max(0, int(estimated_tokens))
-            if feature_enabled('llm_budget') and LLM_DAILY_TOKEN_BUDGET > 0:
+            if feature_enabled('llm_budget') and _llm_token_budget() > 0:
                 self._data['tokens'] += amount
                 self._data['calls'] += 1
                 self._save()
@@ -15813,7 +15896,7 @@ class LLMBudgetStore:
     def reconcile(self, reserved: int, actual_tokens: Optional[int]) -> None:
         """Заменяет консервативную оценку фактическим usage, если он известен."""
         with self._lock:
-            if not feature_enabled('llm_budget') or LLM_DAILY_TOKEN_BUDGET <= 0:
+            if not feature_enabled('llm_budget') or _llm_token_budget() <= 0:
                 return
             if actual_tokens is None:
                 return
@@ -15825,9 +15908,9 @@ class LLMBudgetStore:
     def should_warn(self) -> bool:
         with self._lock:
             self._roll_day()
-            if LLM_DAILY_TOKEN_BUDGET <= 0 or self._data.get('warned'):
+            if _llm_token_budget() <= 0 or self._data.get('warned'):
                 return False
-            if self._data['tokens'] < int(LLM_DAILY_TOKEN_BUDGET * LLM_BUDGET_WARN_RATIO):
+            if self._data['tokens'] < int(_llm_token_budget() * LLM_BUDGET_WARN_RATIO):
                 return False
             self._data['warned'] = True
             self._save()
@@ -15836,9 +15919,9 @@ class LLMBudgetStore:
     def snapshot(self) -> dict:
         with self._lock:
             self._roll_day()
-            return dict(self._data, limit=LLM_DAILY_TOKEN_BUDGET,
-                        remaining=(max(0, LLM_DAILY_TOKEN_BUDGET - self._data['tokens'])
-                                   if LLM_DAILY_TOKEN_BUDGET > 0 else None))
+            return dict(self._data, limit=_llm_token_budget(),
+                        remaining=(max(0, _llm_token_budget() - self._data['tokens'])
+                                   if _llm_token_budget() > 0 else None))
 
 
 error_fingerprints: Optional['ErrorFingerprintStore'] = None
@@ -17983,6 +18066,9 @@ _AFFINITY_MERCH_RE = re.compile(
     r'stage play|musical|коллаб\w*[\s-]+кафе|collab\w*\s+cafe|pop-?up|бонус\w*\s+(?:для|в|за)\s+'
     r'(?:зрител|кинотеатр)|グッズ|特典|舞台|展示|コラボカフェ|ポップアップ',
     re.IGNORECASE)
+# Интервью и беседы: модераторы канала просили их поменьше (октябрь 2026).
+# Это вес, а не фильтр: новость, прозвучавшая в интервью, всё ещё может выйти.
+_AFFINITY_INTERVIEW_RE = re.compile(r'интервью|interview|インタビュー|対談', re.IGNORECASE)
 _AFFINITY_GOSSIP_RE = re.compile(
     r'\bслух|инсайдер|по данным\s+\w+(?:rpk|guy)|\brumou?r|\binsider|\breportedly\b|'
     r'касс\w*\s+сбор|предпродаж|\bbox office\b|\bpresales?\b|opening weekend|'
@@ -18005,6 +18091,8 @@ def _topic_affinity(news: dict) -> float:
         score += 1.5
     if _AFFINITY_MERCH_RE.search(text):
         score -= 4.0
+    if _AFFINITY_INTERVIEW_RE.search(text):
+        score -= 3.0
     if not anime and _AFFINITY_GOSSIP_RE.search(text):
         score -= 2.0
     return score
@@ -18023,6 +18111,11 @@ def _news_priority_score(news: dict) -> float:
             pass
     if news.get('video'):
         score += 4.0
+    elif news.get('_thumb_only'):
+        # Пост о ролике, который Telegram не отдал («Media is too big»): в
+        # канал уходила только обложка. Тот же трейлер у соседнего канала
+        # часто лежит скачиваемым mp4 — пусть выходит его версия.
+        score -= 4.0
     if news.get('images'):
         score += 2.0
     low = f"{news.get('title','')} {news.get('summary','')}".lower()
@@ -22185,12 +22278,79 @@ LLM_MIN_INTERVAL = max(0.0, min(60.0, _env_float('LLM_MIN_INTERVAL', 1.2)))
 # единая пауза для всех означает, что для одного провайдера она мала (упрёмся
 # в лимит), а для другого велика (зря простаиваем).
 LLM_PACE_MAX_SEC = max(2.0, min(300.0, _env_float('LLM_PACE_MAX_SEC', 60.0)))
+# Потолок вызовов на сутки НА ОДНОГО настроенного провайдера: общий потолок
+# считает _llm_daily_limit. Настоящий лимит держат сами провайдеры, бот лишь
+# страхуется от зацикливания.
 LLM_DAILY_LIMIT = max(1, min(10000, _env_int('LLM_DAILY_LIMIT', 900)))
 LLM_MAX_TOKENS = max(64, min(4000, _env_int('LLM_MAX_TOKENS', 700)))
 
 
+def _llm_daily_limit() -> int:
+    """Потолок вызовов на сутки: LLM_DAILY_LIMIT на каждого настроенного провайдера.
+
+    У каждого бесплатного провайдера своя суточная квота. Общий потолок
+    «40 вызовов», подобранный под один Groq, останавливал модель к середине
+    дня, сколько бы запасных ключей ни было, — и посты уходили без пересказа.
+    """
+    return min(10000, LLM_DAILY_LIMIT * max(1, len(_llm_ready_slots())))
+
+
+def _llm_token_budget() -> int:
+    """Бюджет токенов на сутки — так же на каждого настроенного провайдера; 0 — без бюджета."""
+    return LLM_DAILY_TOKEN_BUDGET * max(1, len(_llm_ready_slots()))
+
+# Дополнительные бесплатные провайдеры: ключ в переменной <ИМЯ>_API_KEY, и
+# провайдер встаёт в цепочку запасных. Трёх слотов не хватало: бесплатные
+# пулы упираются в лимит почти одновременно, и пост уходил копией чужого
+# канала без пересказа. Каждый провайдер — свой дневной лимит, поэтому
+# больше ключей — больше пересказов. Модель можно сменить <ИМЯ>_MODEL;
+# иначе берётся проверенная бесплатная из LLM_PRESETS. Порядок — по щедрости
+# бесплатного тарифа и качеству русского текста.
+_LLM_EXTRA_ENV = {
+    'gemini': (_env('GEMINI_API_KEY', ''), _env('GEMINI_MODEL', '')),
+    'groq': (_env('GROQ_API_KEY', ''), _env('GROQ_MODEL', '')),
+    'cerebras': (_env('CEREBRAS_API_KEY', ''), _env('CEREBRAS_MODEL', '')),
+    'mistral': (_env('MISTRAL_API_KEY', ''), _env('MISTRAL_MODEL', '')),
+    'openrouter': (_env('OPENROUTER_API_KEY', ''), _env('OPENROUTER_MODEL', '')),
+    'nvidia': (_env('NVIDIA_API_KEY', ''), _env('NVIDIA_MODEL', '')),
+    'orcarouter': (_env('ORCAROUTER_API_KEY', ''), _env('ORCAROUTER_MODEL', '')),
+    'tokenator': (_env('TOKENATOR_API_KEY', ''), _env('TOKENATOR_MODEL', '')),
+}
+
+
+def _llm_extra_slots(env: dict = _LLM_EXTRA_ENV) -> dict:
+    """Слоты дополнительных провайдеров: {'extra_gemini': (адрес, ключ, модель)}.
+
+    Провайдер, уже занятый основным, запасным или быстрым слотом с тем же
+    ключом, второй раз не добавляем: это были бы те же лимиты под другим именем.
+    """
+    taken = {(LLM_BASE_URL, LLM_API_KEY), (LLM_FALLBACK_BASE_URL, LLM_FALLBACK_API_KEY),
+             (LLM_FAST_BASE_URL, LLM_FAST_API_KEY)}
+    out = {}
+    for name, (key, model) in env.items():
+        key, model = str(key or '').strip(), str(model or '').strip()
+        base_url, default_model = LLM_PRESETS[name]
+        base_url = base_url.rstrip('/')
+        if key and (base_url, key) not in taken:
+            out[f'extra_{name}'] = (base_url, key, model or default_model)
+    return out
+
+
+def _llm_extra_label(slot: str) -> str:
+    """«extra_groq» → «Groq (GROQ_API_KEY)»: /llm показывает провайдера и переменную."""
+    name = slot.split('_', 1)[1]
+    return f'{name.capitalize()} ({name.upper()}_API_KEY)'
+
+
+LLM_EXTRA_SLOTS = _llm_extra_slots()
+LLM_SLOTS = LLM_SLOTS + tuple(LLM_EXTRA_SLOTS)
+LLM_SLOT_HUMAN = {**LLM_SLOT_HUMAN, **{slot: _llm_extra_label(slot) for slot in LLM_EXTRA_SLOTS}}
+
+
 def _llm_slot_env(slot: str) -> tuple[str, str, str]:
     """Адрес, ключ и модель слота ровно так, как их задали переменные."""
+    if slot in LLM_EXTRA_SLOTS:
+        return LLM_EXTRA_SLOTS[slot]
     if slot == 'fallback':
         return LLM_FALLBACK_BASE_URL, LLM_FALLBACK_API_KEY, LLM_FALLBACK_MODEL
     if slot == 'fast':
@@ -22860,10 +23020,10 @@ def _llm_unavailable_reason() -> Optional[str]:
     if _llm_disabled_runtime:
         return f'модель отключена: {_llm_disabled_reason or "ошибки подряд"}'
     if _llm_quota_left() <= 0:
-        return f'дневной лимит вызовов исчерпан ({LLM_DAILY_LIMIT})'
-    if (feature_enabled('llm_budget') and LLM_DAILY_TOKEN_BUDGET > 0
+        return f'дневной лимит вызовов исчерпан ({_llm_daily_limit()})'
+    if (feature_enabled('llm_budget') and _llm_token_budget() > 0
             and llm_budget is not None and not llm_budget.can_charge(0)):
-        return f'исчерпан дневной бюджет токенов ({LLM_DAILY_TOKEN_BUDGET})'
+        return f'исчерпан дневной бюджет токенов ({_llm_token_budget()})'
     return None
 
 
@@ -22873,7 +23033,7 @@ def _llm_quota_left() -> int:
         return 0
     today = _local_now().strftime('%Y-%m-%d')
     used = settings.llm_calls_today if settings.llm_day == today else 0
-    return max(0, LLM_DAILY_LIMIT - used)
+    return max(0, _llm_daily_limit() - used)
 
 
 def _llm_count_call() -> None:
@@ -23141,9 +23301,9 @@ def _llm_can_call() -> bool:
         return False
     if _llm_quota_left() <= 0:
         if not _llm_disabled_runtime:
-            logger.info(f"LLM: дневной лимит {LLM_DAILY_LIMIT} исчерпан — "
+            logger.info(f"LLM: дневной лимит {_llm_daily_limit()} исчерпан — "
                         f"до завтра работаю без модели")
-        _llm_note_failure('quota', f'лимит {LLM_DAILY_LIMIT} вызовов в сутки')
+        _llm_note_failure('quota', f'лимит {_llm_daily_limit()} вызовов в сутки')
         return False
     if _llm_fail_streak >= LLM_FAIL_PAUSE_AFTER:
         if not _llm_disabled_runtime:
@@ -23221,7 +23381,7 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: s
                 return None
             estimated_tokens = _estimate_llm_tokens(messages, max_tokens)
             reserved_tokens = 0
-            if (feature_enabled('llm_budget') and LLM_DAILY_TOKEN_BUDGET > 0
+            if (feature_enabled('llm_budget') and _llm_token_budget() > 0
                     and llm_budget is not None):
                 if not llm_budget.can_charge(estimated_tokens):
                     llm_budget.deny()
@@ -23230,16 +23390,16 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: s
                     if _llm_budget_exhausted_alert_day != today:
                         _llm_budget_exhausted_alert_day = today
                         _queue_admin_alert(
-                            f'💰 Дневной LLM token budget ({LLM_DAILY_TOKEN_BUDGET}) исчерпан. '
+                            f'💰 Дневной LLM token budget ({_llm_token_budget()}) исчерпан. '
                             'До следующего дня бот продолжит работу через fallback без LLM.')
-                    _llm_note_failure('token_budget', f'лимит {LLM_DAILY_TOKEN_BUDGET} токенов')
+                    _llm_note_failure('token_budget', f'лимит {_llm_token_budget()} токенов')
                     return None
                 reserved_tokens = llm_budget.charge(estimated_tokens)
                 metrics.set('anime_bot_llm_budget_tokens', llm_budget.snapshot()['tokens'])
                 if llm_budget.should_warn():
                     snap = llm_budget.snapshot()
                     _queue_admin_alert(
-                        f'💰 LLM budget использован на {int(100 * snap["tokens"] / max(1, LLM_DAILY_TOKEN_BUDGET))}%. '
+                        f'💰 LLM budget использован на {int(100 * snap["tokens"] / max(1, _llm_token_budget()))}%. '
                         f'Осталось примерно {snap["remaining"]} tokens.')
             previous = (_llm_candidate, _llm_json_mode, dict(_llm_extra_ok))
             # Списываем ДО запроса: иначе два пути успели бы выйти за лимит,
@@ -23692,11 +23852,51 @@ def _llm_outage_is_temporary() -> bool:
     # Не can_charge(0): он отвечает «можно», пока израсходовано ровно столько,
     # сколько разрешено, хотя места нет ни на один настоящий вызов. Мерка —
     # самый дешёвый вызов: один только зарезервированный ответ.
-    if (feature_enabled('llm_budget') and LLM_DAILY_TOKEN_BUDGET > 0
+    if (feature_enabled('llm_budget') and _llm_token_budget() > 0
             and llm_budget is not None
             and not llm_budget.can_charge(_estimate_llm_tokens([], LLM_MAX_TOKENS))):
         return False
     return True
+
+
+# Пост чужого Telegram-канала без пересказа модели — это копия чужого поста:
+# так в канал ушла «Красная Шапка» слово в слово (октябрь 2026), и модераторы
+# попросили, чтобы пересказывала и следила за качеством модель. Пока модель
+# недоступна, такой пост ждёт её (бесплатные лимиты обновляются за часы);
+# если не дождался или модель свой пересказ забраковала — пост не выходит.
+TG_REWRITE_REQUIRED = _env_bool('TG_REWRITE_REQUIRED', True)
+TG_REWRITE_WAIT_SEC = max(600, min(86400, _env_int('TG_REWRITE_WAIT_SEC', 4 * 3600)))
+TG_REWRITE_MAX_ATTEMPTS = max(1, min(200, _env_int('TG_REWRITE_MAX_ATTEMPTS', 48)))
+_rewrite_deferral_store = None
+
+
+def _tg_copy_without_rewrite(news: dict) -> bool:
+    """Уйдёт ли в канал копия поста Telegram-канала без пересказа модели.
+
+    Только когда модель у бота есть и ей разрешено переписывать: без неё
+    канал живёт на машинном переводе, и так задумано. Правка админа — тоже
+    пересказ.
+    """
+    return bool(TG_REWRITE_REQUIRED and str(news.get('source') or '').startswith('TG:')
+                and not news.get('_llm_text') and not news.get('_edited_text')
+                and _llm_wanted() and getattr(settings, 'llm_rewrite', False))
+
+
+def _rewrite_defer_news(news: dict) -> bool:
+    """Можно ли ещё подождать модель ради этого поста. Счёт переживает рестарт."""
+    global _rewrite_deferral_store
+    with _llm_deferral_lock:
+        key = normalize_url(str(news.get('link') or '')) or str(news.get('title') or '')[:120]
+        if not key:
+            return False
+        path = DATA_DIR / 'news_rewrite_deferrals.json'
+        if _rewrite_deferral_store is None or _rewrite_deferral_store.path != path:
+            _rewrite_deferral_store = NewsDeferralStore(path)
+        seen = _safe_nonnegative_int(news.get('_rewrite_defer_attempts', 0))
+        wait, attempts = _rewrite_deferral_store.reserve(
+            key, seen, TG_REWRITE_MAX_ATTEMPTS, TG_REWRITE_WAIT_SEC)
+        news['_rewrite_defer_attempts'] = attempts
+        return wait
 
 
 # Сколько раз и сколько времени ждать переводчика для одной новости. Google
@@ -24282,7 +24482,7 @@ def _llm_probe_blocked() -> str:
         return '⛔ <b>Модель выключена</b>\n\n' + _llm_off_reason()
     if _llm_quota_left() <= 0:
         return ('📉 <b>Дневной лимит исчерпан</b>\n\n'
-                f'Израсходовано {LLM_DAILY_LIMIT} вызовов за сутки (LLM_DAILY_LIMIT). '
+                f'Израсходовано {_llm_daily_limit()} вызовов за сутки (LLM_DAILY_LIMIT на провайдера). '
                 'Пробный запрос не отправляю, чтобы не тратить лимит завтрашнего дня.')
     return ''
 
@@ -24437,7 +24637,7 @@ async def llm_command(update, context: ContextTypes.DEFAULT_TYPE):
         # Иначе слот выглядит исчезнувшим: в очереди его нет, а почему — нигде.
         lines.append('⛔ Пропускаю (ключ отклонён): ' + ', '.join(skipped)
                      + '. Разбор — /llmclean')
-    lines.append(f'Вызовов сегодня: {used} из {LLM_DAILY_LIMIT}')
+    lines.append(f'Вызовов сегодня: {used} из {_llm_daily_limit()}')
     if _llm_disabled_runtime:
         lines.append('⚠️ Временно отключена из-за ошибок — вернётся после перезапуска')
     elif _llm_fail_streak:
@@ -26932,10 +27132,10 @@ async def reliability_command(update, context: ContextTypes.DEFAULT_TYPE):
         lines.append('  ⚪️ выключен')
     else:
         snap = llm_budget.snapshot()
-        if LLM_DAILY_TOKEN_BUDGET <= 0:
+        if _llm_token_budget() <= 0:
             lines.append('  🟢 контроль включён · token limit не задан (unlimited)')
         else:
-            lines.append(f'  {snap["tokens"]}/{LLM_DAILY_TOKEN_BUDGET} tokens · '
+            lines.append(f'  {snap["tokens"]}/{_llm_token_budget()} tokens · '
                          f'осталось {snap["remaining"]}')
             lines.append(f'  denied: {snap["denied"]} · calls: {snap["calls"]}')
 
@@ -27143,7 +27343,7 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
             lines.append('  🤖 Модель: ⚠️ отключена из-за ошибок (см. /llm)')
         else:
             lines.append(f'  🤖 Модель {html.escape(_llm_current()[2])}: '
-                         f'{llm_used} из {LLM_DAILY_LIMIT} вызовов сегодня')
+                         f'{llm_used} из {_llm_daily_limit()} вызовов сегодня')
     if DEEPL_API_KEY:
         share = used / DEEPL_MONTHLY_LIMIT * 100 if DEEPL_MONTHLY_LIMIT else 0
         lines.append(f'  📝 DeepL за {month}: {used} симв. (~{share:.0f}% лимита)')
