@@ -24864,6 +24864,13 @@ def _dotenv_comment_out(name: str) -> tuple[bool, str]:
     должна быть обратимой. Рядом кладётся копия файла — если строка была нужна,
     вернуть её можно без нас.
     """
+    # Файла нет — значит переменная пришла из панели хостинга, и убрать её
+    # можно только там. Голое «FileNotFoundError» владельцу ничего не говорит.
+    if not DOTENV_PATH.exists():
+        set_in_env = bool(os.environ.get(name))
+        return False, ('файла .env рядом с кодом нет — '
+                       + ('переменная задана в панели хостинга: удалите или поправьте её там'
+                          if set_in_env else 'и в окружении бота такой переменной нет'))
     try:
         original = DOTENV_PATH.read_text(encoding='utf-8')
     except OSError as exc:

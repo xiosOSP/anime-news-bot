@@ -147,3 +147,15 @@ class TestOnlyTheOwnerMayEditTheConfig:
         await bot.envfile_command(NS(message=NS(reply_text=AsyncMock()),
                                      effective_user=NS(id=999)), NS(args=[]))
         assert denied.await_count == 1
+
+
+def test_remove_without_file_points_to_the_hosting_panel(tmp_path, monkeypatch):
+    # Владелец получил «файл не прочитать: FileNotFoundError» и не понял, где
+    # же задана LLM_MODEL_ALTERNATES. Без файла она может быть только в панели.
+    monkeypatch.setattr(bot, 'DOTENV_PATH', tmp_path / '.env')
+    monkeypatch.setenv('LLM_MODEL_ALTERNATES', 'free-glm-5.3-flash')
+    ok, detail = bot._dotenv_comment_out('LLM_MODEL_ALTERNATES')
+    assert not ok and 'в панели хостинга' in detail
+    monkeypatch.delenv('LLM_MODEL_ALTERNATES')
+    ok, detail = bot._dotenv_comment_out('LLM_MODEL_ALTERNATES')
+    assert not ok and 'такой переменной нет' in detail
