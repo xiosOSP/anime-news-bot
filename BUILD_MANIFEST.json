@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "2059e3e0fbec9cb8dbaffc9d6427ff7607f1aa3b",
-  "generated_at_utc": "2026-10-06T09:35:20.007611+00:00",
+  "git_commit": "4e743a87041a25108b55d817354f2edd1af89361",
+  "generated_at_utc": "2026-10-06T21:19:40.074725+00:00",
   "files": {
     ".env.example": {
       "sha256": "1d45114ec32deffad57d13ba2928bab66cf9fc248bb0e9bcb2f959028479257a",
@@ -30,8 +30,8 @@
       "bytes": 33048
     },
     "anime_news_bot.py": {
-      "sha256": "12883ac5b132f0bf510bd98fc4a48da1141fbcf97f269713598b43c2efb41624",
-      "bytes": 1799134
+      "sha256": "cf23b27b2177ab0c74db65b55f725aff48a1a7083a7006bc6976fda91f4429cb",
+      "bytes": 1799820
     },
     "docs/chat-moderation.md": {
       "sha256": "1bd41c70e2028f54fca1626aeafb186b4a7f6f823a82e1172d42284c79d92151",
@@ -42,8 +42,8 @@
       "bytes": 22111
     },
     "docs/llm-providers.md": {
-      "sha256": "631224018eaa8cad36340dff059bff709f283d7a3519003390dbe669f7aebca8",
-      "bytes": 17285
+      "sha256": "519a5665bc2f46c135af22894eb6db623fec3b3fd52432f4628b58ec5f5238f9",
+      "bytes": 18860
     },
     "docs/maintenance-prompt.md": {
       "sha256": "c47bb19377e7b64daa242799e7c29bc8fb614257bb75a962d1958c756a68d77d",
@@ -62,8 +62,8 @@
       "bytes": 1999
     },
     "llm_protocol.py": {
-      "sha256": "2efe4c900ecd5efecf11f2485541b2d60415a5d44014f8210160f87b067388cb",
-      "bytes": 45621
+      "sha256": "7b2edf2f20f17c3e1091f6854ca5c7a8fde24739f8bde884443c007f3b28238e",
+      "bytes": 45850
     },
     "moderation_llm.py": {
       "sha256": "dbc16ca2e419213acc7bbfd0d62bcfaffc0eb3a46bd3df3d42f742eaf513d48d",
@@ -298,8 +298,8 @@
       "bytes": 16971
     },
     "tests/test_envfile_command.py": {
-      "sha256": "1115ac3b362835879e384ab602fcc9c1cecbf7aa85258d038052719af2baf410",
-      "bytes": 7909
+      "sha256": "270f014710bd92d6a3ef3ba7da4dc934277290cc72995cd28409f096000631a5",
+      "bytes": 8683
     },
     "tests/test_episode_parser.py": {
       "sha256": "e832ffc833166e4bc49b1ecf0011d9d8d22e3f8270d94bde256545eea30c172b",

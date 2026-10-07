@@ -33,8 +33,10 @@ LLM_PRESETS = {
     'gemini':     ('https://generativelanguage.googleapis.com/v1beta/openai',
                    'gemini-2.5-flash'),
     # Бесплатные модели у роутеров снимают без предупреждения: прежний
-    # gemma-3-27b-it:free из каталога уже пропал, и пресет вёл в никуда.
-    'openrouter': ('https://openrouter.ai/api/v1', 'google/gemma-4-31b-it:free'),
+    # gemma-3-27b-it:free из каталога пропал, а gemma-4-31b-it:free неделями
+    # отвечала 429 «temporarily rate-limited upstream» (октябрь 2026). Nemotron
+    # Super из того же бесплатного каталога — крупная модель от самой NVIDIA.
+    'openrouter': ('https://openrouter.ai/api/v1', 'nvidia/nemotron-3-super-120b-a12b:free'),
     'nvidia':     ('https://integrate.api.nvidia.com/v1', 'meta/llama-3.3-70b-instruct'),
     'cerebras':   ('https://api.cerebras.ai/v1', 'llama-3.3-70b'),
     # Каталог у роутеров свой: имя, живущее у одного, у другого даёт
