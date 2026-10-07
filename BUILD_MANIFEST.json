@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "4e743a87041a25108b55d817354f2edd1af89361",
-  "generated_at_utc": "2026-10-06T21:19:40.074725+00:00",
+  "git_commit": "217c70793b6447ea4057180b0b8c0a2f5488bbe1",
+  "generated_at_utc": "2026-10-07T14:52:03.129987+00:00",
   "files": {
     ".env.example": {
       "sha256": "1d45114ec32deffad57d13ba2928bab66cf9fc248bb0e9bcb2f959028479257a",
@@ -30,16 +30,16 @@
       "bytes": 33048
     },
     "anime_news_bot.py": {
-      "sha256": "cf23b27b2177ab0c74db65b55f725aff48a1a7083a7006bc6976fda91f4429cb",
-      "bytes": 1799820
+      "sha256": "a94a0efc9b161530822f32e07f7ff0543b560314753bd9e72836ba43d645f41d",
+      "bytes": 1802119
     },
     "docs/chat-moderation.md": {
-      "sha256": "1bd41c70e2028f54fca1626aeafb186b4a7f6f823a82e1172d42284c79d92151",
-      "bytes": 72590
+      "sha256": "b2338299309164ec952d18f4800fd028cab4d012363dac2bb7cadd3ee3651b5f",
+      "bytes": 73282
     },
     "docs/env-reference.md": {
-      "sha256": "acfb3c6b9886b5ee8591c299612e3fc02fc85d13e4d8f3cfb68d19659c3d9861",
-      "bytes": 22111
+      "sha256": "3f32ed02818f205b254dec9c0636d50138ca25829ce3394536c11009db29a705",
+      "bytes": 22168
     },
     "docs/llm-providers.md": {
       "sha256": "519a5665bc2f46c135af22894eb6db623fec3b3fd52432f4628b58ec5f5238f9",
@@ -122,8 +122,8 @@
       "bytes": 2319
     },
     "tests/conftest.py": {
-      "sha256": "a054d918626f599673422ba10c0188693dcde929f6db449f75af64c6b1ab7b4f",
-      "bytes": 9866
+      "sha256": "29ce0d494dcef162e4ac8bedab4300af6b6b4f17088ccdd586162405ecc51133",
+      "bytes": 10469
     },
     "tests/e2e/test_cli_contract.py": {
       "sha256": "d2458cec46557934a4a39383d91b6959ffb1f68793c687533a86b81e0a2b6fc8",
@@ -468,6 +468,10 @@
     "tests/test_moderation.py": {
       "sha256": "bba2114e6baef3b717641bf3bdb298f7ecb5069fba8a1e012efd3d740d01c84c",
       "bytes": 33088
+    },
+    "tests/test_moderation_16_allowed.py": {
+      "sha256": "06a39457630bab0a6dc14168b88f29d594f52913a416f3d1d577a78477b547a6",
+      "bytes": 5123
     },
     "tests/test_moderation_admins.py": {
       "sha256": "18ba2dd17aaa7ba9f51065c3e004b646f89c956009b50b66695bd70c35dbed3b",

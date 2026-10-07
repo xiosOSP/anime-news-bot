@@ -69,6 +69,17 @@ def _wipe_data_dir() -> None:
 
 
 @pytest.fixture(autouse=True)
+def _media_16_punishable(monkeypatch):
+    """Механика санкций за 16+ (чёрный список, отчёты с кнопками) осталась.
+
+    В чате 16+ разрешено (MODERATION_PUNISH_16=false), но включить наказание
+    можно одной переменной, и прежние тесты держат эту механику рабочей.
+    Новое правило проверяют tests/test_moderation_16_allowed.py явно.
+    """
+    monkeypatch.setattr(_bot, 'MODERATION_PUNISH_16', True)
+
+
+@pytest.fixture(autouse=True)
 def _no_channel_quiet_hours(monkeypatch):
     """Тесты публикации не должны зависеть от того, ночь ли сейчас.
 

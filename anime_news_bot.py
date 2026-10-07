@@ -28537,6 +28537,17 @@ MODERATION_LLM_AUTO_THRESHOLDS = {
     'toxic': .95, 'aggression': .96, 'spam': .96, 'belittling': .97,
 }
 MODERATION_MEDIA_AUTO_THRESHOLDS = {'nsfw': .90, 'spoiler_16': .92}
+# 16+ в чате разрешено: наказание и удаление — только за 18+ (решение админов,
+# октябрь 2026). Бельё, купальники и ягодицы в аниме-чате — обычный фансервис,
+# а предупреждения за них были самой шумной санкцией бота. Находку 16+, в
+# которой рядом есть признаки 18+ чуть ниже порога, по-прежнему смотрит
+# человек. MODERATION_PUNISH_16=true возвращает прежнее поведение.
+MODERATION_PUNISH_16 = _env_bool('MODERATION_PUNISH_16', False)
+
+
+def _mod_16_allowed(category: str) -> bool:
+    """Пропускать ли находку как разрешённое 16+."""
+    return category == 'spoiler_16' and not MODERATION_PUNISH_16
 MODERATION_MEDIA_SOURCE = 'локальный детектор медиа'
 MODERATION_BLOCKLIST_SOURCE = 'чёрный список медиа'
 # Исходы, после которых медиа точно осуждено и удалено: только они пополняют
@@ -28586,6 +28597,8 @@ def _mod_decide(category: str, severity: int, warns: int, streak: int = 0) -> di
         # не наказываем: до порога бот только запоминает, что так было.
         return {'action': 'none', 'human': rule['human'], 'streak': streak}
     base = rule['action']
+    if _mod_16_allowed(category):
+        return {'action': 'none', 'human': rule['human']}
     if category == 'spoiler_16':
         # Suggestive media is the noisiest local detector category. A previous
         # text warning must not turn one later 16+ detection into an hour mute.
@@ -29713,8 +29726,20 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
                 (media.reason if media else 'Локальный детектор отключён')
                 + ('; проверка будет повторена' if scheduled else ''),
                 notify=media is None or (getattr(media, 'review', True) and not scheduled))
-        elif media.category and not (media.category == 'spoiler_16' and
-                                    getattr(message, 'has_media_spoiler', False)):
+        elif (media.category == 'spoiler_16' and _mod_16_allowed(media.category)
+              and getattr(media, 'near_explicit', 0) and not human_only_text
+              and not getattr(message, 'has_media_spoiler', False)):
+            # 16+ разрешено, но рядом были признаки 18+ чуть ниже порога: это
+            # не санкция, а вопрос к человеку — как пограничная находка.
+            evidence = media_evidence(media)
+            local = dict(category='nsfw', confident=True, severity=2,
+                         confidence=float(media.score or 0.0), needs_review=True,
+                         reason=(f'{media.reason}; рядом признаки 18+ ниже порога'
+                                 + (f'; {evidence}' if evidence else '')),
+                         media=media_meta)
+            source = MODERATION_MEDIA_SOURCE
+        elif media.category and not (
+                media.category == 'spoiler_16' and getattr(message, 'has_media_spoiler', False)):
             # Ban-level text takes priority over media; both require deletion.
             if not (local and local.get('confident') and local.get('category') in MODERATION_HUMAN_ONLY):
                 evidence = media_evidence(media)
@@ -30027,6 +30052,10 @@ async def modtest_command(update, context: ContextTypes.DEFAULT_TYPE):
             detail = f'На {scan.frames} проверенных кадрах нагота не обнаружена. Это не гарантия безопасности всего файла.'
         elif scan.category == 'spoiler_16' and getattr(replied, 'has_media_spoiler', False):
             detail = 'Откровенный контент уже под спойлером — нарушения по этому признаку нет.'
+        elif _mod_16_allowed(scan.category):
+            detail = (f'{scan.reason}. Это 16+, а в чате оно разрешено: наказание только за 18+'
+                      + ('; рядом признаки 18+ ниже порога — уйдёт админу на ручную оценку'
+                         if getattr(scan, 'near_explicit', 0) else '') + '.')
         else:
             decision = _mod_decide(scan.category, 2, 0)
             state, confidence, threshold = _mod_decision_state(
