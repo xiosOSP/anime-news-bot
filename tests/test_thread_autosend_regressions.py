@@ -118,10 +118,35 @@ async def test_quiet_mode_explains_zero_sent_after_filtering(monkeypatch):
     assert notify.await_count == 1
     text = notify.await_args.args[1]
     assert 'Новых отправлено этой проверкой: 0' in text
-    assert 'Уже были опубликованы / распознаны как дубли: 2' in text
+    assert 'Уже были в ветке или канале (та же новость, часто из другого источника): 2' in text
     assert 'Отсеяно после подготовки: 1' in text
     assert 'фильтр 1' in text
     assert 'backpressure' not in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_quiet_mode_stays_silent_when_everything_was_a_duplicate(monkeypatch):
+    """Десяток каналов пересказывает одни новости: цикл из одних дублей — норма.
+
+    Отчёт о нём в тихом режиме читался как «бот ничего не отправляет»."""
+    ctx = _common_cycle_stubs(monkeypatch, [_news(i) for i in range(3)], quiet=True)
+    monkeypatch.setattr(bot, 'send_news_to_thread', AsyncMock(return_value='skipped_dup'))
+    await bot._check_news_cycle(ctx)
+    assert bot.notify_admin.await_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('waiting', [0, 4])
+async def test_report_counts_posts_already_waiting_in_thread(monkeypatch, waiting):
+    """«Отправлено 0» — про эту проверку; посты в ветке остались от прошлых."""
+    ctx = _common_cycle_stubs(monkeypatch, [_news(1)], quiet=False)
+    monkeypatch.setattr(bot, 'send_news_to_thread', AsyncMock(return_value='skipped_dup'))
+    monkeypatch.setattr(bot, 'pending_posts', SimpleNamespace(
+        _items={str(i): {} for i in range(waiting)}))
+    await bot._check_news_cycle(ctx)
+    text = bot.notify_admin.await_args.args[1]
+    line = f'В ветке ждут решения: {waiting} (от прошлых проверок)'
+    assert (line in text) is bool(waiting)
 
 
 @pytest.mark.asyncio

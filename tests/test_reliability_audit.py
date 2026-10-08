@@ -92,14 +92,15 @@ async def test_news_command_skips_rejected_links(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_quiet_mode_reports_a_repeated_skip_only_once(tmp_path, monkeypatch):
-    """Дубль по похожему заголовку в историю не пишется и приходит каждый цикл.
+    """Отсеянный кандидат может приходить каждый цикл.
 
     Письмо «0 отправлено, 1 отсеяно» — только в первый раз; новый отсев —
-    снова повод написать.
+    снова повод написать. (Дубли в тихом режиме не пишутся вовсе — это
+    проверяет tests/test_thread_autosend_regressions.py.)
     """
     items = [_news('Same story again from another source', 'https://a.test/1')]
     _cycle_stubs(monkeypatch, tmp_path, items)
-    monkeypatch.setattr(bot, 'send_news_to_thread', AsyncMock(return_value='skipped_dup'))
+    monkeypatch.setattr(bot, 'send_news_to_thread', AsyncMock(return_value='skipped_filter'))
     ctx = NS(bot=MagicMock())
     for _ in range(3):
         await bot._check_news_cycle(ctx)
