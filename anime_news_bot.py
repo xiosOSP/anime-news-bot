@@ -21558,6 +21558,7 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
             uncertain_count = 0
             skipped_count = 0
             new_skipped_count = 0        # отсеяно впервые (см. _first_seen_skip)
+            new_problem_skips = 0        # из них не дубли: дубль — норма, а не сбой
             skipped_reasons: dict[str, int] = {}
             # Потолок пачки считаем по фактическим обращениям к Telegram, а не по
             # сырым кандидатам. Старый вариант резал список ДО финальных фильтров,
@@ -21618,6 +21619,8 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                     skipped_reasons[result] = skipped_reasons.get(result, 0) + 1
                     if _first_seen_skip(news):
                         new_skipped_count += 1
+                        if result != 'skipped_dup':
+                            new_problem_skips += 1
                 # Пауза нужна только после пути, который мог обратиться к
                 # Telegram. Дубликаты/фильтр физически ничего не отправляют и
                 # раньше зря растягивали цикл на минуты.
@@ -21629,8 +21632,11 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
             # Если кандидаты были, но все отсеялись уже в send-pipeline, это тоже
             # диагностически важно: иначе quiet-mode снова выглядит как «бот молчит».
             # Но только про новые отсевы: повтор того же кандидата уже сообщён.
+            # Дубли сюда не входят: десяток каналов пересказывает одни и те же
+            # новости, и цикл, где всё найденное уже вышло, — обычный. Отчёт
+            # о нём в тихом режиме выглядел как «бот ничего не отправляет».
             has_problems = (bool(errors) or failed_count > 0 or uncertain_count > 0
-                            or (sent_count == 0 and new_skipped_count > 0))
+                            or (sent_count == 0 and new_problem_skips > 0))
             # В тихом режиме обычный успешный цикл не шумит, но 0 отправок при
             # наличии отсеянных кандидатов показываем с причинами.
             if not settings.quiet_mode or has_problems:
@@ -21639,6 +21645,11 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                     f"📊 Источники: {' | '.join(stats_lines)}\n"
                     f"🧵 Новых отправлено этой проверкой: {sent_count}\n"
                 )
+                # Счётчик выше — только эта проверка. Посты в ветке остались от
+                # прошлых, и без этой строки «0» читалось как «в ветке пусто».
+                waiting = len(pending_posts._items) if pending_posts is not None else 0
+                if waiting:
+                    message += f"🗂 В ветке ждут решения: {waiting} (от прошлых проверок)\n"
                 if backpressure_deferred:
                     message += (f"⏳ Отложено backpressure-ом: {backpressure_deferred} "
                                 f"({backpressure_level})\n")
@@ -21647,7 +21658,8 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                     filter_n = skipped_reasons.get('skipped_filter', 0)
                     detail = []
                     if dup_n:
-                        message += f"♻️ Уже были опубликованы / распознаны как дубли: {dup_n}\n"
+                        message += (f"♻️ Уже были в ветке или канале (та же новость, часто из "
+                                    f"другого источника): {dup_n}\n")
                     if filter_n:
                         detail.append(f'фильтр {filter_n}')
                     deferred_n = skipped_reasons.get('deferred', 0)
