@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 328 переменных. Почти все — точная настройка со значением
+Бот читает 329 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -429,5 +429,6 @@
 | `TOKENATOR_MODEL` | — | anime_news_bot.py |
 | `TRANSLATION_DEFER_MAX_AGE_SEC` | `21600` | anime_news_bot.py |
 | `TRANSLATION_DEFER_MAX_ATTEMPTS` | `6` | anime_news_bot.py |
+| `WESTERN_DAILY_MAX` | `3` | anime_news_bot.py |
 | `WORK_LOOKUP_PER_CYCLE` | `40` | anime_news_bot.py |
 | `WORK_LOOKUP_URL` | `https://shikimori.io/api/graphql` | anime_news_bot.py |
