@@ -397,7 +397,7 @@ def test_publishing_survives_a_broken_prefetch(llm, tmp_path, monkeypatch):
 
     monkeypatch.setattr(llm, '_llm_prefetch_queue_head', boom)
 
-    async def fake_send(_bot, news):
+    async def fake_send(_bot, news, **_kwargs):
         return 'sent'
 
     monkeypatch.setattr(llm, 'send_news', fake_send)

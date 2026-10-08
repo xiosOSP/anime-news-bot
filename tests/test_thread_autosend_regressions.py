@@ -155,7 +155,7 @@ async def test_confidence_review_exception_does_not_block_channel_queue(monkeypa
 
     await bot._check_news_cycle(ctx)
 
-    bot.send_news.assert_awaited_once_with(ctx.bot, normal)
+    bot.send_news.assert_awaited_once_with(ctx.bot, normal, channel_quota=True)
     queue.ack_done.assert_awaited_once_with(normal)
     assert bot._runtime_health['last_check_result'].startswith('channel:sent')
 

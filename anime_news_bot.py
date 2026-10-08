@@ -7741,6 +7741,8 @@ class PublishedStoryStore:
             'numbers': sorted(_story_numbers(news)),
             'rendered': str(rendered_text or '')[:1200],
             'prompt_version': str(news.get('_prompt_version') or '')[:80],
+            # По этой отметке считается суточный лимит западного кино.
+            'western': _is_western_screen(news),
             'at': datetime.now(timezone.utc).isoformat(),
         }
         with self._lock:
@@ -7748,6 +7750,24 @@ class PublishedStoryStore:
             self._items.append(row)
             self._items = self._items[-self.MAX_ITEMS:]
             self._save()
+
+    def count_since(self, flag: str, since: datetime) -> int:
+        """Сколько публикаций с отметкой ``flag`` вышло начиная с ``since``."""
+        count = 0
+        with self._lock:
+            rows = list(self._items)
+        for row in reversed(rows):
+            try:
+                at = datetime.fromisoformat(str(row.get('at') or ''))
+            except (ValueError, TypeError):
+                continue
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            if at < since:
+                break           # записи идут по времени — дальше только старше
+            if row.get(flag):
+                count += 1
+        return count
 
     def recent(self, limit: int = 30) -> list[dict]:
         """Последние опубликованные истории, новые первыми."""
@@ -13669,7 +13689,8 @@ async def _prepare_and_send_channel_post(bot: Bot, news: dict) -> bool:
 async def _prepare_news_for_send(news: dict, source: str,
                                 count_stats: bool = True, *,
                                 apply_dedup: bool = True,
-                                llm_side_effects: bool = True) -> Optional[str]:
+                                llm_side_effects: bool = True,
+                                channel_quota: bool = False) -> Optional[str]:
     """Общий конвейер подготовки поста: картинка, модель, дедупы.
 
     Живёт отдельно, потому что путей отправки два — в ветку и напрямую в канал.
@@ -13711,6 +13732,16 @@ async def _prepare_news_for_send(news: dict, source: str,
         logger.info('⏸ Пост отложен до живой модели: %s', str(news.get('title', ''))[:60])
         metrics.inc('anime_bot_llm_deferred_total')
         return 'deferred'
+
+    # Лимит только для автопубликации: тему знает модель, поэтому проверка
+    # стоит после неё. Пост, выбранный админом кнопкой, лимит не трогает.
+    if channel_quota and _western_quota_blocks(news):
+        logger.info('⊘ Лимит западного кино на сутки выбран (%d): %s',
+                    WESTERN_DAILY_MAX, str(news.get('title', ''))[:60])
+        metrics.inc('anime_bot_western_quota_skips_total')
+        if count_stats:
+            await stats.record_skipped('filtered', source)
+        return 'skipped_filter'
 
     if await asyncio.to_thread(_left_untranslated, news):
         # Модели нет, и переводчик не ответил: translate_text в этом случае
@@ -13792,7 +13823,8 @@ async def _prepare_news_for_send(news: dict, source: str,
 async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool = True,
                     bypass_history_checks: bool = False,
                     apply_dedup: bool = True,
-                    llm_side_effects: bool = True) -> str:
+                    llm_side_effects: bool = True,
+                    channel_quota: bool = False) -> str:
     """Отправляет один пост с транзакционным резервированием дедупа.
 
     ``track_history=False`` предназначен для приватного просмотра администратором:
@@ -13833,7 +13865,8 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
     try:
         skip = await _prepare_news_for_send(news, source, count_stats=is_channel,
                                             apply_dedup=apply_dedup,
-                                            llm_side_effects=llm_side_effects)
+                                            llm_side_effects=llm_side_effects,
+                                            channel_quota=channel_quota and is_channel)
         if skip:
             if track_history and ledger_claimed:
                 if skip == 'deferred':
@@ -16437,7 +16470,7 @@ class PendingPosts:
             logger.critical(f'Moderation channel_state uncertain не записан: {key}')
         return saved
 
-    def next_for_autopost(self) -> Optional[tuple[str, dict]]:
+    def next_for_autopost(self, skip=None) -> Optional[tuple[str, dict]]:
         """Самый свежий пост из ветки, ещё не ушедший в канал.
 
         Раньше брался самый старый и без предела возраста: когда ветка получает
@@ -16471,6 +16504,8 @@ class PendingPosts:
             except (TypeError, ValueError):
                 fresh_ts = ts
             if fresh_ts < cutoff:
+                continue
+            if skip is not None and skip(item['news']):
                 continue
             rank = (fresh_ts, ts)
             if best_rank is None or rank > best_rank:
@@ -18074,16 +18109,33 @@ _AFFINITY_GOSSIP_RE = re.compile(
     r'касс\w*\s+сбор|предпродаж|\bbox office\b|\bpresales?\b|opening weekend|'
     r'фотосесси|photo\s*shoot|красн\w+\s+дорожк|red carpet',
     re.IGNORECASE)
+# Корпоративная хроника студий: кто возглавил маркетинг, сколько миллиардов
+# долга и бюджета. На канале таких постов бота было по нескольку в день
+# (Skydance, октябрь 2026), реакций — ноль: подписчикам интересны тайтлы,
+# а не кадровые перестановки.
+_AFFINITY_BUSINESS_RE = re.compile(
+    r'возглав\w*|назначен\w*\s+(?:на\s+пост|руководител|глав|президент|директор)|'
+    r'генеральн\w+\s+директор|\bCEO\b|уволен\w*|увольнени|сокращени\w+\s+(?:штат|сотрудник)|'
+    r'покин\w+\s+пост|\bмлрд\b|миллиард|\bдолг\w*|слияни|поглощени|акционер|'
+    r'\bsteps?\s+down\b|\bappointed\b|\blayoffs?\b|\bmerger\b|\bacquisition\b|\bbillion\b',
+    re.IGNORECASE)
+
+
+def _news_is_anime(news: dict) -> bool:
+    """Про аниме ли новость — по вердикту модели, маркерам и профилю источника."""
+    topic = str(news.get('_llm_topic') or '')
+    source = str(news.get('source') or '')
+    general = source in GENERAL_TOPIC_SOURCES
+    return topic in ('аниме', 'манга') or looks_like_anime_news(news) or (
+        not general and not source.startswith('TG:') and topic not in ('кино', 'игры'))
 
 
 def _topic_affinity(news: dict) -> float:
     """Поправка приоритета по теме: что подписчики канала реально смотрят."""
     text = f"{news.get('title', '')}\n{str(news.get('summary') or '')[:300]}"
     topic = str(news.get('_llm_topic') or '')
-    source = str(news.get('source') or '')
-    general = source in GENERAL_TOPIC_SOURCES
-    anime = topic in ('аниме', 'манга') or looks_like_anime_news(news) or (
-        not general and not source.startswith('TG:') and topic not in ('кино', 'игры'))
+    general = str(news.get('source') or '') in GENERAL_TOPIC_SOURCES
+    anime = _news_is_anime(news)
     score = 2.0 if anime else 0.0
     if not anime and (general or topic == 'кино'):
         score -= 3.0                      # западное кино и сериалы без связи с аниме
@@ -18095,7 +18147,44 @@ def _topic_affinity(news: dict) -> float:
         score -= 3.0
     if not anime and _AFFINITY_GOSSIP_RE.search(text):
         score -= 2.0
+    if not anime and _AFFINITY_BUSINESS_RE.search(text):
+        score -= 3.0
     return score
+
+
+# Западное кино, сериалы и комиксы. Веса темы мало: 7–8 октября 2026 из 17
+# постов бота 14 были про Голливуд, Marvel и Skydance — у каждого ноль
+# реакций, у аниме по три. Вес решает, что выйдет раньше, но когда аниме в
+# очереди нет, кино шло подряд. Поэтому у такой темы ещё и суточный лимит:
+# лишнее не публикуется, и канал лучше помолчит, чем выдаст пятый пост про
+# Marvel подряд. 0 — без лимита.
+WESTERN_DAILY_MAX = max(0, min(50, _env_int('WESTERN_DAILY_MAX', 3)))
+
+
+def _is_western_screen(news: dict) -> bool:
+    """Новость про западное кино/сериал/комикс без связи с аниме.
+
+    Игры сюда не входят: про них отдельного запроса не было. Лента общей
+    тематики без вердикта модели тоже не входит — её и так отсеивает
+    off_topic_without_llm, а гадать по ней значило бы отсеять и игры."""
+    if _news_is_anime(news):
+        return False
+    topic = str(news.get('_llm_topic') or '')
+    if topic in ('кино', 'комиксы'):
+        return True
+    return str(news.get('source') or '') in GENERAL_TOPIC_SOURCES and topic not in ('игры', '')
+
+
+def _western_quota_full(now: Optional[datetime] = None) -> bool:
+    if WESTERN_DAILY_MAX <= 0 or story_history is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    return story_history.count_since('western', now - timedelta(days=1)) >= WESTERN_DAILY_MAX
+
+
+def _western_quota_blocks(news: dict) -> bool:
+    """Не выпускать ли новость: она про западное кино, а лимит на сутки выбран."""
+    return _is_western_screen(news) and _western_quota_full()
 
 
 def _news_priority_score(news: dict) -> float:
@@ -21686,7 +21775,7 @@ async def _publish_one_from_queue_locked(bot_api) -> tuple[Optional[str], Option
             break
         post_attempted = next_post
         try:
-            sent_result = await send_news(bot_api, next_post)
+            sent_result = await send_news(bot_api, next_post, channel_quota=True)
         except Exception:
             logger.exception("Отправка поста из очереди упала вне штатного обработчика")
             sent_result = 'failed'
@@ -21775,7 +21864,9 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
     if (pending_posts is None or _history_paused() or _channel_quiet_now()
             or not await _channel_autopost_due()):
         return None
-    row = pending_posts.next_for_autopost()
+    # Пост ветки модель уже разобрала, тема известна: западное кино сверх
+    # лимита пропускаем, чтобы оно не заслоняло собой следующий пост.
+    row = pending_posts.next_for_autopost(skip=_western_quota_blocks)
     if row is None:
         return None
     key, news = row
@@ -21910,6 +22001,14 @@ def _quiet_status_line() -> str:
     state = 'сейчас тихо, посты ждут утра' if _channel_quiet_now() else 'сейчас посты идут'
     return (f"🌙 Ночная тишина канала: {start // 60:02d}:{start % 60:02d}–"
             f"{end // 60:02d}:{end % 60:02d} ({state})\n")
+
+
+def _western_status_line() -> str:
+    """Строка /status: видно, почему кино перестало выходить к вечеру."""
+    if WESTERN_DAILY_MAX <= 0 or story_history is None:
+        return ''
+    used = story_history.count_since('western', datetime.now(timezone.utc) - timedelta(days=1))
+    return f"🎬 Западное кино за сутки: {used} из {WESTERN_DAILY_MAX}\n"
 
 
 def _publish_due(now: Optional[datetime] = None) -> bool:
@@ -22101,6 +22200,7 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
         f"🖼 Только с картинками: {'ВКЛ' if settings.require_image else 'ВЫКЛ'}\n"
         f"📦 В очереди: {queue_size}\n"
         f"{_quiet_status_line()}"
+        f"{_western_status_line()}"
         f"{_scheduled_status_block(context)}"
         f"В истории ссылок: {len(sent_links._set)}\n"
         f"Канал: {CHANNEL_ID}\n"

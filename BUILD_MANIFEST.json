@@ -2,9 +2,17 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "217c70793b6447ea4057180b0b8c0a2f5488bbe1",
-  "generated_at_utc": "2026-10-07T14:52:03.129987+00:00",
+  "git_commit": "9160f286f06c8c71326b5d63ce194f1fc3489c83",
+  "generated_at_utc": "2026-10-08T10:42:11.572762+00:00",
   "files": {
+    ".claude/skills/find-skills/SKILL.md": {
+      "sha256": "c00eeea0e13e74fe4a9d84ba0a8542205a1b736d65f13134fe1a6647eb14976f",
+      "bytes": 5472
+    },
+    ".claude/skills/find-skills/SOURCE.md": {
+      "sha256": "ad491a4e46abd0570286f6547dffe18cba2f669e524ad67846f4d78c43e7f52d",
+      "bytes": 695
+    },
     ".env.example": {
       "sha256": "1d45114ec32deffad57d13ba2928bab66cf9fc248bb0e9bcb2f959028479257a",
       "bytes": 23880
@@ -26,20 +34,20 @@
       "bytes": 33
     },
     "README.md": {
-      "sha256": "5d08862512bc66598027b5d754ee11edac8e5762edcd42da5b2ebdd4cef06259",
-      "bytes": 33048
+      "sha256": "53181408006184f8c406660795ebbf51b56d5821f2e27bf90a54cb784584f76e",
+      "bytes": 33970
     },
     "anime_news_bot.py": {
-      "sha256": "a94a0efc9b161530822f32e07f7ff0543b560314753bd9e72836ba43d645f41d",
-      "bytes": 1802119
+      "sha256": "cf25cd98eefa94d2652a931d521dd556d2484b5921b39d6fda30a3b32b4fc9d5",
+      "bytes": 1808241
     },
     "docs/chat-moderation.md": {
       "sha256": "b2338299309164ec952d18f4800fd028cab4d012363dac2bb7cadd3ee3651b5f",
       "bytes": 73282
     },
     "docs/env-reference.md": {
-      "sha256": "3f32ed02818f205b254dec9c0636d50138ca25829ce3394536c11009db29a705",
-      "bytes": 22168
+      "sha256": "c50a8485bca01fc5fa06a9a2ada8702d71c62acf4aa82f43705d2cac023d3e68",
+      "bytes": 22218
     },
     "docs/llm-providers.md": {
       "sha256": "519a5665bc2f46c135af22894eb6db623fec3b3fd52432f4628b58ec5f5238f9",
@@ -366,8 +374,8 @@
       "bytes": 11951
     },
     "tests/test_llm_batching.py": {
-      "sha256": "cb71fd1f36469f8bd673ef3c4a5c25845045715346dd15c75f210a9f1004bb0d",
-      "bytes": 26187
+      "sha256": "a5be6802ca27c1e5d3f1fef86fd6a04be5636953d3f2d2a2ab212560b0165d63",
+      "bytes": 26198
     },
     "tests/test_llm_defer.py": {
       "sha256": "a38a572b82edd9623182b8b97de53e117ff6e8a5d36657e1782789b0f487ca0a",
@@ -786,8 +794,8 @@
       "bytes": 4156
     },
     "tests/test_thread_autosend_regressions.py": {
-      "sha256": "b951f52553f0855e538f328c6c7bf6279ce8ee37803a349965ac2a61f017cd0e",
-      "bytes": 13224
+      "sha256": "6775eda40035f5358b9fdb11d07a806c9146600548bb0e70992c33416b66308f",
+      "bytes": 13244
     },
     "tests/test_verification_media_stage12.py": {
       "sha256": "4340fe80889e28bd34280ce3c5dabcf5a16f2f0a0bc83e00eb325476c3eacd4a",
@@ -804,6 +812,10 @@
     "tests/test_video_quality.py": {
       "sha256": "ff7c7274557aa19d9ffbbdbf92dc75f679144a08e5a0e8d2c7e99ef07dfab094",
       "bytes": 10257
+    },
+    "tests/test_western_quota.py": {
+      "sha256": "ed72a5c44dc3d6cebda8d2e76285234ec5e7b132a0cd2b46927d7bf4fc6d6b22",
+      "bytes": 10650
     },
     "tests/test_work_identity.py": {
       "sha256": "8116c8fda273ea64dc9eeb901d06ece846089553be381acdc3aa872215cd17f8",
