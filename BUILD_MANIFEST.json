@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "7ac5615a1332d30d34f20ee6f78c26d565bf62ea",
-  "generated_at_utc": "2026-10-09T16:39:58.148531+00:00",
+  "git_commit": "044d92321d3546d6f09722b178f7692c9b4ff69d",
+  "generated_at_utc": "2026-10-09T18:10:07.403111+00:00",
   "files": {
     ".claude/skills/find-skills/SKILL.md": {
       "sha256": "c00eeea0e13e74fe4a9d84ba0a8542205a1b736d65f13134fe1a6647eb14976f",
@@ -50,8 +50,8 @@
       "bytes": 22218
     },
     "docs/llm-providers.md": {
-      "sha256": "519a5665bc2f46c135af22894eb6db623fec3b3fd52432f4628b58ec5f5238f9",
-      "bytes": 18860
+      "sha256": "e9e0bb8f3388b76b4cedb8ac885b828ffc5971430864cec9c49dae7c57787587",
+      "bytes": 19350
     },
     "docs/maintenance-prompt.md": {
       "sha256": "c47bb19377e7b64daa242799e7c29bc8fb614257bb75a962d1958c756a68d77d",
@@ -70,8 +70,8 @@
       "bytes": 1999
     },
     "llm_protocol.py": {
-      "sha256": "1bf55eb60afea12b1656e606a5dba39c50792fe1a3d14778aa77e41c0e47df28",
-      "bytes": 46630
+      "sha256": "fac1170b739ee1af16ebe0254f83f661092effb507cc7cd474a613b48623a267",
+      "bytes": 46781
     },
     "moderation_llm.py": {
       "sha256": "dbc16ca2e419213acc7bbfd0d62bcfaffc0eb3a46bd3df3d42f742eaf513d48d",
@@ -446,8 +446,8 @@
       "bytes": 10922
     },
     "tests/test_llmmodel_argument.py": {
-      "sha256": "11e95c9a1b27a7312c260cd5d363bcfd8d2856e3dcec18c7238e89edb06a7baf",
-      "bytes": 5250
+      "sha256": "703b271ced3c6773ff8f6d36eaf31339e95a4842f24106ed0cf5a65b3d3db086",
+      "bytes": 5270
     },
     "tests/test_local_topic_filter.py": {
       "sha256": "eed9bbad51ddf52255e7bdf94474e60605a94f5f7f5032bf2d1ec981a0264528",
@@ -670,8 +670,8 @@
       "bytes": 13726
     },
     "tests/test_post_quality_20261009.py": {
-      "sha256": "91a90775408224e7c6a9a4e8ed8c27de9f0f95de069fe9dbd2442714630da1e4",
-      "bytes": 6844
+      "sha256": "732a66019e0eaff2737e3228bccc8b6656898e2f363bf428587babafcb0fc764",
+      "bytes": 7301
     },
     "tests/test_post_text.py": {
       "sha256": "3670e109204aa34db33d82d04d6589645e01df5db100e3bd61d748539de2701e",

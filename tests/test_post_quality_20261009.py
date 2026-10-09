@@ -143,3 +143,12 @@ def test_news_verbs_do_not_count_as_new_content():
     """«Вышел» и «представлен» — дежурные слова заметки, не новый факт."""
     assert bot._too_similar('Вышел тизер аниме «Ледяная стена»',
                             'Представлен тизер аниме «Ледяная стена»')
+
+
+# ---------- пресет Gemini работает для нового ключа ----------
+
+def test_gemini_preset_is_open_to_new_keys():
+    """С сентября 2026 модели 2.5 отдаются только тем, кто ими уже пользовался:
+    новый GEMINI_API_KEY на пресете 2.5 Flash получал бы отказ."""
+    _url, model = bot.LLM_PRESETS['gemini']
+    assert not model.startswith('gemini-2.')
