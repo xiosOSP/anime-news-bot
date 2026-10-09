@@ -65,7 +65,7 @@ class TestAWordIsNotAModelName:
         assert '❌' in report and 'сброс' in report
 
     @pytest.mark.parametrize('model', [
-        'openai/gpt-oss-120b', 'mistral-small-latest', 'gemini-2.5-flash',
+        'openai/gpt-oss-120b', 'mistral-small-latest', 'gemini-2.5-flash', 'gemini-3.8-flash',
         'deepseek/deepseek-v4-flash-free', 'google/gemma-4-31b-it:free',
         'meta/llama-3.3-70b-instruct',
     ])
