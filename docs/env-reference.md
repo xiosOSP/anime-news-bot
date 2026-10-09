@@ -188,7 +188,7 @@
 | `LLM_PACE_MAX_SEC` | `60.0` | anime_news_bot.py |
 | `LLM_PRIMARY_RETRY_MAX_SEC` | — | anime_news_bot.py |
 | `LLM_PRIMARY_RETRY_SEC` | `1800` | anime_news_bot.py |
-| `LLM_PROMPT_VERSION` | `editorial-v7-2026-10-06` | anime_news_bot.py |
+| `LLM_PROMPT_VERSION` | `editorial-v8-2026-10-09` | anime_news_bot.py |
 | `LLM_PROVIDER` | — | anime_news_bot.py |
 | `LLM_TIMEOUT` | `30` | anime_news_bot.py |
 

@@ -739,7 +739,7 @@ GOLDEN_DATASET_FILE = Path(__file__).with_name('golden') / 'editorial_cases.json
 STORY_UPDATE_LOOKBACK_DAYS = max(1, min(90, _env_int('STORY_UPDATE_LOOKBACK_DAYS', 21)))
 STORY_UPDATE_SIMILARITY = max(0.60, min(0.95, _env_float('STORY_UPDATE_SIMILARITY', 0.76)))
 REPLAY_BUFFER_MAX = max(20, min(2000, _env_int('REPLAY_BUFFER_MAX', 300)))
-DEFAULT_LLM_PROMPT_VERSION = 'editorial-v7-2026-10-06'
+DEFAULT_LLM_PROMPT_VERSION = 'editorial-v8-2026-10-09'
 LLM_PROMPT_VERSION = (_env('LLM_PROMPT_VERSION', DEFAULT_LLM_PROMPT_VERSION).strip()
                       or DEFAULT_LLM_PROMPT_VERSION)
 LLM_JUDGE_MAX_TOKENS = max(80, min(500, _env_int('LLM_JUDGE_MAX_TOKENS', 180)))
@@ -12614,6 +12614,33 @@ NOISE_SOURCE_TAGS = {
 }
 
 
+# Юбилеи тайтлов и дни рождения героев посреди заголовка: «Четыре года назад
+# вышла «Синяя тюрьма»», «11 лет со дня премьеры «Паразита»», «Сегодня день
+# рождения Мурасакибары». Правила выше ловят только начало заголовка и
+# английские обороты, и такие посты уходили в канал с нулём реакций.
+_NUM_WORD = (r'(?:\d{1,3}|один|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять|'
+             r'одиннадцать|двенадцать|пятнадцать|двадцать|двадцать\s+пять|тридцать)')
+_ANNIVERSARY_SOFT_RE = re.compile(
+    r'\b' + _NUM_WORD + r'\s+(?:год|года|лет)\s+(?:со\s+дня|с\s+(?:момента|премьеры|выхода|'
+    r'релиза|начала|дебюта|старта)|назад)\b|'
+    r'\b(?:исполнил(?:ось|ся|ась)|исполняется|стукнуло)\s+' + _NUM_WORD + r'\s+(?:год|года|лет)\b|'
+    r'\bгодовщин\w*|\b\d{1,3}-?лети[еюя]\b|'
+    r'\b(?:сегодня|отмечает|празднует)\s+(?:свой\s+)?(?:день\s+рождени|юбилей)|'
+    r'\bс\s+(?:днём|днем)\s+рождения\b|'
+    r'\bhappy\s+birthday\b|\b\d{1,3}(?:st|nd|rd|th)\s+anniversary\b|\bturns\s+\d{1,3}\b|'
+    r'\bcelebrat\w*\s+(?:its\s+)?\d{1,3}(?:\s+years|th)\b',
+    re.IGNORECASE)
+# Юбилей как повод для настоящего события — уже новость: «К 10-летию аниме
+# выйдет фильм», «20th Anniversary project announced».
+_ANNIVERSARY_EVENT_RE = re.compile(
+    r'анонс|объяв|announc|reveal|unveil|трейлер|trailer|тизер|teaser|выйдет|выпуст|'
+    r'покажут|проведут|коллаборац|collab|выставк|exhibit|концерт|concert|'
+    # «Happy Birthday to You!» — название тайтла, а «получит сиквел» — событие.
+    r'sequel|сиквел|продолжени|экраниз|adaptation|\bseason\b|сезон|'
+    r'\bwill\s+(?:release|get|air|launch)',
+    re.IGNORECASE)
+
+
 def noise_reason(news: dict) -> str:
     """Чем заголовок выдаёт себя как не-новость. Пусто — новость.
 
@@ -12630,6 +12657,8 @@ def noise_reason(news: dict) -> str:
     for reason, pattern in _NOISE_TITLE_RE:
         if pattern.search(title):
             return reason
+    if _ANNIVERSARY_SOFT_RE.search(title) and not _ANNIVERSARY_EVENT_RE.search(title):
+        return 'годовщина и ностальгия'
     if _self_promo(title, str(news.get('source') or '')):
         return 'самореклама источника'
     return _promo_body_reason(news)
@@ -16378,6 +16407,95 @@ def _release_publish_reservations(news: dict) -> None:
 
 
 PENDING_POSTS_FILE = DATA_DIR / 'pending_posts.json'
+
+
+# ============== ПОСТЫ АДМИНОВ В КАНАЛЕ ==============
+# Админы публикуют в канал и сами, мимо бота. Бот о таких постах не знал, и
+# через час-другой выкладывал ту же новость из другого источника: за одно
+# утро октября 2026 так повторились анонс «Боксёра», перенос аниме по Ghost
+# of Tsushima и трейлер январской премьеры. Теперь пост админа попадает в ту
+# же память, что и пост самого бота, и дедуп видит его как уже вышедший.
+MANUAL_POST_SOURCE = 'Канал: пост админа'
+
+
+def _manual_post_news(text: str, link: str) -> Optional[dict]:
+    """Пост админа в виде новости для дедупа; None — если в нём нет новости.
+
+    Пожелания доброго утра и посты из одной картинки дедупу ничего не дают:
+    короткая строка без трёх значимых слов совпала бы с чем угодно.
+    """
+    title, summary = _tg_title_and_summary(text, '', MANUAL_POST_SOURCE)
+    title = re.sub(r'\s+', ' ', str(title or '')).strip()
+    if len(re.findall(r'[A-Za-zА-Яа-яЁё0-9]{3,}', title)) < 3:
+        return None
+    return {'title': title[:300], 'summary': str(summary or '')[:1500], 'link': link,
+            'source': MANUAL_POST_SOURCE, 'images': [], 'video': ''}
+
+
+def _remember_manual_channel_post(news: dict, photo_fingerprint: str = '',
+                                  *, lookup_budget: int = 3) -> None:
+    """Записывает пост админа во все хранилища, по которым бот ищет повторы.
+
+    Синхронная: тайтл сверяется с Shikimori по сети, поэтому вызывать из
+    потока. Сеть не ответила — пост всё равно запомнен по словам заголовка.
+    """
+    try:
+        _annotate_work_keys([news], budget=lookup_budget)
+    except Exception as e:
+        logger.warning(f'Пост админа: тайтл не опознан ({type(e).__name__}: {e})')
+    if feature_enabled('story_registry') and story_registry is not None:
+        memory = story_registry.observe(news, [MANUAL_POST_SOURCE], [news.get('link') or ''])
+        news['_story_registry_id'] = memory.get('registry_id')
+        story_registry.mark_delivery(news, published=True)
+    if published_texts is not None:
+        published_texts.add(news['title'])
+    if image_hashes is not None:
+        if photo_fingerprint:
+            image_hashes.add(photo_fingerprint, news['title'])
+        video_id = _youtube_id(f"{news.get('title', '')}\n{news.get('summary', '')}")
+        if video_id:
+            image_hashes.add(f'v:{video_id}', news['title'])
+    logger.info(f"📌 Пост админа в канале запомнен для дедупа: {news['title'][:70]}")
+
+
+def _is_our_channel(chat) -> bool:
+    if chat is None:
+        return False
+    if isinstance(CHANNEL_ID, int):
+        return int(getattr(chat, 'id', 0) or 0) == CHANNEL_ID
+    username = str(getattr(chat, 'username', '') or '').casefold()
+    return bool(username) and username == str(CHANNEL_ID).lstrip('@').casefold()
+
+
+async def manual_channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Новый пост в канале, сделанный не ботом: Telegram не присылает боту его
+    собственные сообщения, поэтому всё, что сюда пришло, — от людей."""
+    message = getattr(update, 'channel_post', None)
+    if message is None or not _is_our_channel(getattr(message, 'chat', None)):
+        return
+    text = str(getattr(message, 'text', None) or getattr(message, 'caption', None) or '')
+    username = str(getattr(getattr(message, 'chat', None), 'username', '') or '')
+    message_id = int(getattr(message, 'message_id', 0) or 0)
+    link = (f'https://t.me/{username}/{message_id}' if username
+            else f'tg-channel:{getattr(message.chat, "id", "")}/{message_id}')
+    news = _manual_post_news(text, link)
+    if news is None:
+        return
+    fingerprint = ''
+    photos = getattr(message, 'photo', None) or ()
+    if photos and image_hashes is not None:
+        # Картинку админа запоминаем так же, как свою: тот же постер с другого
+        # сайта под другим заголовком иначе прошёл бы мимо текстового дедупа.
+        try:
+            tg_file = await context.bot.get_file(photos[-1].file_id)
+            data = bytes(await tg_file.download_as_bytearray())
+            fingerprint = await asyncio.to_thread(_image_fingerprint, data) or ''
+        except Exception as e:
+            logger.warning(f'Пост админа: картинка не скачана ({type(e).__name__}: {e})')
+    try:
+        await asyncio.to_thread(_remember_manual_channel_post, news, fingerprint)
+    except Exception:
+        logger.exception('Пост админа не запомнен для дедупа')
 
 
 class PendingPosts:
@@ -23873,11 +23991,15 @@ async def _moderation_classify(chat_id: int, text: str, *, message_id=None,
 _ECHO_STOP = {
     # служебные
     'etogo', 'kotor', 'takje', 'uje', 'godu', 'goda', 'budet', 'budut', 'chto',
-    'kak', 'pri', 'poka', 'tolko', 'the', 'and', 'for', 'with', 'from', 'that',
+    'kak', 'pri', 'poka', 'tolko', 'the', 'and', 'for', 'with', 'from', 'that', 'cto',
     # дежурные глаголы и обороты новостной заметки
-    'preme', 'sosto', 'viide', 'vishe', 'vishl', 'anons', 'opubl', 'bil',
-    'obavl', 'soobs', 'izves', 'stalo', 'stane', 'poluc', 'pokaj', 'predst',
+    'preme', 'sosto', 'viide', 'anons', 'opubl', 'bil',
+    'obavl', 'soobs', 'izves', 'stalo', 'stane', 'poluc', 'pokaj', 'pokaz',
     'treko', 'anime', 'novii', 'nova', 'novoe',
+    # Основы — пять букв уже после транслитерации (ш→s, ч→c): прежние «vishe»,
+    # «predst» и «chto» не совпадали ни с одним словом, и «Вышел тизер» с
+    # «Представлен тизер» считались разными фразами.
+    'visel', 'visla', 'visli', 'vislo', 'preds', 'raskr',
 }
 
 
@@ -23912,9 +24034,31 @@ def _drop_repetitive_paragraphs(title: str, paragraphs: list) -> list:
         if _too_similar(seen, para):
             logger.info(f"✂️ Абзац-повтор убран: {para[:55]}")
             continue
+        # Повтор чаще прячется в первой фразе абзаца, а не во всём абзаце:
+        # «Показан тизер 2 сезона X. Премьера в 2027 году» — вторая фраза новая,
+        # и абзац целиком сохранялся вместе с пересказом заголовка. Проверяем
+        # и по фразам; фраза с новым словом или числом остаётся.
+        sentences = _SENTENCE_SPLIT_RE.split(para.strip())
+        if len(sentences) > 1:
+            fresh = []
+            for sentence in sentences:
+                if _too_similar(seen, sentence):
+                    logger.info(f"✂️ Фраза-повтор убрана: {sentence[:55]}")
+                    continue
+                fresh.append(sentence)
+                seen += '\n' + sentence
+            if not fresh:
+                continue
+            para = ' '.join(fresh)
+        else:
+            seen += '\n' + para
         kept.append(para)
-        seen += '\n' + para
     return kept
+
+
+# Граница фразы: знак конца и заглавная буква, цифра или кавычка дальше.
+# Сокращения вроде «т. е.» продолжаются строчной буквой и не режутся.
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?…])\s+(?=[«"A-ZА-ЯЁ0-9])')
 
 
 def _too_similar(a: str, b: str) -> bool:
@@ -32927,6 +33071,12 @@ def main():
         group=-1,
     )
     app.add_handler(MessageHandler(reply_filter, reply_button_handler))
+    # Посты админов в канале — в память дедупа. Своя группа: обработчики
+    # выше канальные посты пропускают, а группа модерации их и не ждёт.
+    app.add_handler(
+        MessageHandler(filters.UpdateType.CHANNEL_POST, manual_channel_post_handler, block=False),
+        group=2,
+    )
     # Модерация чата: группа 1 — после всех служебных обработчиков, чтобы
     # команды и кнопки бота обрабатывались раньше и не попадали под проверку.
     # Пропускаем ВСЕ сообщения группы, а не только текстовые: флуд стикерами и
