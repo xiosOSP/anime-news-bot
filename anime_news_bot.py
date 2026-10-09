@@ -369,6 +369,16 @@ def _quarantine_unreadable_file(path: Path, reason: str, what: str, *, alert: bo
     return name
 
 
+def _fresh_store_counter() -> int:
+    """Стартовый счётчик ключей после потери файла хранилища.
+
+    Ключи постов — растущие числа, и они уже вшиты в кнопки старых сообщений.
+    Секунды с эпохи заведомо больше любого прежнего счётчика, поэтому новые
+    ключи не совпадут со старыми кнопками.
+    """
+    return int(time.time())
+
+
 # Отступы — только для маленьких файлов, которые читают глазами (настройки,
 # правила). Большие хранилища с indent=2 писались медленным кодировщиком на
 # чистом Python и были в 1,5–3 раза крупнее.
@@ -3679,16 +3689,21 @@ def normalize_url(url: str) -> str:
 
 
 # ============== HTTP RETRY HELPER ==============
-def _parse_retry_after(value) -> Optional[float]:
+def _parse_retry_after(value, cap: Optional[float] = None) -> Optional[float]:
     """Парсит Retry-After как секунды или HTTP-date и ограничивает ожидание.
 
     Серверы встречаются обоих типов. Никогда не разрешаем одному ответу
     заморозить worker дольше HTTP_RETRY_MAX_DELAY.
+
+    cap — свой потолок для тех, кто не спит на месте, а только помечает
+    «не ходить до такого-то времени» (пауза модели). Им 30 секунд мало:
+    бесплатный провайдер на исчерпанной суточной квоте просит ждать часы.
     """
     if value is None:
         return None
+    limit = HTTP_RETRY_MAX_DELAY if cap is None else float(cap)
     try:
-        return min(HTTP_RETRY_MAX_DELAY, max(0.0, float(value)))
+        return min(limit, max(0.0, float(value)))
     except (TypeError, ValueError):
         pass
     try:
@@ -3696,7 +3711,7 @@ def _parse_retry_after(value) -> Optional[float]:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         seconds = (dt - datetime.now(timezone.utc)).total_seconds()
-        return min(HTTP_RETRY_MAX_DELAY, max(0.0, seconds))
+        return min(limit, max(0.0, seconds))
     except (TypeError, ValueError, OverflowError):
         return None
 
@@ -4172,7 +4187,11 @@ class SentLinksStore:
                 }
             if self._purge_transient_unlocked() or dropped_claims:
                 self._save()
-        except json.JSONDecodeError as e:
+        # ValueError, а не только JSONDecodeError: битые байты (обрыв записи
+        # при сбое диска) дают UnicodeDecodeError ещё до разбора JSON. Он не
+        # наследник JSONDecodeError, вылетал из конструктора, и бот падал при
+        # каждом старте, так и не попробовав копию .lastgood.
+        except ValueError as e:
             if restoring:
                 # Испорчена и копия: второй раз не восстанавливаем, встаём на паузу.
                 _quarantine_unreadable_file(self.path, f'{type(e).__name__}: {e}',
@@ -4625,7 +4644,9 @@ class PostQueue:
                         str(raw_inflight['news'].get('title', ''))[:80],
                     )
                     self._save()
-        except (json.JSONDecodeError, TypeError) as e:
+        # ValueError покрывает и JSONDecodeError, и UnicodeDecodeError от битых
+        # байтов: без него очередь роняла запуск бота вместо карантина файла.
+        except (ValueError, TypeError) as e:
             self._items = []
             self._inflight = None
             _quarantine_unreadable_file(self.path, f'{type(e).__name__}: {e}', 'Очередь публикаций')
@@ -5379,13 +5400,27 @@ class BotSettings:
 
     @property
     def llm_primary_slot(self) -> str:
-        raw = str(self._data.get('llm_primary_slot') or '').strip().lower()
-        return raw if raw in ('primary', 'fallback', 'fast') else ''
+        return self._clean_llm_slot(self._data.get('llm_primary_slot'))
+
+    @staticmethod
+    def _clean_llm_slot(value) -> str:
+        """Имя слота модели или пусто.
+
+        Слоты дополнительных провайдеров (extra_gemini и т. п.) тоже годятся:
+        /llmmodel показывает для них кнопки, а раньше выбор молча сохранялся
+        пустой строкой и основной провайдер не менялся. Есть ли такой слот на
+        самом деле, проверяет _llm_primary_slot по LLM_SLOTS.
+        """
+        raw = str(value or '').strip().lower()
+        if raw in ('primary', 'fallback', 'fast'):
+            return raw
+        if re.fullmatch(r'extra_[a-z0-9]{1,32}', raw):
+            return raw
+        return ''
 
     @llm_primary_slot.setter
     def llm_primary_slot(self, value: str) -> None:
-        raw = str(value or '').strip().lower()
-        self._data['llm_primary_slot'] = raw if raw in ('primary', 'fallback', 'fast') else ''
+        self._data['llm_primary_slot'] = self._clean_llm_slot(value)
         self.save()
 
     @property
@@ -8485,7 +8520,9 @@ class AniListClient:
             if isinstance(data, dict):
                 self._cache = {str(k): v for k, v in data.items() if isinstance(v, dict)}
             logger.info(f"AniList cache loaded: {len(self._cache)} entries")
-        except (json.JSONDecodeError, OSError) as e:
+        # ValueError: битые байты в кеше дают UnicodeDecodeError — кеш просто
+        # начинаем заново, а не роняем запуск.
+        except (ValueError, OSError) as e:
             logger.warning(f"Не удалось прочитать AniList кеш: {e}")
             self._cache = {}
 
@@ -14029,10 +14066,20 @@ class CustomSources:
                     and isinstance(it.get('value'), str) and it.get('value')
                     and isinstance(it.get('label'), str) and it.get('label')
                 ]
-        except (OSError, ValueError, KeyError, TypeError) as e:
-            logger.warning(f"custom_sources не загружен: {e}")
+        except OSError as e:
+            self._items = []
+            self._read_failed = True
+            logger.error(f"custom_sources не прочитан: {e}; запись отключена")
+        except (ValueError, KeyError, TypeError) as e:
+            # Источники, добавленные админом через /addsource, нигде больше не
+            # записаны: молча затереть файл — значит потерять их насовсем.
+            self._items = []
+            _quarantine_unreadable_file(self.path, f'{type(e).__name__}: {e}', 'Свои источники')
 
     def _save(self) -> None:
+        if getattr(self, '_read_failed', False):
+            logger.error('custom_sources не сохранён: файл не прочитан при старте')
+            return
         try:
             _atomic_write_json(self.path, self._items)
         except OSError as e:
@@ -14953,10 +15000,24 @@ class ScheduledPosts:
                     logger.warning('Отложка: найдены посты с неопределённым результатом '
                                    'после аварийного рестарта; авто-повтор отключён')
                     self._save()
-        except (OSError, ValueError, TypeError) as e:
-            logger.warning(f"scheduled_posts не загружен: {e}")
+        except OSError as e:
+            # Файл есть, но не читается (права, диск): пустая отложка с
+            # последующей записью затёрла бы все запланированные посты.
+            self._items = {}
+            self._read_failed = True
+            logger.error(f"scheduled_posts не прочитан: {e}; запись отключена")
+        except (ValueError, TypeError) as e:
+            # Битый файл раньше молча становился пустым, а первая же новая
+            # отложка перезаписывала оригинал — все запланированные посты
+            # пропадали без следа. Теперь файл уходит в сторону с копией и
+            # предупреждением, как у очереди и истории.
+            self._items = {}
+            _quarantine_unreadable_file(self.path, f'{type(e).__name__}: {e}', 'Отложка')
+            self._counter = _fresh_store_counter()
 
     def _save(self) -> bool:
+        if getattr(self, '_read_failed', False):
+            return False
         try:
             _atomic_write_json(self.path, {'schema_version': 1, 'counter': self._counter, 'items': self._items})
             return True
@@ -16354,10 +16415,21 @@ class PendingPosts:
                 if recovered:
                     logger.warning('Модерация: найдены ручные публикации с неизвестным результатом')
                     self._save()
-        except (OSError, ValueError, TypeError) as e:
-            logger.warning(f"pending_posts не загружен: {e}")
+        except OSError as e:
+            self._items = {}
+            self._read_failed = True
+            logger.error(f"pending_posts не прочитан: {e}; запись отключена")
+        except (ValueError, TypeError) as e:
+            self._items = {}
+            _quarantine_unreadable_file(self.path, f'{type(e).__name__}: {e}', 'Посты в ветке')
+            # Счётчик не с нуля: под старыми постами в ветке остались кнопки
+            # pub:1, pub:2… С нуля новый пост получил бы тот же ключ, и старая
+            # кнопка «В канал» опубликовала бы чужую новость.
+            self._counter = _fresh_store_counter()
 
     def _save(self) -> bool:
+        if getattr(self, '_read_failed', False):
+            return False
         try:
             _atomic_write_json(self.path, {'schema_version': 1, 'counter': self._counter, 'items': self._items})
             return True
@@ -18113,10 +18185,13 @@ _AFFINITY_GOSSIP_RE = re.compile(
 # долга и бюджета. На канале таких постов бота было по нескольку в день
 # (Skydance, октябрь 2026), реакций — ноль: подписчикам интересны тайтлы,
 # а не кадровые перестановки.
+# «Долг» — только формами самого слова: широкое «долг\w*» ловило
+# «долгожданный», «долгий», «долго» и снимало баллы с обычных трейлеров.
 _AFFINITY_BUSINESS_RE = re.compile(
     r'возглав\w*|назначен\w*\s+(?:на\s+пост|руководител|глав|президент|директор)|'
     r'генеральн\w+\s+директор|\bCEO\b|уволен\w*|увольнени|сокращени\w+\s+(?:штат|сотрудник)|'
-    r'покин\w+\s+пост|\bмлрд\b|миллиард|\bдолг\w*|слияни|поглощени|акционер|'
+    r'покин\w+\s+пост|\bмлрд\b|миллиард|\bдолг(?:а|у|ом|е|и|ов|ам|ами|ах)?\b|'
+    r'\bдолгов(?:ой|ая|ое|ые|ых|ым|ую|ыми|ого|ому)\b|слияни|поглощени|акционер|'
     r'\bsteps?\s+down\b|\bappointed\b|\blayoffs?\b|\bmerger\b|\bacquisition\b|\bbillion\b',
     re.IGNORECASE)
 
@@ -20309,6 +20384,16 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(
                 "❓ Telegram не подтвердил результат. Автоповтор отключён — проверь канал.",
                 show_alert=True)
+        elif result == 'deferred':
+            # Пост ждёт модель или переводчик — его возвращают в очередь, как
+            # делает автопубликатор. Раньше он попадал в ветку «пропущен» ниже
+            # и навсегда исчезал из очереди от одного нажатия кнопки.
+            if await post_queue.defer(next_post):
+                await query.answer("⏸ Пост ждёт модель или перевод — вернул в очередь",
+                                   show_alert=True)
+            else:
+                await query.answer("❌ Хранилище не приняло отсрочку. Пост оставлен в работе — "
+                                   "проверь /health.", show_alert=True)
         else:
             # 'skipped_dup' или 'skipped_filter' — пост уже был отправлен или не подходит,
             # в очередь НЕ возвращаем
@@ -22489,7 +22574,14 @@ def _llm_primary_slot() -> str:
     chosen = getattr(settings, 'llm_primary_slot', '') if settings is not None else ''
     if chosen in LLM_SLOTS and _llm_slot_ready(chosen):
         return chosen
-    return 'primary'
+    if _llm_slot_ready('primary'):
+        return 'primary'
+    # Штатный основной не задан, но есть ключ другого провайдера (например,
+    # только GEMINI_API_KEY): берём первый рабочий слот. Иначе модель считалась
+    # ненастроенной целиком, хотя ключ в окружении был, и посты из каналов
+    # уходили без пересказа.
+    ready = _llm_ready_slots()
+    return ready[0] if ready else 'primary'
 
 
 def _llm_backup_slot() -> Optional[str]:
@@ -23257,7 +23349,11 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
             # На бесплатных тарифах с жёстким лимитом запросов в минуту это
             # означало серию 429 подряд и выключение модели по счётчику ошибок —
             # хотя достаточно было подождать несколько секунд.
-            wait = _parse_retry_after(r.headers.get('Retry-After'))
+            # Потолок — LLM_CIRCUIT_MAX_SEC, а не 30 с общего HTTP-повтора: здесь
+            # мы не спим, а закрываем провайдера на время. С потолком в 30 с
+            # «приходи через час» превращалось в запрос каждые полминуты, и
+            # каждый такой запрос съедал суточный лимит вызовов впустую.
+            wait = _parse_retry_after(r.headers.get('Retry-After'), cap=LLM_CIRCUIT_MAX_SEC)
             # Лимит запросов у одного провайдера ничего не говорит об остальных.
             # Раньше мы всегда пережидали на месте: это верно, когда провайдер
             # один, но при живом соседе бот молчал вместо того, чтобы спросить
@@ -24523,6 +24619,12 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
             logger.warning('LLM: переписывание отклонено (%s): %s%s', rejection, title[:55], detail)
         elif not (_llm_numbers_supported(source_fact_text, proposed_text)
                 and _llm_dates_supported(source_fact_text, proposed_text)):
+            # Отметка нужна посту из Telegram-канала: без неё он считал, что
+            # модель «ещё не ответила», и ждал пересказа до 4 часов. Ответ модели
+            # при этом лежит в кеше 6 часов, так что каждый повтор получал тот
+            # же забракованный текст и заново качал картинки и видео.
+            news['_editorial_rejection'] = 'numbers_dates'
+            metrics.inc('anime_bot_editorial_rejected_total', labels={'reason': 'numbers_dates'})
             logger.warning(f"LLM: обнаружены новые числа/даты — переписывание отклонено: {title[:55]}")
         elif _sanity_ok(new_title, LLM_TITLE_MAX) and _sanity_ok(new_summary, LLM_SUMMARY_MAX * 2):
             parts = [new_title.rstrip('.') + '.' if not new_title.endswith(('.', '!', '?'))
@@ -24540,6 +24642,9 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
             body = _append_release_date(body, date_str)
             news['_llm_text'] = body
         else:
+            # Та же причина, что выше: ответ из кеша не станет короче при повторе.
+            news['_editorial_rejection'] = 'limits'
+            metrics.inc('anime_bot_editorial_rejected_total', labels={'reason': 'limits'})
             logger.info(f"LLM: ответ не влез в лимиты, беру обычный путь: {title[:50]}")
 
     # --- Теги ---
@@ -28660,6 +28765,31 @@ MODERATION_PUNISH_16 = _env_bool('MODERATION_PUNISH_16', False)
 def _mod_16_allowed(category: str) -> bool:
     """Пропускать ли находку как разрешённое 16+."""
     return category == 'spoiler_16' and not MODERATION_PUNISH_16
+
+
+def _mod_admin_16_block(entry: dict) -> bool:
+    """Запись чёрного списка 16+, которую админ поставил сам (/modmiss, «✅ Верно»).
+
+    16+ в чате разрешено, но админ осудил именно этот файл, и бот ему ответил
+    «копии будут удаляться сразу». Такие копии удаляем без наказания автора.
+    """
+    return (bool(entry) and _mod_16_allowed(str(entry.get('category') or ''))
+            and entry.get('source') == 'admin')
+
+
+def _mod_effective_block(entry: dict) -> dict:
+    """Запись чёрного списка, которая ещё действует при нынешних правилах.
+
+    Записи 16+, которые бот завёл сам, пока 16+ наказывалось, теперь не
+    действуют: иначе такая картинка подменяла собой вердикт по тексту
+    сообщения, решение получалось «ничего не делать», и текст (реклама,
+    ссылка) уже не проверялся вовсе.
+    """
+    if not entry:
+        return {}
+    if _mod_16_allowed(str(entry.get('category') or '')) and not _mod_admin_16_block(entry):
+        return {}
+    return entry
 MODERATION_MEDIA_SOURCE = 'локальный детектор медиа'
 MODERATION_BLOCKLIST_SOURCE = 'чёрный список медиа'
 # Исходы, после которых медиа точно осуждено и удалено: только они пополняют
@@ -28861,17 +28991,21 @@ def _mod_blocked_reason(entry: dict) -> str:
 
 async def _mod_enforce(bot: Bot, message, category: str, reason: str, source: str, *,
                        report: bool = True, logged_text: str = '', severity: int = 2,
-                       delete_only: bool = False) -> str:
-    """Санкция по готовому вердикту — тем же путём, что автоматическая."""
+                       delete_only: bool = False, force_delete: bool = False) -> str:
+    """Санкция по готовому вердикту — тем же путём, что автоматическая.
+
+    force_delete — удалить, даже если сама категория сейчас не наказывается
+    (16+ из чёрного списка админа): только удаление, без предупреждения.
+    """
     if chat_moderation is None or category not in MODERATION_RULES:
         return ''
     if category == 'spoiler_16' and getattr(message, 'has_media_spoiler', False):
         return ''
     user_id, name = _mod_actor(message)
     decision = _mod_decide(category, severity, chat_moderation.warn_count(message.chat_id, user_id))
-    if decision.get('action', 'none') == 'none':
+    if decision.get('action', 'none') == 'none' and not force_delete:
         return ''
-    if delete_only:
+    if delete_only or force_delete:
         decision = {'action': 'delete', 'delete': True, 'human': decision.get('human')}
     decision.update(severity=severity, confidence=1.0, confidence_threshold=1.0,
                     decision_state='auto')
@@ -28890,7 +29024,8 @@ async def _mod_media_enforce(bot: Bot, message, entry: dict, *, report: bool = T
     """Санкция за медиа из чёрного списка."""
     return await _mod_enforce(bot, message, str(entry.get('category') or 'spoiler_16'),
                               _mod_blocked_reason(entry), MODERATION_BLOCKLIST_SOURCE,
-                              report=report, delete_only=delete_only)
+                              report=report, delete_only=delete_only,
+                              force_delete=_mod_admin_16_block(entry))
 
 
 def _mod_unblock_for_review(review_id: str, review: dict) -> int:
@@ -29778,9 +29913,10 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
         # Сначала чёрный список по file_id: копия уже осуждённого медиа
         # удаляется сразу, без очереди детектора и без его пограничных оценок.
         sticker_set = str(getattr(getattr(message, 'sticker', None), 'set_name', None) or '')
-        blocked = (chat_moderation.find_blocked_media(attachment_key, sticker_set=sticker_set,
-                                                      chat_id=chat.id)
-                   if attachment_key or sticker_set else {})
+        blocked = _mod_effective_block(
+            chat_moderation.find_blocked_media(attachment_key, sticker_set=sticker_set,
+                                               chat_id=chat.id)
+            if attachment_key or sticker_set else {})
         if not blocked and MODERATION_MEDIA_ENABLED:
             media = await _moderation_media_scanner.check(context.bot, message)
             if media is not None and not (media.status == 'checked' and media.category == 'nsfw'):
@@ -29789,9 +29925,9 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
                 # узнать его можно только так.
                 # Сверка отпечатков с полным списком — десятки миллисекунд;
                 # в цикле событий это пауза для всех чатов, поэтому в потоке.
-                blocked = await asyncio.to_thread(
+                blocked = _mod_effective_block(await asyncio.to_thread(
                     chat_moderation.find_blocked_media,
-                    attachment_key, getattr(media, 'hashes', None) or (), sticker_set, chat.id)
+                    attachment_key, getattr(media, 'hashes', None) or (), sticker_set, chat.id))
         hashes = [str(h) for h in (getattr(media, 'hashes', None) or ())]
         media_meta = dict(file_unique_id=attachment_key, hashes=hashes,
                           message_id=getattr(message, 'message_id', 0) or 0,
@@ -29807,13 +29943,16 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
                 # у шаблонов-мемов с другой подписью, и мут за это — ошибка.
                 chat_moderation.note_blocked_hit(blocked['id'], '' if by_hash else attachment_key)
                 media_meta['blocked_id'] = blocked['id']
+                admin_16 = _mod_admin_16_block(blocked)
                 local = dict(category=str(blocked.get('category') or 'spoiler_16'), confident=True,
                              severity=2, confidence=1.0, needs_review=False,
                              reason=_mod_blocked_reason(blocked) + (' (по сходству кадров)' if by_hash else ''),
                              media=media_meta, source=MODERATION_BLOCKLIST_SOURCE,
-                             delete_only=by_hash)
+                             delete_only=by_hash or admin_16, force_delete=admin_16)
                 source = MODERATION_BLOCKLIST_SOURCE
-                if album_key is not None:
+                # Удаление 16+ по решению админа касается одного файла: остальные
+                # снимки альбома проверяются сами, а не наследуют вердикт.
+                if album_key is not None and not admin_16:
                     _moderation_album_verdicts[album_key] = dict(local)
                     while len(_moderation_album_verdicts) > 500:
                         _moderation_album_verdicts.popitem(last=False)
@@ -29823,7 +29962,10 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
             # письмо без кнопок, и все следующие такие же 15 минут молча
             # уходили в журнал — гифка оставалась в чате.
             category = 'nsfw' if getattr(media, 'near_explicit', 0) else 'spoiler_16'
-            if not human_only_text and not (category == 'spoiler_16' and has_spoiler):
+            # Пограничное разрешённое 16+ — не вопрос к админу: решение по нему
+            # было бы «ничего», а вердикт по тексту оно бы затёрло.
+            if (not human_only_text and not (category == 'spoiler_16' and has_spoiler)
+                    and not _mod_16_allowed(category)):
                 evidence = media_evidence(media)
                 local = dict(category=category, confident=True, severity=2,
                              confidence=float(media.score or 0.0), needs_review=True,
@@ -29851,7 +29993,13 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
                          media=media_meta)
             source = MODERATION_MEDIA_SOURCE
         elif media.category and not (
-                media.category == 'spoiler_16' and getattr(message, 'has_media_spoiler', False)):
+                media.category == 'spoiler_16' and getattr(message, 'has_media_spoiler', False)
+        ) and not _mod_16_allowed(media.category):
+            # Разрешённое 16+ сюда не попадает. Раньше оно заменяло собой вердикт
+            # по тексту, решение по категории было «ничего», и подозрительный
+            # текст рядом с картинкой не шёл к модели. Хуже того, вердикт
+            # запоминался на весь альбом, и соседний снимок 18+ из того же
+            # альбома проходил без проверки.
             # Ban-level text takes priority over media; both require deletion.
             if not (local and local.get('confident') and local.get('category') in MODERATION_HUMAN_ONLY):
                 evidence = media_evidence(media)
@@ -29912,7 +30060,8 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
             return
         streak = _mod_note_belittling(chat.id, user_id, target) if category == 'belittling' else 0
         decision = _mod_decide(category, severity, chat_moderation.warn_count(chat.id, user_id), streak)
-        if local.get('delete_only') and decision.get('action') != 'none':
+        if local.get('delete_only') and (decision.get('action') != 'none'
+                                         or local.get('force_delete')):
             decision = {'action': 'delete', 'delete': True, 'human': decision.get('human')}
         decision['severity'] = severity
         decision['confidence'] = confidence
@@ -31115,9 +31264,15 @@ def _redact_secrets(text: str) -> str:
         return ''
     out = str(text)
     # Сначала точные значения из окружения: они могут не подходить под шаблон.
+    # Ключи дополнительных провайдеров (<ИМЯ>_API_KEY) тоже здесь: некоторые
+    # роутеры возвращают ключ в тексте ошибки 401, а этот текст уходит в лог
+    # и админу в сообщении о переключении модели. Берём их из _LLM_EXTRA_ENV,
+    # а не из LLM_EXTRA_SLOTS: ключ, совпавший с основным слотом, туда не
+    # попадает, но скрывать его всё равно нужно.
+    extra_keys = tuple(key for key, _model in _LLM_EXTRA_ENV.values())
     for secret in (TOKEN, LLM_API_KEY, LLM_FALLBACK_API_KEY, LLM_FAST_API_KEY, MODERATION_LLM_API_KEY,
                    MODERATION_LLM_FALLBACK_API_KEY,
-                   DEEPL_API_KEY, DASHBOARD_TOKEN, HEALTH_METRICS_TOKEN):
+                   DEEPL_API_KEY, DASHBOARD_TOKEN, HEALTH_METRICS_TOKEN, *extra_keys):
         if secret and len(str(secret)) >= 8:
             out = out.replace(str(secret), '<скрыто>')
     # Затем всё, что выглядит как токен бота, включая чужие и старые.

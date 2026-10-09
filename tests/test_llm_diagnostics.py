@@ -36,6 +36,10 @@ def alerts(monkeypatch):
     # получал бы «об этом уже сообщали» и не видел ни одного сообщения.
     monkeypatch.setattr(bot, '_llm_failover_alert_key', '')
     monkeypatch.setattr(bot, '_llm_failover_level', 0)
+    # Основной настроен — тесты про его отказ (см. failover_state ниже).
+    monkeypatch.setattr(bot, 'LLM_API_KEY', 'primary-key')
+    monkeypatch.setattr(bot, 'LLM_BASE_URL', 'https://api.groq.com/openai/v1')
+    monkeypatch.setattr(bot, 'LLM_MODEL', 'llama-3.3-70b-versatile')
     monkeypatch.setattr(bot, 'LLM_FALLBACK_API_KEY', 'key')
     monkeypatch.setattr(bot, 'LLM_FALLBACK_BASE_URL', 'https://api.mistral.ai/v1')
     monkeypatch.setattr(bot, 'LLM_FALLBACK_MODEL', 'mistral-small-latest')
@@ -231,6 +235,11 @@ def failover_state(monkeypatch):
     monkeypatch.setattr(bot, '_llm_failover_alert_key', '')
     monkeypatch.setattr(bot, '_llm_primary_retry_at', 0.0)
     monkeypatch.setattr(bot, '_llm_using_fallback', False)
+    # Основной настроен: эти тесты — про отказ рабочего основного. Без ключа
+    # основным теперь честно становится запасной, и переключаться было бы некуда.
+    monkeypatch.setattr(bot, 'LLM_API_KEY', 'primary-key')
+    monkeypatch.setattr(bot, 'LLM_BASE_URL', 'https://api.groq.com/openai/v1')
+    monkeypatch.setattr(bot, 'LLM_MODEL', 'llama-3.3-70b-versatile')
     monkeypatch.setattr(bot, 'LLM_FALLBACK_API_KEY', 'key')
     monkeypatch.setattr(bot, 'LLM_FALLBACK_BASE_URL', 'https://api.mistral.ai/v1')
     monkeypatch.setattr(bot, 'LLM_FALLBACK_MODEL', 'mistral-small-latest')
