@@ -127,6 +127,7 @@ from moderation_media import (MediaScanner, ensure_rating_models, hashes_match,
                               WORKER_MEMORY_MB_DEFAULT, WORKER_MEMORY_MB_MIN)
 from moderation_llm import ChatModelClient
 from news_deferral import NewsDeferralStore
+import tg_account as tg_account_mod
 from publication_delivery import PublicationBot
 from telegram import (
     Bot,
@@ -739,7 +740,7 @@ GOLDEN_DATASET_FILE = Path(__file__).with_name('golden') / 'editorial_cases.json
 STORY_UPDATE_LOOKBACK_DAYS = max(1, min(90, _env_int('STORY_UPDATE_LOOKBACK_DAYS', 21)))
 STORY_UPDATE_SIMILARITY = max(0.60, min(0.95, _env_float('STORY_UPDATE_SIMILARITY', 0.76)))
 REPLAY_BUFFER_MAX = max(20, min(2000, _env_int('REPLAY_BUFFER_MAX', 300)))
-DEFAULT_LLM_PROMPT_VERSION = 'editorial-v8-2026-10-09'
+DEFAULT_LLM_PROMPT_VERSION = 'editorial-v9-2026-10-09'
 LLM_PROMPT_VERSION = (_env('LLM_PROMPT_VERSION', DEFAULT_LLM_PROMPT_VERSION).strip()
                       or DEFAULT_LLM_PROMPT_VERSION)
 LLM_JUDGE_MAX_TOKENS = max(80, min(500, _env_int('LLM_JUDGE_MAX_TOKENS', 180)))
@@ -2459,6 +2460,10 @@ async def _post_stop(app: Application) -> None:
             logger.info('Остановка: завершено фоновых задач модерации: %d', cancelled)
     except Exception:
         logger.exception('Остановка: фоновые задачи модерации не завершены')
+    try:
+        await asyncio.wait_for(_tg_account_stop(), 15)
+    except Exception:
+        logger.warning('Остановка: аккаунт Telegram не отключился штатно')
 
 
 # Нейтральные названия групп. Само упоминание — не нарушение, и почти всегда
@@ -9840,6 +9845,8 @@ def extract_image_from_entry(entry, summary_html: Optional[str] = None) -> Optio
 
 def _download_image_bytes(url: str) -> Optional[bytes]:
     """Скачивает картинку потоково и прекращает чтение после 9 МБ."""
+    if tg_account_mod.is_media_ref(url):
+        return _tg_account_image_bytes(url)
     try:
         r = http_get_public_with_retry(
             url, headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT, stream=True)
@@ -9897,6 +9904,23 @@ VIDEO_FRAME_HEAD_BYTES = 8 * 1024 * 1024
 VIDEO_FRAME_SEEKS = (1.5, 4.0, 8.0)
 
 
+def _frame_is_dark(info: dict) -> bool:
+    """Тёмный кадр-заставка: чёрный фон и в лучшем случае мелкая надпись.
+
+    Энтропия одна не годится: надпись на чёрном даёт её около 2, как у
+    обычного спокойного кадра. Решает доля светлых точек — у заставки трейлера
+    их 0–3%, у настоящего кадра, даже ночного, больше. Тёмную, но живую сцену
+    выдаёт высокая энтропия.
+    """
+    if info.get('entropy') is None:
+        return False                  # картинку не разобрать — судить не по чему
+    bright = info.get('bright_share')
+    entropy = float(info['entropy'])
+    if entropy < 1.0:
+        return True
+    return bright is not None and float(bright) < 0.05 and entropy < 3.5
+
+
 def _video_frame_bytes(url: str) -> Optional[bytes]:
     """Кадр ролика в полном разрешении из первых мегабайт файла.
 
@@ -9931,7 +9955,10 @@ def _video_frame_bytes(url: str) -> Optional[bytes]:
             data = out.read_bytes()
             # Ролики часто начинаются с чёрного экрана или логотипа на сплошном
             # фоне: такой кадр хуже мыльного превью. Берём самый «живой».
-            entropy = float(_image_quality_info(data).get('entropy') or 0.0)
+            info = _image_quality_info(data)
+            if _frame_is_dark(info):
+                continue
+            entropy = float(info.get('entropy') or 0.0)
             if entropy > best_entropy:
                 best, best_entropy = data, entropy
             if entropy >= 4.0:
@@ -10302,9 +10329,18 @@ async def _optimize_news_media(news: dict) -> None:
     # «с чёрным превью, без картинки и видео». Логотип на чёрном фоне у
     # обычной картинки по тем же цифрам похож, но это настоящая иллюстрация.
     video_thumb = news.get('_video_thumb')
+
+    def is_video_cover(url) -> bool:
+        # Обложкой ролика бывает не только превью из ленты: кадр, вырезанный
+        # ffmpeg из начала файла (#video-frame), и обложка из аккаунта. Первый
+        # кадр трейлера почти всегда чёрный, и раньше он проходил проверку,
+        # потому что сверялась только ссылка превью.
+        url = str(url or '')
+        return (url == video_thumb or url.endswith(VIDEO_FRAME_SUFFIX)
+                or (tg_account_mod.is_media_ref(url) and url.endswith('/thumb')))
     blank = [r for r in rows if r.get('_data') and (
         (r.get('entropy') is not None and r['entropy'] < 1.0)
-        or (r['url'] == video_thumb and r.get('bright_share') is not None
+        or (is_video_cover(r['url']) and r.get('bright_share') is not None
             and r['bright_share'] < 0.05))]
     if blank:
         metrics.inc('anime_bot_media_candidates_dropped_total', len(blank), {'reason': 'blank'})
@@ -10683,16 +10719,28 @@ def _generate_video_thumbnail(path: Optional[Path]) -> Optional[bytes]:
     os.close(fd)
     tmp = Path(tmp_name)
     probe = _probe_video_file(path)
-    seek = VIDEO_THUMB_SEEK_SEC
-    if probe and isinstance(probe.get('duration'), (int, float)) and probe['duration'] > 0:
-        seek = min(seek, max(0.0, float(probe['duration']) * 0.25))
-    cmd = [ffmpeg, '-y', '-ss', str(seek), '-i', str(path), '-frames:v', '1',
-           '-vf', 'scale=320:320:force_original_aspect_ratio=decrease', '-q:v', '4', str(tmp)]
+    duration = (float(probe['duration']) if probe and isinstance(probe.get('duration'), (int, float))
+                and probe['duration'] > 0 else 0.0)
+    # Превью ролика в канале — это и есть его обложка. Первая секунда трейлера
+    # обычно чёрная, и пост выглядел пустым чёрным прямоугольником. Пробуем
+    # несколько моментов и берём первый не тёмный кадр.
+    seeks = [VIDEO_THUMB_SEEK_SEC]
+    if duration:
+        seeks = [min(VIDEO_THUMB_SEEK_SEC, duration * 0.25), duration * 0.2, duration * 0.4, duration * 0.6]
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=20, check=False)
-        data = tmp.read_bytes() if proc.returncode == 0 and tmp.exists() else None
-        if data and len(data) > 200 * 1024:
-            data = None
+        data = None
+        for seek in seeks:
+            cmd = [ffmpeg, '-y', '-ss', f'{max(0.0, seek):.2f}', '-i', str(path), '-frames:v', '1',
+                   '-vf', 'scale=320:320:force_original_aspect_ratio=decrease', '-q:v', '4', str(tmp)]
+            proc = subprocess.run(cmd, capture_output=True, timeout=20, check=False)
+            frame = tmp.read_bytes() if proc.returncode == 0 and tmp.exists() else None
+            if not frame or len(frame) > 200 * 1024:
+                continue
+            if data is None:
+                data = frame              # хоть какой-то кадр лучше, чем никакого
+            if not _frame_is_dark(_image_quality_info(frame)):
+                data = frame
+                break
         _bounded_cache_put(_video_thumbnail_cache, key, data, VIDEO_THUMB_CACHE_MAX)
         if data:
             metrics.inc('anime_bot_video_thumbnails_total', labels={'result': 'ok'})
@@ -11974,8 +12022,147 @@ def _fetch_video_from_embed(post_id: str):
     return None, None, best_thumb or thumb
 
 
+# ---------- чтение каналов через аккаунт Telegram ----------
+# Веб-страница t.me/s/ не отдаёт большие ролики («Media is too big»): трейлер в
+# хорошем качестве до поста не доезжал, и вместо него шёл чёрный первый кадр.
+# Аккаунт читает канал как приложение. Нет переменных или аккаунт не
+# подключился — работает прежний путь через веб-страницу, ничего не ломается.
+TG_ACCOUNT_API_ID = _env_int('TG_ACCOUNT_API_ID', 0)
+TG_ACCOUNT_API_HASH = _env('TG_ACCOUNT_API_HASH', '').strip()
+TG_ACCOUNT_SESSION = _env('TG_ACCOUNT_SESSION', '').strip()
+TG_ACCOUNT_TIMEOUT_SEC = max(5, min(120, _env_int('TG_ACCOUNT_TIMEOUT_SEC', 40)))
+# Скачиваем и больше 50 МБ: потом ролик сжимается под лимит Bot API.
+TG_ACCOUNT_VIDEO_MAX_MB = max(10, min(2000, _env_int('TG_ACCOUNT_VIDEO_MAX_MB', 300)))
+tg_account: Optional['tg_account_mod.AccountReader'] = None
+_tg_account_start_task: Optional[asyncio.Task] = None
+
+
+def _tg_account_configured() -> bool:
+    return bool(TG_ACCOUNT_API_ID and TG_ACCOUNT_API_HASH and TG_ACCOUNT_SESSION)
+
+
+def _tg_account_ready() -> bool:
+    return tg_account is not None and tg_account.ready
+
+
+async def _tg_account_start() -> None:
+    """Подключает аккаунт при запуске бота; неудача — предупреждение админу."""
+    global tg_account
+    if not _tg_account_configured():
+        return
+    reader = tg_account_mod.AccountReader(TG_ACCOUNT_API_ID, TG_ACCOUNT_API_HASH, TG_ACCOUNT_SESSION)
+    ok = await reader.start(timeout=TG_ACCOUNT_TIMEOUT_SEC)
+    tg_account = reader
+    if ok:
+        logger.info(f'📡 Каналы читаются через аккаунт Telegram ({reader.account_name})')
+        return
+    reason = _redact_secrets(reader.error)
+    logger.warning(f'Аккаунт Telegram не подключился: {reason}')
+    _queue_admin_alert(f'⚠️ Аккаунт Telegram для чтения каналов не подключился: {reason}.\n'
+                       'Каналы читаются по-старому, через веб-страницу: большие ролики '
+                       'туда не доезжают. Как получить строку входа — docs/tg-account.md.')
+
+
+async def _tg_account_stop() -> None:
+    if tg_account is not None:
+        await tg_account.stop()
+
+
+def _tg_account_status_line() -> str:
+    """Строка для /status: каким путём сейчас читаются каналы."""
+    if not _tg_account_configured():
+        return '📡 Каналы: через веб-страницу (аккаунт Telegram не настроен)\n'
+    if _tg_account_ready():
+        return f'📡 Каналы: через аккаунт Telegram 🟢 ({tg_account.account_name})\n'
+    reason = _redact_secrets(tg_account.error if tg_account is not None else 'ещё подключается')
+    return f'📡 Каналы: через веб-страницу — аккаунт не подключён ({reason[:120]})\n'
+
+
+def _tg_account_image_bytes(ref: str) -> Optional[bytes]:
+    """Фото или обложка ролика из аккаунта. Вызывается из рабочих потоков."""
+    if not _tg_account_ready():
+        return None
+    try:
+        return tg_account.run_sync(lambda: tg_account.download_bytes(ref, HTTP_IMAGE_MAX_BYTES),
+                                   TG_ACCOUNT_TIMEOUT_SEC)
+    except Exception as e:
+        logger.warning(f'Аккаунт Telegram: картинка {ref} не скачалась: '
+                       f'{_redact_secrets(f"{type(e).__name__}: {e}")}')
+        return None
+
+
+def _tg_account_news(channel: str, label: str, display_name: str,
+                     posts: list) -> list[dict]:
+    """Посты аккаунта → новости того же вида, что даёт веб-страница канала."""
+    news_list: list[dict] = []
+    for post in posts:                        # новые сначала, как и на веб-пути
+        full_text = str(post.text or '').strip()
+        if len(full_text) < 15:
+            continue
+        title, summary = _tg_title_and_summary(full_text, channel, label, display_name)
+        if not title or post.date is None:
+            continue
+        published_parsed = post.date.timetuple()
+        if _is_too_old(published_parsed):
+            continue
+        images = list(post.photo_refs)
+        video_thumb = None
+        note = ''
+        video_url = ''
+        if post.video_ref:
+            too_long = post.video_duration is not None and post.video_duration > TG_VIDEO_MAX_SECONDS
+            if too_long:
+                note = f'ролик {post.video_duration}с длиннее лимита {TG_VIDEO_MAX_SECONDS}с — только кадр'
+            else:
+                video_url = post.video_ref
+                note = 'ролик доступен через аккаунт'
+            video_thumb = post.video_thumb_ref
+            if not images:
+                images = [video_thumb]
+        news_list.append({
+            'title': title,
+            'link': f'https://t.me/{channel}/{post.msg_id}',
+            'summary': summary,
+            'images': images[:MAX_PHOTOS_PER_POST],
+            'video': video_url or None,
+            'published_parsed': published_parsed,
+            'source': label,
+            'lang': _detect_lang(full_text),
+            '_source_tags': tg_source_hashtags(full_text),
+            # Обложка из аккаунта — настоящая, а не мыльное превью ленты.
+            '_thumb_only': False,
+            '_video_thumb': video_thumb,
+            '_video_note': note,
+            '_links': list(post.links),
+            '_via_tg_account': True,
+        })
+        if len(news_list) >= NEWS_PER_SOURCE:
+            break
+    return news_list
+
+
+def _tg_account_collect(channel: str, label: str) -> list[dict]:
+    display_name, posts = tg_account.run_sync(
+        lambda: tg_account.fetch(channel, NEWS_PER_SOURCE * 3), TG_ACCOUNT_TIMEOUT_SEC)
+    news_list = _tg_account_news(channel, label, display_name, posts)
+    result = CountedBatch(reversed(news_list), len(posts))
+    logger.info(f"TG {channel}: собрано {len(result)} постов через аккаунт")
+    return result
+
+
 def get_telegram_channel(channel: str, label: str) -> list[dict]:
-    """Парсит публичный Telegram-канал через t.me/s/. Возвращает список news-словарей."""
+    """Парсит публичный Telegram-канал. Возвращает список news-словарей.
+
+    Сначала через аккаунт Telegram (если настроен), иначе — веб-страница t.me/s/.
+    """
+    if _tg_account_ready():
+        try:
+            return _tg_account_collect(channel, label)
+        except Exception as e:
+            # Сбой аккаунта не должен оставлять канал без новостей: идём старым путём.
+            metrics.inc('anime_bot_tg_account_fallback_total', labels={'source': label})
+            logger.warning(f'TG {channel}: аккаунт не ответил '
+                           f'({_redact_secrets(f"{type(e).__name__}: {e}")}), читаю веб-страницу')
     url = f'https://t.me/s/{channel}'
     r = http_get_public_with_retry(
         url, headers={'User-Agent': USER_AGENT}, timeout=HTTP_TIMEOUT, stream=True)
@@ -12585,6 +12772,20 @@ NOISE_TITLE_RULES = (
         r'^(?!.*(?:умер|скончал|ушёл из жизни|ушел из жизни|\bdied\b|passed away|死去|逝去))'
         r'.*(?:\bозвучк\w*|\bдубляж\w*|\bсэйю\b|\bсейю\b|\bvoice\s+cast\b|'
         r'\b(?:english|russian)\s+dub\b|\bdub\s+cast\b|追加キャスト|キャスト(?:発表|解禁|決定)|声優(?:陣|発表|解禁))',
+    )),
+    # Выход очередной серии: «Эпизод 11 … выпущен на Boosty», «Вышла 5 серия».
+    # Модераторы попросили такого не публиковать (октябрь 2026): это расписание
+    # площадок и команд озвучки, а не новость. Кадры, превью и трейлер серии,
+    # а также дата будущей премьеры («1 серия выйдет 5 января») остаются.
+    ('выход серии', (
+        r'^(?!.*(?:кадр|превью|тизер|трейлер|анонс|preview|teaser|trailer|stills?\b))'
+        r'.*(?:\b(?:эпизод|серия|серии)\s*№?\s*\d{1,4}\b.*\b(?:выпущен\w*|вышел|вышла|вышли|'
+        r'доступн\w*|опубликован\w*|уже\s+на|смотрите|смотреть)\b|'
+        r'\b(?:вышел|вышла|вышли|выпущен\w*|доступн\w*|опубликован\w*)\s+(?:нов\w+\s+|финальн\w+\s+)?'
+        r'(?:\d{1,4}[-‑]?(?:я|й|ой)?\s+)?(?:эпизод|серия|серии)\b|'
+        r'\bрелиз\s+(?:\d{1,4}[-‑]?(?:й|ой)?\s+)?(?:серии|эпизода)\b|'
+        r'\bepisode\s+\d{1,4}\s+(?:is\s+)?(?:out|now\s+available|released|streaming)\b|'
+        r'\bboosty\b|\bбусти\b)',
     )),
     ('фан-контент', (
         r'\bfan\s?art\b',
@@ -13261,6 +13462,8 @@ async def _prepare_video_file(news: dict, *, record_failures: bool = True) -> Op
             if record_failures:
                 _record_media_failure(news, 'article_video_not_found')
         return None
+    if tg_account_mod.is_media_ref(video_url):
+        return await _prepare_account_video(news, video_url, record_failures=record_failures)
     # Прямой mp4/webm — Telegram скачает сам, нам качать не надо
     if _is_direct_video(video_url):
         return None
@@ -13299,6 +13502,83 @@ async def _prepare_video_file(news: dict, *, record_failures: bool = True) -> Op
         if record_failures:
             _record_media_failure(news, 'video_download_failed', news.get('_video_note', ''))
     return path
+
+
+async def _prepare_account_video(news: dict, ref: str, *, record_failures: bool = True) -> Optional[Path]:
+    """Ролик поста канала через аккаунт: скачать, привести к MP4 и ужать под лимит."""
+    if not _tg_account_ready():
+        news['_video_note'] = 'аккаунт Telegram не подключён — ролик не скачать'
+        if record_failures:
+            _record_media_failure(news, 'video_download_failed', news['_video_note'])
+        return None
+    try:
+        path, note = await asyncio.wait_for(
+            tg_account.download_video(ref, VIDEO_DOWNLOAD_DIR, TG_ACCOUNT_VIDEO_MAX_MB * 1024 * 1024),
+            timeout=VIDEO_DOWNLOAD_TIMEOUT_SEC)
+    except Exception as e:
+        path, note = None, f'аккаунт: {_redact_secrets(f"{type(e).__name__}: {e}")}'
+    news['_video_note'] = note
+    if path is None:
+        if record_failures:
+            _record_media_failure(news, 'video_download_failed', note)
+        return None
+    probe = await asyncio.to_thread(_probe_video_file, path)
+    if probe:
+        news['_video_meta'] = probe
+    path = await asyncio.to_thread(_normalize_video_file, path, probe)
+    path = await asyncio.to_thread(_shrink_video_to_limit, path)
+    if path is None:
+        news['_video_note'] = 'ролик не удалось ужать до 48 МБ'
+        if record_failures:
+            _record_media_failure(news, 'video_too_large', news['_video_note'])
+        return None
+    probe = await asyncio.to_thread(_probe_video_file, path)
+    if probe:
+        news['_video_meta'] = probe
+    return path
+
+
+def _shrink_video_to_limit(path: Optional[Path]) -> Optional[Path]:
+    """Ролик больше лимита Bot API ужимаем битрейтом под размер; не вышло — None.
+
+    Нормализация держит качество (CRF), а не размер: полутораминутный трейлер
+    1080p из канала весит 80–150 МБ, и Bot API такой файл не принимает.
+    Битрейт считаем от длительности, чтобы файл гарантированно влез.
+    """
+    if path is None or not path.exists():
+        return None
+    limit = VIDEO_MAX_FILE_SIZE_MB * 1024 * 1024
+    if path.stat().st_size <= limit:
+        return path
+    ffmpeg = _media_tool('ffmpeg')
+    info = _probe_video_file(path) or {}
+    duration = info.get('duration')
+    if not ffmpeg or not isinstance(duration, (int, float)) or duration <= 0:
+        path.unlink(missing_ok=True)
+        return None
+    # 8% запаса на контейнер и неточность кодировщика, 128 кбит/с на звук.
+    video_kbps = int((limit * 8 * 0.92) / float(duration) / 1000) - 128
+    if video_kbps < 250:
+        path.unlink(missing_ok=True)       # такой ролик будет кашей — лучше кадр
+        return None
+    out = path.with_name(path.stem + '.small.mp4')
+    cmd = [ffmpeg, '-y', '-i', str(path), '-map', '0:v:0', '-map', '0:a:0?',
+           '-vf', f'scale=min({VIDEO_NORMALIZE_MAX_WIDTH}\\,iw):-2',
+           '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', f'{video_kbps}k',
+           '-maxrate', f'{video_kbps}k', '-bufsize', f'{video_kbps * 2}k',
+           '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', str(out)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=600, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.warning(f'ffmpeg: ролик не ужат: {e}')
+        proc = None
+    path.unlink(missing_ok=True)
+    if proc is None or proc.returncode != 0 or not out.exists() or not 0 < out.stat().st_size <= limit:
+        out.unlink(missing_ok=True)
+        metrics.inc('anime_bot_video_shrink_total', labels={'result': 'failed'})
+        return None
+    metrics.inc('anime_bot_video_shrink_total', labels={'result': 'ok'})
+    return out
 
 
 async def _probe_video_delivery(news: dict) -> tuple[str, str]:
@@ -16909,6 +17189,8 @@ def _download_needed_host(url) -> bool:
     """Hosts Telegram often cannot fetch directly; bytes never need parsing."""
     if not isinstance(url, str):
         return False
+    if tg_account_mod.is_media_ref(url):
+        return True                 # tgacc:// Telegram по ссылке не скачает
     try:
         host = urlparse(url).netloc.lower()
     except Exception:
@@ -22423,6 +22705,7 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
         f"Итог последней проверки: {_runtime_health.get('last_check_result') or 'ещё нет'}\n"
         f"Ожидание модели: максимум {LLM_DEFER_MAX_ATTEMPTS} попытки / {LLM_DEFER_MAX_AGE_SEC // 60} мин\n"
         f"Скачивание видео: {video_state}\n"
+        f"{_tg_account_status_line()}"
         f"yt-dlp: {yt_status}\n"
         f"ffmpeg: {ffmpeg_status}\n"
         # Блок готовности нужен, только пока автопубликации в канал ещё нет.
@@ -25899,11 +26182,12 @@ async def videocheck_command(update, context: ContextTypes.DEFAULT_TYPE):
     if all(not p.get('video') for p in video_posts):
         await update.message.reply_text(
             'ℹ️ Ни у одного поста нет прямой ссылки на файл.\n\n'
-            'Это значит, что Telegram не отдаёт видео веб-странице канала — '
-            'чаще всего из-за включённой в канале защиты контента. '
-            'Обойти это можно только через пользовательский аккаунт '
-            '(Telethon), а не через бота. Кадр-превью остаётся рабочим '
-            'компромиссом.')
+            'Это значит, что Telegram не отдаёт видео веб-странице канала: '
+            'ролик слишком большой («Media is too big») или в канале включена '
+            'защита контента. Помогает чтение каналов через аккаунт Telegram (Telethon) — '
+            'как его подключить, написано в docs/tg-account.md. '
+            + ('Сейчас аккаунт подключён, но эти посты собраны раньше.'
+               if _tg_account_ready() else 'Сейчас аккаунт не подключён.'))
 
 
 POSTS_EXPORT_DEFAULT = 30
@@ -31416,7 +31700,9 @@ def _redact_secrets(text: str) -> str:
     extra_keys = tuple(key for key, _model in _LLM_EXTRA_ENV.values())
     for secret in (TOKEN, LLM_API_KEY, LLM_FALLBACK_API_KEY, LLM_FAST_API_KEY, MODERATION_LLM_API_KEY,
                    MODERATION_LLM_FALLBACK_API_KEY,
-                   DEEPL_API_KEY, DASHBOARD_TOKEN, HEALTH_METRICS_TOKEN, *extra_keys):
+                   DEEPL_API_KEY, DASHBOARD_TOKEN, HEALTH_METRICS_TOKEN, *extra_keys,
+                   # Строка входа аккаунта — это полный доступ к нему.
+                   TG_ACCOUNT_API_HASH, TG_ACCOUNT_SESSION):
         if secret and len(str(secret)) >= 8:
             out = out.replace(str(secret), '<скрыто>')
     # Затем всё, что выглядит как токен бота, включая чужие и старые.
@@ -32681,6 +32967,12 @@ async def episodes_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def setup_bot_commands(app: Application) -> None:
     """post_init: меню команд + джоб отложки. Джоб регистрируем здесь (после
     initialize) — канонично для PTB и сразу видно в логах, что он поднялся."""
+    # Аккаунт подключается в фоне: Telegram может отвечать до 40 секунд, и всё
+    # это время бот не должен молчать на команды. Пока он не готов, каналы
+    # читаются через веб-страницу.
+    global _tg_account_start_task
+    if _tg_account_configured():
+        _tg_account_start_task = asyncio.get_running_loop().create_task(_tg_account_start())
     # Публикация отложенных постов: проверяем раз в минуту
     app.job_queue.run_repeating(
         publish_scheduled, interval=60, first=15, name='scheduled_publish',

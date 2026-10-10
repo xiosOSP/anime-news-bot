@@ -150,6 +150,14 @@ def startup_verdict(lines: list[str], elapsed: float) -> str:
     return f'дошёл до polling за {elapsed:.1f} с'
 
 
+def telethon_ready() -> str:
+    """Клиент собирается из пустой строки входа — без сети и без аккаунта."""
+    import telethon
+    from telethon.sessions import StringSession
+    StringSession('')
+    return telethon.__version__
+
+
 def main() -> int:
     print(f'Python {sys.version.split()[0]}')
     with tempfile.TemporaryDirectory() as tmp:
@@ -160,6 +168,7 @@ def main() -> int:
             check('rlottie (анимированные стикеры)', rlottie_renders),
             check('ffmpeg из imageio-ffmpeg', ffmpeg_runs),
             check('deno для yt-dlp', deno_runs),
+            check('Telethon (чтение каналов через аккаунт)', telethon_ready),
             check('бот импортируется', lambda: bot_imports(work)),
             check('бот запускается на пустом томе данных', lambda: bot_starts(work)),
         ]

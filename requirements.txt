@@ -27,6 +27,10 @@ rlottie-python==1.3.8
 # раздельными дорожками), превью и нормализации. В образе хостинга ffmpeg
 # нет, а свой Dockerfile — лишняя возня: бинарник едет готовым в пакете.
 imageio-ffmpeg==0.6.0
+# Чтение Telegram-каналов через аккаунт: веб-страница t.me/s/ не отдаёт
+# большие ролики («Media is too big»). Без переменных TG_ACCOUNT_* не
+# используется.
+telethon==1.45.0
 
 # yt-dlp сознательно НЕ закреплён: YouTube регулярно меняет выдачу, и старый
 # yt-dlp перестаёт качать через несколько недель. [default] приносит EJS —
@@ -51,7 +55,10 @@ onnxruntime==1.29.0; python_version >= "3.11"
 onnxruntime==1.23.2; python_version < "3.11"
 opencv-python-headless==5.0.0.93
 packaging==24.0
+pyaes==1.6.1
+pyasn1==0.6.4
 protobuf==7.36.1
+rsa==4.9.1
 soupsieve==2.9.2
 typing-extensions==4.16.0
 tzlocal==5.4.4

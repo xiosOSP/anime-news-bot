@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 329 переменных. Почти все — точная настройка со значением
+Бот читает 334 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -188,7 +188,7 @@
 | `LLM_PACE_MAX_SEC` | `60.0` | anime_news_bot.py |
 | `LLM_PRIMARY_RETRY_MAX_SEC` | — | anime_news_bot.py |
 | `LLM_PRIMARY_RETRY_SEC` | `1800` | anime_news_bot.py |
-| `LLM_PROMPT_VERSION` | `editorial-v8-2026-10-09` | anime_news_bot.py |
+| `LLM_PROMPT_VERSION` | `editorial-v9-2026-10-09` | anime_news_bot.py |
 | `LLM_PROVIDER` | — | anime_news_bot.py |
 | `LLM_TIMEOUT` | `30` | anime_news_bot.py |
 
@@ -422,6 +422,11 @@
 | `STARTUP_REPORT_MAX_IN_WINDOW` | `3` | anime_news_bot.py |
 | `STARTUP_REPORT_WINDOW_SEC` | `1800` | anime_news_bot.py |
 | `TELEGRAM_BOT_TOKEN` | — | anime_news_bot.py |
+| `TG_ACCOUNT_API_HASH` | — | anime_news_bot.py |
+| `TG_ACCOUNT_API_ID` | `0` | anime_news_bot.py |
+| `TG_ACCOUNT_SESSION` | — | anime_news_bot.py |
+| `TG_ACCOUNT_TIMEOUT_SEC` | `40` | anime_news_bot.py |
+| `TG_ACCOUNT_VIDEO_MAX_MB` | `300` | anime_news_bot.py |
 | `TG_REWRITE_MAX_ATTEMPTS` | `48` | anime_news_bot.py |
 | `TG_REWRITE_REQUIRED` | `True` | anime_news_bot.py |
 | `TG_REWRITE_WAIT_SEC` | — | anime_news_bot.py |

@@ -337,7 +337,7 @@ class TestVideoCheckCommand:
         posts = [{'link': 'https://t.me/ch/22342', 'video': None,
                   '_video_note': 'Telegram не отдал mp4 даже на странице поста — только кадр'}]
         out = self._run(monkeypatch, posts)
-        assert 'защиты контента' in out[-1]
+        assert 'защита контента' in out[-1] and 'tg-account.md' in out[-1]
         assert 'Telethon' in out[-1]
 
     def test_no_video_posts(self, monkeypatch):
