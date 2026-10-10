@@ -740,7 +740,7 @@ GOLDEN_DATASET_FILE = Path(__file__).with_name('golden') / 'editorial_cases.json
 STORY_UPDATE_LOOKBACK_DAYS = max(1, min(90, _env_int('STORY_UPDATE_LOOKBACK_DAYS', 21)))
 STORY_UPDATE_SIMILARITY = max(0.60, min(0.95, _env_float('STORY_UPDATE_SIMILARITY', 0.76)))
 REPLAY_BUFFER_MAX = max(20, min(2000, _env_int('REPLAY_BUFFER_MAX', 300)))
-DEFAULT_LLM_PROMPT_VERSION = 'editorial-v9-2026-10-09'
+DEFAULT_LLM_PROMPT_VERSION = 'editorial-v10-2026-10-11'
 LLM_PROMPT_VERSION = (_env('LLM_PROMPT_VERSION', DEFAULT_LLM_PROMPT_VERSION).strip()
                       or DEFAULT_LLM_PROMPT_VERSION)
 LLM_JUDGE_MAX_TOKENS = max(80, min(500, _env_int('LLM_JUDGE_MAX_TOKENS', 180)))
@@ -7394,10 +7394,21 @@ class WorkTitleResolver:
     QUERY = ('query($s:String){animes(search:$s,limit:3)'
              '{id name russian english japanese synonyms}}')
 
+    # Описание и жанры — отдельным запросом по id, а не в общем поиске: поиск
+    # нужен на каждую собранную новость, а справка — только посту, который
+    # идёт к модели. И если Shikimori поменяет поля описания, сломается одна
+    # справка, а не опознание тайтлов, на котором держится весь дедуп.
+    ABOUT_QUERY = ('query($ids:String){animes(ids:$ids,limit:1)'
+                   '{id description genres{russian kind}}}')
+    ABOUT_MAX_ITEMS = 1500
+    ABOUT_HIT_DAYS = 30
+    ABOUT_MISS_DAYS = 2
+
     def __init__(self, path: Path, *, url: str = WORK_LOOKUP_URL):
         self.path = path
         self.url = url
         self._items: dict[str, dict] = {}
+        self._about: dict[str, dict] = {}
         self._lock = threading.RLock()
         self._last_request = 0.0
         self._dirty = False
@@ -7415,6 +7426,9 @@ class WorkTitleResolver:
                 items = raw.get('titles') if isinstance(raw, dict) else None
                 if isinstance(items, dict):
                     self._items = {str(k): v for k, v in items.items() if isinstance(v, dict)}
+                about = raw.get('about') if isinstance(raw, dict) else None
+                if isinstance(about, dict):
+                    self._about = {str(k): v for k, v in about.items() if isinstance(v, dict)}
         except (OSError, ValueError, TypeError) as e:
             logger.warning(f'кеш тайтлов не загружен: {e}')
 
@@ -7425,8 +7439,12 @@ class WorkTitleResolver:
             if len(self._items) > self.MAX_ITEMS:
                 keep = sorted(self._items.items(), key=lambda kv: str(kv[1].get('at') or ''))
                 self._items = dict(keep[-self.MAX_ITEMS:])
+            if len(self._about) > self.ABOUT_MAX_ITEMS:
+                keep = sorted(self._about.items(), key=lambda kv: str(kv[1].get('at') or ''))
+                self._about = dict(keep[-self.ABOUT_MAX_ITEMS:])
             try:
-                _atomic_write_json(self.path, {'schema_version': 1, 'titles': self._items})
+                _atomic_write_json(self.path, {'schema_version': 1, 'titles': self._items,
+                                               'about': self._about})
                 self._dirty = False
             except OSError as e:
                 logger.warning(f'кеш тайтлов не сохранён: {e}')
@@ -7569,6 +7587,103 @@ class WorkTitleResolver:
                 'at': datetime.now(timezone.utc).isoformat()}
             self._dirty = True
         return key
+
+
+    def cached_about(self, key: str) -> Optional[dict]:
+        """Справка о тайтле из кеша: {'text', 'genres'}; {} — нет справки; None — не спрашивали."""
+        with self._lock:
+            row = self._about.get(str(key or ''))
+        if not row:
+            return None
+        try:
+            age = datetime.now(timezone.utc) - datetime.fromisoformat(str(row.get('at')))
+        except (TypeError, ValueError):
+            return None
+        days = self.ABOUT_HIT_DAYS if row.get('text') else self.ABOUT_MISS_DAYS
+        if age > timedelta(days=days):
+            return None
+        return {'text': str(row.get('text') or ''), 'genres': list(row.get('genres') or [])} \
+            if row.get('text') else {}
+
+    def about(self, key: str) -> dict:
+        """Справка о тайтле с Shikimori. Пустой словарь — справки нет или сеть молчит."""
+        key = str(key or '')
+        match = re.fullmatch(r'shiki:(\d{1,9})', key)
+        if not match:
+            return {}
+        ids = match.group(1)
+        cached = self.cached_about(key)
+        if cached is not None:
+            return cached
+        wait = self.MIN_INTERVAL - (time.monotonic() - self._last_request)
+        if wait > 0:
+            time.sleep(wait)
+        self._last_request = time.monotonic()
+        try:
+            response = requests.post(
+                self.url, json={'query': self.ABOUT_QUERY, 'variables': {'ids': ids}},
+                headers={'User-Agent': 'anime-news-bot (Telegram)',
+                         'Content-Type': 'application/json'},
+                timeout=min(HTTP_TIMEOUT, 8), allow_redirects=False)
+            if response.status_code != 200:
+                return {}
+            animes = (response.json().get('data') or {}).get('animes')
+        except (requests.RequestException, ValueError, AttributeError):
+            return {}           # сеть или поля — просто без справки, в кеш не пишем
+        row = animes[0] if isinstance(animes, list) and animes and isinstance(animes[0], dict) else {}
+        text = _shikimori_plain(row.get('description'))
+        genres = [str(g.get('russian') or '').strip() for g in (row.get('genres') or [])
+                  if isinstance(g, dict) and g.get('kind') in (None, 'genre', 'theme', 'demographic')
+                  and str(g.get('russian') or '').strip()][:3]
+        with self._lock:
+            self._about[key] = {'text': text, 'genres': genres,
+                                'at': datetime.now(timezone.utc).isoformat()}
+            self._dirty = True
+        return {'text': text, 'genres': genres} if text else {}
+
+
+# Разметка описаний Shikimori: [character=123]Имя[/character], [[Имя]],
+# [source]…[/source], [spoiler]…[/spoiler]. Спойлер и источник выбрасываем
+# целиком, у остальных тегов оставляем текст.
+_SHIKI_DROP_RE = re.compile(r'\[(spoiler|source)(?:=[^\]]*)?\].*?\[/\1\]', re.I | re.S)
+_SHIKI_TAG_RE = re.compile(r'\[/?[a-z_]+(?:=[^\]]*)?\]', re.I)
+
+
+def _shikimori_plain(description) -> str:
+    """Описание Shikimori без разметки: завязка, без спойлеров, до 400 символов."""
+    text = _SHIKI_DROP_RE.sub(' ', str(description or ''))
+    text = re.sub(r'\[\[([^\]]+)\]\]', r'\1', text)
+    text = _SHIKI_TAG_RE.sub('', text)
+    text = re.sub(r'\s+', ' ', html.unescape(text)).strip()
+    return _extract_sentences(text, max_sentences=2, max_len=400) if text else ''
+
+
+def _work_about(news: dict) -> dict:
+    """Справка о тайтле новости из кеша (без сети): {'text', 'genres'} или {}."""
+    key = str(news.get('_work_key') or '')
+    if work_titles is None or not key.startswith('shiki:'):
+        return {}
+    return work_titles.cached_about(key) or {}
+
+
+async def _attach_work_about(items: list) -> None:
+    """Подтягивает справку Shikimori для постов, которые идут к модели.
+
+    Сеть — в потоке, и не больше нескольких запросов за раз: справка украшает
+    пост, но не должна задерживать публикацию.
+    """
+    if work_titles is None or not feature_enabled('work_identity'):
+        return
+    budget = 4
+    for news in items:
+        key = str(news.get('_work_key') or '')
+        if not key.startswith('shiki:') or work_titles.cached_about(key) is not None:
+            continue
+        if budget <= 0:
+            break
+        budget -= 1
+        await asyncio.to_thread(work_titles.about, key)
+    await asyncio.to_thread(work_titles.flush)
 
 
 work_titles: Optional[WorkTitleResolver] = None
@@ -12794,6 +12909,13 @@ NOISE_TITLE_RULES = (
         r'\bфанарт\b',
         r'\bкосплей (?:дня|недели)\b',
         r'\bлучший косплей\b',
+        # Каверы и «живые версии» опенингов от фанатов, магазинов и блогеров:
+        # «В магазине сняли живую версию опенинга „Табакошки“» (октябрь 2026).
+        # Официальный клип или новый опенинг сериала сюда не попадают.
+        r'\bживую\s+версию\s+(?:опенинга|эндинга|заставки)\b',
+        r'\b(?:кавер\w*|cover)\s+(?:на\s+)?(?:опенинг|эндинг|заставк|песн)\w*',
+        r'\b(?:фанатск\w+|фан-)\s*(?:анимаци\w+|ролик\w*|клип\w*|трейлер\w*|версия|версию)\b',
+        r'\bfan[- ]?(?:made|animation|animated)\b|\b(?:op|opening|ending)\s+cover\b',
     )),
 )
 
@@ -13178,8 +13300,15 @@ def _work_tag(news: dict) -> str:
 def _work_title_hint(news: dict) -> str:
     """Строка для модели: официальные русские названия тайтлов, если известны."""
     russian = str(news.get('_work_russian') or '').strip()
+    about = _work_about(news)
+    about_lines = []
+    if about.get('text'):
+        # Справка — тоже исходный факт: проверки ответа модели видят её как
+        # часть источника, и фраза «о чём» не считается выдумкой.
+        about_lines.append(f'Справка о тайтле (Shikimori, без спойлеров): {about["text"]}'
+                           + (f' Жанры: {", ".join(about["genres"])}.' if about.get('genres') else ''))
     if not _russian_titles_on():
-        return ''
+        return '\n'.join(about_lines)
     lines = []
     if russian:
         original = str(news.get('_work_name') or '').strip()
@@ -13190,7 +13319,7 @@ def _work_title_hint(news: dict) -> str:
     for original, other in _work_title_pairs(news).items():
         if other != russian:
             lines.append(f'Русское название тайтла (Shikimori): «{other}»; в источнике — {original}')
-    return '\n'.join(lines[:6])
+    return '\n'.join(lines[:6] + about_lines)
 
 
 def _with_russian_work_name(title: str, news: dict) -> str:
@@ -13226,6 +13355,35 @@ def _with_russian_work_name(title: str, news: dict) -> str:
     return title[:match.start()] + replacement + title[match.end():]
 
 
+# Четыре и больше латинских слов КАПСОМ подряд: так некоторые источники пишут
+# длинные названия ранобэ («IN A WORLD FULL OF ZOMBIES I'M THE ONLY ONE…»), и в
+# посте это выглядит как крик. Короткие аббревиатуры (MAPPA, PV, OVA) поодиночке
+# под правило не попадают.
+_CAPS_RUN_RE = re.compile(r"\b[A-Z][A-Z0-9'’]*(?:[\s:,\-–]+[A-Z][A-Z0-9'’]*){3,}\b")
+_CAPS_SMALL_WORDS = frozenset({'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'and',
+                               'or', 'but', 'by', 'with', 'from', 'as', 'no', 'wa', 'ga', 'wo', 'ni'})
+
+
+def _tame_caps_latin(text: str) -> str:
+    """Название капсом → обычным регистром: первая буква слова заглавная."""
+    def fix(match: re.Match) -> str:
+        words = re.split(r'(\s+|[:,\-–]+)', match.group(0))
+        out, first = [], True
+        for word in words:
+            if not re.search(r'[A-Z]', word):
+                out.append(word)
+                continue
+            if re.fullmatch(r'[IVX]+', word) and not first:
+                out.append(word)                    # римская цифра: «Part II»
+            elif word.lower() in _CAPS_SMALL_WORDS and not first:
+                out.append(word.lower())
+            else:
+                out.append(word[0] + word[1:].lower())
+            first = False
+        return ''.join(out)
+    return _CAPS_RUN_RE.sub(fix, str(text or ''))
+
+
 def _with_tags(text: str, news: dict) -> str:
     """Дописывает в конец поста хэштег тайтла и хэштеги от модели.
 
@@ -13257,7 +13415,8 @@ def format_news_short(news: dict) -> str:
     llm_text = news.get('_llm_text')
     if llm_text:
         # Модель пересказывает статью и иногда переносит из неё адрес.
-        return _apply_editorial_rules(_with_tags(_strip_links(llm_text), news), news)
+        text = _with_about(_tame_caps_latin(_strip_links(llm_text)), news)
+        return _apply_editorial_rules(_with_tags(text, news), news)
     is_ru = news.get('lang') == 'ru'
 
     # Эпизоды форматируем отдельно (они и так короткие); парсер английский
@@ -13320,6 +13479,7 @@ def format_news_short(news: dict) -> str:
         parts.append(ru_summary)
     body = '\n\n'.join(parts)
     body = _append_release_date(body, date_str)
+    body = _with_about(_tame_caps_latin(body), news)
     body = _with_tags(body, news)
     return _apply_editorial_rules(body, news)
 
@@ -13435,7 +13595,14 @@ def _post_html(text: str, limit: int, news: Optional[dict] = None) -> str:
     out = prefix + f'<b>{html.escape(first.strip())}</b>'
     rest = rest.strip('\n')
     if rest:
-        out += '\n\n' + html.escape(rest)
+        # Строка «о чём» — цитатой, как оформляет завязку владелец канала.
+        about = _about_line(news or {})
+        # Сравниваем построчно: абзацы по пути к посту иногда склеиваются
+        # одним переводом строки, и цитата иначе терялась бы.
+        lines = [f'<blockquote>{html.escape(line.strip())}</blockquote>'
+                 if about and line.strip() == about else html.escape(line)
+                 for line in rest.split('\n')]
+        out += '\n\n' + '\n'.join(lines)
     return out
 
 
@@ -24343,6 +24510,48 @@ def _content_stems(text: str) -> set:
     return stems
 
 
+ABOUT_MAX = 220
+
+
+def _checked_about(about: str, source: str, body: str) -> str:
+    """Фраза «о чём» от модели, если она прошла те же проверки, что и пересказ.
+
+    Отдельно от пересказа: выдуманная фраза о сюжете не должна стоить посту
+    всего текста — её просто не будет.
+    """
+    about = re.sub(r'\s+', ' ', str(about or '')).strip().strip('«»"')
+    if not about or len(about) > ABOUT_MAX or len(re.findall(r'[А-Яа-яЁё]', about)) < 10:
+        return ''
+    if not about.endswith(('.', '!', '?', '…')):
+        about += '.'
+    if _editorial_rejection(source, about, ''):
+        return ''
+    if not (_llm_numbers_supported(source, about) and _llm_dates_supported(source, about)):
+        return ''
+    if _too_similar(body, about):
+        return ''               # повтор заголовка или текста другими словами
+    return about
+
+
+def _about_line(news: dict) -> str:
+    """Что показать строкой «о чём»: фраза модели, иначе начало справки Shikimori."""
+    about = str(news.get('_about') or '').strip()
+    if about:
+        return about
+    if news.get('_llm_text') or news.get('_edited_text'):
+        return ''               # модель справку видела и решила, что она не нужна
+    text = str(_work_about(news).get('text') or '')
+    return _extract_sentences(text, max_sentences=1, max_len=ABOUT_MAX) if text else ''
+
+
+def _with_about(text: str, news: dict) -> str:
+    """Дописывает строку «о чём» отдельным абзацем: в посте она станет цитатой."""
+    about = _about_line(news)
+    if not about or about in text or _too_similar(text, about):
+        return text
+    return f'{text.rstrip()}\n\n{about}'
+
+
 def _drop_repetitive_paragraphs(title: str, paragraphs: list) -> list:
     """Убирает явные повторы; новые значимые слова сохраняют абзац.
 
@@ -24841,6 +25050,7 @@ async def _llm_enrich_chunk(chunk: list) -> int:
     что и при одиночном вызове. Иначе пакетный путь пришлось бы поддерживать
     вторым комплектом правил, и они бы разъехались.
     """
+    await _attach_work_about(chunk)
     texts = [await _llm_source_text(news) for news in chunk]
     raw = await _llm_call([
         {'role': 'system', 'content': LLM_BATCH_SYSTEM_PROMPT},
@@ -24993,6 +25203,8 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
         return 'off'
     news['_prompt_version'] = LLM_PROMPT_VERSION
     metrics.inc('anime_bot_llm_prompt_total', labels={'version': LLM_PROMPT_VERSION})
+    if cached is None:
+        await _attach_work_about([news])
     summary = await _llm_source_text(news)
 
     # Официальное русское название — тоже исходный факт: без него проверки
@@ -25064,7 +25276,7 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
 
     # A fresh result replaces the previous rewrite, including its rejection.
     # Otherwise a rejected rewrite or empty tags leave stale publishable text.
-    for field in ('_llm_text', '_llm_tags', '_llm_judge_status', '_llm_judge_reason'):
+    for field in ('_llm_text', '_llm_tags', '_llm_judge_status', '_llm_judge_reason', '_about'):
         news.pop(field, None)
     news.pop('_editorial_rejection', None)
     new_title = str(data.get('title') or '').strip()
@@ -25108,6 +25320,9 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
                 (news.get('title') or '') + '\n' + (news.get('summary') or '')[:600])
             body = _append_release_date(body, date_str)
             news['_llm_text'] = body
+            about = _checked_about(str(data.get('about') or ''), source_fact_text, body)
+            if about:
+                news['_about'] = about
         else:
             # Та же причина, что выше: ответ из кеша не станет короче при повторе.
             news['_editorial_rejection'] = 'limits'
