@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "f5155e353c5cb9b9c7b3c3531f1237dd75f52d42",
-  "generated_at_utc": "2026-10-09T20:16:46.609741+00:00",
+  "git_commit": "acd34b936950ecde7a1f24de8ed79e1ce2d597bf",
+  "generated_at_utc": "2026-10-10T19:12:29.512128+00:00",
   "files": {
     ".claude/skills/find-skills/SKILL.md": {
       "sha256": "c00eeea0e13e74fe4a9d84ba0a8542205a1b736d65f13134fe1a6647eb14976f",
@@ -38,8 +38,8 @@
       "bytes": 33970
     },
     "anime_news_bot.py": {
-      "sha256": "747435043dc0b223ab391e2950451c74ab158e0e999b8c193ab9eb338f4112b6",
-      "bytes": 1848292
+      "sha256": "ddf71021ff3a4f6597bc4e9cecd1890f264f30985fe1c70dbfafd1d571e83438",
+      "bytes": 1852815
     },
     "docs/chat-moderation.md": {
       "sha256": "b2338299309164ec952d18f4800fd028cab4d012363dac2bb7cadd3ee3651b5f",
@@ -50,8 +50,8 @@
       "bytes": 22485
     },
     "docs/llm-providers.md": {
-      "sha256": "e9e0bb8f3388b76b4cedb8ac885b828ffc5971430864cec9c49dae7c57787587",
-      "bytes": 19350
+      "sha256": "d1c1df0a6123ee152672e4df6c446057db521bd45af04bf20a876d8816560fb3",
+      "bytes": 19655
     },
     "docs/maintenance-prompt.md": {
       "sha256": "c47bb19377e7b64daa242799e7c29bc8fb614257bb75a962d1958c756a68d77d",
@@ -414,8 +414,8 @@
       "bytes": 6470
     },
     "tests/test_llm_free_quota.py": {
-      "sha256": "16ab7393caad055dbac2639ab607ffdc42e4e525153c12072fc888c9bcc4e368",
-      "bytes": 5791
+      "sha256": "417a5f1c54a20067cef757a571e616f2386fb1d54ec4a2165fc0724b4c430b0e",
+      "bytes": 6932
     },
     "tests/test_llm_key_health.py": {
       "sha256": "99bf34af6ff87a6098275c41761f5ceeed473ba7dc66cc276952e6e3a4b0561d",
@@ -444,6 +444,10 @@
     "tests/test_llm_provider_rotation.py": {
       "sha256": "b73458ecba8376fbe5d0799c80672a4c837c43ba470a81e29a67fb5e1b9c06a1",
       "bytes": 13785
+    },
+    "tests/test_llm_region.py": {
+      "sha256": "5bd73ecd44fbe424427df62b76ce7a8c273d15723dd0e81fbdd3fc631106e65f",
+      "bytes": 4425
     },
     "tests/test_llm_transport_audit.py": {
       "sha256": "7b78dde2b0685e6b2e803b10dc87de3b22c1f9f7189b41fa11b6e600c9503c81",
