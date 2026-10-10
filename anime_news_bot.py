@@ -740,7 +740,7 @@ GOLDEN_DATASET_FILE = Path(__file__).with_name('golden') / 'editorial_cases.json
 STORY_UPDATE_LOOKBACK_DAYS = max(1, min(90, _env_int('STORY_UPDATE_LOOKBACK_DAYS', 21)))
 STORY_UPDATE_SIMILARITY = max(0.60, min(0.95, _env_float('STORY_UPDATE_SIMILARITY', 0.76)))
 REPLAY_BUFFER_MAX = max(20, min(2000, _env_int('REPLAY_BUFFER_MAX', 300)))
-DEFAULT_LLM_PROMPT_VERSION = 'editorial-v10-2026-10-11'
+DEFAULT_LLM_PROMPT_VERSION = 'editorial-v11-2026-10-11'
 LLM_PROMPT_VERSION = (_env('LLM_PROMPT_VERSION', DEFAULT_LLM_PROMPT_VERSION).strip()
                       or DEFAULT_LLM_PROMPT_VERSION)
 LLM_JUDGE_MAX_TOKENS = max(80, min(500, _env_int('LLM_JUDGE_MAX_TOKENS', 180)))
@@ -13364,6 +13364,37 @@ _CAPS_SMALL_WORDS = frozenset({'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', '
                                'or', 'but', 'by', 'with', 'from', 'as', 'no', 'wa', 'ga', 'wo', 'ni'})
 
 
+# Жаргон фанатских лент, который бот переносил в пост: «Вышел KV и трейлер»,
+# «Показан второй PV». Подписчик канала этих сокращений не знает.
+_JARGON_RULES = (
+    (re.compile(r'(?<![\w-])KV(?![\w-]|-?\d)'), 'постер'),
+    (re.compile(r'(?<![\w-])PV(?![\w-]|-?\d)'), 'промо-ролик'),
+    (re.compile(r'\bключев(ой|ого|ому|ым|ом|ые|ых|ыми)\s+визуал(а|у|ом|е|ы|ов|ам|ами|ах)?\b',
+                re.IGNORECASE), None),
+)
+_VISUAL_TO_POSTER = {'': 'постер', 'а': 'постера', 'у': 'постеру', 'ом': 'постером', 'е': 'постере',
+                     'ы': 'постеры', 'ов': 'постеров', 'ам': 'постерам', 'ами': 'постерами',
+                     'ах': 'постерах'}
+
+
+def _polish_post_text(text: str) -> str:
+    """Последняя правка текста поста: жаргон и неразрывные дефисы.
+
+    Модель пишет «аниме‑адаптация» с неразрывным дефисом (U+2011). На вид то
+    же самое, но поиск по каналу такое слово не находит, а часть шрифтов
+    рисует вместо дефиса пустой квадрат.
+    """
+    text = str(text or '').replace('\u2011', '-').replace('\u2010', '-')
+    for pattern, repl in _JARGON_RULES[:2]:
+        text = pattern.sub(repl, text)
+
+    def visual(match: re.Match) -> str:
+        adjective = match.group(0).split()[0]
+        noun = _VISUAL_TO_POSTER.get((match.group(2) or '').lower(), 'постер')
+        return f'{adjective} {noun}'
+    return _JARGON_RULES[2][0].sub(visual, text)
+
+
 def _tame_caps_latin(text: str) -> str:
     """Название капсом → обычным регистром: первая буква слова заглавная."""
     def fix(match: re.Match) -> str:
@@ -13415,7 +13446,7 @@ def format_news_short(news: dict) -> str:
     llm_text = news.get('_llm_text')
     if llm_text:
         # Модель пересказывает статью и иногда переносит из неё адрес.
-        text = _with_about(_tame_caps_latin(_strip_links(llm_text)), news)
+        text = _with_about(_polish_post_text(_tame_caps_latin(_strip_links(llm_text))), news)
         return _apply_editorial_rules(_with_tags(text, news), news)
     is_ru = news.get('lang') == 'ru'
 
@@ -13479,7 +13510,7 @@ def format_news_short(news: dict) -> str:
         parts.append(ru_summary)
     body = '\n\n'.join(parts)
     body = _append_release_date(body, date_str)
-    body = _with_about(_tame_caps_latin(body), news)
+    body = _with_about(_polish_post_text(_tame_caps_latin(body)), news)
     body = _with_tags(body, news)
     return _apply_editorial_rules(body, news)
 
@@ -24570,7 +24601,7 @@ def _drop_repetitive_paragraphs(title: str, paragraphs: list) -> list:
         # «Показан тизер 2 сезона X. Премьера в 2027 году» — вторая фраза новая,
         # и абзац целиком сохранялся вместе с пересказом заголовка. Проверяем
         # и по фразам; фраза с новым словом или числом остаётся.
-        sentences = _SENTENCE_SPLIT_RE.split(para.strip())
+        sentences = _split_clauses(para.strip())
         if len(sentences) > 1:
             fresh = []
             for sentence in sentences:
@@ -24581,11 +24612,34 @@ def _drop_repetitive_paragraphs(title: str, paragraphs: list) -> list:
                 seen += '\n' + sentence
             if not fresh:
                 continue
-            para = ' '.join(fresh)
+            if len(fresh) < len(sentences):
+                # Абзац собираем заново, только если из него что-то убрали:
+                # иначе «;» автора превращалась бы в точку без причины.
+                para = ' '.join(fresh)
         else:
             seen += '\n' + para
         kept.append(para)
     return kept
+
+
+def _split_clauses(text: str) -> list[str]:
+    """Фразы абзаца; фраза с «;» делится ещё и по нему.
+
+    «Постер аниме «Едок» опубликован; анимацию делает студия Cab.» — первая
+    половина пересказывает заголовок, вторая несёт факт. Целиком фраза не
+    повтор, и раньше она уходила в пост вместе с пересказом.
+    """
+    out: list[str] = []
+    for sentence in _SENTENCE_SPLIT_RE.split(text):
+        parts = [p.strip() for p in re.split(r';\s+', sentence) if p.strip()]
+        if len(parts) == 1:
+            out.append(sentence)
+            continue
+        end = sentence.rstrip()[-1:] if sentence.rstrip()[-1:] in '.!?…' else '.'
+        for part in parts:
+            part = part.rstrip('.!?…')
+            out.append(part[:1].upper() + part[1:] + end)
+    return out
 
 
 # Граница фразы: знак конца и заглавная буква, цифра или кавычка дальше.
