@@ -23096,6 +23096,33 @@ def _llm_backup_model() -> str:
     return _llm_backup_config()[2]
 
 
+# Отказ по стране: провайдер видит адрес сервера и не обслуживает её. Google
+# отвечает так на Gemini с адресов, которые числятся за Россией, даже если сам
+# сервер стоит в Нидерландах (Bothost, октябрь 2026). Повтор и ожидание не
+# помогут никогда — помогает только другой провайдер.
+_LLM_REGION_MARKERS = (
+    'user location is not supported', 'location is not supported',
+    'unsupported_country_region_territory', 'country, region, or territory not supported',
+    'not available in your country', 'not available in your region',
+    'not supported in your region', 'not supported in your country',
+)
+
+
+def _llm_region_refused(status: int, body: str) -> bool:
+    # Успешный ответ модели может процитировать эти слова в тексте новости.
+    if status < 400:
+        return False
+    text = (body or '').lower()
+    return any(marker in text for marker in _LLM_REGION_MARKERS)
+
+
+def _llm_slot_key_env(slot: str) -> str:
+    """Имя переменной с ключом слота: LLM_API_KEY, GEMINI_API_KEY…"""
+    if str(slot).startswith('extra_'):
+        return f'{str(slot)[6:].upper()}_API_KEY'
+    return LLM_SLOT_ENV_NAMES.get(slot, ('', 'LLM_API_KEY'))[1]
+
+
 def _llm_fatal_reason(status: int, body: str) -> Optional[dict]:
     """Ошибка провайдера, которую не исправит повтор.
 
@@ -23116,6 +23143,15 @@ def _llm_fatal_reason(status: int, body: str) -> Optional[dict]:
         if isinstance(data, dict) and 'choices' in data:
             return None
     text = (body or '').lower()
+    if _llm_region_refused(status, body):
+        # Раньше это был «обычный» 400: бот решал, что провайдер не понял
+        # строгий JSON, выключал JSON-режим для ВСЕХ моделей и оставался на
+        # отказывающем провайдере, вместо того чтобы перейти к следующему.
+        return {'reason': 'region',
+                'log': 'провайдер не обслуживает страну, из которой идут запросы',
+                'admin': 'провайдер не обслуживает страну, из которой идут запросы бота '
+                         '(страну он определяет по адресу сервера). Ожидание не поможет: '
+                         'ключ этого провайдера на нынешнем хостинге бесполезен, его можно стереть.'}
     # Роутеры отдают 404 с кодом model_not_found и тогда, когда модель есть, но
     # у неё сейчас нет свободной мощности: «No available capacity ... Please try
     # again later». Это временный отказ, а не ошибка конфигурации. Раньше он
@@ -23821,6 +23857,10 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
         if fatal:
             _llm_last_usage_tokens = 0  # Auth/model/billing/capacity refusals do not run the model.
             _remember_provider_error(r.status_code, r.text)
+            if fatal['reason'] == 'region' and llm_key_health is not None:
+                # Как с отклонённым ключом: к этому слоту больше не ходим, и
+                # перезапуск (а он тут частый) этого не отменяет.
+                llm_key_health.remember_rejected(slot, api_key, r.status_code, model)
             _llm_note_failure('http', f'HTTP {r.status_code}: {fatal["log"]}', model=model,
                               free=True)
             if _llm_try_failover(fatal['reason'], fatal['admin'],
@@ -25153,6 +25193,8 @@ def _llm_off_reason() -> str:
         parts.append('💳 Нет средств или исчерпан бесплатный тариф.')
     elif _llm_disabled_reason == 'model':
         parts.append('📦 Провайдер не знает такую модель — проверь LLM_MODEL.')
+    elif _llm_disabled_reason == 'region':
+        parts.append('🌍 Провайдер не обслуживает страну сервера — нужен другой провайдер.')
     elif _llm_disabled_runtime:
         parts.append('⛔ Модель временно выключена.')
     else:
@@ -25373,7 +25415,7 @@ def _llm_probe_slot(slot: str, timeout: float = 12.0, model: str = '') -> dict:
         # обычный путь к отклонённому слоту больше не обращается вовсе.
         if r.status_code == 200:
             llm_key_health.forget(slot)
-        elif r.status_code in (401, 403):
+        elif r.status_code in (401, 403) or _llm_region_refused(r.status_code, r.text):
             llm_key_health.remember_rejected(slot, api_key, r.status_code, model)
     if r.status_code == 200:
         return {'slot': slot, 'model': model, 'ok': True, 'status': 200,
@@ -25385,6 +25427,7 @@ def _llm_probe_slot(slot: str, timeout: float = 12.0, model: str = '') -> dict:
             # «Подождать» и «поправить настройки» — разные советы, и путать их
             # дорого: при 404 по имени модели ожидание не поможет никогда.
             'temporary': fatal.get('reason') == 'capacity' or r.status_code == 429,
+            'region': fatal.get('reason') == 'region',
             'detail': _redact_secrets(' '.join((r.text or '').split()))[:200]}
 
 
@@ -25422,7 +25465,10 @@ def _llm_cleanup_plan(results: list[dict]) -> dict:
         provider, key, model, base = LLM_SLOT_ENV_NAMES.get(slot, ('', '', '', ''))
         human = LLM_SLOT_HUMAN.get(slot, slot).split(' (')[0]
         status = int(row.get('status') or 0)
-        if status in (401, 403):
+        if row.get('region'):
+            remove.append(f'{_llm_slot_key_env(slot)} — провайдер не обслуживает страну сервера '
+                          '(так он видит адрес хостинга). Ключ здесь не заработает, его можно стереть')
+        elif status in (401, 403):
             replace.append(f'{key} — провайдер отклонил ключ ({status}). Заменить ключ '
                            f'или стереть слот целиком: {provider}, {key}')
         elif status == 429 or row.get('temporary'):
@@ -25722,6 +25768,9 @@ async def llmping_command(update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f'   HTTP {row["status"]} за {row["took"]:.1f} с')
             if row['detail']:
                 lines.append(f'   <code>{html.escape(row["detail"])}</code>')
+            if row.get('region'):
+                lines.append(f'   🌍 провайдер не работает из страны сервера — ожидание не поможет; '
+                             f'<code>{html.escape(_llm_slot_key_env(row["slot"]))}</code> можно стереть')
             # Провайдер сам называет рабочее имя модели — не заставляем искать
             # его в документации, когда ответ уже пришёл.
             if row.get('suggested'):
@@ -25783,7 +25832,14 @@ async def llmping_command(update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append('Проверить один вариант, не тревожа остальных: '
                              '<code>/llmping имя-модели</code>')
     else:
-        alive = ', '.join(LLM_SLOT_HUMAN[r['slot']].split(' (')[0] for r in working)
+        # Слот с запасными моделями на том же ключе раньше печатался столько
+        # раз, сколько моделей ответило: «Отвечают: основной, основной,
+        # основной». Слот — один раз, ответившие модели — в скобках.
+        by_slot: dict[str, list[str]] = {}
+        for r in working:
+            by_slot.setdefault(r['slot'], []).append(r['model'])
+        alive = '; '.join(f"{LLM_SLOT_HUMAN[slot].split(' (')[0]} ({', '.join(models)})"
+                          for slot, models in by_slot.items())
         current = _llm_primary_slot()
         lines.append(f'Отвечают: <b>{html.escape(alive)}</b>.')
         if not any(r['slot'] == current for r in working):
@@ -27766,6 +27822,7 @@ async def reliability_command(update, context: ContextTypes.DEFAULT_TYPE):
             'billing': 'нет средств или исчерпан бесплатный тариф — пополни баланс '
                        'или смени провайдера через LLM_BASE_URL',
             'model': 'провайдер не знает эту модель — проверь LLM_MODEL и LLM_BASE_URL',
+            'region': 'провайдер не обслуживает страну сервера — нужен ключ другого провайдера',
         }
         reason = _llm_disabled_reason or 'unknown'
         lines.append(f'  ⛔ выключена до рестарта: <code>{html.escape(reason)}</code>')
