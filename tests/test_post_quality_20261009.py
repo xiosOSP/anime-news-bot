@@ -152,3 +152,46 @@ def test_gemini_preset_is_open_to_new_keys():
     новый GEMINI_API_KEY на пресете 2.5 Flash получал бы отказ."""
     _url, model = bot.LLM_PRESETS['gemini']
     assert not model.startswith('gemini-2.')
+
+
+# ---------- октябрь 2026, вторая неделя: жаргон, дефисы, пересказ через «;» ----------
+
+@pytest.mark.parametrize('raw,expected', [
+    ('Вышел KV и главный трейлер аниме.', 'Вышел постер и главный трейлер аниме.'),
+    ('Показан второй PV аниме.', 'Показан второй промо-ролик аниме.'),
+    ('Представлен ключевой визуал, без ключевого визуала никак.',
+     'Представлен ключевой постер, без ключевого постера никак.'),
+    ('Аниме‑адаптация вышла.', 'Аниме-адаптация вышла.'),
+])
+def test_jargon_and_nonbreaking_hyphens_are_cleaned(raw, expected):
+    assert bot._polish_post_text(raw) == expected
+
+
+def test_model_names_with_kv_are_left_alone():
+    assert bot._polish_post_text('Танк KV-2, самолёт PV-1 и студия KVA.') == \
+        'Танк KV-2, самолёт PV-1 и студия KVA.'
+
+
+def test_llm_post_goes_through_polish(monkeypatch):
+    monkeypatch.setattr(bot, 'settings', None)
+    text = bot.format_news_short({'_llm_text': 'Вышел KV аниме‑проекта «X».', 'title': 't'})
+    assert 'KV' not in text and '‑' not in text
+
+
+def test_echo_half_of_a_semicolon_sentence_is_dropped():
+    title = 'Показан постер аниме «Едок: Сверхзаказ»'
+    body = ['Постер аниме «Едок: Сверхзаказ» опубликован; анимацию делает студия Cab.']
+    assert bot._drop_repetitive_paragraphs(title, body) == ['Анимацию делает студия Cab.']
+
+
+def test_semicolon_sentence_without_echo_is_kept_as_written():
+    assert bot._drop_repetitive_paragraphs('Анонс', ['Премьера в 2027 году; студия MAPPA.']) == \
+        ['Премьера в 2027 году; студия MAPPA.']
+
+
+def test_subject_is_asked_in_latin_to_match_russian_and_english_sources():
+    """Бот дважды выложил перенос «Призрака Цусимы»: один источник английский,
+    другой русский, и ключи «Ghost of Tsushima» и «Призрак Цусимы» не совпали."""
+    assert 'ЛАТИНИЦЕЙ' in bot.LLM_SYSTEM_PROMPT and 'Ghost of Tsushima: Legends' in bot.LLM_SYSTEM_PROMPT
+    subjects = bot.RecentSubjects
+    assert subjects._key('Ghost of Tsushima: Legends') == subjects._key('ghost of tsushima legends')

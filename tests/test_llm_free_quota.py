@@ -122,3 +122,25 @@ class _AsyncReturn:
 
         msg.edit_text = edit
         return msg
+
+
+@pytest.mark.asyncio
+async def test_summary_names_each_provider_once_with_its_models(three, monkeypatch):
+    """«Отвечают: основной, основной, основной» не говорило, КТО отвечает."""
+    async def fake_sleep(seconds):
+        pass
+
+    monkeypatch.setattr(bot.asyncio, 'sleep', fake_sleep)
+    monkeypatch.setattr(bot, '_llm_probe_slot',
+                        lambda slot, timeout=12.0, model='': {
+                            'slot': slot, 'model': model, 'ok': True, 'status': 200,
+                            'took': 0.1, 'detail': '', 'suggested': '', 'temporary': False})
+    monkeypatch.setattr(bot, 'is_admin', lambda _u: True)
+    update = MagicMock()
+    update.message.reply_text = _AsyncReturn()
+    await bot.llmping_command(update, MagicMock(args=[]))
+    summary = [line for line in update.message.reply_text.calls[-1].split('\n')
+               if line.startswith('Отвечают')][0]
+    primary = bot.LLM_SLOT_HUMAN['primary'].split(' (')[0]
+    assert summary.count(primary) == 1
+    assert 'qwen/qwen3.8-27b-free' in summary and 'tencent/hy3-free' in summary
