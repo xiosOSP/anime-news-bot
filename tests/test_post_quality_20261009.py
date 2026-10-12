@@ -195,3 +195,65 @@ def test_subject_is_asked_in_latin_to_match_russian_and_english_sources():
     assert 'ЛАТИНИЦЕЙ' in bot.LLM_SYSTEM_PROMPT and 'Ghost of Tsushima: Legends' in bot.LLM_SYSTEM_PROMPT
     subjects = bot.RecentSubjects
     assert subjects._key('Ghost of Tsushima: Legends') == subjects._key('ghost of tsushima legends')
+
+
+# ---------- подборка под видом новости: альбом из разных тайтлов ----------
+# Пересказ поста из канала (октябрь 2026): шесть постеров разных аниме, текст —
+# список сиквелов. В канал ушло «Анонсирован 4 сезон «Необъятного океана»» с
+# артами Наруто, Ванпанчмена и Re:Zero.
+
+DIGEST = {
+    'title': 'Анонсирован 4 сезон аниме «Необъятный океан» и другие сиквелы',
+    'summary': '🔥 «Наруто» — новый проект\n🔥 «Доктор Стоун» — финал\n'
+               '🔥 «Ванпанчмен» — 3 сезон\n🔥 «Re:Zero» — 4 сезон',
+    'link': 'https://b.example/2', 'source': 'TG: B',
+    'images': [f'https://b.example/{i}.jpg' for i in range(6)],
+}
+
+
+def test_album_of_different_titles_is_a_digest():
+    assert bot.noise_reason(dict(DIGEST)) == 'подборка'
+
+
+def test_one_title_album_with_song_names_is_news():
+    news = {'title': 'Кадры 3 серии «Re:Zero»',
+            'summary': 'Опенинг «Reweave» исполнит MYTH & ROID, эндинг — «Ashes».',
+            'images': [f'https://c.example/{i}.jpg' for i in range(9)]}
+    assert bot.noise_reason(news) == ''
+
+
+def test_same_list_without_album_is_not_judged_by_this_rule():
+    news = dict(DIGEST, images=['https://b.example/0.jpg'])
+    assert not bot._looks_like_digest(news)
+
+
+def test_digest_in_a_cluster_does_not_lend_its_album(monkeypatch):
+    monkeypatch.setitem(bot.FEATURE_FLAGS, 'work_identity', False)
+    now = bot.time.gmtime()
+    real = {'title': 'Анонсирован 4 сезон аниме «Необъятный океан»', 'summary': 'Премьера в 2027 году.',
+            'link': 'https://a.example/1', 'source': 'TG: A',
+            'images': ['https://a.example/poster.jpg'], 'published_parsed': now}
+    out = bot._cluster_news([dict(DIGEST, published_parsed=now), real], persist_intelligence=False)
+    assert len(out) == 1
+    assert out[0]['link'] == real['link'], 'главной стала подборка — отсев снял бы и новость'
+    assert out[0]['images'] == ['https://a.example/poster.jpg']
+
+
+def test_officially_announced_release_is_an_echo_of_the_title():
+    title = 'Официально анонсирован 4-й сезон «Необъятный океан»'
+    body = ['Официально объявлен выпуск 4-го сезона аниме «Необъятный океан».']
+    assert bot._drop_repetitive_paragraphs(title, body) == []
+
+
+def test_list_of_names_without_quotes_is_a_digest_too():
+    news = {'title': 'Сиквелы, которые анонсировали в сентябре',
+            'summary': '— Наруто: новый проект\n— Доктор Стоун: финал\n— Ванпанчмен: третий сезон',
+            'images': [f'https://b.example/{i}.jpg' for i in range(6)]}
+    assert bot._looks_like_digest(news)
+
+
+def test_longer_name_of_the_same_title_is_counted_once():
+    news = {'title': '«Магическая битва»: кадры', 'images': list('abcd'),
+            'summary': '«Магическая битва: Сибуя», «Магическая битва: Смертельная миграция» и '
+                       '«Магическая битва» — опенинг «Specialz».'}
+    assert not bot._looks_like_digest(news)

@@ -56,6 +56,7 @@ from moderation_rules import check_text as check_moderation_text, normalize as n
 from post_text import (
     _extract_sentences,
     _strip_links,
+    _tg_is_list_item,
     _tg_split_leading_sentence,
     _tg_title_and_summary,
     tg_source_hashtags,
@@ -12964,6 +12965,40 @@ _ANNIVERSARY_EVENT_RE = re.compile(
     re.IGNORECASE)
 
 
+# Подборка под видом новости: альбом постеров РАЗНЫХ тайтлов и текст-список.
+# Модель вынимала из такого поста одну новость («анонсирован 4 сезон
+# «Необъятного океана»»), а альбом уходил целиком — шесть артов Наруто,
+# Ванпанчмена, Re:Zero и других под чужой новостью (октябрь 2026).
+_DIGEST_QUOTED_RE = re.compile(r'«([^«»\n]{2,80})»')
+DIGEST_MIN_IMAGES = 3
+
+
+def _digest_signals(news: dict) -> tuple[int, int]:
+    """Сколько разных названий в «ёлочках» и сколько строк-пунктов в тексте."""
+    text = f"{news.get('title') or ''}\n{news.get('summary') or ''}"
+    names = {re.sub(r'\s+', ' ', m.group(1)).strip().casefold()
+             for m in _DIGEST_QUOTED_RE.finditer(text)}
+    # «Магическая битва» и «Магическая битва: Сибуя» — один тайтл, не два.
+    names = {n for n in names if not any(n != o and o in n for o in names)}
+    list_lines = sum(1 for line in text.split('\n')
+                     if _tg_is_list_item(line) and re.search(r'[A-Za-zА-Яа-яЁё]{3,}', line))
+    return len(names), list_lines
+
+
+def _looks_like_digest(news: dict) -> bool:
+    """Альбом из 3+ картинок при тексте о нескольких тайтлах.
+
+    Без альбома такой текст ещё может быть новостью (линейка сезона одной
+    строкой), а вот картинки в нём заведомо не про одну новость. Порог по
+    названиям — четыре: в обычной новости в кавычках бывают и тайтл, и песня,
+    и студия.
+    """
+    if len(news.get('images') or []) < DIGEST_MIN_IMAGES:
+        return False
+    names, list_lines = _digest_signals(news)
+    return names >= 4 or list_lines >= 3
+
+
 def noise_reason(news: dict) -> str:
     """Чем заголовок выдаёт себя как не-новость. Пусто — новость.
 
@@ -12980,6 +13015,8 @@ def noise_reason(news: dict) -> str:
     for reason, pattern in _NOISE_TITLE_RE:
         if pattern.search(title):
             return reason
+    if _looks_like_digest(news):
+        return 'подборка'
     if _ANNIVERSARY_SOFT_RE.search(title) and not _ANNIVERSARY_EVENT_RE.search(title):
         return 'годовщина и ностальгия'
     if _self_promo(title, str(news.get('source') or '')):
@@ -18585,7 +18622,10 @@ def _cluster_news(items: list[dict], *, persist_intelligence: bool = True) -> li
     collapsed = 0
     for cluster in clusters:
         # Primary: официальный источник > reputation > более содержательный материал.
+        # Подборка в кластере — подтверждение, но не главный материал: иначе
+        # отсев шума снял бы вместе с ней и настоящую новость.
         primary = max(cluster, key=lambda n: (
+            0 if _looks_like_digest(n) else 1,
             1 if _is_official_news(n) else 0,
             _source_reputation_score(n.get('source', '')),
             1 if n.get('video') else 0,
@@ -18598,6 +18638,9 @@ def _cluster_news(items: list[dict], *, persist_intelligence: bool = True) -> li
         # бы один thumbnail.
         all_images: list[str] = []
         for n in [primary] + [x for x in cluster if x is not primary]:
+            # Альбом подборки — постеры разных тайтлов: в чужую новость не берём.
+            if n is not primary and _looks_like_digest(n):
+                continue
             for image_url in (n.get('images') or []):
                 if image_url and image_url not in all_images:
                     all_images.append(image_url)
@@ -24521,6 +24564,8 @@ _ECHO_STOP = {
     # «predst» и «chto» не совпадали ни с одним словом, и «Вышел тизер» с
     # «Представлен тизер» считались разными фразами.
     'visel', 'visla', 'visli', 'vislo', 'preds', 'raskr',
+    # «Официально объявлен выпуск 4 сезона» — тот же анонс другими словами.
+    'vipus', 'ofici',
 }
 
 
