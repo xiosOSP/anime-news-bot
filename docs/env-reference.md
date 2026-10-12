@@ -188,7 +188,7 @@
 | `LLM_PACE_MAX_SEC` | `60.0` | anime_news_bot.py |
 | `LLM_PRIMARY_RETRY_MAX_SEC` | — | anime_news_bot.py |
 | `LLM_PRIMARY_RETRY_SEC` | `1800` | anime_news_bot.py |
-| `LLM_PROMPT_VERSION` | `editorial-v11-2026-10-11` | anime_news_bot.py |
+| `LLM_PROMPT_VERSION` | `editorial-v12-2026-10-12` | anime_news_bot.py |
 | `LLM_PROVIDER` | — | anime_news_bot.py |
 | `LLM_TIMEOUT` | `30` | anime_news_bot.py |
 
@@ -434,6 +434,6 @@
 | `TOKENATOR_MODEL` | — | anime_news_bot.py |
 | `TRANSLATION_DEFER_MAX_AGE_SEC` | `21600` | anime_news_bot.py |
 | `TRANSLATION_DEFER_MAX_ATTEMPTS` | `6` | anime_news_bot.py |
-| `WESTERN_DAILY_MAX` | `3` | anime_news_bot.py |
+| `WESTERN_DAILY_MAX` | `1` | anime_news_bot.py |
 | `WORK_LOOKUP_PER_CYCLE` | `40` | anime_news_bot.py |
 | `WORK_LOOKUP_URL` | `https://shikimori.io/api/graphql` | anime_news_bot.py |

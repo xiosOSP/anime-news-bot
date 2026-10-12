@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "38a9ce21f7f92d8a9c1c99374be41407e605461b",
-  "generated_at_utc": "2026-10-10T22:13:28.452109+00:00",
+  "git_commit": "72d4dfbf9f121bf0525eb2d2f1b53bea2e95005c",
+  "generated_at_utc": "2026-10-12T09:47:52.537780+00:00",
   "files": {
     ".claude/skills/find-skills/SKILL.md": {
       "sha256": "c00eeea0e13e74fe4a9d84ba0a8542205a1b736d65f13134fe1a6647eb14976f",
@@ -38,15 +38,15 @@
       "bytes": 33970
     },
     "anime_news_bot.py": {
-      "sha256": "23b7428d2c021978bd02380d2a22dde56062c7c329a9b1cd97e3480e90c637c9",
-      "bytes": 1867910
+      "sha256": "c6e728c304e5888a260c0eae956164383161bb302d861f8ee10d63af47eab6d7",
+      "bytes": 1873469
     },
     "docs/chat-moderation.md": {
       "sha256": "b2338299309164ec952d18f4800fd028cab4d012363dac2bb7cadd3ee3651b5f",
       "bytes": 73282
     },
     "docs/env-reference.md": {
-      "sha256": "7cc3dbe6bf0b9b4a3f8225c783bb703902d830deedd76d64b9c46d81ad591465",
+      "sha256": "69034025f49e06c20e49654d181258a64053104befed1a53d03f21f4407d2a92",
       "bytes": 22486
     },
     "docs/llm-providers.md": {
@@ -74,8 +74,8 @@
       "bytes": 1999
     },
     "llm_protocol.py": {
-      "sha256": "0ff857d409fc5d3f745666ae2d579da1af25948aa0924d88e6aed151af05d68d",
-      "bytes": 48679
+      "sha256": "93c804ab7194aa9e3643056e050e7e3027412fdaba8526ec52ce6e81a648ac57",
+      "bytes": 48980
     },
     "moderation_llm.py": {
       "sha256": "dbc16ca2e419213acc7bbfd0d62bcfaffc0eb3a46bd3df3d42f742eaf513d48d",
@@ -682,8 +682,8 @@
       "bytes": 13726
     },
     "tests/test_post_quality_20261009.py": {
-      "sha256": "6e37b5873b774ec80e9b0476518953c01e3d97272accccef2462396673ffb47f",
-      "bytes": 9918
+      "sha256": "4488715599541a29273b1adc296b5e5bdc5208df127039295788fde2a7bed26d",
+      "bytes": 15846
     },
     "tests/test_post_text.py": {
       "sha256": "3670e109204aa34db33d82d04d6589645e01df5db100e3bd61d748539de2701e",
@@ -838,8 +838,8 @@
       "bytes": 10257
     },
     "tests/test_western_quota.py": {
-      "sha256": "ed72a5c44dc3d6cebda8d2e76285234ec5e7b132a0cd2b46927d7bf4fc6d6b22",
-      "bytes": 10650
+      "sha256": "f038b86753779290f4fbdde8576d1b7d8060177141b70cc6c77cf0423da472d8",
+      "bytes": 11224
     },
     "tests/test_work_identity.py": {
       "sha256": "8116c8fda273ea64dc9eeb901d06ece846089553be381acdc3aa872215cd17f8",

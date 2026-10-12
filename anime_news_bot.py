@@ -56,6 +56,7 @@ from moderation_rules import check_text as check_moderation_text, normalize as n
 from post_text import (
     _extract_sentences,
     _strip_links,
+    _tg_is_list_item,
     _tg_split_leading_sentence,
     _tg_title_and_summary,
     tg_source_hashtags,
@@ -64,6 +65,7 @@ from post_text import (
 )
 # Протокол с языковой моделью: что мы ей говорим и как проверяем ответ. — llm_protocol.py; здесь то, чем пользуется бот.
 from llm_protocol import (
+    _llm_number_set,
     LLM_BATCH_SYSTEM_PROMPT,
     LLM_JUDGE_SYSTEM_PROMPT,
     LLM_KINDS_FILLER,
@@ -740,7 +742,7 @@ GOLDEN_DATASET_FILE = Path(__file__).with_name('golden') / 'editorial_cases.json
 STORY_UPDATE_LOOKBACK_DAYS = max(1, min(90, _env_int('STORY_UPDATE_LOOKBACK_DAYS', 21)))
 STORY_UPDATE_SIMILARITY = max(0.60, min(0.95, _env_float('STORY_UPDATE_SIMILARITY', 0.76)))
 REPLAY_BUFFER_MAX = max(20, min(2000, _env_int('REPLAY_BUFFER_MAX', 300)))
-DEFAULT_LLM_PROMPT_VERSION = 'editorial-v11-2026-10-11'
+DEFAULT_LLM_PROMPT_VERSION = 'editorial-v12-2026-10-12'
 LLM_PROMPT_VERSION = (_env('LLM_PROMPT_VERSION', DEFAULT_LLM_PROMPT_VERSION).strip()
                       or DEFAULT_LLM_PROMPT_VERSION)
 LLM_JUDGE_MAX_TOKENS = max(80, min(500, _env_int('LLM_JUDGE_MAX_TOKENS', 180)))
@@ -12964,6 +12966,40 @@ _ANNIVERSARY_EVENT_RE = re.compile(
     re.IGNORECASE)
 
 
+# Подборка под видом новости: альбом постеров РАЗНЫХ тайтлов и текст-список.
+# Модель вынимала из такого поста одну новость («анонсирован 4 сезон
+# «Необъятного океана»»), а альбом уходил целиком — шесть артов Наруто,
+# Ванпанчмена, Re:Zero и других под чужой новостью (октябрь 2026).
+_DIGEST_QUOTED_RE = re.compile(r'«([^«»\n]{2,80})»')
+DIGEST_MIN_IMAGES = 3
+
+
+def _digest_signals(news: dict) -> tuple[int, int]:
+    """Сколько разных названий в «ёлочках» и сколько строк-пунктов в тексте."""
+    text = f"{news.get('title') or ''}\n{news.get('summary') or ''}"
+    names = {re.sub(r'\s+', ' ', m.group(1)).strip().casefold()
+             for m in _DIGEST_QUOTED_RE.finditer(text)}
+    # «Магическая битва» и «Магическая битва: Сибуя» — один тайтл, не два.
+    names = {n for n in names if not any(n != o and o in n for o in names)}
+    list_lines = sum(1 for line in text.split('\n')
+                     if _tg_is_list_item(line) and re.search(r'[A-Za-zА-Яа-яЁё]{3,}', line))
+    return len(names), list_lines
+
+
+def _looks_like_digest(news: dict) -> bool:
+    """Альбом из 3+ картинок при тексте о нескольких тайтлах.
+
+    Без альбома такой текст ещё может быть новостью (линейка сезона одной
+    строкой), а вот картинки в нём заведомо не про одну новость. Порог по
+    названиям — четыре: в обычной новости в кавычках бывают и тайтл, и песня,
+    и студия.
+    """
+    if len(news.get('images') or []) < DIGEST_MIN_IMAGES:
+        return False
+    names, list_lines = _digest_signals(news)
+    return names >= 4 or list_lines >= 3
+
+
 def noise_reason(news: dict) -> str:
     """Чем заголовок выдаёт себя как не-новость. Пусто — новость.
 
@@ -12980,6 +13016,8 @@ def noise_reason(news: dict) -> str:
     for reason, pattern in _NOISE_TITLE_RE:
         if pattern.search(title):
             return reason
+    if _looks_like_digest(news):
+        return 'подборка'
     if _ANNIVERSARY_SOFT_RE.search(title) and not _ANNIVERSARY_EVENT_RE.search(title):
         return 'годовщина и ностальгия'
     if _self_promo(title, str(news.get('source') or '')):
@@ -18585,7 +18623,10 @@ def _cluster_news(items: list[dict], *, persist_intelligence: bool = True) -> li
     collapsed = 0
     for cluster in clusters:
         # Primary: официальный источник > reputation > более содержательный материал.
+        # Подборка в кластере — подтверждение, но не главный материал: иначе
+        # отсев шума снял бы вместе с ней и настоящую новость.
         primary = max(cluster, key=lambda n: (
+            0 if _looks_like_digest(n) else 1,
             1 if _is_official_news(n) else 0,
             _source_reputation_score(n.get('source', '')),
             1 if n.get('video') else 0,
@@ -18598,6 +18639,9 @@ def _cluster_news(items: list[dict], *, persist_intelligence: bool = True) -> li
         # бы один thumbnail.
         all_images: list[str] = []
         for n in [primary] + [x for x in cluster if x is not primary]:
+            # Альбом подборки — постеры разных тайтлов: в чужую новость не берём.
+            if n is not primary and _looks_like_digest(n):
+                continue
             for image_url in (n.get('images') or []):
                 if image_url and image_url not in all_images:
                     all_images.append(image_url)
@@ -18777,6 +18821,10 @@ _AFFINITY_INTERVIEW_RE = re.compile(r'интервью|interview|インタビュ
 _AFFINITY_GOSSIP_RE = re.compile(
     r'\bслух|инсайдер|по данным\s+\w+(?:rpk|guy)|\brumou?r|\binsider|\breportedly\b|'
     r'касс\w*\s+сбор|предпродаж|\bbox office\b|\bpresales?\b|opening weekend|'
+    # Сборы без слова «касса»: «"Тайный дневник Верити" заработал 113 млн долларов
+    # при бюджете в 40 млн» (октябрь 2026, ноль реакций).
+    r'(?:заработал|собрал|окупил)\w*\s+(?:уже\s+|более\s+|почти\s+|свыше\s+)?\$?\d[\d\s.,]*\s*'
+    r'(?:млн|миллион|млрд|миллиард)|\bgrossed\b|\bearned\s+\$|'
     r'фотосесси|photo\s*shoot|красн\w+\s+дорожк|red carpet',
     re.IGNORECASE)
 # Корпоративная хроника студий: кто возглавил маркетинг, сколько миллиардов
@@ -18831,7 +18879,10 @@ def _topic_affinity(news: dict) -> float:
 # очереди нет, кино шло подряд. Поэтому у такой темы ещё и суточный лимит:
 # лишнее не публикуется, и канал лучше помолчит, чем выдаст пятый пост про
 # Marvel подряд. 0 — без лимита.
-WESTERN_DAILY_MAX = max(0, min(50, _env_int('WESTERN_DAILY_MAX', 3)))
+# По умолчанию один пост в сутки: при трёх 12 октября три из четырёх постов
+# бота подряд были западными (сборы, комикс, хронометраж), и владелец
+# попросил уменьшить ещё.
+WESTERN_DAILY_MAX = max(0, min(50, _env_int('WESTERN_DAILY_MAX', 1)))
 
 
 def _is_western_screen(news: dict) -> bool:
@@ -24521,6 +24572,8 @@ _ECHO_STOP = {
     # «predst» и «chto» не совпадали ни с одним словом, и «Вышел тизер» с
     # «Представлен тизер» считались разными фразами.
     'visel', 'visla', 'visli', 'vislo', 'preds', 'raskr',
+    # «Официально объявлен выпуск 4 сезона» — тот же анонс другими словами.
+    'vipus', 'ofici',
 }
 
 
@@ -24602,10 +24655,10 @@ def _drop_repetitive_paragraphs(title: str, paragraphs: list) -> list:
         # и абзац целиком сохранялся вместе с пересказом заголовка. Проверяем
         # и по фразам; фраза с новым словом или числом остаётся.
         sentences = _split_clauses(para.strip())
-        if len(sentences) > 1:
+        if len(sentences) > 1 or _number_echo(title, para):
             fresh = []
             for sentence in sentences:
-                if _too_similar(seen, sentence):
+                if _too_similar(seen, sentence) or _number_echo(title, sentence):
                     logger.info(f"✂️ Фраза-повтор убрана: {sentence[:55]}")
                     continue
                 fresh.append(sentence)
@@ -24620,6 +24673,34 @@ def _drop_repetitive_paragraphs(title: str, paragraphs: list) -> list:
             seen += '\n' + para
         kept.append(para)
     return kept
+
+
+_PROPER_WORD_RE = re.compile(r'(?<![.!?…]\s)(?<!^)\b[A-ZА-ЯЁ][\w\-]{2,}')
+
+
+def _number_echo(title: str, sentence: str) -> bool:
+    """Фраза повторяет заголовок другими словами, но с теми же числами.
+
+    «"Верити" заработал 113 млн долларов при бюджете в 40 млн» и под ним
+    «Фильм собрал 113 млн долларов, превысив бюджет в 40 млн долларов»:
+    слова разные («заработал» и «собрал»), и сравнение по словам повтора не
+    видело. Признак повтора — все числа фразы уже есть в заголовке, а нового
+    имени (студии, площадки, страны) фраза не приносит.
+    """
+    numbers = _llm_number_set(sentence)
+    if not numbers or not numbers <= _llm_number_set(title):
+        return False
+    # Одно общее число — слабое доказательство: «Сезон 2 расскажет о походе
+    # героев в столицу» под «Анонсирован 2 сезон» — уже новый факт. Тогда
+    # повтором считаем, только если новых слов почти нет.
+    if len(numbers) < 2 and len(_content_stems(sentence) - _content_stems(title)) > 1:
+        return False
+    title_words = {w.casefold()[:5] for w in re.findall(r'[\w\-]{3,}', str(title or ''))}
+    for match in _PROPER_WORD_RE.finditer(str(sentence or '').strip()):
+        if match.group(0).casefold()[:5] not in title_words:
+            return False
+    names = {m.group(1).casefold() for m in _DIGEST_QUOTED_RE.finditer(sentence)}
+    return all(name in str(title).casefold() for name in names)
 
 
 def _split_clauses(text: str) -> list[str]:

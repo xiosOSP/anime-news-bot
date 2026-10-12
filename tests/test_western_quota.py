@@ -8,6 +8,7 @@ Skydance (кто возглавил маркетинг, сколько милл�
 """
 import asyncio
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -225,3 +226,13 @@ def test_anime_business_news_is_not_penalised():
     plain = _anime()
     business = dict(_anime(), title='Новый продюсер возглавит аниме-студию MAPPA')
     assert bot._topic_affinity(business) == bot._topic_affinity(plain)
+
+
+def test_default_is_one_western_post_a_day():
+    """Владелец попросил меньше западного (октябрь 2026): по умолчанию — один пост.
+
+    Значение читается при импорте, поэтому проверяем сам дефолт в коде: в
+    прогоне переменная окружения могла бы его подменить.
+    """
+    source = Path(bot.__file__).read_text(encoding='utf-8')
+    assert "_env_int('WESTERN_DAILY_MAX', 1)" in source
