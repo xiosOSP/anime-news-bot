@@ -65,6 +65,7 @@ from post_text import (
 )
 # Протокол с языковой моделью: что мы ей говорим и как проверяем ответ. — llm_protocol.py; здесь то, чем пользуется бот.
 from llm_protocol import (
+    _llm_number_set,
     LLM_BATCH_SYSTEM_PROMPT,
     LLM_JUDGE_SYSTEM_PROMPT,
     LLM_KINDS_FILLER,
@@ -741,7 +742,7 @@ GOLDEN_DATASET_FILE = Path(__file__).with_name('golden') / 'editorial_cases.json
 STORY_UPDATE_LOOKBACK_DAYS = max(1, min(90, _env_int('STORY_UPDATE_LOOKBACK_DAYS', 21)))
 STORY_UPDATE_SIMILARITY = max(0.60, min(0.95, _env_float('STORY_UPDATE_SIMILARITY', 0.76)))
 REPLAY_BUFFER_MAX = max(20, min(2000, _env_int('REPLAY_BUFFER_MAX', 300)))
-DEFAULT_LLM_PROMPT_VERSION = 'editorial-v11-2026-10-11'
+DEFAULT_LLM_PROMPT_VERSION = 'editorial-v12-2026-10-12'
 LLM_PROMPT_VERSION = (_env('LLM_PROMPT_VERSION', DEFAULT_LLM_PROMPT_VERSION).strip()
                       or DEFAULT_LLM_PROMPT_VERSION)
 LLM_JUDGE_MAX_TOKENS = max(80, min(500, _env_int('LLM_JUDGE_MAX_TOKENS', 180)))
@@ -18820,6 +18821,10 @@ _AFFINITY_INTERVIEW_RE = re.compile(r'интервью|interview|インタビュ
 _AFFINITY_GOSSIP_RE = re.compile(
     r'\bслух|инсайдер|по данным\s+\w+(?:rpk|guy)|\brumou?r|\binsider|\breportedly\b|'
     r'касс\w*\s+сбор|предпродаж|\bbox office\b|\bpresales?\b|opening weekend|'
+    # Сборы без слова «касса»: «"Тайный дневник Верити" заработал 113 млн долларов
+    # при бюджете в 40 млн» (октябрь 2026, ноль реакций).
+    r'(?:заработал|собрал|окупил)\w*\s+(?:уже\s+|более\s+|почти\s+|свыше\s+)?\$?\d[\d\s.,]*\s*'
+    r'(?:млн|миллион|млрд|миллиард)|\bgrossed\b|\bearned\s+\$|'
     r'фотосесси|photo\s*shoot|красн\w+\s+дорожк|red carpet',
     re.IGNORECASE)
 # Корпоративная хроника студий: кто возглавил маркетинг, сколько миллиардов
@@ -24647,10 +24652,10 @@ def _drop_repetitive_paragraphs(title: str, paragraphs: list) -> list:
         # и абзац целиком сохранялся вместе с пересказом заголовка. Проверяем
         # и по фразам; фраза с новым словом или числом остаётся.
         sentences = _split_clauses(para.strip())
-        if len(sentences) > 1:
+        if len(sentences) > 1 or _number_echo(title, para):
             fresh = []
             for sentence in sentences:
-                if _too_similar(seen, sentence):
+                if _too_similar(seen, sentence) or _number_echo(title, sentence):
                     logger.info(f"✂️ Фраза-повтор убрана: {sentence[:55]}")
                     continue
                 fresh.append(sentence)
@@ -24665,6 +24670,34 @@ def _drop_repetitive_paragraphs(title: str, paragraphs: list) -> list:
             seen += '\n' + para
         kept.append(para)
     return kept
+
+
+_PROPER_WORD_RE = re.compile(r'(?<![.!?…]\s)(?<!^)\b[A-ZА-ЯЁ][\w\-]{2,}')
+
+
+def _number_echo(title: str, sentence: str) -> bool:
+    """Фраза повторяет заголовок другими словами, но с теми же числами.
+
+    «"Верити" заработал 113 млн долларов при бюджете в 40 млн» и под ним
+    «Фильм собрал 113 млн долларов, превысив бюджет в 40 млн долларов»:
+    слова разные («заработал» и «собрал»), и сравнение по словам повтора не
+    видело. Признак повтора — все числа фразы уже есть в заголовке, а нового
+    имени (студии, площадки, страны) фраза не приносит.
+    """
+    numbers = _llm_number_set(sentence)
+    if not numbers or not numbers <= _llm_number_set(title):
+        return False
+    # Одно общее число — слабое доказательство: «Сезон 2 расскажет о походе
+    # героев в столицу» под «Анонсирован 2 сезон» — уже новый факт. Тогда
+    # повтором считаем, только если новых слов почти нет.
+    if len(numbers) < 2 and len(_content_stems(sentence) - _content_stems(title)) > 1:
+        return False
+    title_words = {w.casefold()[:5] for w in re.findall(r'[\w\-]{3,}', str(title or ''))}
+    for match in _PROPER_WORD_RE.finditer(str(sentence or '').strip()):
+        if match.group(0).casefold()[:5] not in title_words:
+            return False
+    names = {m.group(1).casefold() for m in _DIGEST_QUOTED_RE.finditer(sentence)}
+    return all(name in str(title).casefold() for name in names)
 
 
 def _split_clauses(text: str) -> list[str]:

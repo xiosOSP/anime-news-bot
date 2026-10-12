@@ -257,3 +257,50 @@ def test_longer_name_of_the_same_title_is_counted_once():
             'summary': '«Магическая битва: Сибуя», «Магическая битва: Смертельная миграция» и '
                        '«Магическая битва» — опенинг «Specialz».'}
     assert not bot._looks_like_digest(news)
+
+
+# ---------- пересказ заголовка с теми же числами ----------
+
+BOX = '«Тайный дневник Верити» заработал 113 млн долларов при бюджете в 40 млн'
+
+
+def test_same_numbers_in_other_words_are_an_echo():
+    body = ['Фильм собрал 113 млн долларов, превысив бюджет в 40 млн долларов.']
+    assert bot._drop_repetitive_paragraphs(BOX, body) == []
+
+
+@pytest.mark.parametrize('title,body,kept', [
+    ('Сезон выйдет 5 января', 'Премьера 5 января на Netflix.', 'Премьера 5 января на Netflix.'),
+    ('Сезон выйдет 5 января', 'Премьера 5 января. Серий будет 12.', 'Серий будет 12.'),
+    ('Сезон «Магии» выйдет 5 января', 'Премьера 5 января, а «ледяной стены» — позже.',
+     'Премьера 5 января, а «ледяной стены» — позже.'),
+])
+def test_number_echo_keeps_new_names_and_numbers(title, body, kept):
+    assert bot._drop_repetitive_paragraphs(title, [body]) == [kept]
+
+
+def test_sentence_without_numbers_is_not_a_number_echo():
+    assert not bot._number_echo('Сезон выйдет 5 января', 'Премьера скоро.')
+
+
+def test_box_office_counts_as_gossip():
+    assert bot._AFFINITY_GOSSIP_RE.search(BOX)
+
+
+def test_title_must_carry_the_main_fact():
+    assert 'Главный факт' in bot.LLM_SYSTEM_PROMPT
+
+
+def test_one_shared_number_with_new_words_is_not_an_echo():
+    title = 'Анонсирован 2 сезон аниме «Ледяная стена»'
+    body = 'Сезон 2 расскажет о походе героев в столицу.'
+    assert bot._drop_repetitive_paragraphs(title, [body]) == [body]
+
+
+def test_one_shared_number_and_nothing_new_is_an_echo():
+    assert bot._number_echo('Сезон выйдет 5 января', 'Выход сезона — 5 января.')
+
+
+def test_new_quoted_title_keeps_a_sentence_with_the_same_numbers():
+    assert not bot._number_echo('Сезон «Магии» выйдет 5 января 2027',
+                                'Тогда же, 5 января 2027, выйдет и «ледяная стена».')
