@@ -14327,6 +14327,22 @@ async def _prepare_news_for_send(news: dict, source: str,
             await stats.record_skipped('filtered', source)
         return 'skipped_filter'
 
+    # Ключи тайтла считаем после модели: её subject — латинское имя, которое
+    # связывает русские переводы. Сохраняем в новости, чтобы ветка и очередь
+    # не спрашивали AniList второй раз.
+    if '_work_keys' not in news:
+        news['_work_keys'] = await asyncio.to_thread(_work_identity_keys, news, lookups=2)
+    if channel_quota:
+        repeat = _work_repeat_hit(news)
+        if repeat:
+            who = 'админ' if repeat.get('by') == 'admin' else 'бот'
+            logger.info('⊘ Про этот тайтл уже был пост (%s: «%s»): %s', who,
+                        str(repeat.get('title') or '')[:50], str(news.get('title', ''))[:60])
+            metrics.inc('anime_bot_work_repeat_skips_total', labels={'by': who})
+            if count_stats:
+                await stats.record_skipped('duplicate', source)
+            return 'skipped_dup'
+
     if await asyncio.to_thread(_left_untranslated, news):
         # Модели нет, и переводчик не ответил: translate_text в этом случае
         # возвращает исходник, и в русский канал уходил английский пост целиком.
@@ -16927,6 +16943,146 @@ def _release_publish_reservations(news: dict) -> None:
 PENDING_POSTS_FILE = DATA_DIR / 'pending_posts.json'
 
 
+# ============== ОДИН ТАЙТЛ — ОДИН ПОСТ ==============
+# Читатели жаловались на дубли (октябрь 2026). Пример: владелец выложил
+# «Экзорцист Нюэ (Nue's Exorcist) официально анонсировано», бот в тот же день —
+# «Постер и тизер аниме «Оммёдзи Нуэ»», а назавтра ещё «Анонсировано аниме по
+# манге «Оммёдзи Нуэ», премьера летом 2027». Один тайтл, три названия, и
+# прежние проверки сравнивали события, а не тайтл: анонс, постер и тизер для
+# них — разные новости. Теперь автопостинг пишет о тайтле не чаще раза в
+# WORK_REPEAT_HOURS, считая и посты админов. Кнопка админа это не трогает.
+WORK_REPEAT_HOURS = max(0, min(168, _env_int('WORK_REPEAT_HOURS', 36)))
+WORK_MEMORY_FILE = DATA_DIR / 'recent_works.json'
+_LATIN_PAREN_RE = re.compile(r'\(([A-Za-z][^()\n]{2,80})\)')
+_QUOTED_ANY_RE = re.compile(r'«([^«»\n]{2,80})»')
+
+
+def _work_name_key(name: str) -> str:
+    key = _entity_key(_clean_work_name(str(name or '')))
+    return key if len(key) >= 5 else ''
+
+
+def _work_identity_keys(news: dict, *, lookups: int = 0) -> list[str]:
+    """Ключи тайтла новости: по ним два поста про одно произведение совпадают.
+
+    Русские переводы названия расходятся («Оммёдзи Нуэ» и «Экзорцист Нюэ»),
+    поэтому главная опора — латинское имя: subject модели, имя в скобках,
+    латиница в «ёлочках». AniList сводит английское и ромадзи к одному
+    («Nue's Exorcist» → «Nue no Onmyouji»). lookups — сколько раз можно
+    спросить AniList по сети; 0 — только кеш и сами названия.
+    """
+    keys: list[str] = []
+
+    def add(key: str) -> None:
+        if key and key not in keys:
+            keys.append(key)
+
+    work_key = str(news.get('_work_key') or '')
+    if work_key:
+        add('work:' + work_key)
+    title = str(news.get('title') or '')
+    latin: list[str] = []
+    for value in (news.get('_llm_subject'), news.get('_work_name'),
+                  *(m.group(1) for m in _LATIN_PAREN_RE.finditer(title)),
+                  *(m.group(1) for m in _QUOTED_ANY_RE.finditer(title))):
+        value = str(value or '').strip()
+        if not value:
+            continue
+        if re.search(r'[A-Za-z]', value) and not re.search(r'[А-Яа-яЁё]', value):
+            latin.append(value)
+        elif len(value) >= 6 or ' ' in value:
+            # Русское название надёжно только для повторов самого бота: перевод
+            # у разных каналов свой. Короткие слова в кавычках — не тайтл.
+            add('ru:' + _work_name_key(value) if _work_name_key(value) else '')
+    for name in dict.fromkeys(latin):
+        add('name:' + _work_name_key(name) if _work_name_key(name) else '')
+        if anilist is None or not _anilist_candidate_ok(name):
+            continue
+        info = None
+        key = AniListClient._norm_key(name)
+        with anilist._lock:
+            cached = anilist._cache.get(key)
+        if cached is not None and anilist._is_cache_fresh(cached):
+            info = anilist.lookup(name)
+        elif lookups > 0:
+            lookups -= 1
+            try:
+                info = anilist.lookup(name)
+            except Exception as e:
+                logger.debug(f'AniList для ключа тайтла: {e}')
+        if info and WorkTitleResolver.names_match(name, _anilist_names(info)):
+            canonical = _work_name_key(info.get('romaji') or info.get('english') or '')
+            add('ani:' + canonical if canonical else '')
+    return keys[:12]
+
+
+class WorkMemory:
+    """О каких тайтлах канал писал недавно — бот и админы. Файл на диске:
+    перезапуск, а он у хостинга частый, память не обнуляет."""
+    MAX_ITEMS = 600
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._items: list[dict] = []
+        self._lock = threading.Lock()
+        try:
+            if path.exists():
+                raw = json.loads(path.read_text(encoding='utf-8'))
+                if isinstance(raw, list):
+                    self._items = [x for x in raw if isinstance(x, dict) and isinstance(x.get('keys'), list)]
+        except (OSError, ValueError) as e:
+            logger.warning(f'recent_works не загружен: {e}')
+
+    def remember(self, keys, title: str, by: str) -> None:
+        keys = [str(k) for k in keys or () if k]
+        if not keys:
+            return
+        with self._lock:
+            self._items.append({'keys': keys[:12], 'title': str(title or '')[:120], 'by': by,
+                                'at': time.time()})
+            edge = time.time() - 7 * 86400
+            self._items = [x for x in self._items if float(x.get('at') or 0) > edge][-self.MAX_ITEMS:]
+            items = list(self._items)
+        try:
+            _atomic_write_json(self.path, items)
+        except OSError as e:
+            logger.error(f'recent_works не сохранён: {e}')
+
+    def seen(self, keys, hours: float) -> Optional[dict]:
+        """Последний пост о том же тайтле за ``hours`` часов, иначе None."""
+        wanted = {str(k) for k in keys or () if k}
+        if not wanted or hours <= 0:
+            return None
+        edge = time.time() - hours * 3600
+        with self._lock:
+            for row in reversed(self._items):
+                if float(row.get('at') or 0) >= edge and wanted & set(row.get('keys') or ()):
+                    return dict(row)
+        return None
+
+
+work_memory: Optional['WorkMemory'] = None
+
+
+def _work_repeat_hit(news: dict) -> Optional[dict]:
+    """Был ли недавно пост о том же тайтле. Ключи посчитаны заранее."""
+    # WORK_REPEAT_HOURS=0 выключает проверку: seen() при нуле часов молчит.
+    if work_memory is None:
+        return None
+    keys = news.get('_work_keys') or _work_identity_keys(news)
+    return work_memory.seen(keys, WORK_REPEAT_HOURS)
+
+
+def _work_repeat_blocks(news: dict) -> bool:
+    return _work_repeat_hit(news) is not None
+
+
+def _autopost_skip(news: dict) -> bool:
+    """Пост ветки, который автопостинг пропускает: западное сверх лимита или
+    тайтл, о котором канал уже писал."""
+    return _western_quota_blocks(news) or _work_repeat_blocks(news)
+
+
 # ============== ПОСТЫ АДМИНОВ В КАНАЛЕ ==============
 # Админы публикуют в канал и сами, мимо бота. Бот о таких постах не знал, и
 # через час-другой выкладывал ту же новость из другого источника: за одно
@@ -16967,6 +17123,9 @@ def _remember_manual_channel_post(news: dict, photo_fingerprint: str = '',
         story_registry.mark_delivery(news, published=True)
     if published_texts is not None:
         published_texts.add(news['title'])
+    if work_memory is not None:
+        work_memory.remember(_work_identity_keys(news, lookups=lookup_budget),
+                             news['title'], 'admin')
     if image_hashes is not None:
         if photo_fingerprint:
             image_hashes.add(photo_fingerprint, news['title'])
@@ -21594,6 +21753,9 @@ def _media_summary(news: dict) -> str:
 
 def _record_story_history(news: dict) -> None:
     story_history.record(news, format_news_short(news))
+    if work_memory is not None:
+        work_memory.remember(news.get('_work_keys') or _work_identity_keys(news),
+                             str(news.get('title') or ''), 'bot')
 
 
 def _post_card(news: dict, meta: dict, *, countdown: bool = False,
@@ -22614,7 +22776,7 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
         return None
     # Пост ветки модель уже разобрала, тема известна: западное кино сверх
     # лимита пропускаем, чтобы оно не заслоняло собой следующий пост.
-    row = pending_posts.next_for_autopost(skip=_western_quota_blocks)
+    row = pending_posts.next_for_autopost(skip=_autopost_skip)
     if row is None:
         return None
     key, news = row
@@ -33489,6 +33651,7 @@ def _init_globals() -> None:
     не затрагивая реальные данные пользователя."""
     global sent_links, translator, post_queue, settings, stats, anilist, pending_posts, moderation_feedback
     global editorial_rules, editorial_glossary, entity_memory, story_history, replay_buffer, story_registry, source_yield, work_titles
+    global work_memory
     global error_fingerprints, llm_budget, admin_audit, experiments, adaptive_publishing, analytics_store
     if sent_links is None:
         sent_links = SentLinksStore(SENT_LINKS_FILE)
@@ -33567,6 +33730,8 @@ def _init_globals() -> None:
         entity_memory = EntityMemory(ENTITY_MEMORY_FILE)
     if story_history is None:
         story_history = PublishedStoryStore(PUBLISHED_STORIES_FILE)
+    if work_memory is None:
+        work_memory = WorkMemory(WORK_MEMORY_FILE)
     if story_registry is None:
         story_registry = StoryRegistry(STORY_REGISTRY_FILE)
     if work_titles is None:

@@ -196,7 +196,7 @@ def test_thread_autopost_uses_the_limit(monkeypatch):
         return True
     monkeypatch.setattr(bot, '_channel_autopost_due', due)
     asyncio.run(bot._autopost_one_from_thread(MagicMock()))
-    pending.next_for_autopost.assert_called_once_with(skip=bot._western_quota_blocks)
+    pending.next_for_autopost.assert_called_once_with(skip=bot._autopost_skip)
 
 
 def test_status_shows_the_limit(history, monkeypatch):
