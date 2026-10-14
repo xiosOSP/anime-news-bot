@@ -99,9 +99,11 @@ from llm_protocol import (
 from news_stories import (
     _clean_work_name,
     same_work_event,
+    story_event_classes,
     story_event_families,
     story_explicit_work_names,
     story_work_names,
+    story_work_numbers,
     is_rubric_word,
     numbers_conflict,
     title_numbers,
@@ -17061,8 +17063,13 @@ AUTOPOST_MAX_FAILS = 3
 # WORK_REPEAT_HOURS, считая и посты админов. Кнопка админа это не трогает.
 WORK_REPEAT_HOURS = max(0, min(168, _env_int('WORK_REPEAT_HOURS', 36)))
 WORK_MEMORY_FILE = DATA_DIR / 'recent_works.json'
+WORK_KEYS_MAX = 16
+# Анонс, постер, дата и трейлер в первые сутки — одна новость в нескольких
+# пересказах («анонсировано» у админа и «постер и тизер» у бота в тот же день).
+# Позже совпадать должно само событие: трейлер через два дня — уже новость.
+WORK_PACKAGE_HOURS = 24
+_WORK_PACKAGE_EVENTS = frozenset({'announce', 'visual', 'date', 'trailer'})
 _LATIN_PAREN_RE = re.compile(r'\(([A-Za-z][^()\n]{2,80})\)')
-_QUOTED_ANY_RE = re.compile(r'«([^«»\n]{2,80})»')
 
 
 # Площадки, студии, издатели и премии — не тайтлы, хотя стоят в тех же
@@ -17088,14 +17095,59 @@ def _work_name_key(name: str) -> str:
     return key if len(key) >= 5 and key not in _WORK_NOT_TITLE_KEYS else ''
 
 
+# Окончания русских падежей, длинные сначала. «Ненасытного Берсерка» и
+# «Ненасытный Берсерк», «Секретных войнах» и «Секретные войны» давали разные
+# ключи, и повтор о том же тайтле проходил. Это не морфология, а грубая
+# обрезка: от слова остаётся не меньше четырёх букв, а короткие слова
+# («по», «краю») не трогаются.
+_RU_CASE_ENDINGS = tuple(sorted((
+    'ами', 'ями', 'ого', 'его', 'ому', 'ему', 'ыми', 'ими', 'ой', 'ей', 'ий', 'ый', 'ая', 'яя',
+    'ое', 'ее', 'ую', 'юю', 'ые', 'ие', 'ых', 'их', 'ым', 'им', 'ом', 'ем', 'ам', 'ям', 'ах',
+    'ях', 'ов', 'ев', 'а', 'я', 'о', 'е', 'у', 'ю', 'ы', 'и', 'ь', 'й'), key=len, reverse=True))
+
+
+def _ru_stem(word: str) -> str:
+    word = word.casefold().replace('ё', 'е')
+    if len(word) <= 4 or not re.fullmatch(r'[а-я]+', word):
+        return word
+    for ending in _RU_CASE_ENDINGS:
+        if word.endswith(ending) and len(word) - len(ending) >= 4:
+            return word[:-len(ending)]
+    return word
+
+
+def _work_stem_key(name: str) -> str:
+    """Ключ русского названия без падежных окончаний; '' — не тайтл."""
+    if not _work_name_key(name):
+        return ''
+    words = re.findall(r'[0-9a-zа-яё]+', _clean_work_name(name).casefold())
+    key = ''.join(_ru_stem(w) for w in words)
+    return key if len(key) >= 5 else ''
+
+
+def _work_final_title(news: dict) -> str:
+    """Заголовок, каким пост выходит в канал: первая строка пересказа модели.
+
+    Ключи считались только по заголовку источника, а у nexvlsz тайтл стоит
+    в прямых кавычках "…" и ключа не давал вовсе: два поста подряд о постере
+    «Киберпанка» прошли мимо проверки. В пересказе модели тайтл всегда в «ёлочках».
+    """
+    text = str(news.get('_llm_text') or '').strip()
+    return text.split('\n', 1)[0].strip() if text else ''
+
+
 def _work_identity_keys(news: dict, *, lookups: int = 0) -> list[str]:
     """Ключи тайтла новости: по ним два поста про одно произведение совпадают.
 
     Русские переводы названия расходятся («Оммёдзи Нуэ» и «Экзорцист Нюэ»),
     поэтому главная опора — латинское имя: subject модели, имя в скобках,
-    латиница в «ёлочках». AniList сводит английское и ромадзи к одному
+    латиница в кавычках. AniList сводит английское и ромадзи к одному
     («Nue's Exorcist» → «Nue no Onmyouji»). lookups — сколько раз можно
     спросить AniList по сети; 0 — только кеш и сами названия.
+
+    Имена берутся из заголовка источника и из заголовка пересказа: в
+    «ёлочках», "прямых" и “английских” кавычках, в скобках и без кавычек после
+    слова «аниме» («Кадры к 2 серии аниме Голубая шкатулка» — так пишут админы).
     """
     keys: list[str] = []
 
@@ -17106,11 +17158,15 @@ def _work_identity_keys(news: dict, *, lookups: int = 0) -> list[str]:
     work_key = str(news.get('_work_key') or '')
     if work_key:
         add('work:' + work_key)
-    title = str(news.get('title') or '')
+    names: list[str] = []
+    for title in dict.fromkeys(t for t in (str(news.get('title') or ''), _work_final_title(news)) if t):
+        names += [m.group(1) for m in _LATIN_PAREN_RE.finditer(title)]
+        # Имя без кавычек идёт до знака препинания: «аниме Оммёдзи Нуэ, премьера
+        # летом» — после запятой уже не название.
+        names += [name.split(',')[0] for name in story_explicit_work_names(title)]
     latin: list[str] = []
-    for value in (news.get('_llm_subject'), news.get('_work_name'),
-                  *(m.group(1) for m in _LATIN_PAREN_RE.finditer(title)),
-                  *(m.group(1) for m in _QUOTED_ANY_RE.finditer(title))):
+    russian: list[str] = []
+    for value in (news.get('_llm_subject'), news.get('_work_name'), *names):
         value = str(value or '').strip()
         if not value:
             continue
@@ -17119,7 +17175,7 @@ def _work_identity_keys(news: dict, *, lookups: int = 0) -> list[str]:
         elif len(value) >= 6 or ' ' in value:
             # Русское название надёжно только для повторов самого бота: перевод
             # у разных каналов свой. Короткие слова в кавычках — не тайтл.
-            add('ru:' + _work_name_key(value) if _work_name_key(value) else '')
+            russian.append(value)
     for name in dict.fromkeys(latin):
         add('name:' + _work_name_key(name) if _work_name_key(name) else '')
         if anilist is None or not _anilist_candidate_ok(name):
@@ -17139,7 +17195,12 @@ def _work_identity_keys(news: dict, *, lookups: int = 0) -> list[str]:
         if info and WorkTitleResolver.names_match(name, _anilist_names(info)):
             canonical = _work_name_key(info.get('romaji') or info.get('english') or '')
             add('ani:' + canonical if canonical else '')
-    return keys[:12]
+    # Русские ключи — после латинских: их больше (два заголовка, две формы), и
+    # обрезка списка не должна съедать имя, общее для разных переводов.
+    for value in dict.fromkeys(russian):
+        add('ru:' + _work_name_key(value) if _work_name_key(value) else '')
+        add('rs:' + _work_stem_key(value) if _work_stem_key(value) else '')
+    return keys[:WORK_KEYS_MAX]
 
 
 class WorkMemory:
@@ -17159,13 +17220,20 @@ class WorkMemory:
         except (OSError, ValueError) as e:
             logger.warning(f'recent_works не загружен: {e}')
 
-    def remember(self, keys, title: str, by: str) -> None:
+    def remember(self, keys, title: str, by: str, events=None, numbers=None) -> None:
+        """events и numbers — род события и номера сезона/серии поста (см.
+        _work_events_related). Без них запись блокирует любой пост о тайтле,
+        как до их появления."""
         keys = [str(k) for k in keys or () if k]
         if not keys:
             return
+        row = {'keys': keys[:WORK_KEYS_MAX], 'title': str(title or '')[:120], 'by': by,
+               'at': time.time()}
+        if events is not None:
+            row['events'] = sorted(str(e) for e in events)
+            row['nums'] = sorted(str(n) for n in numbers or ())
         with self._lock:
-            self._items.append({'keys': keys[:12], 'title': str(title or '')[:120], 'by': by,
-                                'at': time.time()})
+            self._items.append(row)
             edge = time.time() - 7 * 86400
             self._items = [x for x in self._items if float(x.get('at') or 0) > edge][-self.MAX_ITEMS:]
             items = list(self._items)
@@ -17174,17 +17242,71 @@ class WorkMemory:
         except OSError as e:
             logger.error(f'recent_works не сохранён: {e}')
 
-    def seen(self, keys, hours: float) -> Optional[dict]:
-        """Последний пост о том же тайтле за ``hours`` часов, иначе None."""
+    def seen(self, keys, hours: float, events=None, numbers=None) -> Optional[dict]:
+        """Последний пост о том же тайтле и том же событии за ``hours`` часов.
+
+        events=None — не сравнивать события (любой пост о тайтле).
+        """
         wanted = {str(k) for k in keys or () if k}
         if not wanted or hours <= 0:
             return None
-        edge = time.time() - hours * 3600
+        now = time.time()
+        edge = now - hours * 3600
         with self._lock:
             for row in reversed(self._items):
-                if float(row.get('at') or 0) >= edge and wanted & set(row.get('keys') or ()):
+                at = float(row.get('at') or 0)
+                if at < edge or not wanted & set(row.get('keys') or ()):
+                    continue
+                if events is None or 'events' not in row or _work_events_related(
+                        set(events), set(row.get('events') or ()), set(numbers or ()),
+                        set(row.get('nums') or ()), (now - at) / 3600, row.get('by')):
                     return dict(row)
         return None
+
+
+def _work_events_related(new_events: set, old_events: set, new_numbers: set, old_numbers: set,
+                         age_hours: float, old_by: Optional[str]) -> bool:
+    """Тот же ли это повод для поста, что и у прошлого поста о тайтле.
+
+    Раньше любой пост о тайтле закрывал тайтл на полтора дня. Админ выложил
+    сравнение аниме и манги «Голубой шкатулки» — и анонс её третьего сезона
+    бот бы не выпустил; «Кадры 4 серии» закрывали «Кадры 5 серии».
+    """
+    if numbers_conflict(new_numbers, old_numbers):
+        return False                    # «2 сезон» и «3 сезон», 4 и 5 серия — разные новости
+    if not old_events:
+        # Пост админа без события — арт, сравнение, отсчёт до премьеры, шутка —
+        # новостью о тайтле не был и новость не закрывает. Свой пост без
+        # события закрывает только такой же «безымянный»: это, скорее всего,
+        # тот же сюжет из другого источника.
+        return old_by != 'admin' and not new_events
+    if not new_events:
+        return False
+    if new_events & old_events:
+        return True
+    return (age_hours <= WORK_PACKAGE_HOURS and bool(new_events & _WORK_PACKAGE_EVENTS)
+            and bool(old_events & _WORK_PACKAGE_EVENTS))
+
+
+def _work_events(news: dict) -> set:
+    """Род события поста: по заголовку, каким пост выходит, иначе по источнику."""
+    final = _work_final_title(news)
+    events = set(story_event_classes(final)) if final else set()
+    return events or set(story_event_classes(news))
+
+
+def _work_numbers(news: dict) -> set:
+    return set(story_work_numbers(_work_final_title(news) or str(news.get('title') or '')))
+
+
+def _work_remember(news: dict, by: str, *, lookups: int = 0) -> None:
+    """Запомнить вышедший пост — бота или админа — вместе с его событием."""
+    if work_memory is None:
+        return
+    keys = list(dict.fromkeys([*(news.get('_work_keys') or ()),
+                               *_work_identity_keys(news, lookups=lookups)]))
+    work_memory.remember(keys, _work_final_title(news) or str(news.get('title') or ''), by,
+                         events=_work_events(news), numbers=_work_numbers(news))
 
 
 work_memory: Optional['WorkMemory'] = None
@@ -17196,7 +17318,7 @@ def _work_repeat_hit(news: dict) -> Optional[dict]:
     if work_memory is None:
         return None
     keys = news.get('_work_keys') or _work_identity_keys(news)
-    return work_memory.seen(keys, WORK_REPEAT_HOURS)
+    return work_memory.seen(keys, WORK_REPEAT_HOURS, _work_events(news), _work_numbers(news))
 
 
 def _work_repeat_blocks(news: dict) -> bool:
@@ -17250,9 +17372,7 @@ def _remember_manual_channel_post(news: dict, photo_fingerprint: str = '',
         story_registry.mark_delivery(news, published=True)
     if published_texts is not None:
         published_texts.add(news['title'])
-    if work_memory is not None:
-        work_memory.remember(_work_identity_keys(news, lookups=lookup_budget),
-                             news['title'], 'admin')
+    _work_remember(news, 'admin', lookups=lookup_budget)
     if image_hashes is not None:
         if photo_fingerprint:
             image_hashes.add(photo_fingerprint, news['title'])
@@ -21922,9 +22042,7 @@ def _media_summary(news: dict) -> str:
 
 def _record_story_history(news: dict) -> None:
     story_history.record(news, format_news_short(news))
-    if work_memory is not None:
-        work_memory.remember(news.get('_work_keys') or _work_identity_keys(news),
-                             str(news.get('title') or ''), 'bot')
+    _work_remember(news, 'bot')
 
 
 def _post_card(news: dict, meta: dict, *, countdown: bool = False,
