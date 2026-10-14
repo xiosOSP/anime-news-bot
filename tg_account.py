@@ -252,6 +252,14 @@ class AccountUnavailable(RuntimeError):
     """Аккаунт не подключён или запрос к нему не удался."""
 
 
+class MessageMissing(AccountUnavailable):
+    """Аккаунт на связи, но сообщения в канале уже нет: его удалили.
+
+    Отдельный класс, чтобы бот не брал картинку с веб-страницы удалённого
+    поста: там вместо фото стоит аватарка канала.
+    """
+
+
 class AccountReader:
     """Подключение к Telegram от имени аккаунта и чтение публичных каналов."""
 
@@ -398,7 +406,7 @@ class AccountReader:
         msg, _title = await self._with_peer(
             channel, lambda client, peer: client.get_messages(peer, ids=int(msg_id)))
         if msg is None:
-            raise AccountUnavailable(f'сообщение {channel}/{msg_id} не найдено')
+            raise MessageMissing(f'сообщение {channel}/{msg_id} не найдено')
         return msg
 
     async def download_bytes(self, ref: str, max_bytes: int) -> Optional[bytes]:

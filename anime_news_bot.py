@@ -12278,10 +12278,13 @@ def _tg_account_image_bytes(ref: str) -> Optional[bytes]:
     """Фото или обложка ролика из аккаунта. Вызывается из рабочих потоков."""
     if _tg_account_ready():
         try:
-            data = tg_account.run_sync(lambda: tg_account.download_bytes(ref, HTTP_IMAGE_MAX_BYTES),
+            # None — у сообщения нет такого фото; веб-страница его тоже не даст.
+            return tg_account.run_sync(lambda: tg_account.download_bytes(ref, HTTP_IMAGE_MAX_BYTES),
                                        TG_ACCOUNT_TIMEOUT_SEC)
-            if data:
-                return data
+        except tg_account_mod.MessageMissing:
+            # Пост удалили: на его веб-странице вместо фото аватарка канала.
+            logger.info(f'Аккаунт Telegram: сообщения {ref} больше нет — картинку не беру')
+            return None
         except Exception as e:
             logger.warning(f'Аккаунт Telegram: картинка {ref} не скачалась: '
                            f'{_redact_secrets(f"{type(e).__name__}: {e}")}')

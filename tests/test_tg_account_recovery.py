@@ -407,6 +407,31 @@ def test_web_page_of_the_post_gives_the_picture_when_the_account_is_down(monkeyp
     assert bot._tg_account_image_bytes('tgacc://chan/7/video') is None
 
 
+def test_deleted_post_gives_no_picture_not_the_channel_avatar(monkeypatch):
+    def deleted(factory, timeout):
+        raise tg_account.MessageMissing('сообщение chan/7 не найдено')
+    monkeypatch.setattr(bot, 'tg_account', NS(ready=True, run_sync=deleted, download_bytes=lambda r, m: None))
+    monkeypatch.setattr(bot, 'fetch_og_image', lambda page: pytest.fail('у удалённого поста там аватарка'))
+    assert bot._tg_account_image_bytes('tgacc://chan/7/photo') is None
+
+
+def test_slow_account_falls_back_to_the_web_page(monkeypatch):
+    def slow(factory, timeout):
+        raise tg_account.AccountUnavailable('Telegram не ответил за 40 с')
+    monkeypatch.setattr(bot, 'tg_account', NS(ready=True, run_sync=slow, download_bytes=lambda r, m: None))
+    monkeypatch.setattr(bot, 'fetch_og_image', lambda page: 'https://cdn4.telesco.pe/file/p.jpg')
+    monkeypatch.setattr(bot, '_download_image_bytes', lambda url: b'jpeg')
+    assert bot._tg_account_image_bytes('tgacc://chan/7/photo') == b'jpeg'
+
+
+@pytest.mark.asyncio
+async def test_reader_tells_a_deleted_message_apart():
+    reader = _reader(Client(messages=[]))
+    await reader.start()
+    with pytest.raises(tg_account.MessageMissing):
+        await reader.download_bytes('tgacc://chan/7/photo', 10 ** 6)
+
+
 # ---------------------------------------------------------------- автопостинг из ветки
 
 def test_autopost_stops_retrying_a_post_that_keeps_failing(tmp_path, monkeypatch):
