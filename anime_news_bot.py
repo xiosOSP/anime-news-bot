@@ -54,6 +54,7 @@ from safe_http import is_public_ip as _safe_http_is_public_ip, public_get
 from moderation_rules import check_text as check_moderation_text, normalize as normalize_moderation_text
 # Текст поста: предложения, обрывки, ссылки и заголовки телеграм-постов. — post_text.py; здесь то, чем пользуется бот.
 from post_text import (
+    _TG_LIST_MARK_RE,
     _extract_sentences,
     _strip_links,
     _tg_is_list_item,
@@ -81,6 +82,7 @@ from llm_protocol import (
     _LLM_FAILURE_HUMAN,
     _LLM_TEMPORARY_MARKERS,
     _borrowed_names,
+    _drop_unfounded_rumor_label,
     _editorial_rejection,
     _unsupported_names,
     _llm_batch_owner,
@@ -12850,6 +12852,8 @@ NOISE_TITLE_RULES = (
         r',?\s+ranked\s*$',
         r'^\s*(?:лучшие|худшие)\s',
         r'\bподборк[аиуе]\b',
+        # «Арты за неделю», «Арты дня» — альбом рисунков разных тайтлов.
+        r'\bарты?\s+(?:за\s+(?:неделю|день|месяц)|недели|дня|месяца)\b',
         # «…アニソン特集！» в конце заголовка — тематическая подборка («特集上映»
         # в середине — спецпоказ, это новость), «5つの理由» — «5 причин»,
         # «まとめ一覧» и «キャラクター一覧» — сводные списки. Просто «まとめ»
@@ -13003,6 +13007,15 @@ NOISE_TITLE_RULES = (
         r'\bрелиз\s+(?:\d{1,4}[-‑]?(?:й|ой)?\s+)?(?:серии|эпизода)\b|'
         r'\bepisode\s+\d{1,4}\s+(?:is\s+)?(?:out|now\s+available|released|streaming)\b|'
         r'\bboosty\b|\bбусти\b)',
+        # Тот же выход серии другим порядком слов: «5 серия «Х» уже вышла»,
+        # «Можно посмотреть 5-ю серию». Правило выше ждало номер после слова
+        # «серия» или глагол перед ним, и такие посты проходили. «Будут
+        # доступны» — про будущее, это не выход.
+        r'^(?!.*(?:кадр|превью|тизер|трейлер|анонс|постер|опенинг|эндинг|preview|teaser|trailer|stills?\b))'
+        r'(?=.*(?:\b\d{1,4}[-‑]?(?:я|й|ю|ой|го)?\s+(?:эпизод\w*|сери[яиюей])\b|'
+        r'\b(?:эпизод\w*|сери[яиюей])\s*№?\s*\d{1,4}\b))'
+        r'.*(?:\bвышл[аио]\b|\bвышел\b|\bвыпущен\w*|(?<!будут )(?<!будет )\bдоступ(?:ен|н\w*)|'
+        r'\bопубликован\w*|\bуже\s+на\b|\bсмотрите\b|\bсмотреть\b|\bпосмотреть\b)',
     )),
     ('фан-контент', (
         r'\bfan\s?art\b',
@@ -13066,6 +13079,33 @@ _ANNIVERSARY_EVENT_RE = re.compile(
     r'sequel|сиквел|продолжени|экраниз|adaptation|\bseason\b|сезон|'
     r'\bwill\s+(?:release|get|air|launch)',
     re.IGNORECASE)
+# Юбилей — повод для нового события: «к 10-летию», «в честь юбилея»,
+# «anniversary project». Такой пост — новость при любых других словах.
+_ANNIVERSARY_FOR_RE = re.compile(
+    r'\bк\s+(?:\d{1,3}[-‐‑]?(?:летию|летнему)|юбиле\w*|годовщин\w*)|'
+    r'\bв\s+честь\s+(?:\d{1,3}[-‐‑]?лети\w*|юбиле\w*|годовщин\w*)|\bприуроч\w*|'
+    r'\bюбилейн\w+\s+(?:проект|фильм|сериал|выпуск|сезон|коллаб\w*|выставк\w*|концерт\w*|'
+    r'издани\w*|трейлер\w*|ролик\w*|визуал\w*|постер\w*)|'
+    r'\banniversary\s+(?:project|movie|film|event|collab\w*|exhibition|visual|pv|trailer|'
+    r'edition|campaign|concert|anime|series|special)|'
+    r'\bfor\s+(?:its|the)\s+\d{1,3}(?:st|nd|rd|th)\s+anniversary|\bto\s+(?:celebrate|commemorate|mark)\b',
+    re.IGNORECASE)
+# Взгляд назад: «10 лет назад вышел первый сезон», «со дня премьеры». Слова
+# «сезон» и «анонс» в таком заголовке — о событии тех лет, а не о новом, и
+# раньше они пропускали ностальгию в канал.
+_ANNIVERSARY_RETRO_RE = re.compile(
+    r'\bназад\b|\bago\b|\bсо\s+дня\b|\bс\s+(?:момента|премьеры|выхода|релиза|начала|дебюта|старта)\b|'
+    r'\bsince\b|\byears?\s+later\b',
+    re.IGNORECASE)
+
+
+def _anniversary_is_news(title: str) -> bool:
+    """Юбилей в заголовке, но новость есть: новое событие к юбилею."""
+    if _ANNIVERSARY_FOR_RE.search(title):
+        return True
+    if _ANNIVERSARY_RETRO_RE.search(title):
+        return False
+    return bool(_ANNIVERSARY_EVENT_RE.search(title))
 
 
 # Подборка под видом новости: альбом постеров РАЗНЫХ тайтлов и текст-список.
@@ -13076,6 +13116,32 @@ _DIGEST_QUOTED_RE = re.compile(r'«([^«»\n]{2,80})»')
 DIGEST_MIN_IMAGES = 3
 
 
+# Строка-факт одной новости: «🎬 Студия: MAPPA», «📅 Премьера: январь 2027».
+_DIGEST_FACT_LABEL_RE = re.compile(
+    r'^(?:студи|режисс|сценари|композитор|дизайн|премьер|дата|выход|релиз|жанр|сери|эпизод|сезон|'
+    r'платформ|где\s+смотреть|трейлер|источник|автор|оригинал|статус|каст|в\s+ролях|озвуч|'
+    r'персонаж|опенинг|эндинг|studio|director|premiere|release|genre|episode|cast|staff|source|'
+    r'author)\w*\s*[:—–-]', re.IGNORECASE)
+
+
+def _digest_list_line(line: str) -> bool:
+    """Пункт подборки: маркер списка или эмодзи перед названием произведения.
+
+    Эмодзи в начале строки ставят и в обычной новости — «🎬 Студия: MAPPA»,
+    «📅 Премьера: январь». Три такие строки при альбоме из постеров одного
+    тайтла считались подборкой, и анонс с карточкой фактов не выходил.
+    """
+    stripped = line.strip()
+    if not _tg_is_list_item(stripped) or not re.search(r'[A-Za-zА-Яа-яЁё]{3,}', stripped):
+        return False
+    content = re.sub(r'^(?:\d{1,2}[.)]\s*|[^\w«"]+)', '', stripped)
+    if _DIGEST_FACT_LABEL_RE.match(content):
+        return False
+    if _TG_LIST_MARK_RE.match(stripped):
+        return True
+    return bool(_DIGEST_QUOTED_RE.search(stripped) or re.search(r'"[^"\n]{2,80}"', stripped))
+
+
 def _digest_signals(news: dict) -> tuple[int, int]:
     """Сколько разных названий в «ёлочках» и сколько строк-пунктов в тексте."""
     text = f"{news.get('title') or ''}\n{news.get('summary') or ''}"
@@ -13083,8 +13149,7 @@ def _digest_signals(news: dict) -> tuple[int, int]:
              for m in _DIGEST_QUOTED_RE.finditer(text)}
     # «Магическая битва» и «Магическая битва: Сибуя» — один тайтл, не два.
     names = {n for n in names if not any(n != o and o in n for o in names)}
-    list_lines = sum(1 for line in text.split('\n')
-                     if _tg_is_list_item(line) and re.search(r'[A-Za-zА-Яа-яЁё]{3,}', line))
+    list_lines = sum(1 for line in text.split('\n') if _digest_list_line(line))
     return len(names), list_lines
 
 
@@ -13120,7 +13185,7 @@ def noise_reason(news: dict) -> str:
             return reason
     if _looks_like_digest(news):
         return 'подборка'
-    if _ANNIVERSARY_SOFT_RE.search(title) and not _ANNIVERSARY_EVENT_RE.search(title):
+    if _ANNIVERSARY_SOFT_RE.search(title) and not _anniversary_is_news(title):
         return 'годовщина и ностальгия'
     if _self_promo(title, str(news.get('source') or '')):
         return 'самореклама источника'
@@ -25133,6 +25198,14 @@ def _drop_repetitive_paragraphs(title: str, paragraphs: list) -> list:
 
 
 _PROPER_WORD_RE = re.compile(r'(?<![.!?…]\s)(?<!^)\b[A-ZА-ЯЁ][\w\-]{2,}')
+# Слова, которыми пересказ заголовка с теми же числами отличается от него
+# самого: «фильм собрал», «составили», «превысив», «выход». Факта в них нет.
+# Для _too_similar список не годится: там повтор «фильма» и есть тавтология.
+_NUMBER_ECHO_FILLER = frozenset({
+    'film', 'filma', 'filme', 'filmo', 'filmu', 'seria', 'serii', 'seriu', 'serie',
+    'sobra', 'zarab', 'previ', 'sosta', 'start', 'vihod', 'sbori', 'sboro', 'nabra',
+    'prine', 'vsego', 'okolo', 'bolee', 'menee', 'pocti',
+})
 
 
 def _number_echo(title: str, sentence: str) -> bool:
@@ -25147,10 +25220,14 @@ def _number_echo(title: str, sentence: str) -> bool:
     numbers = _llm_number_set(sentence)
     if not numbers or not numbers <= _llm_number_set(title):
         return False
-    # Одно общее число — слабое доказательство: «Сезон 2 расскажет о походе
-    # героев в столицу» под «Анонсирован 2 сезон» — уже новый факт. Тогда
-    # повтором считаем, только если новых слов почти нет.
-    if len(numbers) < 2 and len(_content_stems(sentence) - _content_stems(title)) > 1:
+    # Новые слова — новый факт: «Сезон 2 расскажет о походе героев в
+    # столицу» под «Анонсирован 2 сезон». Раньше при двух общих числах слова
+    # не проверялись вовсе, и «…собрал 113 млн при бюджете 40 млн и стал
+    # самым кассовым хоррором года» исчезало вместе с рекордом. Одно новое
+    # слово ещё не факт: «Дебют сериала — 5 января».
+    new = {stem for stem in _content_stems(sentence) - _content_stems(title)
+           if stem not in _NUMBER_ECHO_FILLER}
+    if len(new) > 1:
         return False
     title_words = {w.casefold()[:5] for w in re.findall(r'[\w\-]{3,}', str(title or ''))}
     for match in _PROPER_WORD_RE.finditer(str(sentence or '').strip()):
@@ -25158,6 +25235,31 @@ def _number_echo(title: str, sentence: str) -> bool:
             return False
     names = {m.group(1).casefold() for m in _DIGEST_QUOTED_RE.finditer(sentence)}
     return all(name in str(title).casefold() for name in names)
+
+
+# Фразы о том, кто и где выложил материал, а не о самой новости: «Пользователь
+# bgette разместил заставку…» Модель переносила их из подписи источника.
+_SOURCE_META_SENTENCE_RE = re.compile(
+    r'^(?:пользовател\w*|юзер\w*|аккаунт\w*)\s+@?\S+\s+'
+    r'(?:разместил|опубликовал|выложил|поделил|загрузил|залил)\w*', re.IGNORECASE)
+# Меню ссылок источника, ставшее «фактом»: «Платформа KINOLINK | KINOBOT.»
+_SOURCE_MENU_IN_TEXT_RE = re.compile(r'\b[A-ZА-ЯЁ0-9]{3,}\s*\|\s*[A-ZА-ЯЁ0-9]{3,}\b')
+
+
+def _drop_source_meta(paragraphs: list) -> list:
+    """Убирает из пересказа фразы о том, кто выложил материал, и меню ссылок."""
+    kept = []
+    for para in paragraphs:
+        sentences = _split_clauses(str(para).strip())
+        fresh = [s for s in sentences
+                 if not (_SOURCE_META_SENTENCE_RE.match(s.strip()) or _SOURCE_MENU_IN_TEXT_RE.search(s))]
+        if len(fresh) == len(sentences):
+            kept.append(para)
+            continue
+        logger.info(f'✂️ Убрана фраза об источнике: {para[:60]}')
+        if fresh:
+            kept.append(' '.join(fresh))
+    return kept
 
 
 def _split_clauses(text: str) -> list[str]:
@@ -25873,6 +25975,12 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
     news.pop('_editorial_rejection', None)
     new_title = str(data.get('title') or '').strip()
     new_summary = str(data.get('summary') or '').strip()
+    unlabeled = _drop_unfounded_rumor_label(new_title, source_fact_text)
+    if unlabeled != new_title:
+        logger.info(f'LLM: снята пометка «Слух:» — в источнике слуха нет: {unlabeled[:60]}')
+        new_title = unlabeled
+        if news.get('_llm_kind') == 'слух':
+            news['_llm_kind'] = 'новость'     # и 👀 перед заголовком тоже не нужен
 
     # --- Текст: только если он адекватен ---
     if settings.llm_rewrite and new_title:
@@ -25902,8 +26010,8 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
                      else new_title]
             if new_summary:
                 body = _trim_paragraphs(new_summary)
-                paragraphs = _drop_repetitive_paragraphs(
-                    new_title, [p for p in re.split(r'\n\s*\n', body) if p.strip()])
+                paragraphs = _drop_source_meta(_drop_repetitive_paragraphs(
+                    new_title, [p for p in re.split(r'\n\s*\n', body) if p.strip()]))
                 if paragraphs:
                     parts.append('\n\n'.join(paragraphs))
             body = '\n\n'.join(p for p in parts if p)
