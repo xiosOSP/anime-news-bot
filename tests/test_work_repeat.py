@@ -63,6 +63,40 @@ def test_short_quoted_word_is_not_a_title(monkeypatch):
     assert bot._work_identity_keys({'title': 'Новое «Аниме» студии'}) == []
 
 
+def test_platform_in_brackets_does_not_link_different_titles(monkeypatch, memory):
+    """Площадка в скобках — не тайтл: после поста про один сериал Netflix
+    новость про другой сериал той же площадки не считается повтором."""
+    monkeypatch.setattr(bot, 'anilist', None)
+    memory.remember(bot._work_identity_keys(
+        {'title': 'Сериал «Ведьмак» продлён на пятый сезон (Netflix)'}), 'Ведьмак', 'admin')
+    assert not bot._work_repeat_blocks({'title': 'Мультсериал «Аркейн» получит спин-офф (Netflix)'})
+
+
+def test_russian_platform_in_quotes_is_not_a_title(monkeypatch, memory):
+    monkeypatch.setattr(bot, 'anilist', None)
+    memory.remember(bot._work_identity_keys(
+        {'title': '«Кинопоиск» купил права на «Человек-бензопила»'}), 'ЧБ', 'bot')
+    assert not bot._work_repeat_blocks({'title': '«Кинопоиск» покажет «Магическую битву»'})
+
+
+def test_studio_as_subject_is_not_a_title(monkeypatch, memory):
+    monkeypatch.setattr(bot, 'anilist', None)
+    memory.remember(bot._work_identity_keys(
+        {'title': 'Студия MAPPA открыла офис в Осаке', '_llm_subject': 'MAPPA'}), 'MAPPA', 'bot')
+    assert not bot._work_repeat_blocks(
+        {'title': 'Студия «MAPPA» ищет аниматоров', '_llm_subject': 'MAPPA'})
+
+
+def test_title_next_to_platform_still_repeats(monkeypatch, memory):
+    """Сам тайтл в тех же постах по-прежнему ловится как повтор."""
+    monkeypatch.setattr(bot, 'anilist', None)
+    memory.remember(bot._work_identity_keys(
+        {'title': 'Сериал «Ведьмак» продлён (Netflix)', '_llm_subject': 'The Witcher'}),
+        'Ведьмак', 'bot')
+    assert bot._work_repeat_blocks({'title': 'Кадры пятого сезона (Netflix)',
+                                    '_llm_subject': 'The Witcher'})
+
+
 def test_latin_subject_links_different_russian_names(monkeypatch):
     """Каналы переводят название по-своему; subject модели — латиница."""
     monkeypatch.setattr(bot, 'anilist', None)
