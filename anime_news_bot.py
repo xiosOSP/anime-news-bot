@@ -16957,9 +16957,27 @@ _LATIN_PAREN_RE = re.compile(r'\(([A-Za-z][^()\n]{2,80})\)')
 _QUOTED_ANY_RE = re.compile(r'«([^«»\n]{2,80})»')
 
 
+# Площадки, студии, издатели и премии — не тайтлы, хотя стоят в тех же
+# скобках и кавычках: «Сериал «Ведьмак» продлён (Netflix)», «Студия «MAPPA»…»,
+# «Кинопоиск» купил права…». Ключом тайтла такое имя склеивало бы разные
+# новости: после поста про «Ведьмака» сутки молчали бы все новости с
+# «(Netflix)», после одной новости «Кинопоиска» — все остальные его новости.
+# Латинские имена берём из PROTECTED_TERMS до раздела тайтлов: там как раз
+# площадки, студии, издатели и новостные сайты; киностудии, русские площадки
+# и премии дописаны руками. «Orange» — ещё и манга, её не трогаем.
+_WORK_NOT_TITLE_KEYS = frozenset(
+    _entity_key(name) for name in (
+        *(t for t in PROTECTED_TERMS[:PROTECTED_TERMS.index('ONE PIECE')] if t != 'Orange'),
+        'Marvel Studios', 'DC Studios', 'Warner Bros', 'Paramount', 'Lucasfilm', 'Pixar',
+        'Sony Pictures', 'Universal Pictures', 'Crunchyroll Anime Awards', 'Anime Awards', 'Кинопоиск', 'Иви', 'Okko', 'Wink',
+        'Кион', 'Premier', 'Start', 'Амедиатека', 'Союзмультфильм', 'Оскар',
+        'Золотой глобус', 'Jump Festa', 'Comiket',
+    ))
+
+
 def _work_name_key(name: str) -> str:
     key = _entity_key(_clean_work_name(str(name or '')))
-    return key if len(key) >= 5 else ''
+    return key if len(key) >= 5 and key not in _WORK_NOT_TITLE_KEYS else ''
 
 
 def _work_identity_keys(news: dict, *, lookups: int = 0) -> list[str]:
