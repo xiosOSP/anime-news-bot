@@ -13,7 +13,7 @@ def registered() -> dict:
     """Команда → функция-обработчик, как их регистрирует main()."""
     source = inspect.getsource(bot.main)
     return {name: getattr(bot, fn) for name, fn in
-            re.findall(r'CommandHandler\("([a-z_]+)",\s*(\w+)\)', source)}
+            re.findall(r'CommandHandler\("([a-z_]+)",\s*(\w+)(?:,\s*block=False)?\)', source)}
 
 
 def in_help() -> list:

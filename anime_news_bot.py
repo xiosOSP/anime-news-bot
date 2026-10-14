@@ -17727,9 +17727,11 @@ async def _resolve_photos_for_album(photos: list, primary_crop_plan: Optional[di
                 # меткой и ссылку tgacc:// Bot API не поймёт: один такой элемент
                 # ронял весь альбом, и пост уходил без картинок или не уходил.
                 continue
+            if data and tg_account_mod.is_media_ref(ph) and data in resolved:
+                # Без аккаунта фото альбома берутся с веб-страницы поста, и она
+                # может отдать одну картинку на несколько сообщений альбома.
+                continue
             value = data if data else value
-        if isinstance(value, (bytes, bytearray)) and bytes(value) in resolved:
-            continue        # одна и та же картинка дважды в альбоме не нужна
         resolved.append(value)
     return resolved
 
@@ -19384,7 +19386,12 @@ async def _run_source_collector_bounded(name: str, collector, timeout: float):
     cannot block interpreter shutdown after SIGTERM.
     """
     loop = asyncio.get_running_loop()
-    deadline = time.monotonic() + max(0.01, float(timeout))
+    budget = max(0.01, float(timeout))
+    # Ожидание слота и сам сбор считаются раздельно. Раньше срок был общий:
+    # здоровый источник, которому слот достался поздно (пул заняли медленные
+    # сайты), получал остаток в пару секунд, обрывался по таймауту и получал
+    # «жёсткую» ошибку — шаг к выключению breaker'ом за чужую медлительность.
+    deadline = time.monotonic() + budget
     while True:
         try:
             if _source_worker_try_acquire(name):
@@ -19422,9 +19429,8 @@ async def _run_source_collector_bounded(name: str, collector, timeout: float):
 
     thread = threading.Thread(target=worker, name=f'source-fetch:{str(name)[:32]}', daemon=True)
     thread.start()
-    left = max(0.01, deadline - time.monotonic())
     try:
-        ok, value = await asyncio.wait_for(asyncio.shield(fut), timeout=left)
+        ok, value = await asyncio.wait_for(asyncio.shield(fut), timeout=budget)
     except asyncio.TimeoutError as exc:
         # The daemon thread may still finish later. Its result is a plain tuple,
         # not an exception Future, so abandoning it cannot emit task warnings.
@@ -19713,7 +19719,11 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
             logger.info('Тайтл опознан у %d новостей', marked)
     except Exception as e:
         logger.warning('Сверка тайтлов не удалась: %s: %s', type(e).__name__, e)
-    all_news = _cluster_news(all_news, persist_intelligence=False)
+    # Склейка — в потоке: сверка каждой новости с реестром историй (до 2500
+    # записей, difflib) занимает секунды, на хостинге — до десяти. Всё это время
+    # бот не отвечал на кнопки и не модерировал чат. Хранилища, которые она
+    # трогает (реестр, выход источников, разведка), защищены своими замками.
+    all_news = await asyncio.to_thread(_cluster_news, all_news, persist_intelligence=False)
     if feature_enabled('source_intelligence') and source_intelligence is not None:
         await asyncio.to_thread(source_intelligence.flush)
     if story_registry is not None:
@@ -20549,6 +20559,13 @@ def _actor(update: Update) -> tuple[bool, str]:
         return False, '?'
     name = user.full_name or user.username or str(user.id)
     return user.id in _all_admin_ids(), name
+
+
+# Кнопки, за которыми публикация: «📢 В канал» под постом ветки, «сейчас» у
+# отложенного поста, «отправить сейчас» в очереди. Они готовят видео и шлют
+# пост — до минуты, поэтому main() запускает их задачей, не держа остальные
+# обновления.
+SLOW_CALLBACK_RE = r'^(?:pub:|snow:|queue:send_now$)'
 
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -33957,6 +33974,24 @@ def _validate_runtime_config() -> None:
     )
 
 
+# Таймауты запросов к Bot API. У PTB по умолчанию 5 секунд на ответ и 20 на
+# выгрузку файла. Ролик в 40–50 МБ с хостинга грузится дольше, а большой файл
+# Telegram ещё и обрабатывает перед ответом. Таймаут посреди отправки — это
+# «результат неизвестен»: пост не повторяется (вдруг уже вышел), и админу
+# приходится проверять канал руками. Поэтому ждём дольше.
+BOT_API_CONNECT_TIMEOUT = 10.0
+BOT_API_READ_TIMEOUT = 30.0
+BOT_API_WRITE_TIMEOUT = 30.0
+BOT_API_MEDIA_WRITE_TIMEOUT = 180.0
+
+
+def _application_builder():
+    return (Application.builder().token(TOKEN)
+            .connect_timeout(BOT_API_CONNECT_TIMEOUT).pool_timeout(BOT_API_CONNECT_TIMEOUT)
+            .read_timeout(BOT_API_READ_TIMEOUT).write_timeout(BOT_API_WRITE_TIMEOUT)
+            .media_write_timeout(BOT_API_MEDIA_WRITE_TIMEOUT))
+
+
 def main():
     # Самый первый вывод — чтобы в логах хостинга было видно что процесс стартовал
     print("=== Запуск anime_news_bot ===", flush=True)
@@ -34002,67 +34037,70 @@ def main():
     check_video_deps()
 
     print("Создаю Application...", flush=True)
-    app = (Application.builder().token(TOKEN).job_queue(JobQueue())
+    app = (_application_builder().job_queue(JobQueue())
            .post_init(setup_bot_commands).post_stop(_post_stop)
            .post_shutdown(_post_shutdown).build())
 
     app.add_error_handler(_global_error_handler)
 
-    # Команды
+    # Команды. Долгие идут задачей (block=False): сбор всех источников, загрузка
+    # роликов, опрос моделей, архив бэкапа длятся до нескольких минут, и всё это
+    # время PTB не разбирал другие обновления — ни кнопки админов, ни сообщения
+    # чата для модерации. Их список сверяет tests/test_slow_handlers.py.
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("news", news_command))
-    app.add_handler(CommandHandler("preview", preview_command))
+    app.add_handler(CommandHandler("news", news_command, block=False))
+    app.add_handler(CommandHandler("preview", preview_command, block=False))
     app.add_handler(CommandHandler("start_auto", start_auto))
     app.add_handler(CommandHandler("stop_auto", stop_auto))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("chatinfo", chatinfo_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("deepl", deepl_command))
-    app.add_handler(CommandHandler("backup", backup_command))
+    app.add_handler(CommandHandler("backup", backup_command, block=False))
     app.add_handler(CommandHandler("historyok", historyok_command))
     app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("doctor", doctor_command))
     app.add_handler(CommandHandler("features", features_command))
-    app.add_handler(CommandHandler("videocheck", videocheck_command))
+    app.add_handler(CommandHandler("videocheck", videocheck_command, block=False))
     app.add_handler(CommandHandler("media", media_command))
     app.add_handler(CommandHandler("llm", llm_command))
     app.add_handler(CommandHandler("llmmodel", llmmodel_command))
-    app.add_handler(CommandHandler("llmping", llmping_command))
-    app.add_handler(CommandHandler("llmclean", llmclean_command))
+    app.add_handler(CommandHandler("llmping", llmping_command, block=False))
+    app.add_handler(CommandHandler("llmclean", llmclean_command, block=False))
     app.add_handler(CommandHandler("envfile", envfile_command))
-    app.add_handler(CommandHandler("mediaping", mediaping_command))
+    app.add_handler(CommandHandler("mediaping", mediaping_command, block=False))
     app.add_handler(CommandHandler("reliability", reliability_command))
     app.add_handler(CommandHandler("experiments", experiments_command))
     app.add_handler(CommandHandler("adaptive", adaptive_command))
     app.add_handler(CommandHandler("analytics", analytics_command))
     app.add_handler(CommandHandler("lifecycle", lifecycle_command))
-    app.add_handler(CommandHandler("audit", audit_command))
+    app.add_handler(CommandHandler("audit", audit_command, block=False))
     app.add_handler(CommandHandler("reloadconfig", reloadconfig_command))
-    app.add_handler(CommandHandler("verifybackup", verifybackup_command))
+    app.add_handler(CommandHandler("verifybackup", verifybackup_command, block=False))
     app.add_handler(CommandHandler("schema", schema_command))
-    app.add_handler(CommandHandler("selftest", selftest_command))
-    app.add_handler(CommandHandler("canary", canary_command))
+    app.add_handler(CommandHandler("selftest", selftest_command, block=False))
+    app.add_handler(CommandHandler("canary", canary_command, block=False))
     app.add_handler(CommandHandler("scheduled", scheduled_command))
     app.add_handler(CommandHandler("tz", tz_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("sources", sources_command))
     app.add_handler(CommandHandler("sourceintel", sourceintel_command))
-    app.add_handler(CommandHandler("discover", discover_command))
+    app.add_handler(CommandHandler("discover", discover_command, block=False))
     app.add_handler(CommandHandler("addsource", addsource_command))
     app.add_handler(CommandHandler("delsource", delsource_command))
     app.add_handler(CommandHandler("admins", admins_command))
     app.add_handler(CommandHandler("addadmin", addadmin_command))
     app.add_handler(CommandHandler("deladmin", deladmin_command))
     app.add_handler(CommandHandler("logs", logs_command))
-    app.add_handler(CommandHandler("posts", posts_command))
+    app.add_handler(CommandHandler("posts", posts_command, block=False))
     app.add_handler(CommandHandler("blacklist", blacklist_command))
     app.add_handler(CommandHandler("feedback", feedback_command))
     app.add_handler(CommandHandler("rules", rules_command))
     app.add_handler(CommandHandler("glossary", glossary_command))
     app.add_handler(CommandHandler("entity", entity_command))
-    app.add_handler(CommandHandler("replay", replay_command))
-    app.add_handler(CommandHandler("golden", golden_command))
+    app.add_handler(CommandHandler("replay", replay_command, block=False))
+    app.add_handler(CommandHandler("golden", golden_command, block=False))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("modhere", modhere_command))
     app.add_handler(CommandHandler("modoff", modoff_command))
@@ -34071,15 +34109,18 @@ def main():
     app.add_handler(CommandHandler("modquality", modquality_command))
     app.add_handler(CommandHandler("modmiss", modmiss_command))
     app.add_handler(CommandHandler("modunblock", modunblock_command))
-    app.add_handler(CommandHandler("modllmping", modllmping_command))
-    app.add_handler(CommandHandler("modtest", modtest_command))
+    app.add_handler(CommandHandler("modllmping", modllmping_command, block=False))
+    app.add_handler(CommandHandler("modtest", modtest_command, block=False))
     app.add_handler(CommandHandler("modlog", modlog_command))
     app.add_handler(CommandHandler("modmode", modmode_command))
     app.add_handler(CommandHandler("modadmins", modadmins_command))
     app.add_handler(CommandHandler("warns", warns_command))
     app.add_handler(CommandHandler("unwarn", unwarn_command))
 
-    # Inline-кнопки (callback_query)
+    # Inline-кнопки (callback_query). Публикация кнопкой готовит видео и шлёт
+    # пост — это минута, поэтому такие кнопки тоже идут задачей. Остальные
+    # (настройки) — по порядку: два быстрых нажатия не должны перемешаться.
+    app.add_handler(CallbackQueryHandler(settings_callback, pattern=SLOW_CALLBACK_RE, block=False))
     app.add_handler(CallbackQueryHandler(settings_callback))
 
     # Reply-кнопки (обычные текстовые сообщения с конкретным текстом)
@@ -34098,7 +34139,7 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, awaiting_input_handler),
         group=-1,
     )
-    app.add_handler(MessageHandler(reply_filter, reply_button_handler))
+    app.add_handler(MessageHandler(reply_filter, reply_button_handler, block=False))
     # Посты админов в канале — в память дедупа. Своя группа: обработчики
     # выше канальные посты пропускают, а группа модерации их и не ждёт.
     app.add_handler(
