@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import logging
+import os
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +36,20 @@ SCHEME = 'tgacc://'
 MEDIA_KINDS = ('photo', 'thumb', 'video')
 _REF_RE = re.compile(r'^tgacc://([A-Za-z0-9_]{3,64})/(\d{1,12})/(photo|thumb|video)$')
 _URL_RE = re.compile(r'https?://[^\s<>"\']+')
+
+# Ошибки, после которых переподключаться бесполезно: вход сброшен, строка
+# входа использована с двух адресов сразу, аккаунт удалён, неверный api_id.
+# Без новой строки входа и перезапуска бота они повторятся каждый раз, а
+# попытки каждые пять минут только мешали бы Telegram и забивали журнал.
+FATAL_ERRORS = frozenset({
+    'AuthKeyUnregisteredError', 'AuthKeyDuplicatedError', 'AuthKeyInvalidError',
+    'AuthKeyNotFound', 'SessionRevokedError', 'SessionExpiredError',
+    'UserDeactivatedError', 'UserDeactivatedBanError', 'PhoneNumberBannedError',
+    'ApiIdInvalidError',
+})
+# Канал по сохранённому id и хэшу не находится: хэш чужого аккаунта или канал
+# пересоздан. Тогда один раз узнаём канал по имени заново.
+_STALE_PEER_ERRORS = frozenset({'ChannelInvalidError', 'PeerIdInvalidError'})
 
 
 def media_ref(channel: str, msg_id: int, kind: str) -> str:
@@ -154,6 +171,81 @@ def posts_from_messages(channel: str, messages) -> list[AccountPost]:
     return posts
 
 
+# ---------------------------------------------------------------- где лежат каналы
+
+class PeerCache:
+    """id и хэш доступа каналов на диске, чтобы не спрашивать Telegram заново.
+
+    Узнать канал по имени (contacts.ResolveUsername) Telegram даёт редко:
+    после пары сотен таких запросов в сутки — FLOOD_WAIT на часы. Строка входа
+    узнанные каналы не хранит, и каждый перезапуск бота спрашивал все каналы
+    заново, а перезапусков при выкладке бывает несколько за день. Хэш доступа
+    у каждого аккаунта свой, поэтому файл помнит, чей он, и чужой не берёт.
+    Через неделю запись обновляется: канал мог сменить название.
+    """
+    TTL_SEC = 7 * 24 * 3600
+
+    def __init__(self, path: Optional[Path]):
+        self.path = Path(path) if path else None
+        self.account = 0
+        self.items: dict[str, dict] = {}
+
+    def load(self, account_id: int) -> None:
+        self.account = int(account_id or 0)
+        self.items = {}
+        if self.path is None or not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding='utf-8'))
+        except (OSError, ValueError) as e:
+            logger.warning('Кэш каналов аккаунта не прочитан (%s): узнаю каналы заново',
+                           type(e).__name__)
+            return
+        if not isinstance(data, dict) or int(data.get('account') or 0) != self.account:
+            return                         # другой аккаунт: его хэши нам не подходят
+        for name, row in (data.get('channels') or {}).items():
+            try:
+                self.items[str(name).lower()] = {
+                    'id': int(row['id']), 'hash': int(row['hash']),
+                    'title': str(row.get('title') or ''), 'at': float(row.get('at') or 0)}
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    def get(self, channel: str) -> Optional[dict]:
+        row = self.items.get(channel.lower())
+        if row is None or time.time() - row['at'] > self.TTL_SEC:
+            return None
+        return row
+
+    def put(self, channel: str, peer_id: int, access_hash: int, title: str) -> None:
+        self.items[channel.lower()] = {'id': int(peer_id), 'hash': int(access_hash),
+                                       'title': str(title or ''), 'at': time.time()}
+        self._save()
+
+    def drop(self, channel: str) -> None:
+        if self.items.pop(channel.lower(), None) is not None:
+            self._save()
+
+    def _save(self) -> None:
+        if self.path is None:
+            return
+        body = json.dumps({'account': self.account, 'channels': self.items},
+                          ensure_ascii=False, indent=1)
+        tmp = self.path.with_name(self.path.name + '.tmp')
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(body, encoding='utf-8')
+            os.replace(tmp, self.path)
+        except OSError as e:
+            # Кэш — не данные: без него каналы просто узнаются заново.
+            logger.warning('Кэш каналов аккаунта не записан: %s', type(e).__name__)
+
+
+def _input_channel(peer_id: int, access_hash: int):
+    from telethon.tl.types import InputPeerChannel
+    return InputPeerChannel(channel_id=int(peer_id), access_hash=int(access_hash))
+
+
 # ---------------------------------------------------------------- клиент
 
 class AccountUnavailable(RuntimeError):
@@ -164,7 +256,8 @@ class AccountReader:
     """Подключение к Telegram от имени аккаунта и чтение публичных каналов."""
 
     def __init__(self, api_id: int, api_hash: str, session: str, *,
-                 client_factory: Optional[Callable[[], Any]] = None):
+                 client_factory: Optional[Callable[[], Any]] = None,
+                 peer_cache_path: Optional[Path] = None):
         self.api_id = int(api_id)
         self.api_hash = str(api_hash)
         self.session = str(session)
@@ -173,13 +266,17 @@ class AccountReader:
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[int] = None
         self.error = ''
+        # True — переподключение не поможет (см. FATAL_ERRORS): сторож бота
+        # тогда не дёргает Telegram каждые пять минут.
+        self.fatal = False
         self.account_name = ''
-        self._titles: dict[str, str] = {}
+        self.peers = PeerCache(peer_cache_path)
+        self._resolved: dict[str, Any] = {}
 
     @property
     def ready(self) -> bool:
         client = self.client
-        if client is None or self.loop is None or self.loop.is_closed():
+        if client is None or self.fatal or self.loop is None or self.loop.is_closed():
             return False
         try:
             return bool(client.is_connected())
@@ -201,13 +298,16 @@ class AccountReader:
         """Подключается. False — с понятной причиной в ``self.error``."""
         self.loop = asyncio.get_running_loop()
         self._loop_thread = threading.get_ident()
+        self.fatal = False
+        client = None
+        me = None
         try:
             client = self._make_client()
             await asyncio.wait_for(client.connect(), timeout)
             if not await asyncio.wait_for(client.is_user_authorized(), timeout):
                 self.error = ('строка входа TG_ACCOUNT_SESSION не подходит: '
                               'вход сброшен или строка скопирована не целиком')
-                await self._disconnect(client)
+                self.fatal = True
                 return False
             me = await asyncio.wait_for(client.get_me(), timeout)
         except asyncio.TimeoutError:
@@ -215,11 +315,18 @@ class AccountReader:
             return False
         except Exception as e:
             self.error = f'{type(e).__name__}: {e}'
+            self.fatal = type(e).__name__ in FATAL_ERRORS
             return False
+        finally:
+            # Неудачный клиент закрываем: его фоновые задачи иначе жили бы в
+            # цикле бота, и каждое переподключение сторожа добавляло бы новые.
+            if me is None and client is not None:
+                await self._disconnect(client)
         self.client = client
         self.error = ''
         name = ' '.join(x for x in (getattr(me, 'first_name', ''), getattr(me, 'last_name', '')) if x)
         self.account_name = name or str(getattr(me, 'username', '') or 'аккаунт')
+        self.peers.load(getattr(me, 'id', 0) or 0)
         return True
 
     @staticmethod
@@ -239,21 +346,57 @@ class AccountReader:
             raise AccountUnavailable(self.error or 'аккаунт не подключён')
         return self.client
 
+    async def _peer(self, client, channel: str) -> tuple[Any, str]:
+        """Канал для запросов и его название: из кэша или, один раз, у Telegram.
+
+        По имени канал узнаём только если его нет в кэше (см. :class:`PeerCache`);
+        сами сообщения читаются по id и хэшу.
+        """
+        key = channel.lower()
+        if key in self._resolved:
+            return self._resolved[key]
+        row = self.peers.get(channel)
+        if row is not None:
+            found = (_input_channel(row['id'], row['hash']), row['title'])
+        else:
+            entity = await client.get_entity(channel)
+            title = str(getattr(entity, 'title', '') or '')
+            peer_id, access_hash = getattr(entity, 'id', None), getattr(entity, 'access_hash', None)
+            if isinstance(peer_id, int) and isinstance(access_hash, int):
+                self.peers.put(channel, peer_id, access_hash, title)
+                found = (_input_channel(peer_id, access_hash), title)
+            else:
+                found = (channel, title)   # не канал с хэшем — читаем по имени
+        self._resolved[key] = found
+        return found
+
+    async def _with_peer(self, channel: str, call: Callable[[Any, Any], Awaitable]):
+        """Запрос к каналу; устаревший хэш — узнать канал заново и повторить один раз."""
+        client = self._require()
+        peer, title = await self._peer(client, channel)
+        try:
+            return await call(client, peer), title
+        except Exception as e:
+            if type(e).__name__ not in _STALE_PEER_ERRORS or isinstance(peer, str):
+                raise
+            logger.info('Канал %s по сохранённому хэшу не нашёлся (%s), узнаю заново',
+                        channel, type(e).__name__)
+            self._resolved.pop(channel.lower(), None)
+            self.peers.drop(channel)
+            peer, title = await self._peer(client, channel)
+            return await call(client, peer), title
+
     async def fetch(self, channel: str, limit: int = 20) -> tuple[str, list[AccountPost]]:
         """Название канала и его последние посты (новые сначала)."""
-        client = self._require()
-        if channel not in self._titles:
-            # Имя канала разрешаем один раз: у Telegram на это жёсткий лимит,
-            # а сами сообщения читаются по уже известному каналу.
-            entity = await client.get_entity(channel)
-            self._titles[channel] = str(getattr(entity, 'title', '') or '')
         # Альбом занимает несколько сообщений, поэтому берём с запасом.
-        messages = await client.get_messages(channel, limit=max(1, int(limit)) * 2)
-        return self._titles[channel], posts_from_messages(channel, messages)
+        count = max(1, int(limit)) * 2
+        messages, title = await self._with_peer(
+            channel, lambda client, peer: client.get_messages(peer, limit=count))
+        return title, posts_from_messages(channel, messages)
 
     async def _message(self, channel: str, msg_id: int):
-        client = self._require()
-        msg = await client.get_messages(channel, ids=int(msg_id))
+        msg, _title = await self._with_peer(
+            channel, lambda client, peer: client.get_messages(peer, ids=int(msg_id)))
         if msg is None:
             raise AccountUnavailable(f'сообщение {channel}/{msg_id} не найдено')
         return msg
@@ -290,8 +433,15 @@ class AccountReader:
             return None, f'ролик {size // (1024 * 1024)} МБ больше лимита {max_bytes // (1024 * 1024)} МБ'
         dest_dir.mkdir(parents=True, exist_ok=True)
         target = dest_dir / f'tgacc-{channel}-{msg_id}.mp4'
-        path = await self._require().download_media(msg, file=str(target))
+        try:
+            path = await self._require().download_media(msg, file=str(target))
+        except BaseException:
+            # Обрыв или таймаут посреди загрузки: Telethon оставляет недокачанный
+            # файл, а ролик бывает в сотни мегабайт — диск хостинга не резиновый.
+            target.unlink(missing_ok=True)
+            raise
         if not path or not Path(path).exists() or Path(path).stat().st_size <= 0:
+            target.unlink(missing_ok=True)
             return None, 'ролик не скачался'
         return Path(path), f'скачан через аккаунт ({Path(path).stat().st_size // 1024} КБ)'
 
@@ -313,3 +463,20 @@ class AccountReader:
         except concurrent.futures.TimeoutError:
             future.cancel()
             raise AccountUnavailable(f'Telegram не ответил за {timeout:.0f} с') from None
+        except Exception as e:
+            self._note_failure(e)
+            raise
+
+    def _note_failure(self, exc: BaseException) -> None:
+        """Вход сбросили, пока бот работал: отключиться и больше не пробовать.
+
+        Иначе клиент оставался «подключённым», каждый канал сначала ловил
+        ошибку аккаунта и лишь потом шёл на веб-страницу, а в /status висело 🟢.
+        """
+        if type(exc).__name__ not in FATAL_ERRORS or self.fatal:
+            return
+        self.fatal = True
+        self.error = f'{type(exc).__name__}: {exc}'
+        loop = self.loop
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(lambda: loop.create_task(self.stop()))

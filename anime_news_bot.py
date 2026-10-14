@@ -12150,8 +12150,16 @@ TG_ACCOUNT_SESSION = _env('TG_ACCOUNT_SESSION', '').strip()
 TG_ACCOUNT_TIMEOUT_SEC = max(5, min(120, _env_int('TG_ACCOUNT_TIMEOUT_SEC', 40)))
 # Скачиваем и больше 50 МБ: потом ролик сжимается под лимит Bot API.
 TG_ACCOUNT_VIDEO_MAX_MB = max(10, min(2000, _env_int('TG_ACCOUNT_VIDEO_MAX_MB', 300)))
+# id и хэши каналов: без них каждый перезапуск заново узнавал все каналы по
+# имени, а на это у Telegram жёсткий суточный лимит (см. tg_account.PeerCache).
+TG_ACCOUNT_PEERS_FILE = DATA_DIR / 'tg_account_peers.json'
+# Сколько пост с медиа из аккаунта ждёт, пока аккаунт переподключится. Дольше —
+# публикуем как есть: картинку тогда отдаст веб-страница поста.
+TG_ACCOUNT_MEDIA_WAIT_SEC = 20 * 60
 tg_account: Optional['tg_account_mod.AccountReader'] = None
 _tg_account_start_task: Optional[asyncio.Task] = None
+_tg_account_alert_sent = False       # о текущем обрыве админ уже предупреждён
+_tg_account_down_since = 0.0         # когда сторож впервые увидел аккаунт отключённым
 
 
 def _tg_account_configured() -> bool:
@@ -12162,25 +12170,92 @@ def _tg_account_ready() -> bool:
     return tg_account is not None and tg_account.ready
 
 
-async def _tg_account_start() -> None:
-    """Подключает аккаунт при запуске бота; неудача — предупреждение админу."""
-    global tg_account
-    if not _tg_account_configured():
+def _tg_account_alert_down(reason: str) -> None:
+    """Одно предупреждение на обрыв, а не каждые пять минут, пока сторож пробует."""
+    global _tg_account_alert_sent
+    if _tg_account_alert_sent:
         return
-    reader = tg_account_mod.AccountReader(TG_ACCOUNT_API_ID, TG_ACCOUNT_API_HASH, TG_ACCOUNT_SESSION)
-    ok = await reader.start(timeout=TG_ACCOUNT_TIMEOUT_SEC)
-    tg_account = reader
-    if ok:
-        logger.info(f'📡 Каналы читаются через аккаунт Telegram ({reader.account_name})')
-        return
-    reason = _redact_secrets(reader.error)
-    logger.warning(f'Аккаунт Telegram не подключился: {reason}')
+    _tg_account_alert_sent = True
     _queue_admin_alert(f'⚠️ Аккаунт Telegram для чтения каналов не подключился: {reason}.\n'
                        'Каналы читаются по-старому, через веб-страницу: большие ролики '
                        'туда не доезжают. Как получить строку входа — docs/tg-account.md.')
 
 
+async def _tg_account_start() -> None:
+    """Подключает аккаунт: при запуске бота и когда сторож видит обрыв."""
+    global tg_account, _tg_account_alert_sent, _tg_account_down_since
+    if not _tg_account_configured():
+        return
+    old = tg_account
+    if old is not None:
+        # Клиент, у которого Telethon исчерпал попытки, так и висит в цикле
+        # бота со своими задачами. Закрываем его, прежде чем заводить новый.
+        await old.stop()
+    reader = tg_account_mod.AccountReader(TG_ACCOUNT_API_ID, TG_ACCOUNT_API_HASH, TG_ACCOUNT_SESSION,
+                                          peer_cache_path=TG_ACCOUNT_PEERS_FILE)
+    ok = await reader.start(timeout=TG_ACCOUNT_TIMEOUT_SEC)
+    tg_account = reader
+    if ok:
+        _tg_account_down_since = 0.0
+        logger.info(f'📡 Каналы читаются через аккаунт Telegram ({reader.account_name})')
+        if _tg_account_alert_sent:
+            _tg_account_alert_sent = False
+            _queue_admin_alert('✅ Аккаунт Telegram снова подключён: каналы опять читаются через него.')
+        return
+    reason = _redact_secrets(reader.error)
+    logger.warning(f'Аккаунт Telegram не подключился: {reason}')
+    _tg_account_alert_down(reason)
+
+
+def _tg_account_watchdog() -> None:
+    """Аккаунт отвалился — подключить заново, не дожидаясь перезапуска бота.
+
+    Telethon сам переподключается лишь несколько раз подряд. После обрыва сети
+    подольше клиент так и оставался отключённым, и до перезапуска бота каналы
+    читались только через веб-страницу — без больших роликов. Сторож живёт в
+    health_probe_job и пробует раз в пять минут.
+    """
+    global _tg_account_start_task, _tg_account_down_since
+    if not _tg_account_configured():
+        return
+    if _tg_account_ready():
+        _tg_account_down_since = 0.0
+        return
+    if not _tg_account_down_since:
+        _tg_account_down_since = time.time()
+    if _tg_account_start_task is not None and not _tg_account_start_task.done():
+        return                                      # подключение уже идёт
+    if tg_account is not None and getattr(tg_account, 'fatal', False):
+        # Вход сброшен: без новой строки входа и перезапуска не поможет.
+        _tg_account_alert_down(_redact_secrets(tg_account.error or 'вход сброшен'))
+        return
+    logger.info('📡 Аккаунт Telegram не подключён — подключаю заново')
+    _tg_account_start_task = asyncio.get_running_loop().create_task(_tg_account_start())
+
+
+def _tg_account_media_waits(news: dict) -> bool:
+    """Медиа поста лежит в аккаунте, а он сейчас переподключается.
+
+    Такой пост лучше придержать на несколько минут: Bot API ссылку tgacc:// не
+    поймёт, и пост ушёл бы без картинки и ролика или потратил бы попытку
+    отправки (отложенный пост снимается после трёх). Ждём не дольше
+    TG_ACCOUNT_MEDIA_WAIT_SEC и не ждём вовсе, если вход сброшен.
+    """
+    if not _tg_account_configured() or _tg_account_ready():
+        return False
+    if tg_account is not None and getattr(tg_account, 'fatal', False):
+        return False
+    if _tg_account_down_since and time.time() - _tg_account_down_since > TG_ACCOUNT_MEDIA_WAIT_SEC:
+        return False
+    refs = list(news.get('images') or []) + [news.get('video'), news.get('_video_thumb')]
+    return any(tg_account_mod.is_media_ref(ref) for ref in refs)
+
+
 async def _tg_account_stop() -> None:
+    task = _tg_account_start_task
+    if task is not None and not task.done():
+        task.cancel()
+        await asyncio.wait({task}, timeout=5)
     if tg_account is not None:
         await tg_account.stop()
 
@@ -12197,15 +12272,38 @@ def _tg_account_status_line() -> str:
 
 def _tg_account_image_bytes(ref: str) -> Optional[bytes]:
     """Фото или обложка ролика из аккаунта. Вызывается из рабочих потоков."""
-    if not _tg_account_ready():
+    if _tg_account_ready():
+        try:
+            data = tg_account.run_sync(lambda: tg_account.download_bytes(ref, HTTP_IMAGE_MAX_BYTES),
+                                       TG_ACCOUNT_TIMEOUT_SEC)
+            if data:
+                return data
+        except Exception as e:
+            logger.warning(f'Аккаунт Telegram: картинка {ref} не скачалась: '
+                           f'{_redact_secrets(f"{type(e).__name__}: {e}")}')
+    return _tg_account_web_image(ref)
+
+
+def _tg_account_web_image(ref: str) -> Optional[bytes]:
+    """Та же картинка с веб-страницы поста, когда аккаунт её не отдал.
+
+    Аккаунт бывает недоступен минуты (обрыв, переподключение) или часами
+    (вход сброшен), а пост уже собран со ссылками tgacc://. У сообщения с
+    фото или роликом страница t.me/канал/номер показывает именно его картинку
+    (?single — одно сообщение, а не весь альбом).
+    """
+    parsed = tg_account_mod.parse_media_ref(ref)
+    if parsed is None or parsed[2] == 'video':
         return None
-    try:
-        return tg_account.run_sync(lambda: tg_account.download_bytes(ref, HTTP_IMAGE_MAX_BYTES),
-                                   TG_ACCOUNT_TIMEOUT_SEC)
-    except Exception as e:
-        logger.warning(f'Аккаунт Telegram: картинка {ref} не скачалась: '
-                       f'{_redact_secrets(f"{type(e).__name__}: {e}")}')
+    channel, msg_id, _kind = parsed
+    page = f'https://t.me/{channel}/{msg_id}?single'
+    url = _normalize_image_url(fetch_og_image(page) or '', page)
+    if not url or tg_account_mod.is_media_ref(url):
         return None
+    data = _download_image_bytes(url)
+    if data:
+        logger.info(f'Аккаунт Telegram не отдал {ref} — картинка взята с веб-страницы поста')
+    return data
 
 
 def _tg_account_news(channel: str, label: str, display_name: str,
@@ -14284,6 +14382,13 @@ async def _prepare_news_for_send(news: dict, source: str,
 
     Возвращает код пропуска ('skipped_filter' / 'skipped_dup') или None, если
     пост можно отправлять."""
+    if _tg_account_media_waits(news):
+        # Проверка первой: дальше картинки качаются для отбора, и без аккаунта
+        # они бы просто выпали из поста.
+        logger.info('⏸ Медиа поста в аккаунте Telegram, а он переподключается: %s',
+                    str(news.get('title', ''))[:60])
+        metrics.inc('anime_bot_tg_account_media_deferred_total')
+        return 'deferred'
     await _improve_thumb(news)
     await _discover_article_video(news)
     await _ensure_youtube_cover(news)
@@ -16941,6 +17046,9 @@ def _release_publish_reservations(news: dict) -> None:
 
 
 PENDING_POSTS_FILE = DATA_DIR / 'pending_posts.json'
+# Сколько раз автопостинг пробует отправить в канал один пост ветки (см.
+# PendingPosts.mark_channel_failed).
+AUTOPOST_MAX_FAILS = 3
 
 
 # ============== ОДИН ТАЙТЛ — ОДИН ПОСТ ==============
@@ -17096,9 +17204,10 @@ def _work_repeat_blocks(news: dict) -> bool:
 
 
 def _autopost_skip(news: dict) -> bool:
-    """Пост ветки, который автопостинг пропускает: западное сверх лимита или
-    тайтл, о котором канал уже писал."""
-    return _western_quota_blocks(news) or _work_repeat_blocks(news)
+    """Пост ветки, который автопостинг пропускает: западное сверх лимита,
+    тайтл, о котором канал уже писал, или медиа ждёт переподключения аккаунта."""
+    return (_western_quota_blocks(news) or _work_repeat_blocks(news)
+            or _tg_account_media_waits(news))
 
 
 # ============== ПОСТЫ АДМИНОВ В КАНАЛЕ ==============
@@ -17345,6 +17454,26 @@ class PendingPosts:
             return False
         return True
 
+    def mark_channel_failed(self, key: str) -> bool:
+        """Автопостинг не смог отправить пост: вернуть в pending и посчитать.
+
+        Автопостинг берёт самый свежий пост. Если он не уходит раз за разом
+        (картинки не скачиваются, Telegram отказывает), без счётчика он вставал
+        первым на каждом тике и держал канал, пока не появится пост свежее.
+        После AUTOPOST_MAX_FAILS неудач автопостинг его пропускает; кнопка
+        «📢 В канал» по-прежнему работает.
+        """
+        item = self._items.get(key)
+        if not item:
+            return False
+        old_state, old_fails = item.get('channel_state'), item.get('channel_fails')
+        item['channel_state'] = 'pending'
+        item['channel_fails'] = _safe_nonnegative_int(old_fails or 0) + 1
+        if not self._save():
+            item['channel_state'], item['channel_fails'] = old_state, old_fails
+            return False
+        return True
+
     def mark_channel_uncertain(self, key: str) -> bool:
         item = self._items.get(key)
         if not item:
@@ -17379,6 +17508,8 @@ class PendingPosts:
             if str(item.get('channel_state') or 'pending') != 'pending':
                 continue
             if not isinstance(item.get('news'), dict):
+                continue
+            if _safe_nonnegative_int(item.get('channel_fails') or 0) >= AUTOPOST_MAX_FAILS:
                 continue
             try:
                 ts = float(item.get('ts') or 0.0)
@@ -17591,11 +17722,14 @@ async def _resolve_photos_for_album(photos: list, primary_crop_plan: Optional[di
                            target_aspect=primary_crop_plan.get('target_aspect'))
         if isinstance(value, str) and _download_needed_host(value):
             data = await asyncio.to_thread(_cached_image_bytes, value)
-            if not data and value.endswith(VIDEO_FRAME_SUFFIX):
-                # Кадр не достался — ссылка на ролик с меткой для Telegram не
-                # картинка: такой элемент ронял бы весь альбом.
+            if not data and (value.endswith(VIDEO_FRAME_SUFFIX) or tg_account_mod.is_media_ref(value)):
+                # Кадр или фото из аккаунта не достались. Ссылку на ролик с
+                # меткой и ссылку tgacc:// Bot API не поймёт: один такой элемент
+                # ронял весь альбом, и пост уходил без картинок или не уходил.
                 continue
             value = data if data else value
+        if isinstance(value, (bytes, bytearray)) and bytes(value) in resolved:
+            continue        # одна и та же картинка дважды в альбоме не нужна
         resolved.append(value)
     return resolved
 
@@ -21853,6 +21987,12 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"📅 Отложка: {len(due)} из {total} постов пора публиковать")
 
     for key, news in due:
+        if _tg_account_media_waits(news):
+            # Медиа в аккаунте, а он переподключается: ждём, не тратя попытку.
+            # После трёх неудач пост снимается с отложки, а аккаунт обычно
+            # возвращается за несколько минут.
+            logger.info('Отложка: пост ждёт аккаунт Telegram: %s', str(news.get('title', ''))[:60])
+            continue
         meta = scheduled_posts.meta(key)      # ДО pop — потом данных не будет
         card = _post_card(news, meta)
         guard = _PublishGuard(f'sched:{key}')
@@ -22815,13 +22955,13 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
                 pending_posts.mark_channel_uncertain(key)
             raise
         except Exception:
-            pending_posts.mark_channel_pending(key)
+            pending_posts.mark_channel_failed(key)
             logger.exception('Автопостинг в канал упал')
             metrics.inc('anime_bot_publish_attempts_total',
                         labels={'mode': 'autopost', 'result': 'failed'})
             return 'failed'
     if not ok:
-        pending_posts.mark_channel_pending(key)
+        pending_posts.mark_channel_failed(key)
         metrics.inc('anime_bot_publish_attempts_total',
                     labels={'mode': 'autopost', 'result': 'failed'})
         return 'failed'
@@ -33045,6 +33185,10 @@ def _stop_health_server() -> None:
 
 async def health_probe_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Периодически обновляет readiness и самовосстанавливает auto-job."""
+    try:
+        _tg_account_watchdog()
+    except Exception:
+        logger.exception('Сторож аккаунта Telegram упал')
     try:
         # APScheduler job не является durable-состоянием. Если пользователь оставил
         # авторассылку включённой, а job исчез из-за restart/race/ошибки scheduler,
