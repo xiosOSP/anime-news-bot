@@ -191,25 +191,35 @@ class PeerCache:
         self.items: dict[str, dict] = {}
 
     def load(self, account_id: int) -> None:
+        """Никогда не бросает: испорченный файл — просто пустой кэш.
+
+        Ошибка здесь вылетела бы из start() уже с подключённым клиентом: он
+        остался бы висеть, а сторож каждые пять минут заводил бы ещё один.
+        """
         self.account = int(account_id or 0)
         self.items = {}
-        if self.path is None or not self.path.exists():
+        if self.path is None:
             return
         try:
+            if not self.path.exists():
+                return
             data = json.loads(self.path.read_text(encoding='utf-8'))
-        except (OSError, ValueError) as e:
+            if not isinstance(data, dict) or data.get('account') != self.account:
+                return                     # другой аккаунт: его хэши нам не подходят
+            channels = data.get('channels')
+            if not isinstance(channels, dict):
+                return
+            for name, row in channels.items():
+                try:
+                    self.items[str(name).lower()] = {
+                        'id': int(row['id']), 'hash': int(row['hash']),
+                        'title': str(row.get('title') or ''), 'at': float(row.get('at') or 0)}
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    continue
+        except Exception as e:
+            self.items = {}
             logger.warning('Кэш каналов аккаунта не прочитан (%s): узнаю каналы заново',
                            type(e).__name__)
-            return
-        if not isinstance(data, dict) or int(data.get('account') or 0) != self.account:
-            return                         # другой аккаунт: его хэши нам не подходят
-        for name, row in (data.get('channels') or {}).items():
-            try:
-                self.items[str(name).lower()] = {
-                    'id': int(row['id']), 'hash': int(row['hash']),
-                    'title': str(row.get('title') or ''), 'at': float(row.get('at') or 0)}
-            except (KeyError, TypeError, ValueError):
-                continue
 
     def get(self, channel: str) -> Optional[dict]:
         row = self.items.get(channel.lower())
@@ -280,6 +290,7 @@ class AccountReader:
         self.account_name = ''
         self.peers = PeerCache(peer_cache_path)
         self._resolved: dict[str, Any] = {}
+        self._stop_task: Optional[asyncio.Task] = None
 
     @property
     def ready(self) -> bool:
@@ -378,12 +389,24 @@ class AccountReader:
         self._resolved[key] = found
         return found
 
+    async def _guarded(self, awaitable):
+        """Запрос к Telegram с проверкой на сброшенный вход.
+
+        Ролик бот качает прямо из цикла событий, минуя run_sync. Без этой
+        проверки сброс входа, замеченный на ролике, не выключал аккаунт.
+        """
+        try:
+            return await awaitable
+        except Exception as e:
+            self._note_failure(e)
+            raise
+
     async def _with_peer(self, channel: str, call: Callable[[Any, Any], Awaitable]):
         """Запрос к каналу; устаревший хэш — узнать канал заново и повторить один раз."""
         client = self._require()
-        peer, title = await self._peer(client, channel)
+        peer, title = await self._guarded(self._peer(client, channel))
         try:
-            return await call(client, peer), title
+            return await self._guarded(call(client, peer)), title
         except Exception as e:
             if type(e).__name__ not in _STALE_PEER_ERRORS or isinstance(peer, str):
                 raise
@@ -391,8 +414,8 @@ class AccountReader:
                         channel, type(e).__name__)
             self._resolved.pop(channel.lower(), None)
             self.peers.drop(channel)
-            peer, title = await self._peer(client, channel)
-            return await call(client, peer), title
+            peer, title = await self._guarded(self._peer(client, channel))
+            return await self._guarded(call(client, peer)), title
 
     async def fetch(self, channel: str, limit: int = 20) -> tuple[str, list[AccountPost]]:
         """Название канала и его последние посты (новые сначала)."""
@@ -418,11 +441,11 @@ class AccountReader:
         msg = await self._message(channel, msg_id)
         client = self._require()
         if kind == 'thumb':
-            data = await client.download_media(msg, file=bytes, thumb=-1)
+            data = await self._guarded(client.download_media(msg, file=bytes, thumb=-1))
         else:
             if not getattr(msg, 'photo', None):
                 return None
-            data = await client.download_media(msg, file=bytes)
+            data = await self._guarded(client.download_media(msg, file=bytes))
         if not isinstance(data, (bytes, bytearray)) or not data or len(data) > max_bytes:
             return None
         return bytes(data)
@@ -442,7 +465,7 @@ class AccountReader:
         dest_dir.mkdir(parents=True, exist_ok=True)
         target = dest_dir / f'tgacc-{channel}-{msg_id}.mp4'
         try:
-            path = await self._require().download_media(msg, file=str(target))
+            path = await self._guarded(self._require().download_media(msg, file=str(target)))
         except BaseException:
             # Обрыв или таймаут посреди загрузки: Telethon оставляет недокачанный
             # файл, а ролик бывает в сотни мегабайт — диск хостинга не резиновый.
@@ -487,4 +510,8 @@ class AccountReader:
         self.error = f'{type(exc).__name__}: {exc}'
         loop = self.loop
         if loop is not None and not loop.is_closed():
-            loop.call_soon_threadsafe(lambda: loop.create_task(self.stop()))
+            loop.call_soon_threadsafe(self._stop_soon)
+
+    def _stop_soon(self) -> None:
+        # Ссылку держим: задачу без ссылки сборщик мусора может снять на полпути.
+        self._stop_task = self.loop.create_task(self.stop())

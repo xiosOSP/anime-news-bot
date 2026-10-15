@@ -25,6 +25,7 @@ import post_text
     '5 лет назад анонсировали аниме «Магическая битва»',
     'Исполнилось 20 лет со дня выхода трейлера «Наруто»',
     'Naruto celebrates 20 years since its anime premiere',
+    '10 лет назад был анонсирован первый сезон «Наруто»',
 ])
 def test_looking_back_is_noise_even_with_event_words(title):
     assert bot.noise_reason({'title': title}) == 'годовщина и ностальгия'
@@ -36,6 +37,8 @@ def test_looking_back_is_noise_even_with_event_words(title):
     'Аниме «Боксёр» исполнилось 5 лет — студия анонсировала второй сезон',
     'Bleach 20th Anniversary project announced',
     'К 10-летию со дня премьеры «Паразита» выйдет новый фильм',
+    # Событие впереди сильнее взгляда назад.
+    'Спустя 10 лет с момента выхода первого сезона «Ван-Панчмен» получит продолжение',
 ])
 def test_new_event_for_the_anniversary_is_news(title):
     assert bot.noise_reason({'title': title}) == ''
@@ -59,6 +62,12 @@ def test_episode_release_in_any_word_order_is_noise(title):
     'Кадры 5 серии уже доступны',
     'Постер 5 серии опубликован',
     'Опенинг 5 серии «Ледяной стены» вышел',
+    # Число серий в сезоне — не выход серии.
+    'Сериал «Ведьмак»: 4 сезон из 8 серий выйдет на Netflix — съёмки уже на финальной стадии',
+    '2 сезон «Фрирен» получит 24 серии, смотреть можно будет с января',
+    '1 серия выйдет 5 января, смотреть её покажут на Crunchyroll',
+    '5 серия «Ледяной стены» выйдет в пятницу, работа уже на финальной стадии',
+    'Второй сезон «Ледяной стены» из 24 серий выпущен на Blu-ray',
 ])
 def test_episode_material_and_future_dates_stay(title):
     assert bot.noise_reason({'title': title}) == ''

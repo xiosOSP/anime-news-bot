@@ -119,6 +119,26 @@ async def test_login_revoked_while_working_takes_the_reader_down():
 
 
 @pytest.mark.asyncio
+async def test_revoked_login_noticed_on_a_video_download_in_the_loop(tmp_path):
+    """Ролик бот качает прямо из цикла событий, без run_sync."""
+    clip = NS(id=9, date=None, message='трейлер', video=object(), video_note=None, gif=None,
+              file=NS(duration=90, size=50 * 1024 * 1024))
+    client = Client(messages=[clip])
+
+    async def revoked(msg, file=None, thumb=None):
+        raise _error('AuthKeyUnregisteredError')
+    client.download_media = revoked
+    reader = _reader(client)
+    await reader.start()
+    with pytest.raises(Exception):
+        await reader.download_video('tgacc://chan/9/video', tmp_path, 300 * 1024 * 1024)
+    assert reader.fatal and not reader.ready
+    await asyncio.sleep(0.05)
+    assert reader._stop_task is not None and reader._stop_task.done()
+    assert client.connected is False, 'клиент со сброшенным входом не отключён'
+
+
+@pytest.mark.asyncio
 async def test_reader_is_down_right_after_the_login_is_revoked():
     """Отключение идёт задачей в цикле; до неё каналы уже не должны ждать аккаунт."""
     reader = _reader(Client())
@@ -196,6 +216,21 @@ async def test_unreadable_cache_is_not_fatal(tmp_path):
     assert await reader.start()
     await reader.fetch('chan')
     assert client.resolved == ['chan']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('body', ['{"account":"abc"}', '{"account":[5]}',
+                                  '{"account":1001,"channels":[1]}',
+                                  '{"account":1001,"channels":{"chan":5}}', '[]'])
+async def test_odd_cache_file_does_not_break_the_start(tmp_path, body):
+    """Раньше такое содержимое роняло start() с уже подключённым клиентом."""
+    cache = tmp_path / 'peers.json'
+    cache.write_text(body, encoding='utf-8')
+    client = Client()
+    reader = _reader(client, cache)
+    assert await reader.start()
+    await reader.fetch('chan')
+    assert client.resolved == ['chan'] and client.connected
 
 
 # ---------------------------------------------------------------- недокачанный ролик
@@ -392,19 +427,39 @@ async def test_same_picture_is_not_sent_twice_in_one_album(monkeypatch):
     assert resolved == [b'same', b'other']
 
 
-def test_web_page_of_the_post_gives_the_picture_when_the_account_is_down(monkeypatch):
-    monkeypatch.setattr(bot, 'tg_account', None)
-    pages = []
+AVATAR = 'https://cdn4.telesco.pe/file/avatar.jpg'
+PHOTO = 'https://cdn4.telesco.pe/file/photo.jpg'
+
+
+@pytest.fixture
+def web(monkeypatch):
+    """Веб-страницы t.me: у канала — аватарка, у поста — его фото."""
+    monkeypatch.setattr(bot, '_tg_channel_avatars', {})
+    pages = {'https://t.me/chan': AVATAR}
+    asked = []
 
     def og(page):
-        pages.append(page)
-        return 'https://cdn4.telesco.pe/file/photo.jpg'
+        asked.append(page)
+        return pages.get(page, PHOTO)
     monkeypatch.setattr(bot, 'fetch_og_image', og)
-    monkeypatch.setattr(bot, '_download_image_bytes',
-                        lambda url: b'jpeg' if url == 'https://cdn4.telesco.pe/file/photo.jpg' else None)
-    assert bot._tg_account_image_bytes('tgacc://chan/7/photo') == b'jpeg'
-    assert pages == ['https://t.me/chan/7?single']
+    monkeypatch.setattr(bot, '_download_image_bytes', lambda url: f'img:{url}'.encode())
+    return pages, asked
+
+
+def test_web_page_of_the_post_gives_the_picture_when_the_account_is_down(monkeypatch, web):
+    monkeypatch.setattr(bot, 'tg_account', None)
+    _pages, asked = web
+    assert bot._tg_account_image_bytes('tgacc://chan/7/photo') == f'img:{PHOTO}'.encode()
+    assert 'https://t.me/chan/7?single' in asked
     assert bot._tg_account_image_bytes('tgacc://chan/7/video') is None
+
+
+def test_deleted_post_shows_the_avatar_and_gives_nothing(monkeypatch, web):
+    """Без аккаунта не узнать, что пост удалён, — но страница показывает аватарку."""
+    monkeypatch.setattr(bot, 'tg_account', None)
+    pages, _asked = web
+    pages['https://t.me/chan/8?single'] = AVATAR
+    assert bot._tg_account_image_bytes('tgacc://chan/8/photo') is None
 
 
 def test_deleted_post_gives_no_picture_not_the_channel_avatar(monkeypatch):
@@ -415,13 +470,11 @@ def test_deleted_post_gives_no_picture_not_the_channel_avatar(monkeypatch):
     assert bot._tg_account_image_bytes('tgacc://chan/7/photo') is None
 
 
-def test_slow_account_falls_back_to_the_web_page(monkeypatch):
+def test_slow_account_falls_back_to_the_web_page(monkeypatch, web):
     def slow(factory, timeout):
         raise tg_account.AccountUnavailable('Telegram не ответил за 40 с')
     monkeypatch.setattr(bot, 'tg_account', NS(ready=True, run_sync=slow, download_bytes=lambda r, m: None))
-    monkeypatch.setattr(bot, 'fetch_og_image', lambda page: 'https://cdn4.telesco.pe/file/p.jpg')
-    monkeypatch.setattr(bot, '_download_image_bytes', lambda url: b'jpeg')
-    assert bot._tg_account_image_bytes('tgacc://chan/7/photo') == b'jpeg'
+    assert bot._tg_account_image_bytes('tgacc://chan/7/photo') == f'img:{PHOTO}'.encode()
 
 
 @pytest.mark.asyncio
@@ -448,6 +501,10 @@ def test_autopost_stops_retrying_a_post_that_keeps_failing(tmp_path, monkeypatch
     key, _news = store.next_for_autopost()
     assert key == older, 'неуходящий пост держал автопостинг'
     assert store.channel_state(fresh) == 'pending'      # кнопкой его опубликовать можно
+    # Сбой мог быть временным: через пару часов пост получает ещё попытку.
+    store._items[fresh]['channel_failed_at'] -= bot.AUTOPOST_FAIL_COOLDOWN_SEC + 60
+    key, _news = store.next_for_autopost()
+    assert key == fresh
 
 
 # ---------------------------------------------------------------- хостинг

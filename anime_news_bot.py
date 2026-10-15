@@ -12291,6 +12291,20 @@ def _tg_account_image_bytes(ref: str) -> Optional[bytes]:
     return _tg_account_web_image(ref)
 
 
+_tg_channel_avatars: dict[str, str] = {}
+
+
+def _tg_channel_avatar(channel: str) -> str:
+    """Аватарка канала (og:image его страницы); один запрос за время работы."""
+    key = channel.casefold()
+    if key not in _tg_channel_avatars:
+        page = f'https://t.me/{channel}'
+        if len(_tg_channel_avatars) > 200:
+            _tg_channel_avatars.clear()
+        _tg_channel_avatars[key] = _normalize_image_url(fetch_og_image(page) or '', page) or ''
+    return _tg_channel_avatars[key]
+
+
 def _tg_account_web_image(ref: str) -> Optional[bytes]:
     """Та же картинка с веб-страницы поста, когда аккаунт её не отдал.
 
@@ -12306,6 +12320,10 @@ def _tg_account_web_image(ref: str) -> Optional[bytes]:
     page = f'https://t.me/{channel}/{msg_id}?single'
     url = _normalize_image_url(fetch_og_image(page) or '', page)
     if not url or tg_account_mod.is_media_ref(url):
+        return None
+    if url == _tg_channel_avatar(channel):
+        # Пост удалили: страница показывает канал, а не фото поста.
+        logger.info(f'Веб-страница {page}: вместо фото аватарка канала — пост удалён')
         return None
     data = _download_image_bytes(url)
     if data:
@@ -13012,13 +13030,16 @@ NOISE_TITLE_RULES = (
         r'\bboosty\b|\bбусти\b)',
         # Тот же выход серии другим порядком слов: «5 серия «Х» уже вышла»,
         # «Можно посмотреть 5-ю серию». Правило выше ждало номер после слова
-        # «серия» или глагол перед ним, и такие посты проходили. «Будут
-        # доступны» — про будущее, это не выход.
+        # «серия» или глагол перед ним, и такие посты проходили. Номер серии —
+        # «5 серия», «5-ю серию», «эпизод 12»; «8 серий» и «24 серии» — это
+        # число серий в сезоне, а не выход. «Будут доступны» и «смотреть можно
+        # будет» — про будущее.
         r'^(?!.*(?:кадр|превью|тизер|трейлер|анонс|постер|опенинг|эндинг|preview|teaser|trailer|stills?\b))'
-        r'(?=.*(?:\b\d{1,4}[-‑]?(?:я|й|ю|ой|го)?\s+(?:эпизод\w*|сери[яиюей])\b|'
-        r'\b(?:эпизод\w*|сери[яиюей])\s*№?\s*\d{1,4}\b))'
+        r'(?=.*(?:\b\d{1,4}[-‑]?(?:я|й|ю|ой)?\s+(?:эпизод|серия|серию)\b|'
+        r'\b(?:эпизод|серия)\s*№?\s*\d{1,4}\b))'
         r'.*(?:\bвышл[аио]\b|\bвышел\b|\bвыпущен\w*|(?<!будут )(?<!будет )\bдоступ(?:ен|н\w*)|'
-        r'\bопубликован\w*|\bуже\s+на\b|\bсмотрите\b|\bсмотреть\b|\bпосмотреть\b)',
+        r'\bопубликован\w*|\bуже\s+на\s+(?-i:[A-ZА-ЯЁ])|\bсмотрите\b|'
+        r'\bможно\s+(?:уже\s+)?(?:по)?смотреть\b)',
     )),
     ('фан-контент', (
         r'\bfan\s?art\b',
@@ -13102,9 +13123,21 @@ _ANNIVERSARY_RETRO_RE = re.compile(
     re.IGNORECASE)
 
 
+# Событие впереди: «Спустя 10 лет с момента выхода первого сезона «Ван-Панчмен»
+# получит продолжение» — новость, хотя в заголовке есть и «с момента выхода».
+# Только будущее время и настоящее английское: «был анонсирован» и
+# «анонсировали» в заголовке со словом «назад» — о событии тех лет.
+_ANNIVERSARY_FORWARD_RE = re.compile(
+    r'\b(?:получ(?:ит|ат)|выйд(?:ет|ут)|выпуст(?:ит|ят)|покаж(?:ет|ут)|провед(?:[её]т|ут)|'
+    r'пройд[её]т|откро[её]тся|стартует|начн[её]тся|продлят|вернётся|вернется)\b|'
+    r'\bwill\s+(?:release|get|air|launch|return|premiere)\b|'
+    r'\bgets?\s+(?:a\s+)?(?:new\s+)?(?:sequel|season|movie|film|anime)\b',
+    re.IGNORECASE)
+
+
 def _anniversary_is_news(title: str) -> bool:
-    """Юбилей в заголовке, но новость есть: новое событие к юбилею."""
-    if _ANNIVERSARY_FOR_RE.search(title):
+    """Юбилей в заголовке, но новость есть: новое событие к юбилею или впереди."""
+    if _ANNIVERSARY_FOR_RE.search(title) or _ANNIVERSARY_FORWARD_RE.search(title):
         return True
     if _ANNIVERSARY_RETRO_RE.search(title):
         return False
@@ -17116,9 +17149,10 @@ def _release_publish_reservations(news: dict) -> None:
 
 
 PENDING_POSTS_FILE = DATA_DIR / 'pending_posts.json'
-# Сколько раз автопостинг пробует отправить в канал один пост ветки (см.
-# PendingPosts.mark_channel_failed).
+# Сколько раз автопостинг пробует отправить в канал один пост ветки и сколько
+# потом ждёт до следующей попытки (см. PendingPosts.mark_channel_failed).
 AUTOPOST_MAX_FAILS = 3
+AUTOPOST_FAIL_COOLDOWN_SEC = 2 * 3600
 
 
 # ============== ОДИН ТАЙТЛ — ОДИН ПОСТ ==============
@@ -17349,7 +17383,10 @@ def _work_events_related(new_events: set, old_events: set, new_numbers: set, old
         # тот же сюжет из другого источника.
         return old_by != 'admin' and not new_events
     if not new_events:
-        return False
+        # Новый пост о событии не говорит («Новые подробности о втором сезоне
+        # «X»»). В первые сутки после поста о тайтле это почти всегда пересказ
+        # того же; позже — скорее что-то своё.
+        return age_hours <= WORK_PACKAGE_HOURS
     if new_events & old_events:
         return True
     return (age_hours <= WORK_PACKAGE_HOURS and bool(new_events & _WORK_PACKAGE_EVENTS)
@@ -17648,17 +17685,19 @@ class PendingPosts:
         Автопостинг берёт самый свежий пост. Если он не уходит раз за разом
         (картинки не скачиваются, Telegram отказывает), без счётчика он вставал
         первым на каждом тике и держал канал, пока не появится пост свежее.
-        После AUTOPOST_MAX_FAILS неудач автопостинг его пропускает; кнопка
-        «📢 В канал» по-прежнему работает.
+        После AUTOPOST_MAX_FAILS неудач автопостинг его пропускает
+        AUTOPOST_FAIL_COOLDOWN_SEC, потом даёт ещё попытку: сбой бывает и
+        временным. Кнопка «📢 В канал» работает всегда.
         """
         item = self._items.get(key)
         if not item:
             return False
-        old_state, old_fails = item.get('channel_state'), item.get('channel_fails')
+        old = {k: item.get(k) for k in ('channel_state', 'channel_fails', 'channel_failed_at')}
         item['channel_state'] = 'pending'
-        item['channel_fails'] = _safe_nonnegative_int(old_fails or 0) + 1
+        item['channel_fails'] = _safe_nonnegative_int(old['channel_fails'] or 0) + 1
+        item['channel_failed_at'] = time.time()
         if not self._save():
-            item['channel_state'], item['channel_fails'] = old_state, old_fails
+            item.update(old)
             return False
         return True
 
@@ -17698,7 +17737,12 @@ class PendingPosts:
             if not isinstance(item.get('news'), dict):
                 continue
             if _safe_nonnegative_int(item.get('channel_fails') or 0) >= AUTOPOST_MAX_FAILS:
-                continue
+                try:
+                    failed_at = float(item.get('channel_failed_at') or 0.0)
+                except (TypeError, ValueError):
+                    failed_at = 0.0
+                if time.time() - failed_at < AUTOPOST_FAIL_COOLDOWN_SEC:
+                    continue
             try:
                 ts = float(item.get('ts') or 0.0)
             except (TypeError, ValueError):
@@ -22465,8 +22509,23 @@ async def settings_command(update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# /news и /preview идут задачей (block=False), и второй вызов, пока первый ещё
+# собирает источники, запустил бы второй полный сбор параллельно: двойная
+# нагрузка на сайты и на модель ради того же самого ответа.
+_manual_collect_lock = asyncio.Lock()
+_MANUAL_COLLECT_BUSY = '⏳ Уже ищу новости по прошлой команде — пришлю, как закончу.'
+
+
 @admin_only
 async def news_command(update, context: ContextTypes.DEFAULT_TYPE):
+    if _manual_collect_lock.locked():
+        await update.message.reply_text(_MANUAL_COLLECT_BUSY)
+        return
+    async with _manual_collect_lock:
+        await _news_command_locked(update, context)
+
+
+async def _news_command_locked(update, context) -> None:
     msg = await update.message.reply_text("🔍 Ищу новости...")
     all_news, stats, _ = await collect_all_news()
     filtered = [
@@ -22492,6 +22551,14 @@ async def news_command(update, context: ContextTypes.DEFAULT_TYPE):
 async def preview_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Показать примеры в личку — точно так же как они будут в канале,
     но без публикации в канал и без записи в историю."""
+    if _manual_collect_lock.locked():
+        await update.message.reply_text(_MANUAL_COLLECT_BUSY)
+        return
+    async with _manual_collect_lock:
+        await _preview_command_locked(update, context)
+
+
+async def _preview_command_locked(update, context) -> None:
     msg = await update.message.reply_text("🔍 Собираю примеры (видео может качаться долго)...")
     all_news, _, _ = await collect_all_news()
     if not all_news:

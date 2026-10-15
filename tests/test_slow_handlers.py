@@ -110,3 +110,36 @@ async def test_hung_source_is_still_cut_off(monkeypatch):
         return []
     with pytest.raises(TimeoutError):
         await bot._run_source_collector_bounded('hung-source', hung, 0.2)
+
+
+@pytest.mark.asyncio
+async def test_second_news_command_does_not_start_a_second_collection(monkeypatch):
+    """/news идёт задачей; второй вызов, пока первый собирает, только отвечает."""
+    gate = asyncio.Event()
+    collected = []
+
+    async def collect():
+        collected.append(1)
+        await gate.wait()
+        return [], ['A: 0'], []
+    monkeypatch.setattr(bot, 'collect_all_news', collect)
+    replies = []
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            replies.append(text)
+            return self
+
+        async def edit_text(self, text, **kw):
+            replies.append(text)
+    update = NS(message=Msg())
+    news = inspect.unwrap(bot.news_command)
+    preview = inspect.unwrap(bot.preview_command)
+    first = asyncio.create_task(news(update, NS(bot=None)))
+    await asyncio.sleep(0.01)
+    await news(update, NS(bot=None))
+    await preview(update, NS(bot=None))
+    gate.set()
+    await first
+    assert collected == [1]
+    assert replies.count(bot._MANUAL_COLLECT_BUSY) == 2

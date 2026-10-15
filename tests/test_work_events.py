@@ -132,8 +132,11 @@ def test_event_and_numbers_of_the_rewrite_are_used(memory):
     assert not bot._work_repeat_blocks(_post('Кадры 5 серии аниме «Ледяная стена»'))
 
 
-def test_post_without_event_is_not_closed_by_an_event_post(memory):
-    _published(memory, _post('Вышел трейлер аниме «Голубая шкатулка»'))
+def test_post_without_event_is_closed_only_on_the_first_day(memory):
+    """«Новые подробности о «X»» наутро после анонса — пересказ того же."""
+    _published(memory, _post('Вышел трейлер аниме «Голубая шкатулка»'), hours_ago=5)
+    assert bot._work_repeat_blocks(_post('Новые подробности о втором сезоне «Голубой шкатулки»'))
+    memory._items[-1]['at'] -= 25 * 3600
     assert not bot._work_repeat_blocks(_post('Манга «Голубая шкатулка» стала самой продаваемой'))
 
 
