@@ -240,6 +240,28 @@ _ATTRIBUTED_NEWS_RE = re.compile(
     r'\b(?:по данным|по словам|сообщает|сообщают|может|возможно|вероятно)\b', re.I)
 
 
+# «Слух:» в начале заголовка — пометка, что новость не подтверждена. Модель
+# ставила её и прямым словам автора: «Слух: автор манги «Black Torch» готов
+# к второму сезону», хотя в источнике автор заявил это сам. Пометку снимаем,
+# только если в источнике нет ни слова о слухе, утечке или неназванном
+# источнике — где они есть, пометка нужна.
+_RUMOR_LABEL_RE = re.compile(r'^(?:слух|слухи|rumou?r)\s*[:—–-]\s*', re.I)
+_RUMOR_SOURCE_RE = re.compile(
+    _UNCERTAIN_NEWS_RE.pattern + r'|утечк\w*|якобы|\bинсайд\w*|'
+    r'\bпо\s+(?:неподтвержд\w+\s+)?(?:данным|информации|сведениям)\b|'
+    r'\bисточник\w*\s+(?:сообща|утвержда|говор|рассказ)', re.I)
+
+
+def _drop_unfounded_rumor_label(title: str, source: str) -> str:
+    """Заголовок без «Слух:», если в источнике нет и намёка на слух."""
+    title = str(title or '')
+    match = _RUMOR_LABEL_RE.match(title)
+    if not match or _RUMOR_SOURCE_RE.search(str(source or '')):
+        return title
+    rest = title[match.end():].strip()
+    return rest[:1].upper() + rest[1:] if rest else title
+
+
 def _source_lead(source: str) -> str:
     """Заголовок и первый абзац источника — там статья объявляет, слух ли это.
 

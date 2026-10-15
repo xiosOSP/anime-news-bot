@@ -158,6 +158,22 @@ def telethon_ready() -> str:
     return telethon.__version__
 
 
+def cryptg_ready() -> str:
+    """Telethon шифрует через cryptg, а не на чистом Python.
+
+    Без колеса cryptg под Python хостинга pip молча ставит пакет из исходников
+    или не ставит вовсе, и большие ролики перестают успевать скачаться.
+    """
+    import cryptg
+    import telethon.crypto.aes as aes
+    key, iv, data = bytes(range(32)), bytes(range(32, 64)), bytes(64)
+    if cryptg.decrypt_ige(cryptg.encrypt_ige(data, key, iv), key, iv) != data:
+        raise RuntimeError('cryptg шифрует с ошибкой')
+    if aes.cryptg is None:
+        raise RuntimeError('Telethon не видит cryptg')
+    return 'Telethon шифрует через cryptg'
+
+
 def main() -> int:
     print(f'Python {sys.version.split()[0]}')
     with tempfile.TemporaryDirectory() as tmp:
@@ -169,6 +185,7 @@ def main() -> int:
             check('ffmpeg из imageio-ffmpeg', ffmpeg_runs),
             check('deno для yt-dlp', deno_runs),
             check('Telethon (чтение каналов через аккаунт)', telethon_ready),
+            check('cryptg (быстрая загрузка роликов через аккаунт)', cryptg_ready),
             check('бот импортируется', lambda: bot_imports(work)),
             check('бот запускается на пустом томе данных', lambda: bot_starts(work)),
         ]

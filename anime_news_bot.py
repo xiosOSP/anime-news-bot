@@ -54,6 +54,7 @@ from safe_http import is_public_ip as _safe_http_is_public_ip, public_get
 from moderation_rules import check_text as check_moderation_text, normalize as normalize_moderation_text
 # Текст поста: предложения, обрывки, ссылки и заголовки телеграм-постов. — post_text.py; здесь то, чем пользуется бот.
 from post_text import (
+    _TG_LIST_MARK_RE,
     _extract_sentences,
     _strip_links,
     _tg_is_list_item,
@@ -81,6 +82,7 @@ from llm_protocol import (
     _LLM_FAILURE_HUMAN,
     _LLM_TEMPORARY_MARKERS,
     _borrowed_names,
+    _drop_unfounded_rumor_label,
     _editorial_rejection,
     _unsupported_names,
     _llm_batch_owner,
@@ -99,9 +101,11 @@ from llm_protocol import (
 from news_stories import (
     _clean_work_name,
     same_work_event,
+    story_event_classes,
     story_event_families,
     story_explicit_work_names,
     story_work_names,
+    story_work_numbers,
     is_rubric_word,
     numbers_conflict,
     title_numbers,
@@ -12150,8 +12154,16 @@ TG_ACCOUNT_SESSION = _env('TG_ACCOUNT_SESSION', '').strip()
 TG_ACCOUNT_TIMEOUT_SEC = max(5, min(120, _env_int('TG_ACCOUNT_TIMEOUT_SEC', 40)))
 # Скачиваем и больше 50 МБ: потом ролик сжимается под лимит Bot API.
 TG_ACCOUNT_VIDEO_MAX_MB = max(10, min(2000, _env_int('TG_ACCOUNT_VIDEO_MAX_MB', 300)))
+# id и хэши каналов: без них каждый перезапуск заново узнавал все каналы по
+# имени, а на это у Telegram жёсткий суточный лимит (см. tg_account.PeerCache).
+TG_ACCOUNT_PEERS_FILE = DATA_DIR / 'tg_account_peers.json'
+# Сколько пост с медиа из аккаунта ждёт, пока аккаунт переподключится. Дольше —
+# публикуем как есть: картинку тогда отдаст веб-страница поста.
+TG_ACCOUNT_MEDIA_WAIT_SEC = 20 * 60
 tg_account: Optional['tg_account_mod.AccountReader'] = None
 _tg_account_start_task: Optional[asyncio.Task] = None
+_tg_account_alert_sent = False       # о текущем обрыве админ уже предупреждён
+_tg_account_down_since = 0.0         # когда сторож впервые увидел аккаунт отключённым
 
 
 def _tg_account_configured() -> bool:
@@ -12162,25 +12174,92 @@ def _tg_account_ready() -> bool:
     return tg_account is not None and tg_account.ready
 
 
-async def _tg_account_start() -> None:
-    """Подключает аккаунт при запуске бота; неудача — предупреждение админу."""
-    global tg_account
-    if not _tg_account_configured():
+def _tg_account_alert_down(reason: str) -> None:
+    """Одно предупреждение на обрыв, а не каждые пять минут, пока сторож пробует."""
+    global _tg_account_alert_sent
+    if _tg_account_alert_sent:
         return
-    reader = tg_account_mod.AccountReader(TG_ACCOUNT_API_ID, TG_ACCOUNT_API_HASH, TG_ACCOUNT_SESSION)
-    ok = await reader.start(timeout=TG_ACCOUNT_TIMEOUT_SEC)
-    tg_account = reader
-    if ok:
-        logger.info(f'📡 Каналы читаются через аккаунт Telegram ({reader.account_name})')
-        return
-    reason = _redact_secrets(reader.error)
-    logger.warning(f'Аккаунт Telegram не подключился: {reason}')
+    _tg_account_alert_sent = True
     _queue_admin_alert(f'⚠️ Аккаунт Telegram для чтения каналов не подключился: {reason}.\n'
                        'Каналы читаются по-старому, через веб-страницу: большие ролики '
                        'туда не доезжают. Как получить строку входа — docs/tg-account.md.')
 
 
+async def _tg_account_start() -> None:
+    """Подключает аккаунт: при запуске бота и когда сторож видит обрыв."""
+    global tg_account, _tg_account_alert_sent, _tg_account_down_since
+    if not _tg_account_configured():
+        return
+    old = tg_account
+    if old is not None:
+        # Клиент, у которого Telethon исчерпал попытки, так и висит в цикле
+        # бота со своими задачами. Закрываем его, прежде чем заводить новый.
+        await old.stop()
+    reader = tg_account_mod.AccountReader(TG_ACCOUNT_API_ID, TG_ACCOUNT_API_HASH, TG_ACCOUNT_SESSION,
+                                          peer_cache_path=TG_ACCOUNT_PEERS_FILE)
+    ok = await reader.start(timeout=TG_ACCOUNT_TIMEOUT_SEC)
+    tg_account = reader
+    if ok:
+        _tg_account_down_since = 0.0
+        logger.info(f'📡 Каналы читаются через аккаунт Telegram ({reader.account_name})')
+        if _tg_account_alert_sent:
+            _tg_account_alert_sent = False
+            _queue_admin_alert('✅ Аккаунт Telegram снова подключён: каналы опять читаются через него.')
+        return
+    reason = _redact_secrets(reader.error)
+    logger.warning(f'Аккаунт Telegram не подключился: {reason}')
+    _tg_account_alert_down(reason)
+
+
+def _tg_account_watchdog() -> None:
+    """Аккаунт отвалился — подключить заново, не дожидаясь перезапуска бота.
+
+    Telethon сам переподключается лишь несколько раз подряд. После обрыва сети
+    подольше клиент так и оставался отключённым, и до перезапуска бота каналы
+    читались только через веб-страницу — без больших роликов. Сторож живёт в
+    health_probe_job и пробует раз в пять минут.
+    """
+    global _tg_account_start_task, _tg_account_down_since
+    if not _tg_account_configured():
+        return
+    if _tg_account_ready():
+        _tg_account_down_since = 0.0
+        return
+    if not _tg_account_down_since:
+        _tg_account_down_since = time.time()
+    if _tg_account_start_task is not None and not _tg_account_start_task.done():
+        return                                      # подключение уже идёт
+    if tg_account is not None and getattr(tg_account, 'fatal', False):
+        # Вход сброшен: без новой строки входа и перезапуска не поможет.
+        _tg_account_alert_down(_redact_secrets(tg_account.error or 'вход сброшен'))
+        return
+    logger.info('📡 Аккаунт Telegram не подключён — подключаю заново')
+    _tg_account_start_task = asyncio.get_running_loop().create_task(_tg_account_start())
+
+
+def _tg_account_media_waits(news: dict) -> bool:
+    """Медиа поста лежит в аккаунте, а он сейчас переподключается.
+
+    Такой пост лучше придержать на несколько минут: Bot API ссылку tgacc:// не
+    поймёт, и пост ушёл бы без картинки и ролика или потратил бы попытку
+    отправки (отложенный пост снимается после трёх). Ждём не дольше
+    TG_ACCOUNT_MEDIA_WAIT_SEC и не ждём вовсе, если вход сброшен.
+    """
+    if not _tg_account_configured() or _tg_account_ready():
+        return False
+    if tg_account is not None and getattr(tg_account, 'fatal', False):
+        return False
+    if _tg_account_down_since and time.time() - _tg_account_down_since > TG_ACCOUNT_MEDIA_WAIT_SEC:
+        return False
+    refs = list(news.get('images') or []) + [news.get('video'), news.get('_video_thumb')]
+    return any(tg_account_mod.is_media_ref(ref) for ref in refs)
+
+
 async def _tg_account_stop() -> None:
+    task = _tg_account_start_task
+    if task is not None and not task.done():
+        task.cancel()
+        await asyncio.wait({task}, timeout=5)
     if tg_account is not None:
         await tg_account.stop()
 
@@ -12197,15 +12276,59 @@ def _tg_account_status_line() -> str:
 
 def _tg_account_image_bytes(ref: str) -> Optional[bytes]:
     """Фото или обложка ролика из аккаунта. Вызывается из рабочих потоков."""
-    if not _tg_account_ready():
+    if _tg_account_ready():
+        try:
+            # None — у сообщения нет такого фото; веб-страница его тоже не даст.
+            return tg_account.run_sync(lambda: tg_account.download_bytes(ref, HTTP_IMAGE_MAX_BYTES),
+                                       TG_ACCOUNT_TIMEOUT_SEC)
+        except tg_account_mod.MessageMissing:
+            # Пост удалили: на его веб-странице вместо фото аватарка канала.
+            logger.info(f'Аккаунт Telegram: сообщения {ref} больше нет — картинку не беру')
+            return None
+        except Exception as e:
+            logger.warning(f'Аккаунт Telegram: картинка {ref} не скачалась: '
+                           f'{_redact_secrets(f"{type(e).__name__}: {e}")}')
+    return _tg_account_web_image(ref)
+
+
+_tg_channel_avatars: dict[str, str] = {}
+
+
+def _tg_channel_avatar(channel: str) -> str:
+    """Аватарка канала (og:image его страницы); один запрос за время работы."""
+    key = channel.casefold()
+    if key not in _tg_channel_avatars:
+        page = f'https://t.me/{channel}'
+        if len(_tg_channel_avatars) > 200:
+            _tg_channel_avatars.clear()
+        _tg_channel_avatars[key] = _normalize_image_url(fetch_og_image(page) or '', page) or ''
+    return _tg_channel_avatars[key]
+
+
+def _tg_account_web_image(ref: str) -> Optional[bytes]:
+    """Та же картинка с веб-страницы поста, когда аккаунт её не отдал.
+
+    Аккаунт бывает недоступен минуты (обрыв, переподключение) или часами
+    (вход сброшен), а пост уже собран со ссылками tgacc://. У сообщения с
+    фото или роликом страница t.me/канал/номер показывает именно его картинку
+    (?single — одно сообщение, а не весь альбом).
+    """
+    parsed = tg_account_mod.parse_media_ref(ref)
+    if parsed is None or parsed[2] == 'video':
         return None
-    try:
-        return tg_account.run_sync(lambda: tg_account.download_bytes(ref, HTTP_IMAGE_MAX_BYTES),
-                                   TG_ACCOUNT_TIMEOUT_SEC)
-    except Exception as e:
-        logger.warning(f'Аккаунт Telegram: картинка {ref} не скачалась: '
-                       f'{_redact_secrets(f"{type(e).__name__}: {e}")}')
+    channel, msg_id, _kind = parsed
+    page = f'https://t.me/{channel}/{msg_id}?single'
+    url = _normalize_image_url(fetch_og_image(page) or '', page)
+    if not url or tg_account_mod.is_media_ref(url):
         return None
+    if url == _tg_channel_avatar(channel):
+        # Пост удалили: страница показывает канал, а не фото поста.
+        logger.info(f'Веб-страница {page}: вместо фото аватарка канала — пост удалён')
+        return None
+    data = _download_image_bytes(url)
+    if data:
+        logger.info(f'Аккаунт Telegram не отдал {ref} — картинка взята с веб-страницы поста')
+    return data
 
 
 def _tg_account_news(channel: str, label: str, display_name: str,
@@ -12750,6 +12873,8 @@ NOISE_TITLE_RULES = (
         r',?\s+ranked\s*$',
         r'^\s*(?:лучшие|худшие)\s',
         r'\bподборк[аиуе]\b',
+        # «Арты за неделю», «Арты дня» — альбом рисунков разных тайтлов.
+        r'\bарты?\s+(?:за\s+(?:неделю|день|месяц)|недели|дня|месяца)\b',
         # «…アニソン特集！» в конце заголовка — тематическая подборка («特集上映»
         # в середине — спецпоказ, это новость), «5つの理由» — «5 причин»,
         # «まとめ一覧» и «キャラクター一覧» — сводные списки. Просто «まとめ»
@@ -12903,6 +13028,18 @@ NOISE_TITLE_RULES = (
         r'\bрелиз\s+(?:\d{1,4}[-‑]?(?:й|ой)?\s+)?(?:серии|эпизода)\b|'
         r'\bepisode\s+\d{1,4}\s+(?:is\s+)?(?:out|now\s+available|released|streaming)\b|'
         r'\bboosty\b|\bбусти\b)',
+        # Тот же выход серии другим порядком слов: «5 серия «Х» уже вышла»,
+        # «Можно посмотреть 5-ю серию». Правило выше ждало номер после слова
+        # «серия» или глагол перед ним, и такие посты проходили. Номер серии —
+        # «5 серия», «5-ю серию», «эпизод 12»; «8 серий» и «24 серии» — это
+        # число серий в сезоне, а не выход. «Будут доступны» и «смотреть можно
+        # будет» — про будущее.
+        r'^(?!.*(?:кадр|превью|тизер|трейлер|анонс|постер|опенинг|эндинг|preview|teaser|trailer|stills?\b))'
+        r'(?=.*(?:\b\d{1,4}[-‑]?(?:я|й|ю|ой)?\s+(?:эпизод|серия|серию)\b|'
+        r'\b(?:эпизод|серия)\s*№?\s*\d{1,4}\b))'
+        r'.*(?:\bвышл[аио]\b|\bвышел\b|\bвыпущен\w*|(?<!будут )(?<!будет )\bдоступ(?:ен|н\w*)|'
+        r'\bопубликован\w*|\bуже\s+на\s+(?-i:[A-ZА-ЯЁ])|\bсмотрите\b|'
+        r'\bможно\s+(?:уже\s+)?(?:по)?смотреть\b)',
     )),
     ('фан-контент', (
         r'\bfan\s?art\b',
@@ -12966,6 +13103,45 @@ _ANNIVERSARY_EVENT_RE = re.compile(
     r'sequel|сиквел|продолжени|экраниз|adaptation|\bseason\b|сезон|'
     r'\bwill\s+(?:release|get|air|launch)',
     re.IGNORECASE)
+# Юбилей — повод для нового события: «к 10-летию», «в честь юбилея»,
+# «anniversary project». Такой пост — новость при любых других словах.
+_ANNIVERSARY_FOR_RE = re.compile(
+    r'\bк\s+(?:\d{1,3}[-‐‑]?(?:летию|летнему)|юбиле\w*|годовщин\w*)|'
+    r'\bв\s+честь\s+(?:\d{1,3}[-‐‑]?лети\w*|юбиле\w*|годовщин\w*)|\bприуроч\w*|'
+    r'\bюбилейн\w+\s+(?:проект|фильм|сериал|выпуск|сезон|коллаб\w*|выставк\w*|концерт\w*|'
+    r'издани\w*|трейлер\w*|ролик\w*|визуал\w*|постер\w*)|'
+    r'\banniversary\s+(?:project|movie|film|event|collab\w*|exhibition|visual|pv|trailer|'
+    r'edition|campaign|concert|anime|series|special)|'
+    r'\bfor\s+(?:its|the)\s+\d{1,3}(?:st|nd|rd|th)\s+anniversary|\bto\s+(?:celebrate|commemorate|mark)\b',
+    re.IGNORECASE)
+# Взгляд назад: «10 лет назад вышел первый сезон», «со дня премьеры». Слова
+# «сезон» и «анонс» в таком заголовке — о событии тех лет, а не о новом, и
+# раньше они пропускали ностальгию в канал.
+_ANNIVERSARY_RETRO_RE = re.compile(
+    r'\bназад\b|\bago\b|\bсо\s+дня\b|\bс\s+(?:момента|премьеры|выхода|релиза|начала|дебюта|старта)\b|'
+    r'\bsince\b|\byears?\s+later\b',
+    re.IGNORECASE)
+
+
+# Событие впереди: «Спустя 10 лет с момента выхода первого сезона «Ван-Панчмен»
+# получит продолжение» — новость, хотя в заголовке есть и «с момента выхода».
+# Только будущее время и настоящее английское: «был анонсирован» и
+# «анонсировали» в заголовке со словом «назад» — о событии тех лет.
+_ANNIVERSARY_FORWARD_RE = re.compile(
+    r'\b(?:получ(?:ит|ат)|выйд(?:ет|ут)|выпуст(?:ит|ят)|покаж(?:ет|ут)|провед(?:[её]т|ут)|'
+    r'пройд[её]т|откро[её]тся|стартует|начн[её]тся|продлят|вернётся|вернется)\b|'
+    r'\bwill\s+(?:release|get|air|launch|return|premiere)\b|'
+    r'\bgets?\s+(?:a\s+)?(?:new\s+)?(?:sequel|season|movie|film|anime)\b',
+    re.IGNORECASE)
+
+
+def _anniversary_is_news(title: str) -> bool:
+    """Юбилей в заголовке, но новость есть: новое событие к юбилею или впереди."""
+    if _ANNIVERSARY_FOR_RE.search(title) or _ANNIVERSARY_FORWARD_RE.search(title):
+        return True
+    if _ANNIVERSARY_RETRO_RE.search(title):
+        return False
+    return bool(_ANNIVERSARY_EVENT_RE.search(title))
 
 
 # Подборка под видом новости: альбом постеров РАЗНЫХ тайтлов и текст-список.
@@ -12976,6 +13152,32 @@ _DIGEST_QUOTED_RE = re.compile(r'«([^«»\n]{2,80})»')
 DIGEST_MIN_IMAGES = 3
 
 
+# Строка-факт одной новости: «🎬 Студия: MAPPA», «📅 Премьера: январь 2027».
+_DIGEST_FACT_LABEL_RE = re.compile(
+    r'^(?:студи|режисс|сценари|композитор|дизайн|премьер|дата|выход|релиз|жанр|сери|эпизод|сезон|'
+    r'платформ|где\s+смотреть|трейлер|источник|автор|оригинал|статус|каст|в\s+ролях|озвуч|'
+    r'персонаж|опенинг|эндинг|studio|director|premiere|release|genre|episode|cast|staff|source|'
+    r'author)\w*\s*[:—–-]', re.IGNORECASE)
+
+
+def _digest_list_line(line: str) -> bool:
+    """Пункт подборки: маркер списка или эмодзи перед названием произведения.
+
+    Эмодзи в начале строки ставят и в обычной новости — «🎬 Студия: MAPPA»,
+    «📅 Премьера: январь». Три такие строки при альбоме из постеров одного
+    тайтла считались подборкой, и анонс с карточкой фактов не выходил.
+    """
+    stripped = line.strip()
+    if not _tg_is_list_item(stripped) or not re.search(r'[A-Za-zА-Яа-яЁё]{3,}', stripped):
+        return False
+    content = re.sub(r'^(?:\d{1,2}[.)]\s*|[^\w«"]+)', '', stripped)
+    if _DIGEST_FACT_LABEL_RE.match(content):
+        return False
+    if _TG_LIST_MARK_RE.match(stripped):
+        return True
+    return bool(_DIGEST_QUOTED_RE.search(stripped) or re.search(r'"[^"\n]{2,80}"', stripped))
+
+
 def _digest_signals(news: dict) -> tuple[int, int]:
     """Сколько разных названий в «ёлочках» и сколько строк-пунктов в тексте."""
     text = f"{news.get('title') or ''}\n{news.get('summary') or ''}"
@@ -12983,8 +13185,7 @@ def _digest_signals(news: dict) -> tuple[int, int]:
              for m in _DIGEST_QUOTED_RE.finditer(text)}
     # «Магическая битва» и «Магическая битва: Сибуя» — один тайтл, не два.
     names = {n for n in names if not any(n != o and o in n for o in names)}
-    list_lines = sum(1 for line in text.split('\n')
-                     if _tg_is_list_item(line) and re.search(r'[A-Za-zА-Яа-яЁё]{3,}', line))
+    list_lines = sum(1 for line in text.split('\n') if _digest_list_line(line))
     return len(names), list_lines
 
 
@@ -13020,7 +13221,7 @@ def noise_reason(news: dict) -> str:
             return reason
     if _looks_like_digest(news):
         return 'подборка'
-    if _ANNIVERSARY_SOFT_RE.search(title) and not _ANNIVERSARY_EVENT_RE.search(title):
+    if _ANNIVERSARY_SOFT_RE.search(title) and not _anniversary_is_news(title):
         return 'годовщина и ностальгия'
     if _self_promo(title, str(news.get('source') or '')):
         return 'самореклама источника'
@@ -14284,6 +14485,13 @@ async def _prepare_news_for_send(news: dict, source: str,
 
     Возвращает код пропуска ('skipped_filter' / 'skipped_dup') или None, если
     пост можно отправлять."""
+    if _tg_account_media_waits(news):
+        # Проверка первой: дальше картинки качаются для отбора, и без аккаунта
+        # они бы просто выпали из поста.
+        logger.info('⏸ Медиа поста в аккаунте Telegram, а он переподключается: %s',
+                    str(news.get('title', ''))[:60])
+        metrics.inc('anime_bot_tg_account_media_deferred_total')
+        return 'deferred'
     await _improve_thumb(news)
     await _discover_article_video(news)
     await _ensure_youtube_cover(news)
@@ -16941,6 +17149,10 @@ def _release_publish_reservations(news: dict) -> None:
 
 
 PENDING_POSTS_FILE = DATA_DIR / 'pending_posts.json'
+# Сколько раз автопостинг пробует отправить в канал один пост ветки и сколько
+# потом ждёт до следующей попытки (см. PendingPosts.mark_channel_failed).
+AUTOPOST_MAX_FAILS = 3
+AUTOPOST_FAIL_COOLDOWN_SEC = 2 * 3600
 
 
 # ============== ОДИН ТАЙТЛ — ОДИН ПОСТ ==============
@@ -16953,8 +17165,13 @@ PENDING_POSTS_FILE = DATA_DIR / 'pending_posts.json'
 # WORK_REPEAT_HOURS, считая и посты админов. Кнопка админа это не трогает.
 WORK_REPEAT_HOURS = max(0, min(168, _env_int('WORK_REPEAT_HOURS', 36)))
 WORK_MEMORY_FILE = DATA_DIR / 'recent_works.json'
+WORK_KEYS_MAX = 16
+# Анонс, постер, дата и трейлер в первые сутки — одна новость в нескольких
+# пересказах («анонсировано» у админа и «постер и тизер» у бота в тот же день).
+# Позже совпадать должно само событие: трейлер через два дня — уже новость.
+WORK_PACKAGE_HOURS = 24
+_WORK_PACKAGE_EVENTS = frozenset({'announce', 'visual', 'date', 'trailer'})
 _LATIN_PAREN_RE = re.compile(r'\(([A-Za-z][^()\n]{2,80})\)')
-_QUOTED_ANY_RE = re.compile(r'«([^«»\n]{2,80})»')
 
 
 # Площадки, студии, издатели и премии — не тайтлы, хотя стоят в тех же
@@ -16980,14 +17197,59 @@ def _work_name_key(name: str) -> str:
     return key if len(key) >= 5 and key not in _WORK_NOT_TITLE_KEYS else ''
 
 
+# Окончания русских падежей, длинные сначала. «Ненасытного Берсерка» и
+# «Ненасытный Берсерк», «Секретных войнах» и «Секретные войны» давали разные
+# ключи, и повтор о том же тайтле проходил. Это не морфология, а грубая
+# обрезка: от слова остаётся не меньше четырёх букв, а короткие слова
+# («по», «краю») не трогаются.
+_RU_CASE_ENDINGS = tuple(sorted((
+    'ами', 'ями', 'ого', 'его', 'ому', 'ему', 'ыми', 'ими', 'ой', 'ей', 'ий', 'ый', 'ая', 'яя',
+    'ое', 'ее', 'ую', 'юю', 'ые', 'ие', 'ых', 'их', 'ым', 'им', 'ом', 'ем', 'ам', 'ям', 'ах',
+    'ях', 'ов', 'ев', 'а', 'я', 'о', 'е', 'у', 'ю', 'ы', 'и', 'ь', 'й'), key=len, reverse=True))
+
+
+def _ru_stem(word: str) -> str:
+    word = word.casefold().replace('ё', 'е')
+    if len(word) <= 4 or not re.fullmatch(r'[а-я]+', word):
+        return word
+    for ending in _RU_CASE_ENDINGS:
+        if word.endswith(ending) and len(word) - len(ending) >= 4:
+            return word[:-len(ending)]
+    return word
+
+
+def _work_stem_key(name: str) -> str:
+    """Ключ русского названия без падежных окончаний; '' — не тайтл."""
+    if not _work_name_key(name):
+        return ''
+    words = re.findall(r'[0-9a-zа-яё]+', _clean_work_name(name).casefold())
+    key = ''.join(_ru_stem(w) for w in words)
+    return key if len(key) >= 5 else ''
+
+
+def _work_final_title(news: dict) -> str:
+    """Заголовок, каким пост выходит в канал: первая строка пересказа модели.
+
+    Ключи считались только по заголовку источника, а у nexvlsz тайтл стоит
+    в прямых кавычках "…" и ключа не давал вовсе: два поста подряд о постере
+    «Киберпанка» прошли мимо проверки. В пересказе модели тайтл всегда в «ёлочках».
+    """
+    text = str(news.get('_llm_text') or '').strip()
+    return text.split('\n', 1)[0].strip() if text else ''
+
+
 def _work_identity_keys(news: dict, *, lookups: int = 0) -> list[str]:
     """Ключи тайтла новости: по ним два поста про одно произведение совпадают.
 
     Русские переводы названия расходятся («Оммёдзи Нуэ» и «Экзорцист Нюэ»),
     поэтому главная опора — латинское имя: subject модели, имя в скобках,
-    латиница в «ёлочках». AniList сводит английское и ромадзи к одному
+    латиница в кавычках. AniList сводит английское и ромадзи к одному
     («Nue's Exorcist» → «Nue no Onmyouji»). lookups — сколько раз можно
     спросить AniList по сети; 0 — только кеш и сами названия.
+
+    Имена берутся из заголовка источника и из заголовка пересказа: в
+    «ёлочках», "прямых" и “английских” кавычках, в скобках и без кавычек после
+    слова «аниме» («Кадры к 2 серии аниме Голубая шкатулка» — так пишут админы).
     """
     keys: list[str] = []
 
@@ -16998,11 +17260,15 @@ def _work_identity_keys(news: dict, *, lookups: int = 0) -> list[str]:
     work_key = str(news.get('_work_key') or '')
     if work_key:
         add('work:' + work_key)
-    title = str(news.get('title') or '')
+    names: list[str] = []
+    for title in dict.fromkeys(t for t in (str(news.get('title') or ''), _work_final_title(news)) if t):
+        names += [m.group(1) for m in _LATIN_PAREN_RE.finditer(title)]
+        # Имя без кавычек идёт до знака препинания: «аниме Оммёдзи Нуэ, премьера
+        # летом» — после запятой уже не название.
+        names += [name.split(',')[0] for name in story_explicit_work_names(title)]
     latin: list[str] = []
-    for value in (news.get('_llm_subject'), news.get('_work_name'),
-                  *(m.group(1) for m in _LATIN_PAREN_RE.finditer(title)),
-                  *(m.group(1) for m in _QUOTED_ANY_RE.finditer(title))):
+    russian: list[str] = []
+    for value in (news.get('_llm_subject'), news.get('_work_name'), *names):
         value = str(value or '').strip()
         if not value:
             continue
@@ -17011,7 +17277,7 @@ def _work_identity_keys(news: dict, *, lookups: int = 0) -> list[str]:
         elif len(value) >= 6 or ' ' in value:
             # Русское название надёжно только для повторов самого бота: перевод
             # у разных каналов свой. Короткие слова в кавычках — не тайтл.
-            add('ru:' + _work_name_key(value) if _work_name_key(value) else '')
+            russian.append(value)
     for name in dict.fromkeys(latin):
         add('name:' + _work_name_key(name) if _work_name_key(name) else '')
         if anilist is None or not _anilist_candidate_ok(name):
@@ -17031,7 +17297,12 @@ def _work_identity_keys(news: dict, *, lookups: int = 0) -> list[str]:
         if info and WorkTitleResolver.names_match(name, _anilist_names(info)):
             canonical = _work_name_key(info.get('romaji') or info.get('english') or '')
             add('ani:' + canonical if canonical else '')
-    return keys[:12]
+    # Русские ключи — после латинских: их больше (два заголовка, две формы), и
+    # обрезка списка не должна съедать имя, общее для разных переводов.
+    for value in dict.fromkeys(russian):
+        add('ru:' + _work_name_key(value) if _work_name_key(value) else '')
+        add('rs:' + _work_stem_key(value) if _work_stem_key(value) else '')
+    return keys[:WORK_KEYS_MAX]
 
 
 class WorkMemory:
@@ -17051,13 +17322,20 @@ class WorkMemory:
         except (OSError, ValueError) as e:
             logger.warning(f'recent_works не загружен: {e}')
 
-    def remember(self, keys, title: str, by: str) -> None:
+    def remember(self, keys, title: str, by: str, events=None, numbers=None) -> None:
+        """events и numbers — род события и номера сезона/серии поста (см.
+        _work_events_related). Без них запись блокирует любой пост о тайтле,
+        как до их появления."""
         keys = [str(k) for k in keys or () if k]
         if not keys:
             return
+        row = {'keys': keys[:WORK_KEYS_MAX], 'title': str(title or '')[:120], 'by': by,
+               'at': time.time()}
+        if events is not None:
+            row['events'] = sorted(str(e) for e in events)
+            row['nums'] = sorted(str(n) for n in numbers or ())
         with self._lock:
-            self._items.append({'keys': keys[:12], 'title': str(title or '')[:120], 'by': by,
-                                'at': time.time()})
+            self._items.append(row)
             edge = time.time() - 7 * 86400
             self._items = [x for x in self._items if float(x.get('at') or 0) > edge][-self.MAX_ITEMS:]
             items = list(self._items)
@@ -17066,17 +17344,74 @@ class WorkMemory:
         except OSError as e:
             logger.error(f'recent_works не сохранён: {e}')
 
-    def seen(self, keys, hours: float) -> Optional[dict]:
-        """Последний пост о том же тайтле за ``hours`` часов, иначе None."""
+    def seen(self, keys, hours: float, events=None, numbers=None) -> Optional[dict]:
+        """Последний пост о том же тайтле и том же событии за ``hours`` часов.
+
+        events=None — не сравнивать события (любой пост о тайтле).
+        """
         wanted = {str(k) for k in keys or () if k}
         if not wanted or hours <= 0:
             return None
-        edge = time.time() - hours * 3600
+        now = time.time()
+        edge = now - hours * 3600
         with self._lock:
             for row in reversed(self._items):
-                if float(row.get('at') or 0) >= edge and wanted & set(row.get('keys') or ()):
+                at = float(row.get('at') or 0)
+                if at < edge or not wanted & set(row.get('keys') or ()):
+                    continue
+                if events is None or 'events' not in row or _work_events_related(
+                        set(events), set(row.get('events') or ()), set(numbers or ()),
+                        set(row.get('nums') or ()), (now - at) / 3600, row.get('by')):
                     return dict(row)
         return None
+
+
+def _work_events_related(new_events: set, old_events: set, new_numbers: set, old_numbers: set,
+                         age_hours: float, old_by: Optional[str]) -> bool:
+    """Тот же ли это повод для поста, что и у прошлого поста о тайтле.
+
+    Раньше любой пост о тайтле закрывал тайтл на полтора дня. Админ выложил
+    сравнение аниме и манги «Голубой шкатулки» — и анонс её третьего сезона
+    бот бы не выпустил; «Кадры 4 серии» закрывали «Кадры 5 серии».
+    """
+    if numbers_conflict(new_numbers, old_numbers):
+        return False                    # «2 сезон» и «3 сезон», 4 и 5 серия — разные новости
+    if not old_events:
+        # Пост админа без события — арт, сравнение, отсчёт до премьеры, шутка —
+        # новостью о тайтле не был и новость не закрывает. Свой пост без
+        # события закрывает только такой же «безымянный»: это, скорее всего,
+        # тот же сюжет из другого источника.
+        return old_by != 'admin' and not new_events
+    if not new_events:
+        # Новый пост о событии не говорит («Новые подробности о втором сезоне
+        # «X»»). В первые сутки после поста о тайтле это почти всегда пересказ
+        # того же; позже — скорее что-то своё.
+        return age_hours <= WORK_PACKAGE_HOURS
+    if new_events & old_events:
+        return True
+    return (age_hours <= WORK_PACKAGE_HOURS and bool(new_events & _WORK_PACKAGE_EVENTS)
+            and bool(old_events & _WORK_PACKAGE_EVENTS))
+
+
+def _work_events(news: dict) -> set:
+    """Род события поста: по заголовку, каким пост выходит, иначе по источнику."""
+    final = _work_final_title(news)
+    events = set(story_event_classes(final)) if final else set()
+    return events or set(story_event_classes(news))
+
+
+def _work_numbers(news: dict) -> set:
+    return set(story_work_numbers(_work_final_title(news) or str(news.get('title') or '')))
+
+
+def _work_remember(news: dict, by: str, *, lookups: int = 0) -> None:
+    """Запомнить вышедший пост — бота или админа — вместе с его событием."""
+    if work_memory is None:
+        return
+    keys = list(dict.fromkeys([*(news.get('_work_keys') or ()),
+                               *_work_identity_keys(news, lookups=lookups)]))
+    work_memory.remember(keys, _work_final_title(news) or str(news.get('title') or ''), by,
+                         events=_work_events(news), numbers=_work_numbers(news))
 
 
 work_memory: Optional['WorkMemory'] = None
@@ -17088,7 +17423,7 @@ def _work_repeat_hit(news: dict) -> Optional[dict]:
     if work_memory is None:
         return None
     keys = news.get('_work_keys') or _work_identity_keys(news)
-    return work_memory.seen(keys, WORK_REPEAT_HOURS)
+    return work_memory.seen(keys, WORK_REPEAT_HOURS, _work_events(news), _work_numbers(news))
 
 
 def _work_repeat_blocks(news: dict) -> bool:
@@ -17096,9 +17431,10 @@ def _work_repeat_blocks(news: dict) -> bool:
 
 
 def _autopost_skip(news: dict) -> bool:
-    """Пост ветки, который автопостинг пропускает: западное сверх лимита или
-    тайтл, о котором канал уже писал."""
-    return _western_quota_blocks(news) or _work_repeat_blocks(news)
+    """Пост ветки, который автопостинг пропускает: западное сверх лимита,
+    тайтл, о котором канал уже писал, или медиа ждёт переподключения аккаунта."""
+    return (_western_quota_blocks(news) or _work_repeat_blocks(news)
+            or _tg_account_media_waits(news))
 
 
 # ============== ПОСТЫ АДМИНОВ В КАНАЛЕ ==============
@@ -17141,9 +17477,7 @@ def _remember_manual_channel_post(news: dict, photo_fingerprint: str = '',
         story_registry.mark_delivery(news, published=True)
     if published_texts is not None:
         published_texts.add(news['title'])
-    if work_memory is not None:
-        work_memory.remember(_work_identity_keys(news, lookups=lookup_budget),
-                             news['title'], 'admin')
+    _work_remember(news, 'admin', lookups=lookup_budget)
     if image_hashes is not None:
         if photo_fingerprint:
             image_hashes.add(photo_fingerprint, news['title'])
@@ -17345,6 +17679,28 @@ class PendingPosts:
             return False
         return True
 
+    def mark_channel_failed(self, key: str) -> bool:
+        """Автопостинг не смог отправить пост: вернуть в pending и посчитать.
+
+        Автопостинг берёт самый свежий пост. Если он не уходит раз за разом
+        (картинки не скачиваются, Telegram отказывает), без счётчика он вставал
+        первым на каждом тике и держал канал, пока не появится пост свежее.
+        После AUTOPOST_MAX_FAILS неудач автопостинг его пропускает
+        AUTOPOST_FAIL_COOLDOWN_SEC, потом даёт ещё попытку: сбой бывает и
+        временным. Кнопка «📢 В канал» работает всегда.
+        """
+        item = self._items.get(key)
+        if not item:
+            return False
+        old = {k: item.get(k) for k in ('channel_state', 'channel_fails', 'channel_failed_at')}
+        item['channel_state'] = 'pending'
+        item['channel_fails'] = _safe_nonnegative_int(old['channel_fails'] or 0) + 1
+        item['channel_failed_at'] = time.time()
+        if not self._save():
+            item.update(old)
+            return False
+        return True
+
     def mark_channel_uncertain(self, key: str) -> bool:
         item = self._items.get(key)
         if not item:
@@ -17380,6 +17736,13 @@ class PendingPosts:
                 continue
             if not isinstance(item.get('news'), dict):
                 continue
+            if _safe_nonnegative_int(item.get('channel_fails') or 0) >= AUTOPOST_MAX_FAILS:
+                try:
+                    failed_at = float(item.get('channel_failed_at') or 0.0)
+                except (TypeError, ValueError):
+                    failed_at = 0.0
+                if time.time() - failed_at < AUTOPOST_FAIL_COOLDOWN_SEC:
+                    continue
             try:
                 ts = float(item.get('ts') or 0.0)
             except (TypeError, ValueError):
@@ -17591,9 +17954,14 @@ async def _resolve_photos_for_album(photos: list, primary_crop_plan: Optional[di
                            target_aspect=primary_crop_plan.get('target_aspect'))
         if isinstance(value, str) and _download_needed_host(value):
             data = await asyncio.to_thread(_cached_image_bytes, value)
-            if not data and value.endswith(VIDEO_FRAME_SUFFIX):
-                # Кадр не достался — ссылка на ролик с меткой для Telegram не
-                # картинка: такой элемент ронял бы весь альбом.
+            if not data and (value.endswith(VIDEO_FRAME_SUFFIX) or tg_account_mod.is_media_ref(value)):
+                # Кадр или фото из аккаунта не достались. Ссылку на ролик с
+                # меткой и ссылку tgacc:// Bot API не поймёт: один такой элемент
+                # ронял весь альбом, и пост уходил без картинок или не уходил.
+                continue
+            if data and tg_account_mod.is_media_ref(ph) and data in resolved:
+                # Без аккаунта фото альбома берутся с веб-страницы поста, и она
+                # может отдать одну картинку на несколько сообщений альбома.
                 continue
             value = data if data else value
         resolved.append(value)
@@ -19250,7 +19618,12 @@ async def _run_source_collector_bounded(name: str, collector, timeout: float):
     cannot block interpreter shutdown after SIGTERM.
     """
     loop = asyncio.get_running_loop()
-    deadline = time.monotonic() + max(0.01, float(timeout))
+    budget = max(0.01, float(timeout))
+    # Ожидание слота и сам сбор считаются раздельно. Раньше срок был общий:
+    # здоровый источник, которому слот достался поздно (пул заняли медленные
+    # сайты), получал остаток в пару секунд, обрывался по таймауту и получал
+    # «жёсткую» ошибку — шаг к выключению breaker'ом за чужую медлительность.
+    deadline = time.monotonic() + budget
     while True:
         try:
             if _source_worker_try_acquire(name):
@@ -19288,9 +19661,8 @@ async def _run_source_collector_bounded(name: str, collector, timeout: float):
 
     thread = threading.Thread(target=worker, name=f'source-fetch:{str(name)[:32]}', daemon=True)
     thread.start()
-    left = max(0.01, deadline - time.monotonic())
     try:
-        ok, value = await asyncio.wait_for(asyncio.shield(fut), timeout=left)
+        ok, value = await asyncio.wait_for(asyncio.shield(fut), timeout=budget)
     except asyncio.TimeoutError as exc:
         # The daemon thread may still finish later. Its result is a plain tuple,
         # not an exception Future, so abandoning it cannot emit task warnings.
@@ -19579,7 +19951,11 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
             logger.info('Тайтл опознан у %d новостей', marked)
     except Exception as e:
         logger.warning('Сверка тайтлов не удалась: %s: %s', type(e).__name__, e)
-    all_news = _cluster_news(all_news, persist_intelligence=False)
+    # Склейка — в потоке: сверка каждой новости с реестром историй (до 2500
+    # записей, difflib) занимает секунды, на хостинге — до десяти. Всё это время
+    # бот не отвечал на кнопки и не модерировал чат. Хранилища, которые она
+    # трогает (реестр, выход источников, разведка), защищены своими замками.
+    all_news = await asyncio.to_thread(_cluster_news, all_news, persist_intelligence=False)
     if feature_enabled('source_intelligence') and source_intelligence is not None:
         await asyncio.to_thread(source_intelligence.flush)
     if story_registry is not None:
@@ -20415,6 +20791,13 @@ def _actor(update: Update) -> tuple[bool, str]:
         return False, '?'
     name = user.full_name or user.username or str(user.id)
     return user.id in _all_admin_ids(), name
+
+
+# Кнопки, за которыми публикация: «📢 В канал» под постом ветки, «сейчас» у
+# отложенного поста, «отправить сейчас» в очереди. Они готовят видео и шлют
+# пост — до минуты, поэтому main() запускает их задачей, не держа остальные
+# обновления.
+SLOW_CALLBACK_RE = r'^(?:pub:|snow:|queue:send_now$)'
 
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -21771,9 +22154,7 @@ def _media_summary(news: dict) -> str:
 
 def _record_story_history(news: dict) -> None:
     story_history.record(news, format_news_short(news))
-    if work_memory is not None:
-        work_memory.remember(news.get('_work_keys') or _work_identity_keys(news),
-                             str(news.get('title') or ''), 'bot')
+    _work_remember(news, 'bot')
 
 
 def _post_card(news: dict, meta: dict, *, countdown: bool = False,
@@ -21853,6 +22234,12 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"📅 Отложка: {len(due)} из {total} постов пора публиковать")
 
     for key, news in due:
+        if _tg_account_media_waits(news):
+            # Медиа в аккаунте, а он переподключается: ждём, не тратя попытку.
+            # После трёх неудач пост снимается с отложки, а аккаунт обычно
+            # возвращается за несколько минут.
+            logger.info('Отложка: пост ждёт аккаунт Telegram: %s', str(news.get('title', ''))[:60])
+            continue
         meta = scheduled_posts.meta(key)      # ДО pop — потом данных не будет
         card = _post_card(news, meta)
         guard = _PublishGuard(f'sched:{key}')
@@ -22122,8 +22509,23 @@ async def settings_command(update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# /news и /preview идут задачей (block=False), и второй вызов, пока первый ещё
+# собирает источники, запустил бы второй полный сбор параллельно: двойная
+# нагрузка на сайты и на модель ради того же самого ответа.
+_manual_collect_lock = asyncio.Lock()
+_MANUAL_COLLECT_BUSY = '⏳ Уже ищу новости по прошлой команде — пришлю, как закончу.'
+
+
 @admin_only
 async def news_command(update, context: ContextTypes.DEFAULT_TYPE):
+    if _manual_collect_lock.locked():
+        await update.message.reply_text(_MANUAL_COLLECT_BUSY)
+        return
+    async with _manual_collect_lock:
+        await _news_command_locked(update, context)
+
+
+async def _news_command_locked(update, context) -> None:
     msg = await update.message.reply_text("🔍 Ищу новости...")
     all_news, stats, _ = await collect_all_news()
     filtered = [
@@ -22149,6 +22551,14 @@ async def news_command(update, context: ContextTypes.DEFAULT_TYPE):
 async def preview_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Показать примеры в личку — точно так же как они будут в канале,
     но без публикации в канал и без записи в историю."""
+    if _manual_collect_lock.locked():
+        await update.message.reply_text(_MANUAL_COLLECT_BUSY)
+        return
+    async with _manual_collect_lock:
+        await _preview_command_locked(update, context)
+
+
+async def _preview_command_locked(update, context) -> None:
     msg = await update.message.reply_text("🔍 Собираю примеры (видео может качаться долго)...")
     all_news, _, _ = await collect_all_news()
     if not all_news:
@@ -22815,13 +23225,13 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
                 pending_posts.mark_channel_uncertain(key)
             raise
         except Exception:
-            pending_posts.mark_channel_pending(key)
+            pending_posts.mark_channel_failed(key)
             logger.exception('Автопостинг в канал упал')
             metrics.inc('anime_bot_publish_attempts_total',
                         labels={'mode': 'autopost', 'result': 'failed'})
             return 'failed'
     if not ok:
-        pending_posts.mark_channel_pending(key)
+        pending_posts.mark_channel_failed(key)
         metrics.inc('anime_bot_publish_attempts_total',
                     labels={'mode': 'autopost', 'result': 'failed'})
         return 'failed'
@@ -24858,6 +25268,14 @@ def _drop_repetitive_paragraphs(title: str, paragraphs: list) -> list:
 
 
 _PROPER_WORD_RE = re.compile(r'(?<![.!?…]\s)(?<!^)\b[A-ZА-ЯЁ][\w\-]{2,}')
+# Слова, которыми пересказ заголовка с теми же числами отличается от него
+# самого: «фильм собрал», «составили», «превысив», «выход». Факта в них нет.
+# Для _too_similar список не годится: там повтор «фильма» и есть тавтология.
+_NUMBER_ECHO_FILLER = frozenset({
+    'film', 'filma', 'filme', 'filmo', 'filmu', 'seria', 'serii', 'seriu', 'serie',
+    'sobra', 'zarab', 'previ', 'sosta', 'start', 'vihod', 'sbori', 'sboro', 'nabra',
+    'prine', 'vsego', 'okolo', 'bolee', 'menee', 'pocti',
+})
 
 
 def _number_echo(title: str, sentence: str) -> bool:
@@ -24872,10 +25290,14 @@ def _number_echo(title: str, sentence: str) -> bool:
     numbers = _llm_number_set(sentence)
     if not numbers or not numbers <= _llm_number_set(title):
         return False
-    # Одно общее число — слабое доказательство: «Сезон 2 расскажет о походе
-    # героев в столицу» под «Анонсирован 2 сезон» — уже новый факт. Тогда
-    # повтором считаем, только если новых слов почти нет.
-    if len(numbers) < 2 and len(_content_stems(sentence) - _content_stems(title)) > 1:
+    # Новые слова — новый факт: «Сезон 2 расскажет о походе героев в
+    # столицу» под «Анонсирован 2 сезон». Раньше при двух общих числах слова
+    # не проверялись вовсе, и «…собрал 113 млн при бюджете 40 млн и стал
+    # самым кассовым хоррором года» исчезало вместе с рекордом. Одно новое
+    # слово ещё не факт: «Дебют сериала — 5 января».
+    new = {stem for stem in _content_stems(sentence) - _content_stems(title)
+           if stem not in _NUMBER_ECHO_FILLER}
+    if len(new) > 1:
         return False
     title_words = {w.casefold()[:5] for w in re.findall(r'[\w\-]{3,}', str(title or ''))}
     for match in _PROPER_WORD_RE.finditer(str(sentence or '').strip()):
@@ -24883,6 +25305,31 @@ def _number_echo(title: str, sentence: str) -> bool:
             return False
     names = {m.group(1).casefold() for m in _DIGEST_QUOTED_RE.finditer(sentence)}
     return all(name in str(title).casefold() for name in names)
+
+
+# Фразы о том, кто и где выложил материал, а не о самой новости: «Пользователь
+# bgette разместил заставку…» Модель переносила их из подписи источника.
+_SOURCE_META_SENTENCE_RE = re.compile(
+    r'^(?:пользовател\w*|юзер\w*|аккаунт\w*)\s+@?\S+\s+'
+    r'(?:разместил|опубликовал|выложил|поделил|загрузил|залил)\w*', re.IGNORECASE)
+# Меню ссылок источника, ставшее «фактом»: «Платформа KINOLINK | KINOBOT.»
+_SOURCE_MENU_IN_TEXT_RE = re.compile(r'\b[A-ZА-ЯЁ0-9]{3,}\s*\|\s*[A-ZА-ЯЁ0-9]{3,}\b')
+
+
+def _drop_source_meta(paragraphs: list) -> list:
+    """Убирает из пересказа фразы о том, кто выложил материал, и меню ссылок."""
+    kept = []
+    for para in paragraphs:
+        sentences = _split_clauses(str(para).strip())
+        fresh = [s for s in sentences
+                 if not (_SOURCE_META_SENTENCE_RE.match(s.strip()) or _SOURCE_MENU_IN_TEXT_RE.search(s))]
+        if len(fresh) == len(sentences):
+            kept.append(para)
+            continue
+        logger.info(f'✂️ Убрана фраза об источнике: {para[:60]}')
+        if fresh:
+            kept.append(' '.join(fresh))
+    return kept
 
 
 def _split_clauses(text: str) -> list[str]:
@@ -25598,6 +26045,12 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
     news.pop('_editorial_rejection', None)
     new_title = str(data.get('title') or '').strip()
     new_summary = str(data.get('summary') or '').strip()
+    unlabeled = _drop_unfounded_rumor_label(new_title, source_fact_text)
+    if unlabeled != new_title:
+        logger.info(f'LLM: снята пометка «Слух:» — в источнике слуха нет: {unlabeled[:60]}')
+        new_title = unlabeled
+        if news.get('_llm_kind') == 'слух':
+            news['_llm_kind'] = 'новость'     # и 👀 перед заголовком тоже не нужен
 
     # --- Текст: только если он адекватен ---
     if settings.llm_rewrite and new_title:
@@ -25627,8 +26080,8 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
                      else new_title]
             if new_summary:
                 body = _trim_paragraphs(new_summary)
-                paragraphs = _drop_repetitive_paragraphs(
-                    new_title, [p for p in re.split(r'\n\s*\n', body) if p.strip()])
+                paragraphs = _drop_source_meta(_drop_repetitive_paragraphs(
+                    new_title, [p for p in re.split(r'\n\s*\n', body) if p.strip()]))
                 if paragraphs:
                     parts.append('\n\n'.join(paragraphs))
             body = '\n\n'.join(p for p in parts if p)
@@ -33046,6 +33499,10 @@ def _stop_health_server() -> None:
 async def health_probe_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Периодически обновляет readiness и самовосстанавливает auto-job."""
     try:
+        _tg_account_watchdog()
+    except Exception:
+        logger.exception('Сторож аккаунта Telegram упал')
+    try:
         # APScheduler job не является durable-состоянием. Если пользователь оставил
         # авторассылку включённой, а job исчез из-за restart/race/ошибки scheduler,
         # watchdog восстанавливает его максимум через пять минут.
@@ -33813,6 +34270,24 @@ def _validate_runtime_config() -> None:
     )
 
 
+# Таймауты запросов к Bot API. У PTB по умолчанию 5 секунд на ответ и 20 на
+# выгрузку файла. Ролик в 40–50 МБ с хостинга грузится дольше, а большой файл
+# Telegram ещё и обрабатывает перед ответом. Таймаут посреди отправки — это
+# «результат неизвестен»: пост не повторяется (вдруг уже вышел), и админу
+# приходится проверять канал руками. Поэтому ждём дольше.
+BOT_API_CONNECT_TIMEOUT = 10.0
+BOT_API_READ_TIMEOUT = 30.0
+BOT_API_WRITE_TIMEOUT = 30.0
+BOT_API_MEDIA_WRITE_TIMEOUT = 180.0
+
+
+def _application_builder():
+    return (Application.builder().token(TOKEN)
+            .connect_timeout(BOT_API_CONNECT_TIMEOUT).pool_timeout(BOT_API_CONNECT_TIMEOUT)
+            .read_timeout(BOT_API_READ_TIMEOUT).write_timeout(BOT_API_WRITE_TIMEOUT)
+            .media_write_timeout(BOT_API_MEDIA_WRITE_TIMEOUT))
+
+
 def main():
     # Самый первый вывод — чтобы в логах хостинга было видно что процесс стартовал
     print("=== Запуск anime_news_bot ===", flush=True)
@@ -33858,67 +34333,70 @@ def main():
     check_video_deps()
 
     print("Создаю Application...", flush=True)
-    app = (Application.builder().token(TOKEN).job_queue(JobQueue())
+    app = (_application_builder().job_queue(JobQueue())
            .post_init(setup_bot_commands).post_stop(_post_stop)
            .post_shutdown(_post_shutdown).build())
 
     app.add_error_handler(_global_error_handler)
 
-    # Команды
+    # Команды. Долгие идут задачей (block=False): сбор всех источников, загрузка
+    # роликов, опрос моделей, архив бэкапа длятся до нескольких минут, и всё это
+    # время PTB не разбирал другие обновления — ни кнопки админов, ни сообщения
+    # чата для модерации. Их список сверяет tests/test_slow_handlers.py.
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("news", news_command))
-    app.add_handler(CommandHandler("preview", preview_command))
+    app.add_handler(CommandHandler("news", news_command, block=False))
+    app.add_handler(CommandHandler("preview", preview_command, block=False))
     app.add_handler(CommandHandler("start_auto", start_auto))
     app.add_handler(CommandHandler("stop_auto", stop_auto))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("chatinfo", chatinfo_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("deepl", deepl_command))
-    app.add_handler(CommandHandler("backup", backup_command))
+    app.add_handler(CommandHandler("backup", backup_command, block=False))
     app.add_handler(CommandHandler("historyok", historyok_command))
     app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("doctor", doctor_command))
     app.add_handler(CommandHandler("features", features_command))
-    app.add_handler(CommandHandler("videocheck", videocheck_command))
+    app.add_handler(CommandHandler("videocheck", videocheck_command, block=False))
     app.add_handler(CommandHandler("media", media_command))
     app.add_handler(CommandHandler("llm", llm_command))
     app.add_handler(CommandHandler("llmmodel", llmmodel_command))
-    app.add_handler(CommandHandler("llmping", llmping_command))
-    app.add_handler(CommandHandler("llmclean", llmclean_command))
+    app.add_handler(CommandHandler("llmping", llmping_command, block=False))
+    app.add_handler(CommandHandler("llmclean", llmclean_command, block=False))
     app.add_handler(CommandHandler("envfile", envfile_command))
-    app.add_handler(CommandHandler("mediaping", mediaping_command))
+    app.add_handler(CommandHandler("mediaping", mediaping_command, block=False))
     app.add_handler(CommandHandler("reliability", reliability_command))
     app.add_handler(CommandHandler("experiments", experiments_command))
     app.add_handler(CommandHandler("adaptive", adaptive_command))
     app.add_handler(CommandHandler("analytics", analytics_command))
     app.add_handler(CommandHandler("lifecycle", lifecycle_command))
-    app.add_handler(CommandHandler("audit", audit_command))
+    app.add_handler(CommandHandler("audit", audit_command, block=False))
     app.add_handler(CommandHandler("reloadconfig", reloadconfig_command))
-    app.add_handler(CommandHandler("verifybackup", verifybackup_command))
+    app.add_handler(CommandHandler("verifybackup", verifybackup_command, block=False))
     app.add_handler(CommandHandler("schema", schema_command))
-    app.add_handler(CommandHandler("selftest", selftest_command))
-    app.add_handler(CommandHandler("canary", canary_command))
+    app.add_handler(CommandHandler("selftest", selftest_command, block=False))
+    app.add_handler(CommandHandler("canary", canary_command, block=False))
     app.add_handler(CommandHandler("scheduled", scheduled_command))
     app.add_handler(CommandHandler("tz", tz_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("sources", sources_command))
     app.add_handler(CommandHandler("sourceintel", sourceintel_command))
-    app.add_handler(CommandHandler("discover", discover_command))
+    app.add_handler(CommandHandler("discover", discover_command, block=False))
     app.add_handler(CommandHandler("addsource", addsource_command))
     app.add_handler(CommandHandler("delsource", delsource_command))
     app.add_handler(CommandHandler("admins", admins_command))
     app.add_handler(CommandHandler("addadmin", addadmin_command))
     app.add_handler(CommandHandler("deladmin", deladmin_command))
     app.add_handler(CommandHandler("logs", logs_command))
-    app.add_handler(CommandHandler("posts", posts_command))
+    app.add_handler(CommandHandler("posts", posts_command, block=False))
     app.add_handler(CommandHandler("blacklist", blacklist_command))
     app.add_handler(CommandHandler("feedback", feedback_command))
     app.add_handler(CommandHandler("rules", rules_command))
     app.add_handler(CommandHandler("glossary", glossary_command))
     app.add_handler(CommandHandler("entity", entity_command))
-    app.add_handler(CommandHandler("replay", replay_command))
-    app.add_handler(CommandHandler("golden", golden_command))
+    app.add_handler(CommandHandler("replay", replay_command, block=False))
+    app.add_handler(CommandHandler("golden", golden_command, block=False))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("modhere", modhere_command))
     app.add_handler(CommandHandler("modoff", modoff_command))
@@ -33927,15 +34405,18 @@ def main():
     app.add_handler(CommandHandler("modquality", modquality_command))
     app.add_handler(CommandHandler("modmiss", modmiss_command))
     app.add_handler(CommandHandler("modunblock", modunblock_command))
-    app.add_handler(CommandHandler("modllmping", modllmping_command))
-    app.add_handler(CommandHandler("modtest", modtest_command))
+    app.add_handler(CommandHandler("modllmping", modllmping_command, block=False))
+    app.add_handler(CommandHandler("modtest", modtest_command, block=False))
     app.add_handler(CommandHandler("modlog", modlog_command))
     app.add_handler(CommandHandler("modmode", modmode_command))
     app.add_handler(CommandHandler("modadmins", modadmins_command))
     app.add_handler(CommandHandler("warns", warns_command))
     app.add_handler(CommandHandler("unwarn", unwarn_command))
 
-    # Inline-кнопки (callback_query)
+    # Inline-кнопки (callback_query). Публикация кнопкой готовит видео и шлёт
+    # пост — это минута, поэтому такие кнопки тоже идут задачей. Остальные
+    # (настройки) — по порядку: два быстрых нажатия не должны перемешаться.
+    app.add_handler(CallbackQueryHandler(settings_callback, pattern=SLOW_CALLBACK_RE, block=False))
     app.add_handler(CallbackQueryHandler(settings_callback))
 
     # Reply-кнопки (обычные текстовые сообщения с конкретным текстом)
@@ -33954,7 +34435,7 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, awaiting_input_handler),
         group=-1,
     )
-    app.add_handler(MessageHandler(reply_filter, reply_button_handler))
+    app.add_handler(MessageHandler(reply_filter, reply_button_handler, block=False))
     # Посты админов в канале — в память дедупа. Своя группа: обработчики
     # выше канальные посты пропускают, а группа модерации их и не ждёт.
     app.add_handler(

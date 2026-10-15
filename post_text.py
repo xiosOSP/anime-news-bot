@@ -36,6 +36,12 @@ _TG_MEANINGFUL_RE = re.compile(r'[A-Za-zА-Яа-яЁё0-9]')
 # Подпись канала под постом: «@channel», ссылка на t.me, либо короткая строка
 # с названием самого источника.
 _TG_SIGNATURE_RE = re.compile(r'(?:^|\s)@[A-Za-z0-9_]{4,}\s*$|t\.me/', re.IGNORECASE)
+# Меню ссылок канала в конце поста: «KINOLINK | KINOBOT», «YouTube | VK |
+# Telegram» — каждое слово там ссылка. Модель принимала такую строку за факт и
+# писала в пост «Платформа KINOLINK | KINOBOT». Строка из нескольких слов
+# через «|» без пробелов внутри слов — меню, а не текст: «Жанр: экшен |
+# фэнтези» сюда не попадает.
+_TG_LINK_MENU_RE = re.compile(r'^\W*[^\W_][\w.+-]{1,24}(?:\s*\|[^\w|]*[^\W_][\w.+-]{1,24}){1,6}\W*$')
 
 
 def _tg_strip_decoration(value: str) -> str:
@@ -52,7 +58,7 @@ def _tg_is_signature(line: str, channel: str, label: str, display_name: str = ''
     """
     if len(line) > 60:
         return False                     # длинная строка — это уже содержание
-    if _TG_SIGNATURE_RE.search(line):
+    if _TG_SIGNATURE_RE.search(line) or _TG_LINK_MENU_RE.match(line.strip()):
         return True
     clean = _tg_strip_decoration(line)
     if not clean:
