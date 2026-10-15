@@ -72,8 +72,10 @@ def test_different_titles_with_similar_words_do_not_meet():
 
 
 def test_russian_keys_do_not_push_out_the_latin_name():
-    news = _post('«Альфа один», «Бета два», «Гамма три», «Дельта четыре», «Эпсилон пять»',
-                 '«Дзета шесть», «Эта семь», «Тета восемь», «Йота девять» и «Каппа десять»',
+    words = ('Альфа', 'Бета', 'Гамма', 'Дельта', 'Эпсилон', 'Дзета', 'Тета', 'Йота', 'Каппа',
+             'Лямбда', 'Омикрон', 'Сигма', 'Омега', 'Ипсилон')
+    news = _post(', '.join(f'«{w} проект»' for w in words[:7]),
+                 ', '.join(f'«{w} проект»' for w in words[7:]),
                  _llm_subject='Nue no Onmyouji')
     keys = bot._work_identity_keys(news)
     assert len(keys) == bot.WORK_KEYS_MAX
@@ -148,3 +150,102 @@ def test_records_written_before_events_still_close_the_title(memory):
 def test_window_still_applies(memory):
     _published(memory, _post('Анонсировано аниме «Оммёдзи Нуэ»'), hours_ago=40)
     assert not bot._work_repeat_blocks(_post('Анонсировано аниме по манге «Оммёдзи Нуэ»'))
+
+
+# ---------------------------------------------------------------- один тайтл на разных языках
+
+SLF_RU = 'Рубеж Шангри-Ла: Любитель игрошлака бросает вызов топ-игре'
+SLF_ROMAJI = 'Shangri-La Frontier: Kusoge Hunter, Kamige ni Idoman to Su'
+
+
+@pytest.fixture
+def titles(monkeypatch, tmp_path):
+    """Кеш Shikimori: у каждого сезона своя запись."""
+    resolver = bot.WorkTitleResolver(tmp_path / 'titles.json')
+    now = bot.datetime.now(bot.timezone.utc).isoformat()
+    rows = {
+        'SHANGRI-LA FRONTIER': {'key': 'shiki:57', 'name': SLF_ROMAJI + ' 3rd Season',
+                                'russian': SLF_RU + ' 3'},
+        SLF_RU: {'key': 'shiki:52', 'name': SLF_ROMAJI, 'russian': SLF_RU},
+    }
+    for query, row in rows.items():
+        row = dict(row, rule=bot.WORK_MATCH_RULE, at=now)
+        resolver._items[resolver._norm(query)] = row
+        resolver._index(row)
+    monkeypatch.setattr(bot, 'work_titles', resolver)
+    return resolver
+
+
+def test_shangri_la_poster_and_premiere_are_one_news(memory, monkeypatch):
+    """Живой случай: 13:08 — постер и дата третьего сезона «SHANGRI-LA FRONTIER»,
+    14:09 — «Премьера 3 сезона «Рубеж Шангри-Ла…» назначена на 10 января»."""
+    monkeypatch.setattr(bot, 'work_titles', None)
+    first = _post('SHANGRI-LA FRONTIER Season 3 new visual, January 10 premiere',
+                  'Анонсирован новый постер 3 сезона «SHANGRI-LA FRONTIER» и дата премьеры — 10 января 2027.',
+                  _llm_subject='SHANGRI-LA FRONTIER')
+    _published(memory, first, hours_ago=1)
+    second = _post('Премьера 3 сезона «Рубеж Шангри-Ла» — 10 января',
+                   f'Премьера 3 сезона «{SLF_RU}» назначена на 10 января.',
+                   _llm_subject=SLF_ROMAJI, _work_key='shiki:52', _work_name='Рубеж Шангри-Ла',
+                   _work_russian=SLF_RU)
+    assert bot._work_repeat_blocks(second)
+
+
+def test_different_season_records_of_one_title_meet(memory, titles):
+    _published(memory, _post('Новый постер третьего сезона', 'Новый постер 3 сезона.',
+                             _work_key='shiki:57'), hours_ago=2)
+    assert bot._work_repeat_blocks(_post('Премьера 3 сезона назначена', 'Премьера 3 сезона — 10 января.',
+                                         _work_key='shiki:52'))
+
+
+def test_name_the_bot_already_resolved_links_without_a_record_key(memory, titles):
+    """Японское имя ключа слов не даёт, но бот уже знает, какой это тайтл."""
+    now = bot.datetime.now(bot.timezone.utc).isoformat()
+    titles._items[titles._norm('シャングリラ・フロンティア')] = {
+        'key': 'shiki:52', 'name': SLF_ROMAJI, 'russian': SLF_RU, 'rule': bot.WORK_MATCH_RULE, 'at': now}
+    _published(memory, _post('Премьера 3 сезона', 'Премьера 3 сезона — 10 января.',
+                             _work_key='shiki:52'), hours_ago=2)
+    assert bot._work_repeat_blocks(_post('「シャングリラ・フロンティア」3期 ティザービジュアル',
+                                         'Постер 3 сезона «シャングリラ・フロンティア».'))
+
+
+def test_two_works_of_one_franchise_stay_apart(memory):
+    _published(memory, _post('Трейлер', 'Вышел трейлер «Mobile Suit Gundam: The Witch from Mercury».',
+                             _llm_subject='Mobile Suit Gundam: The Witch from Mercury'), hours_ago=2)
+    assert not bot._work_repeat_blocks(_post('Трейлер', 'Вышел трейлер «Mobile Suit Gundam: Hathaway».',
+                                             _llm_subject='Mobile Suit Gundam: Hathaway'))
+
+
+@pytest.mark.parametrize('a,b,meet', [
+    ({'main:shangrilafrontier'}, {'name:shangrilafrontier'}, True),
+    ({'name:shangrilafrontier'}, {'main:shangrilafrontier'}, True),
+    ({'main:mobilesuitgundam'}, {'main:mobilesuitgundam'}, False),
+    ({'work:shiki:1'}, {'work:shiki:1'}, True),
+    ({'name:a1234'}, {'name:b1234'}, False),
+])
+def test_keys_meet(a, b, meet):
+    assert bot._work_keys_meet(a, b) is meet
+
+
+def test_short_main_part_is_not_a_title():
+    assert bot._work_main_key('Re:Zero kara Hajimeru Isekai Seikatsu') == ''
+    assert bot._work_main_key('Bleach: Thousand-Year Blood War') == ''
+    assert bot._work_main_key('Shangri-La Frontier: Kusoge Hunter') == 'shangrilafrontier'
+    assert bot._work_main_key('Shangri-La Frontier') == ''
+
+
+def test_post_waiting_in_the_thread_is_checked_with_fresh_keys(memory, monkeypatch):
+    """У поста, ждущего в ветке, ключи посчитаны прежней версией бота."""
+    monkeypatch.setattr(bot, 'work_titles', None)
+    _published(memory, _post('x', 'Постер 3 сезона «SHANGRI-LA FRONTIER».',
+                             _llm_subject='SHANGRI-LA FRONTIER'), hours_ago=1)
+    waiting = _post('y', f'Премьера 3 сезона «{SLF_RU}» назначена на 10 января.',
+                    _llm_subject=SLF_ROMAJI, _work_keys=['ru:старыйключ'])
+    assert bot._work_repeat_blocks(waiting)
+
+
+def test_record_names_survive_a_restart(titles, tmp_path):
+    titles._dirty = True
+    titles.flush()
+    again = bot.WorkTitleResolver(titles.path)
+    assert again.entry_names('shiki:52') == (SLF_ROMAJI, SLF_RU)
