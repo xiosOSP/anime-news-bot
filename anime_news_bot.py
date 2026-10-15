@@ -7415,6 +7415,8 @@ class WorkTitleResolver:
         self.url = url
         self._items: dict[str, dict] = {}
         self._about: dict[str, dict] = {}
+        # Ключ записи → (ромадзи, русское имя): см. entry_names.
+        self._by_key: dict[str, tuple[str, str]] = {}
         self._lock = threading.RLock()
         self._last_request = 0.0
         self._dirty = False
@@ -7437,6 +7439,23 @@ class WorkTitleResolver:
                     self._about = {str(k): v for k, v in about.items() if isinstance(v, dict)}
         except (OSError, ValueError, TypeError) as e:
             logger.warning(f'кеш тайтлов не загружен: {e}')
+        for row in self._items.values():
+            self._index(row)
+
+    def _index(self, row: dict) -> None:
+        key = str(row.get('key') or '')
+        if key and (row.get('name') or row.get('russian')):
+            self._by_key[key] = (str(row.get('name') or ''), str(row.get('russian') or ''))
+
+    def entry_names(self, key: str) -> tuple[str, str]:
+        """Ромадзи и русское имя записи Shikimori по её ключу — только из кеша.
+
+        У каждого сезона своя запись: «SHANGRI-LA FRONTIER» могло опознаться
+        как третий сезон, а «Рубеж Шангри-Ла» — как первый, и ключи записей не
+        совпадали. Имена записей без хвоста «2nd Season» у сезонов общие.
+        """
+        with self._lock:
+            return self._by_key.get(str(key or ''), ('', ''))
 
     def flush(self) -> None:
         with self._lock:
@@ -7586,11 +7605,13 @@ class WorkTitleResolver:
         found = self._accept(name, candidates)
         key = f"shiki:{found['id']}" if found else ''
         with self._lock:
-            self._items[self._norm(name)] = {
+            row = {
                 'key': key, 'name': str((found or {}).get('name') or '')[:120],
                 'russian': re.sub(r'\s+', ' ', str((found or {}).get('russian') or '')).strip()[:160],
                 'rule': WORK_MATCH_RULE,
                 'at': datetime.now(timezone.utc).isoformat()}
+            self._items[self._norm(name)] = row
+            self._index(row)
             self._dirty = True
         return key
 
@@ -17165,7 +17186,7 @@ AUTOPOST_FAIL_COOLDOWN_SEC = 2 * 3600
 # WORK_REPEAT_HOURS, считая и посты админов. Кнопка админа это не трогает.
 WORK_REPEAT_HOURS = max(0, min(168, _env_int('WORK_REPEAT_HOURS', 36)))
 WORK_MEMORY_FILE = DATA_DIR / 'recent_works.json'
-WORK_KEYS_MAX = 16
+WORK_KEYS_MAX = 24
 # Анонс, постер, дата и трейлер в первые сутки — одна новость в нескольких
 # пересказах («анонсировано» у админа и «постер и тизер» у бота в тот же день).
 # Позже совпадать должно само событие: трейлер через два дня — уже новость.
@@ -17227,6 +17248,35 @@ def _work_stem_key(name: str) -> str:
     return key if len(key) >= 5 else ''
 
 
+def _work_main_key(name: str) -> str:
+    """Ключ главной части латинского названия до подзаголовка.
+
+    «Shangri-La Frontier: Kusoge Hunter, Kamige ni Idoman to Su» — так
+    модель пишет subject по справке Shikimori, а источник пишет просто
+    «SHANGRI-LA FRONTIER». Главная часть сравнивается только с полным именем
+    другого поста (см. _work_keys_meet), но не с такой же главной частью: у
+    «Gundam: Hathaway» и «Gundam: The Witch from Mercury» она общая, а тайтлы
+    разные. Короче семи букв не берём: «Re» из «Re:Zero» — не название.
+    """
+    parts = re.split(r'\s*(?::|～|~|\s[-–—]\s)\s*', str(name or '').strip(), maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        return ''
+    key = _work_name_key(parts[0])
+    return key if len(key) >= 7 else ''
+
+
+def _work_keys_meet(a, b) -> bool:
+    """Есть ли у двух постов общий тайтл: общий ключ или главная часть
+    одного названия равна полному имени другого."""
+    a, b = set(a or ()), set(b or ())
+    if any(not key.startswith('main:') for key in a & b):
+        return True
+
+    def part(keys, prefix):
+        return {key[len(prefix):] for key in keys if key.startswith(prefix)}
+    return bool(part(a, 'main:') & part(b, 'name:')) or bool(part(b, 'main:') & part(a, 'name:'))
+
+
 def _work_final_title(news: dict) -> str:
     """Заголовок, каким пост выходит в канал: первая строка пересказа модели.
 
@@ -17257,18 +17307,29 @@ def _work_identity_keys(news: dict, *, lookups: int = 0) -> list[str]:
         if key and key not in keys:
             keys.append(key)
 
-    work_key = str(news.get('_work_key') or '')
-    if work_key:
-        add('work:' + work_key)
     names: list[str] = []
     for title in dict.fromkeys(t for t in (str(news.get('title') or ''), _work_final_title(news)) if t):
         names += [m.group(1) for m in _LATIN_PAREN_RE.finditer(title)]
         # Имя без кавычек идёт до знака препинания: «аниме Оммёдзи Нуэ, премьера
         # летом» — после запятой уже не название.
         names += [name.split(',')[0] for name in story_explicit_work_names(title)]
+    mentioned = [str(value or '').strip() for value in
+                 (news.get('_llm_subject'), news.get('_work_name'), *names)]
+    # Записи Shikimori: найденная при сборе и те, что бот уже знает по именам
+    # из этой новости (только кеш, без сети). Их имена — общий язык для
+    # «SHANGRI-LA FRONTIER» и «Рубеж Шангри-Ла»: два поста о третьем сезоне
+    # вышли подряд (октябрь 2026), потому что у них не нашлось общего ключа.
+    entries = [str(news.get('_work_key') or '')]
+    if work_titles is not None:
+        entries += [work_titles.cached(value) or '' for value in mentioned if value]
+    official: list[str] = []
+    for entry in dict.fromkeys(e for e in entries if e):
+        add('work:' + entry)
+        if work_titles is not None:
+            official += list(work_titles.entry_names(entry))
     latin: list[str] = []
     russian: list[str] = []
-    for value in (news.get('_llm_subject'), news.get('_work_name'), *names):
+    for value in (*mentioned, *official):
         value = str(value or '').strip()
         if not value:
             continue
@@ -17280,6 +17341,7 @@ def _work_identity_keys(news: dict, *, lookups: int = 0) -> list[str]:
             russian.append(value)
     for name in dict.fromkeys(latin):
         add('name:' + _work_name_key(name) if _work_name_key(name) else '')
+        add('main:' + _work_main_key(name) if _work_main_key(name) else '')
         if anilist is None or not _anilist_candidate_ok(name):
             continue
         info = None
@@ -17357,7 +17419,7 @@ class WorkMemory:
         with self._lock:
             for row in reversed(self._items):
                 at = float(row.get('at') or 0)
-                if at < edge or not wanted & set(row.get('keys') or ()):
+                if at < edge or not _work_keys_meet(wanted, row.get('keys') or ()):
                     continue
                 if events is None or 'events' not in row or _work_events_related(
                         set(events), set(row.get('events') or ()), set(numbers or ()),
@@ -17422,7 +17484,9 @@ def _work_repeat_hit(news: dict) -> Optional[dict]:
     # WORK_REPEAT_HOURS=0 выключает проверку: seen() при нуле часов молчит.
     if work_memory is None:
         return None
-    keys = news.get('_work_keys') or _work_identity_keys(news)
+    # Ключи, посчитанные при отправке в ветку, плюс свежие: кеш тайтлов с тех
+    # пор мог узнать запись, а у поста, ждущего в ветке, ключи старой версии.
+    keys = list(dict.fromkeys([*(news.get('_work_keys') or ()), *_work_identity_keys(news)]))
     return work_memory.seen(keys, WORK_REPEAT_HOURS, _work_events(news), _work_numbers(news))
 
 
