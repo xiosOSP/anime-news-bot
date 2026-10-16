@@ -17494,11 +17494,59 @@ def _work_repeat_blocks(news: dict) -> bool:
     return _work_repeat_hit(news) is not None
 
 
+def _autopost_skip_reason(news: dict) -> str:
+    """Почему автопостинг пропускает пост ветки; пусто — не пропускает."""
+    if _western_quota_blocks(news):
+        return 'западное кино сверх лимита'
+    if _work_repeat_blocks(news):
+        return 'про тайтл уже был пост'
+    if _tg_account_media_waits(news):
+        return 'медиа ждёт аккаунт Telegram'
+    return ''
+
+
 def _autopost_skip(news: dict) -> bool:
     """Пост ветки, который автопостинг пропускает: западное сверх лимита,
     тайтл, о котором канал уже писал, или медиа ждёт переподключения аккаунта."""
-    return (_western_quota_blocks(news) or _work_repeat_blocks(news)
-            or _tg_account_media_waits(news))
+    return bool(_autopost_skip_reason(news))
+
+
+# Пустой слот автопостинга: когда и почему в канал ничего не ушло. Раньше
+# бот в таком случае просто молчал, и по каналу было не понять, это нехватка
+# новостей или проверки отсеяли всё, что лежит в ветке.
+_autopost_empty: dict = {}
+AUTOPOST_EMPTY_LOG_SEC = 30 * 60
+
+
+def _note_empty_slot(reasons: dict, total: int) -> None:
+    summary = _empty_slot_summary(reasons, total)
+    now = time.time()
+    previous = dict(_autopost_empty)
+    _autopost_empty.update({'at': datetime.now(timezone.utc).isoformat(), 'summary': summary})
+    if summary != previous.get('summary') or now - float(previous.get('logged') or 0) >= AUTOPOST_EMPTY_LOG_SEC:
+        _autopost_empty['logged'] = now
+        logger.info('📭 Пора выложить пост в канал, но подходящего нет: %s', summary)
+    else:
+        _autopost_empty['logged'] = previous.get('logged')
+
+
+def _empty_slot_summary(reasons: dict, total: int) -> str:
+    if not total:
+        return 'в ветке нет постов'
+    parts = [f'{label} — {count}' for label, count in
+             sorted(reasons.items(), key=lambda row: (-row[1], row[0]))]
+    return f'в ветке {total}: ' + ', '.join(parts) if parts else f'в ветке {total}'
+
+
+def _autopost_empty_status_line() -> str:
+    """Строка /status: последний слот, в который в канал ничего не ушло."""
+    if not _autopost_empty.get('at'):
+        return ''
+    try:
+        at = _fmt_local(datetime.fromisoformat(_autopost_empty['at']))
+    except (TypeError, ValueError):
+        at = '?'
+    return f"📭 Последний пустой слот канала ({at}): {_autopost_empty.get('summary')}\n"
 
 
 # ============== ПОСТЫ АДМИНОВ В КАНАЛЕ ==============
@@ -17775,7 +17823,7 @@ class PendingPosts:
             logger.critical(f'Moderation channel_state uncertain не записан: {key}')
         return saved
 
-    def next_for_autopost(self, skip=None) -> Optional[tuple[str, dict]]:
+    def next_for_autopost(self, skip=None, reasons: Optional[dict] = None) -> Optional[tuple[str, dict]]:
         """Самый свежий пост из ветки, ещё не ушедший в канал.
 
         Раньше брался самый старый и без предела возраста: когда ветка получает
@@ -17795,8 +17843,13 @@ class PendingPosts:
         cutoff = time.time() - max_age_hours * 3600
         best_key: Optional[str] = None
         best_rank: Optional[tuple[float, float]] = None
+
+        def count(reason: str) -> None:
+            if reasons is not None:
+                reasons[reason] = reasons.get(reason, 0) + 1
         for key, item in self._items.items():
             if str(item.get('channel_state') or 'pending') != 'pending':
+                count('уже публикуется или результат неизвестен')
                 continue
             if not isinstance(item.get('news'), dict):
                 continue
@@ -17806,6 +17859,7 @@ class PendingPosts:
                 except (TypeError, ValueError):
                     failed_at = 0.0
                 if time.time() - failed_at < AUTOPOST_FAIL_COOLDOWN_SEC:
+                    count('не ушёл три раза, ждёт')
                     continue
             try:
                 ts = float(item.get('ts') or 0.0)
@@ -17816,9 +17870,13 @@ class PendingPosts:
             except (TypeError, ValueError):
                 fresh_ts = ts
             if fresh_ts < cutoff:
+                count(f'старше {max_age_hours:g} ч')
                 continue
-            if skip is not None and skip(item['news']):
-                continue
+            if skip is not None:
+                reason = skip(item['news'])
+                if reason:
+                    count(reason if isinstance(reason, str) else 'отсеян')
+                    continue
             rank = (fresh_ts, ts)
             if best_rank is None or rank > best_rank:
                 best_key, best_rank = key, rank
@@ -23268,8 +23326,10 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
         return None
     # Пост ветки модель уже разобрала, тема известна: западное кино сверх
     # лимита пропускаем, чтобы оно не заслоняло собой следующий пост.
-    row = pending_posts.next_for_autopost(skip=_autopost_skip)
+    reasons: dict = {}
+    row = pending_posts.next_for_autopost(skip=_autopost_skip_reason, reasons=reasons)
     if row is None:
+        _note_empty_slot(reasons, len(pending_posts._items))
         return None
     key, news = row
     with _PublishGuard(f'pending:{key}') as guard:
@@ -23603,6 +23663,7 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
         f"📦 В очереди: {queue_size}\n"
         f"{_quiet_status_line()}"
         f"{_western_status_line()}"
+        f"{_autopost_empty_status_line()}"
         f"{_scheduled_status_block(context)}"
         f"В истории ссылок: {len(sent_links._set)}\n"
         f"Канал: {CHANNEL_ID}\n"
@@ -25230,7 +25291,24 @@ _ECHO_STOP = {
     'visel', 'visla', 'visli', 'vislo', 'preds', 'raskr',
     # «Официально объявлен выпуск 4 сезона» — тот же анонс другими словами.
     'vipus', 'ofici',
+    # Ссылка на источник — не факт: «По словам продюсера…», «…ожидается к концу
+    # года» под заголовком «…подтвердил, что решение будет принято» (октябрь 2026).
+    'slova', 'ojida', 'zayav', 'zayavi', 'soobsi', 'otmet', 'utoc',
 }
+
+
+def _stem_norm(stem: str) -> str:
+    """Основа без гласных на конце: «конца» и «концу» (konca, koncu) — одно слово.
+
+    Основа — первые пять букв после транслитерации. У короткого слова в них
+    попадает окончание, и падежи одного слова расходились: повтор заголовка
+    «…до конца года» строкой «…к концу года» оставался в посте.
+    """
+    short = stem.rstrip('aeiou')
+    return short if len(short) >= 3 else stem
+
+
+_ECHO_STOP_NORM = frozenset(_stem_norm(stem) for stem in _ECHO_STOP)
 
 
 def _content_stems(text: str) -> set:
@@ -25245,7 +25323,10 @@ def _content_stems(text: str) -> set:
         if len(latin) < 3:
             continue
         stem = latin[:5]
-        if stem not in _ECHO_STOP:
+        if stem in _ECHO_STOP:
+            continue
+        stem = _stem_norm(stem)
+        if stem not in _ECHO_STOP_NORM:
             stems.add(stem)
     return stems
 
@@ -25335,7 +25416,7 @@ _PROPER_WORD_RE = re.compile(r'(?<![.!?…]\s)(?<!^)\b[A-ZА-ЯЁ][\w\-]{2,}')
 # Слова, которыми пересказ заголовка с теми же числами отличается от него
 # самого: «фильм собрал», «составили», «превысив», «выход». Факта в них нет.
 # Для _too_similar список не годится: там повтор «фильма» и есть тавтология.
-_NUMBER_ECHO_FILLER = frozenset({
+_NUMBER_ECHO_FILLER = frozenset(_stem_norm(stem) for stem in {
     'film', 'filma', 'filme', 'filmo', 'filmu', 'seria', 'serii', 'seriu', 'serie',
     'sobra', 'zarab', 'previ', 'sosta', 'start', 'vihod', 'sbori', 'sboro', 'nabra',
     'prine', 'vsego', 'okolo', 'bolee', 'menee', 'pocti',
@@ -25421,15 +25502,34 @@ def _split_clauses(text: str) -> list[str]:
 _SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?…])\s+(?=[«"A-ZА-ЯЁ0-9])')
 
 
+_ECHO_TIME_WORD_RE = re.compile(
+    r'\b(?:сегодня|завтра|послезавтра|вчера|скоро|сейчас|today|tomorrow|tonight|soon|'
+    r'январ\w*|феврал\w*|март\w*|апрел\w*|ма[йяе]|июн\w*|июл\w*|август\w*|сентябр\w*|'
+    r'октябр\w*|ноябр\w*|декабр\w*|весн\w*|лет[оа]м?|осен\w*|зим\w*)\b')
+
+
 def _too_similar(a: str, b: str) -> bool:
     """Only discard an echo with no new content; overlap alone loses facts."""
     wa, wb = _content_stems(a), _content_stems(b)
     if not wa or not wb:
         return False
     # Short numbers and negation are invisible to the word-stem detector.
+    # Слова о сроках — тоже факт, хоть и не имя: «выйдет сегодня» под
+    # заголовком без даты нельзя считать пересказом.
     def details(text):
-        return set(re.findall(r'\b(?:\d+(?:[.,]\d+)?|не|нет|без|not|no)\b', text.lower()))
-    return wb.issubset(wa) and details(b).issubset(details(a))
+        found = set(re.findall(r'\b(?:\d+(?:[.,]\d+)?|не|нет|без|not|no)\b', text.lower()))
+        return found | {_stem_norm(w[:5]) for w in _ECHO_TIME_WORD_RE.findall(text.lower())}
+    if not details(b).issubset(details(a)):
+        return False
+    new = wb - wa
+    if not new:
+        return True
+    # Одно новое обычное слово в длинной фразе — пересказ, а не факт: «По
+    # словам продюсера Питера Сафрана, решение… ожидается к концу года» под
+    # заголовком о том же. Новое имя (площадка, студия, страна) — факт всегда:
+    # «Премьера 5 января на Netflix» остаётся.
+    proper = _content_stems(' '.join(m.group(0) for m in _PROPER_WORD_RE.finditer(str(b).strip())))
+    return len(new) == 1 and len(wb) >= 6 and not (new & proper)
 
 
 def _strip_title_echo(title: str, text: str) -> str:
