@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "c0dc9429faa40ddfee47d0b5e7a62f5055984f2e",
-  "generated_at_utc": "2026-10-16T11:24:15.852102+00:00",
+  "git_commit": "bd120c123d44438581386c4da1a14c02e9b1fa5a",
+  "generated_at_utc": "2026-10-16T11:27:05.240772+00:00",
   "files": {
     ".claude/skills/find-skills/SKILL.md": {
       "sha256": "c00eeea0e13e74fe4a9d84ba0a8542205a1b736d65f13134fe1a6647eb14976f",
@@ -858,8 +858,8 @@
       "bytes": 10257
     },
     "tests/test_western_quota.py": {
-      "sha256": "0aa5bb906d026b8239432ad1263e43b9e04ae51177dc4991fe5c600d68d0c130",
-      "bytes": 11217
+      "sha256": "3628b4b6d0bfbcd17f6600d419b63acc47bf5e30f0a272eee6e572c9b081b303",
+      "bytes": 11461
     },
     "tests/test_work_events.py": {
       "sha256": "b40b5b854af1dfb5c64c19216469e1d7ba0e6b943f8d56b084f404838ac20a48",
