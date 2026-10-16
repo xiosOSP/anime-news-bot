@@ -31,6 +31,7 @@ import copy
 import contextlib
 import time
 import difflib
+import faulthandler
 try:
     import fcntl  # POSIX: защищает DATA_DIR от одновременного запуска двух ботов
 except ImportError:  # pragma: no cover - Windows fallback: polling сам конфликтует
@@ -578,6 +579,15 @@ HTTP_RSS_MAX_BYTES = 5 * 1024 * 1024
 HTTP_HTML_MAX_BYTES = 4 * 1024 * 1024
 HTTP_URL_MAX_CHARS = 4096
 DEDUP_RESERVATION_TTL_SEC = 15 * 60
+# Карантин поста, на подготовке которого умирает процесс. Октябрь 2026: бот
+# качал ролик из Telegram-канала, и контейнер убивали без единой строки в логе;
+# после рестарта сборщик находил ту же новость снова, и так 40 раз подряд.
+# Если процесс умер, готовя один и тот же пост, PREP_CRASH_LIMIT раз подряд,
+# пост больше не берётся (см. SentLinksStore._count_prep_crashes_unlocked).
+# Два, а не один: передеплой посреди подготовки — обычное дело и случается
+# один раз, а не два подряд на одном посте.
+PREP_CRASH_LIMIT = 2
+PREP_CRASH_MEMORY_SEC = 24 * 3600
 # После аварии во время физической отправки результат Telegram неоднозначен.
 # Такие записи держим существенно дольше обычного claim, чтобы рестарт не
 # породил автоматический дубль уже принятого поста.
@@ -4052,6 +4062,8 @@ class SentLinksStore:
         self._recent_titles: deque = deque(maxlen=500)
         self._reservations: dict[str, dict] = {}
         self._rejected: dict[str, dict] = {}
+        # Сколько раз подряд процесс умер, готовя этот URL: {url: {count, title, at}}.
+        self._prep_crashes: dict[str, dict] = {}
         self._lock = asyncio.Lock()
         # Читают историю не только из event loop: `link in sent_links` и
         # has_title() зовут потоки сборщиков и _annotate_work_keys, а
@@ -4138,7 +4150,7 @@ class SentLinksStore:
     def _load(self, restoring: bool = False) -> None:
         if not self.path.exists():
             return
-        dropped_claims: list[tuple[str, str]] = []
+        dropped_claims: list[tuple[str, str, str]] = []
         try:
             with self.path.open('r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -4181,8 +4193,9 @@ class SentLinksStore:
                         # ещё 15 минут, и восстановленный из inflight пост
                         # очередь признавала дублем и выбрасывала, хотя он
                         # не был отправлен ни разу. Освобождаем сразу.
-                        dropped_claims.append((norm_url, str(meta.get('title') or '')))
-                for norm_url, norm_title in dropped_claims:
+                        dropped_claims.append((norm_url, str(meta.get('title') or ''),
+                                               str(meta.get('display') or '')))
+                for norm_url, norm_title, _display in dropped_claims:
                     self._reservations.pop(norm_url, None)
                     self._remove_unlocked(norm_url, norm_title)
                 if dropped_claims:
@@ -4197,6 +4210,15 @@ class SentLinksStore:
                     normalize_url(str(k)): v for k, v in raw_rej.items()
                     if isinstance(v, dict) and normalize_url(str(k))
                 }
+            raw_crashes = data.get('prep_crashes', {})
+            if isinstance(raw_crashes, dict):
+                self._prep_crashes = {
+                    normalize_url(str(k)): v for k, v in raw_crashes.items()
+                    if isinstance(v, dict) and normalize_url(str(k))
+                }
+            # После rejected: карантин пишет туда, а загрузка rejected выше
+            # заменяет словарь целиком.
+            self._count_prep_crashes_unlocked(dropped_claims)
             if self._purge_transient_unlocked() or dropped_claims:
                 self._save()
         # ValueError, а не только JSONDecodeError: битые байты (обрыв записи
@@ -4235,6 +4257,7 @@ class SentLinksStore:
                 'recent': [[ts, norm, sorted(tokens)] for ts, norm, tokens in self._recent_titles],
                 'reservations': {k: dict(v) for k, v in self._reservations.items()},
                 'rejected': {k: dict(v) for k, v in self._rejected.items()},
+                'prep_crashes': {k: dict(v) for k, v in self._prep_crashes.items()},
             }
             if self.history_lost:
                 # Пауза переживает рестарт: иначе пустая, но уже читаемая
@@ -4302,9 +4325,56 @@ class SentLinksStore:
         except (TypeError, ValueError):
             return True
 
+    def _count_prep_crashes_unlocked(self, dropped_claims: list) -> list[str]:
+        """Считает смерти процесса на подготовке поста; возвращает заголовки
+        постов, ушедших в карантин.
+
+        dropped_claims — резервы, которые прошлый процесс взял и не закрыл: он
+        умер, готовя эти посты. Счётчик живёт между запусками и сбрасывается,
+        когда пост дошёл до commit/release/reject, то есть подготовка пережита.
+        """
+        now = time.time()
+        quarantined: list[str] = []
+        for norm_url, norm_title, display in dropped_claims:
+            entry = self._prep_crashes.get(norm_url) or {}
+            try:
+                fresh = now - float(entry.get('at', 0)) <= PREP_CRASH_MEMORY_SEC
+                count = (int(entry.get('count', 0) or 0) if fresh else 0) + 1
+            except (TypeError, ValueError):
+                count = 1
+            if count < PREP_CRASH_LIMIT:
+                self._prep_crashes[norm_url] = {'count': count, 'title': norm_title, 'at': now,
+                                                'display': display}
+                continue
+            self._prep_crashes.pop(norm_url, None)
+            # Как reject(): ссылка и заголовок не возьмутся снова, пока не выйдет
+            # срок отказа, а он не короче окна свежести постов.
+            self._rejected[norm_url] = {'title': norm_title, 'at': now, 'reason': 'prep_crash'}
+            quarantined.append(display or norm_title or norm_url)
+        if quarantined:
+            names = '; '.join(q[:80] for q in quarantined)
+            logger.warning(f'Ledger: карантин — процесс {PREP_CRASH_LIMIT} раза подряд умер, '
+                           f'готовя пост: {names}')
+            try:
+                _queue_admin_alert(
+                    f'⚠️ Бот {PREP_CRASH_LIMIT} раза подряд перезапускался, готовя один и тот '
+                    f'же пост, и больше его не берёт: {names[:300]}. Если новость нужна — '
+                    'выложите её вручную.')
+            except NameError:
+                pass
+        return quarantined
+
     def _purge_transient_unlocked(self) -> bool:
         now = time.time()
         changed = False
+        for norm_url, meta in list(self._prep_crashes.items()):
+            try:
+                stale = now - float(meta.get('at', 0)) > PREP_CRASH_MEMORY_SEC
+            except (TypeError, ValueError):
+                stale = True
+            if stale:
+                self._prep_crashes.pop(norm_url, None)
+                changed = True
         for norm_url, meta in list(self._reservations.items()):
             if self._reservation_expired(meta, now):
                 state = str(meta.get('state') or 'claimed')
@@ -4429,7 +4499,10 @@ class SentLinksStore:
                         return False
                 self._recent_titles.append((time.time(), norm_title, _title_tokens(title)))
             self._add_unlocked(norm_url, norm_title, save=False)
-            self._reservations[norm_url] = {'title': norm_title, 'at': time.time(), 'state': 'claimed'}
+            # display — заголовок как есть: если пост уйдёт в карантин, админ
+            # должен узнать его, а нормализованный ключ склеен в одно слово.
+            self._reservations[norm_url] = {'title': norm_title, 'at': time.time(), 'state': 'claimed',
+                                            'display': str(title or '')[:120]}
             if not self._save():
                 # Без durable claim запрещаем физическую публикацию: иначе после
                 # рестарта тот же URL снова станет новым и может задублироваться.
@@ -4512,6 +4585,7 @@ class SentLinksStore:
         norm_url = normalize_url(link)
         async with self._locked():
             meta = self._reservations.pop(norm_url, None)
+            self._prep_crashes.pop(norm_url, None)
             if self._save():
                 return True
             if meta is not None:
@@ -4530,6 +4604,8 @@ class SentLinksStore:
             meta = self._reservations.pop(norm_url, None)
             if meta is None:
                 return
+            # Подготовка пережита (сбой был, но процесс жив): счёт смертей с нуля.
+            self._prep_crashes.pop(norm_url, None)
             saved_title = str(meta.get('title') or norm_title)
             self._remove_unlocked(norm_url, saved_title)
             if not self._save():
@@ -4545,6 +4621,7 @@ class SentLinksStore:
         norm_title = normalize_title(title)
         async with self._locked():
             meta = self._reservations.pop(norm_url, None)
+            self._prep_crashes.pop(norm_url, None)
             self._remove_unlocked(norm_url, str((meta or {}).get('title') or norm_title))
             self._rejected[norm_url] = {
                 'title': norm_title,
@@ -28685,6 +28762,43 @@ async def media_command(update, context: ContextTypes.DEFAULT_TYPE):
 BACKUP_HOUR = 5                 # во сколько по времени админа делать бэкап
 
 
+# Счётчики памяти всего контейнера (cgroup v2, затем v1). _rss_mb видит только
+# сам процесс бота, а yt-dlp, deno и ffmpeg — отдельные процессы в том же
+# лимите тарифа. Счётчик oom_kill растёт, когда ядро убивает процесс за память,
+# и переживает перезапуск процесса в том же контейнере: по его приросту бот
+# после старта знает, что прошлый процесс убит за память, а не чем-то ещё.
+CGROUP_ROOT = Path('/sys/fs/cgroup')
+
+
+def _cgroup_oom_kills(root: Path = CGROUP_ROOT) -> Optional[int]:
+    for name in ('memory.events', 'memory/memory.oom_control'):
+        try:
+            for line in (root / name).read_text(encoding='utf-8').splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[0] == 'oom_kill':
+                    return int(parts[1])
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _cgroup_memory_mb(root: Path = CGROUP_ROOT) -> dict:
+    """Память контейнера, МБ: current, peak, max (что прочиталось)."""
+    out: dict = {}
+    for key, names in (('current', ('memory.current', 'memory/memory.usage_in_bytes')),
+                       ('peak', ('memory.peak', 'memory/memory.max_usage_in_bytes')),
+                       ('max', ('memory.max', 'memory/memory.limit_in_bytes'))):
+        for name in names:
+            try:
+                raw = (root / name).read_text(encoding='utf-8').strip()
+            except OSError:
+                continue
+            if raw.isdigit() and int(raw) < 1 << 50:   # «max» и 2^63 — лимита нет
+                out[key] = int(raw) // (1024 * 1024)
+            break
+    return out
+
+
 def _rss_mb() -> Optional[int]:
     """Сколько памяти занимает процесс, МБ. None — если не прочиталось."""
     try:
@@ -30262,6 +30376,24 @@ async def analytics_command(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('\n'.join(lines)[:4000], parse_mode=ParseMode.HTML)
 
 
+def _lifecycle_container_memory_line(life: dict) -> str:
+    """Память всего контейнера и вердикт об OOM для /lifecycle."""
+    mem = _cgroup_memory_mb()
+    parts = []
+    if 'current' in mem:
+        parts.append(f'сейчас {mem["current"]} МБ')
+    if 'peak' in mem:
+        parts.append(f'пик {mem["peak"]} МБ')
+    if 'max' in mem:
+        parts.append(f'лимит {mem["max"]} МБ')
+    line = 'Память контейнера: ' + (', '.join(parts) if parts else 'не читается')
+    if life.get('oom_kill_on_last_exit'):
+        line += '\n💥 Прошлый процесс убит за нехватку памяти (OOM)'
+    elif life.get('cgroup_oom_kills') is not None:
+        line += f'\nOOM-убийств в контейнере: {int(life.get("cgroup_oom_kills") or 0)}'
+    return line
+
+
 @admin_only
 async def lifecycle_command(update, context: ContextTypes.DEFAULT_TYPE):
     life = lifecycle_snapshot()
@@ -30276,6 +30408,7 @@ async def lifecycle_command(update, context: ContextTypes.DEFAULT_TYPE):
              + (f', пик {float(life.get("peak_rss_mb") or 0):.0f} МБ' if life.get('peak_rss_mb') else '')
              + (f', прирост за цикл {float(life.get("last_auto_cycle_rss_growth_mb") or 0):+.0f} МБ'
                 if life.get('last_auto_cycle_rss_growth_mb') is not None else ''),
+             _lifecycle_container_memory_line(life),
              f'Health server: <code>{"listening" if _runtime_health.get("health_server_ok") else "not_listening"}</code>',
              f'Polling bootstrap retries: <code>{POLLING_BOOTSTRAP_RETRIES}</code>']
     if life.get('last_restart_interval_sec') is not None:
@@ -32872,6 +33005,19 @@ def _mark_lifecycle_start() -> dict:
         'consecutive_unclean': unclean,
         'last_exit_kind': str(data.get('last_exit_kind') or ''),
     })
+    oom_now = _cgroup_oom_kills()
+    try:
+        oom_before = int(data.get('cgroup_oom_kills'))
+    except (TypeError, ValueError):
+        oom_before = None
+    data['oom_kill_on_last_exit'] = bool(
+        previous_state == 'running' and oom_now is not None and oom_before is not None
+        and oom_now > oom_before)
+    if oom_now is not None:
+        data['cgroup_oom_kills'] = oom_now
+    if data['oom_kill_on_last_exit']:
+        logger.warning('💥 Прошлый процесс убит за нехватку памяти: счётчик OOM контейнера '
+                       '%d → %d. Память считается вместе с yt-dlp и ffmpeg.', oom_before, oom_now)
     _write_lifecycle(data)
     _lifecycle_started = True
     if len(history) >= 4:
@@ -34472,6 +34618,13 @@ def _application_builder():
 def main():
     # Самый первый вывод — чтобы в логах хостинга было видно что процесс стартовал
     print("=== Запуск anime_news_bot ===", flush=True)
+    # Падение внутри библиотеки на C (onnxruntime, opencv, Pillow) убивает
+    # процесс без traceback: в логе просто обрыв и новый запуск. faulthandler
+    # печатает в stderr, в каком месте Python-кода это случилось.
+    try:
+        faulthandler.enable()
+    except (AttributeError, OSError, RuntimeError, ValueError):
+        pass        # у stderr нет файлового дескриптора — без этой диагностики
     # Хостинг может выбрать Python не из runtime.txt — версия в первых строках
     # лога сразу показывает, на чём бот реально работает.
     print(f"Python: {sys.version.split()[0]}", flush=True)
