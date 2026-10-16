@@ -103,6 +103,7 @@ from news_stories import (
     same_work_event,
     story_event_classes,
     story_event_families,
+    story_anchored_work_names,
     story_explicit_work_names,
     story_work_names,
     story_work_numbers,
@@ -13621,7 +13622,10 @@ def _with_russian_work_name(title: str, news: dict) -> str:
 # длинные названия ранобэ («IN A WORLD FULL OF ZOMBIES I'M THE ONLY ONE…»), и в
 # посте это выглядит как крик. Короткие аббревиатуры (MAPPA, PV, OVA) поодиночке
 # под правило не попадают.
-_CAPS_RUN_RE = re.compile(r"\b[A-Z][A-Z0-9'’]*(?:[\s:,\-–]+[A-Z][A-Z0-9'’]*){3,}\b")
+# «×» и « x » между названиями коллаборации — тоже разделитель: на них строка
+# капса рвалась, и «AO BUTA × EXPELLED FROM PARADISE» оставался капсом,
+# потому что ни в одном куске не набиралось четырёх слов.
+_CAPS_RUN_RE = re.compile(r"\b[A-Z][A-Z0-9'’]*(?:(?:[\s:,\-–×]+|\s+x\s+)[A-Z][A-Z0-9'’]*){3,}\b")
 _CAPS_SMALL_WORDS = frozenset({'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'and',
                                'or', 'but', 'by', 'with', 'from', 'as', 'no', 'wa', 'ga', 'wo', 'ni'})
 
@@ -13660,7 +13664,7 @@ def _polish_post_text(text: str) -> str:
 def _tame_caps_latin(text: str) -> str:
     """Название капсом → обычным регистром: первая буква слова заглавная."""
     def fix(match: re.Match) -> str:
-        words = re.split(r'(\s+|[:,\-–]+)', match.group(0))
+        words = re.split(r'(\s+|[:,\-–×]+)', match.group(0))
         out, first = [], True
         for word in words:
             if not re.search(r'[A-Z]', word):
@@ -17213,9 +17217,18 @@ _WORK_NOT_TITLE_KEYS = frozenset(
     ))
 
 
-def _work_name_key(name: str) -> str:
+# Короткие имена («Ганц», «Блич», «Дюна») ключа не получали вовсе, и
+# защита от дублей их не видела. Четыре буквы разрешаем только имени, которое
+# стоит в кавычках сразу после слова «аниме», «фильма»… (short=True): без
+# такой опоры короткое слово в кавычках слишком часто не тайтл, а ложный ключ
+# заглушил бы чужие новости на WORK_REPEAT_HOURS.
+WORK_SHORT_KEY_LEN = 4
+
+
+def _work_name_key(name: str, *, short: bool = False) -> str:
     key = _entity_key(_clean_work_name(str(name or '')))
-    return key if len(key) >= 5 and key not in _WORK_NOT_TITLE_KEYS else ''
+    min_len = WORK_SHORT_KEY_LEN if short else 5
+    return key if len(key) >= min_len and key not in _WORK_NOT_TITLE_KEYS else ''
 
 
 # Окончания русских падежей, длинные сначала. «Ненасытного Берсерка» и
@@ -17239,13 +17252,13 @@ def _ru_stem(word: str) -> str:
     return word
 
 
-def _work_stem_key(name: str) -> str:
+def _work_stem_key(name: str, *, short: bool = False) -> str:
     """Ключ русского названия без падежных окончаний; '' — не тайтл."""
-    if not _work_name_key(name):
+    if not _work_name_key(name, short=short):
         return ''
     words = re.findall(r'[0-9a-zа-яё]+', _clean_work_name(name).casefold())
     key = ''.join(_ru_stem(w) for w in words)
-    return key if len(key) >= 5 else ''
+    return key if len(key) >= (WORK_SHORT_KEY_LEN if short else 5) else ''
 
 
 def _work_main_key(name: str) -> str:
@@ -17308,7 +17321,9 @@ def _work_identity_keys(news: dict, *, lookups: int = 0) -> list[str]:
             keys.append(key)
 
     names: list[str] = []
+    anchored: set[str] = set()
     for title in dict.fromkeys(t for t in (str(news.get('title') or ''), _work_final_title(news)) if t):
+        anchored |= {name.casefold() for name in story_anchored_work_names(title)}
         names += [m.group(1) for m in _LATIN_PAREN_RE.finditer(title)]
         # Имя без кавычек идёт до знака препинания: «аниме Оммёдзи Нуэ, премьера
         # летом» — после запятой уже не название.
@@ -17335,12 +17350,13 @@ def _work_identity_keys(news: dict, *, lookups: int = 0) -> list[str]:
             continue
         if re.search(r'[A-Za-z]', value) and not re.search(r'[А-Яа-яЁё]', value):
             latin.append(value)
-        elif len(value) >= 6 or ' ' in value:
+        elif len(value) >= 6 or ' ' in value or value.casefold() in anchored:
             # Русское название надёжно только для повторов самого бота: перевод
             # у разных каналов свой. Короткие слова в кавычках — не тайтл.
             russian.append(value)
     for name in dict.fromkeys(latin):
-        add('name:' + _work_name_key(name) if _work_name_key(name) else '')
+        short = name.casefold() in anchored
+        add('name:' + _work_name_key(name, short=short) if _work_name_key(name, short=short) else '')
         add('main:' + _work_main_key(name) if _work_main_key(name) else '')
         if anilist is None or not _anilist_candidate_ok(name):
             continue
@@ -17362,8 +17378,9 @@ def _work_identity_keys(news: dict, *, lookups: int = 0) -> list[str]:
     # Русские ключи — после латинских: их больше (два заголовка, две формы), и
     # обрезка списка не должна съедать имя, общее для разных переводов.
     for value in dict.fromkeys(russian):
-        add('ru:' + _work_name_key(value) if _work_name_key(value) else '')
-        add('rs:' + _work_stem_key(value) if _work_stem_key(value) else '')
+        short = value.casefold() in anchored
+        add('ru:' + _work_name_key(value, short=short) if _work_name_key(value, short=short) else '')
+        add('rs:' + _work_stem_key(value, short=short) if _work_stem_key(value, short=short) else '')
     return keys[:WORK_KEYS_MAX]
 
 
