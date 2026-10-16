@@ -454,6 +454,21 @@ def story_explicit_work_names(news_or_title) -> list[str]:
     return out
 
 
+def story_anchored_work_names(news_or_title) -> list[str]:
+    """Имена в кавычках сразу после слова «аниме», «манги», «фильма»….
+
+    Такому имени можно верить, даже если оно короткое: «аниме «Ганц»»,
+    «фильма «Дюна»». Короткое слово в кавычках без такой опоры — часто не
+    тайтл («Сбер», «Нет»).
+    """
+    out: list[str] = []
+    for m in _WORK_QUOTED_AFTER_ANCHOR.finditer(_story_title_of(news_or_title)):
+        name = _clean_work_name(m.group(1))
+        if name and name.casefold() not in (x.casefold() for x in out):
+            out.append(name)
+    return out
+
+
 _FIRST_SENTENCE = re.compile(r'^.*?(?:[.!?。！？](?=\s|$)|$)', re.DOTALL)
 
 
