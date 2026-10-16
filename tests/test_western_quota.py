@@ -196,7 +196,10 @@ def test_thread_autopost_uses_the_limit(monkeypatch):
         return True
     monkeypatch.setattr(bot, '_channel_autopost_due', due)
     asyncio.run(bot._autopost_one_from_thread(MagicMock()))
-    pending.next_for_autopost.assert_called_once_with(skip=bot._autopost_skip)
+    pending.next_for_autopost.assert_called_once()
+    assert pending.next_for_autopost.call_args.kwargs['skip'] is bot._autopost_skip_reason
+    monkeypatch.setattr(bot, '_western_quota_blocks', lambda news: True)
+    assert bot._autopost_skip_reason({'title': 'x'}) == 'западное кино сверх лимита'
 
 
 def test_status_shows_the_limit(history, monkeypatch):
