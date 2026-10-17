@@ -173,6 +173,14 @@ try:
     from PIL import Image
 except ImportError:
     Image = None
+# Потолок картинки из чужого источника. По умолчанию у Pillow 89 млн пикселей,
+# и до двойного потолка он только предупреждает: PNG в 170 КБ размером
+# 13300×13300 через og:image раздувал процесс на ~860 МБ при convert('RGB').
+# С 20 млн ошибка наступает с 40 млн пикселей (8000×5000) — это больше любого
+# постера, а RGB-копия такой картинки помещается в 120 МБ.
+IMAGE_MAX_PIXELS = 20_000_000
+if Image is not None:
+    Image.MAX_IMAGE_PIXELS = IMAGE_MAX_PIXELS
 
 # Опциональная зависимость — если yt-dlp нет, скачивание видео отключится.
 # Импорт ленивый: ролики качает отдельный процесс (video_download.py), а в
@@ -4358,7 +4366,7 @@ class SentLinksStore:
             try:
                 _queue_admin_alert(
                     f'⚠️ Бот {PREP_CRASH_LIMIT} раза подряд перезапускался, готовя один и тот '
-                    f'же пост, и больше его не берёт: {names[:300]}. Если новость нужна — '
+                    f'же пост, и больше его не берёт: {html.escape(names[:300])}. Если новость нужна — '
                     'выложите её вручную.')
             except NameError:
                 pass
@@ -11152,6 +11160,20 @@ def _is_too_old(published_struct, max_age_hours: Optional[int] = None) -> bool:
     return age > timedelta(hours=max_age_hours)
 
 
+def _feedparse(data):
+    """feedparser.parse только для готового текста ленты.
+
+    feedparser сам решает, что ему передали: строку с http:// или file:// он
+    скачивает мимо safe_http, а прочие строки и байты сначала пробует открыть
+    как путь к файлу. Чужой сайт, отдавший телом ответа «/dev/zero», так
+    заставлял бота читать бесконечный файл до OOM, а «/app/data/…» — разбирать
+    наш файл как ленту. Поток feedparser только читает.
+    """
+    if isinstance(data, str):
+        data = data.encode('utf-8')
+    return feedparser.parse(io.BytesIO(bytes(data or b'')))
+
+
 def _parse_rss_bytes(
     rss_data: bytes | str,
     source_name: str,
@@ -11165,7 +11187,7 @@ def _parse_rss_bytes(
     """
     news_list: list[dict] = []
     try:
-        feed = feedparser.parse(rss_data)
+        feed = _feedparse(rss_data)
     except Exception as e:
         logger.warning(f'{source_name}: RSS parse failed: {e}')
         return []
@@ -11905,7 +11927,7 @@ def get_reddit_anime():
 
     try:
         if is_rss:
-            feed = feedparser.parse(data)
+            feed = _feedparse(data)
             for entry in feed.entries[:NEWS_PER_SOURCE * 3]:
                 link = getattr(entry, 'link', None)
                 if not link or link in sent_links:
@@ -12279,7 +12301,7 @@ def _tg_account_alert_down(reason: str) -> None:
     if _tg_account_alert_sent:
         return
     _tg_account_alert_sent = True
-    _queue_admin_alert(f'⚠️ Аккаунт Telegram для чтения каналов не подключился: {reason}.\n'
+    _queue_admin_alert(f'⚠️ Аккаунт Telegram для чтения каналов не подключился: {html.escape(str(reason))}.\n'
                        'Каналы читаются по-старому, через веб-страницу: большие ролики '
                        'туда не доезжают. Как получить строку входа — docs/tg-account.md.')
 
@@ -15496,7 +15518,7 @@ def _scan_article_for_source_candidates(news: dict) -> int:
 def _feed_probe_stats(data: bytes | str) -> dict:
     """Return bounded feed quality signals without fetching article pages."""
     try:
-        feed = feedparser.parse(data)
+        feed = _feedparse(data)
     except Exception as e:
         return {'ok': False, 'error': f'feed parse: {e}'}
     entries = list(getattr(feed, 'entries', None) or [])[:30]
@@ -16513,7 +16535,7 @@ class SourceHealth:
                            reason=str(reason)[:200])
                 try:
                     _queue_admin_alert(
-                        f'🧯 Источник «{name}» временно поставлен на паузу на '
+                        f'🧯 Источник «{html.escape(str(name))}» временно поставлен на паузу на '
                         f'{max(1, (seconds + 59) // 60)} мин после повторных ошибок. '
                         'После паузы будет сделана пробная проверка.')
                 except NameError:
@@ -21992,6 +22014,12 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     key = pending.get('key')
     mode = pending.get('mode')
+    # Права перепроверяем на вводе: между нажатием кнопки и ответом админ мог
+    # выключить открытую модерацию или снять права, а ожидание ввода живёт
+    # дольше этих решений. Перенос отложки — кнопка только для админов.
+    if not is_admin(update) and (mode == 'reschedule' or not settings.open_moderation):
+        context.user_data.pop('await_input', None)
+        return
 
     # === 🕒 Перенос времени у поста, который уже в отложке ===
     if mode == 'reschedule':
@@ -23354,14 +23382,14 @@ async def _publish_one_from_queue_locked(bot_api) -> tuple[Optional[str], Option
                 await notify_admin(
                     bot_api,
                     f"⚠️ Пост удалён из очереди после {QUEUE_MAX_SEND_RETRIES} ошибок отправки:\n"
-                    f"{next_post.get('title', '')[:180]}")
+                    f"{html.escape(str(next_post.get('title', ''))[:180])}")
             else:
                 await notify_admin(
                     bot_api,
                     "⚠️ Ошибка отправки + storage не принял retry-state. "
                     "Пост оставлен inflight и очередь приостановлена до восстановления storage. "
                     "Проверь /health.\n\n"
-                    f"{next_post.get('title', '')[:180]}")
+                    f"{html.escape(str(next_post.get('title', ''))[:180])}")
             break
         if sent_result == 'uncertain':
             await post_queue.ack_done(next_post)
@@ -23369,7 +23397,7 @@ async def _publish_one_from_queue_locked(bot_api) -> tuple[Optional[str], Option
                 bot_api,
                 "❓ Telegram не подтвердил результат публикации. Автоповтор отключён, "
                 "чтобы не создать дубль. Проверь канал и /health.\n\n"
-                f"{next_post.get('title', '')[:180]}")
+                f"{html.escape(str(next_post.get('title', ''))[:180])}")
             break
         await post_queue.ack_done(next_post)
         logger.info(f"Пост из очереди пропущен ({sent_result}): {next_post.get('title', '')[:60]}")
@@ -26744,7 +26772,11 @@ def _llm_cleanup_plan(results: list[dict]) -> dict:
 # Имена, за которыми стоит секрет. Значение такой переменной не показываем
 # никогда: отчёт уходит в переписку, а переписка — это не то место, где
 # ключ должен появиться даже один раз.
-_ENV_SECRET_NAME_RE = re.compile(r'KEY|TOKEN|SECRET|PASSWORD|PASS\b|CREDENTIAL', re.IGNORECASE)
+# SESSION и HASH — вход в аккаунт Telegram (TG_ACCOUNT_SESSION, TG_ACCOUNT_API_HASH):
+# по строке сессии любой входит в аккаунт без кода. /envfile показывал её
+# начало в чате, а история чата хранится в облаке Telegram.
+_ENV_SECRET_NAME_RE = re.compile(r'KEY|TOKEN|SECRET|PASSWORD|PASS\b|CREDENTIAL|SESSION|HASH|SALT',
+                                 re.IGNORECASE)
 # Имена, за которыми обычно адрес или строка подключения. Сам адрес показывать
 # полезно — по нему видно, куда ходит бот, — но логин и пароль в нём
 # (HTTPS_PROXY=http://user:pass@proxy:3128) — тот же секрет, что и ключ.
@@ -28281,9 +28313,9 @@ async def _drain_admin_alerts(bot) -> None:
         src_name, reason = _auto_disabled_pending.pop(0)
         await notify_admin(
             bot,
-            f'⏸ Источник «{src_name}» выключен автоматически\n\n'
+            f'⏸ Источник «{html.escape(str(src_name))}» выключен автоматически\n\n'
             f'Больше {AUTO_DISABLE_AFTER_HOURS} ч не отдаёт новостей.\n'
-            f'{reason[:180]}\n\n'
+            f'{html.escape(str(reason)[:180])}\n\n'
             f'Включить обратно: /settings → 📡 Источники')
 
 
@@ -29697,7 +29729,7 @@ async def _alert_backup_check_failed(bot: Bot, today: str, stage: str, errors) -
     delivered = await notify_admin(
         bot,
         f'⚠️ Ежедневный бэкап не отправлен: архив не прошёл {stage}.\n'
-        f'Причина: {reason}\n\n'
+        f'Причина: {html.escape(reason)}\n\n'
         f'Бот попробует снова через час. Ручной бэкап: /backup')
     if delivered:
         _backup_check_alerted_day = today

@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "1a3f3c7a4aa71bb18332c2d822c7b2413853f291",
-  "generated_at_utc": "2026-10-16T20:10:48.209786+00:00",
+  "git_commit": "a530ca72823907f2082d2704bc61ae39a45a937e",
+  "generated_at_utc": "2026-10-17T08:43:41.239817+00:00",
   "files": {
     ".claude/skills/find-skills/SKILL.md": {
       "sha256": "c00eeea0e13e74fe4a9d84ba0a8542205a1b736d65f13134fe1a6647eb14976f",
@@ -38,8 +38,8 @@
       "bytes": 33970
     },
     "anime_news_bot.py": {
-      "sha256": "8904e488dbcafb6ea9c549e4ec48e5056389a928f7db0dab54d87e550a256cea",
-      "bytes": 1937145
+      "sha256": "2766e78decf1996e4d505525c68540eed0050f2f08ddf12d14dbe0b15f630ef9",
+      "bytes": 1939715
     },
     "docs/chat-moderation.md": {
       "sha256": "b2338299309164ec952d18f4800fd028cab4d012363dac2bb7cadd3ee3651b5f",
@@ -102,8 +102,8 @@
       "bytes": 48885
     },
     "post_text.py": {
-      "sha256": "0f41e354a693538c85ed1e6e0ff79b8dfe3add0dc1043210978c85d1bb6cf37d",
-      "bytes": 32164
+      "sha256": "16ab90542ed2c52b6ec9ac40272a978512fbd57ed85bbf64f3152c58d68a74d2",
+      "bytes": 32758
     },
     "publication_delivery.py": {
       "sha256": "b800acc2cf4735e3f81c1009684056c00e905a64372e2b3011968763f6c90538",
@@ -118,7 +118,7 @@
       "bytes": 333
     },
     "requirements.txt": {
-      "sha256": "411200dd80a05501a96161e9caf388e972b1dd103f00eaf1b37b5c02771db2c1",
+      "sha256": "64dc4ecde7b8122e6b32eae0747a045434299e8233f303f524700d352d1454a2",
       "bytes": 3879
     },
     "runtime.txt": {
@@ -768,6 +768,10 @@
     "tests/test_scheduling_edit.py": {
       "sha256": "1ba719a97a7618a01995dce839948493648a9edf108e347b0f1a6d51c17c1010",
       "bytes": 52380
+    },
+    "tests/test_security_20261017.py": {
+      "sha256": "eda98dd2e805a258d8ac93434da1edf6e064a4a742d556bb5512b926387c3c48",
+      "bytes": 7855
     },
     "tests/test_security_audit.py": {
       "sha256": "087315121cccfe746e84dd69b4b59cda84a2b6b9c8e0e2e975b9d66e2c6b5308",
