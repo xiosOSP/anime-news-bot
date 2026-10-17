@@ -21992,6 +21992,12 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     key = pending.get('key')
     mode = pending.get('mode')
+    # Права перепроверяем на вводе: между нажатием кнопки и ответом админ мог
+    # выключить открытую модерацию или снять права, а ожидание ввода живёт
+    # дольше этих решений. Перенос отложки — кнопка только для админов.
+    if not is_admin(update) and (mode == 'reschedule' or not settings.open_moderation):
+        context.user_data.pop('await_input', None)
+        return
 
     # === 🕒 Перенос времени у поста, который уже в отложке ===
     if mode == 'reschedule':
@@ -26744,7 +26750,11 @@ def _llm_cleanup_plan(results: list[dict]) -> dict:
 # Имена, за которыми стоит секрет. Значение такой переменной не показываем
 # никогда: отчёт уходит в переписку, а переписка — это не то место, где
 # ключ должен появиться даже один раз.
-_ENV_SECRET_NAME_RE = re.compile(r'KEY|TOKEN|SECRET|PASSWORD|PASS\b|CREDENTIAL', re.IGNORECASE)
+# SESSION и HASH — вход в аккаунт Telegram (TG_ACCOUNT_SESSION, TG_ACCOUNT_API_HASH):
+# по строке сессии любой входит в аккаунт без кода. /envfile показывал её
+# начало в чате, а история чата хранится в облаке Telegram.
+_ENV_SECRET_NAME_RE = re.compile(r'KEY|TOKEN|SECRET|PASSWORD|PASS\b|CREDENTIAL|SESSION|HASH|SALT',
+                                 re.IGNORECASE)
 # Имена, за которыми обычно адрес или строка подключения. Сам адрес показывать
 # полезно — по нему видно, куда ходит бот, — но логин и пароль в нём
 # (HTTPS_PROXY=http://user:pass@proxy:3128) — тот же секрет, что и ключ.
