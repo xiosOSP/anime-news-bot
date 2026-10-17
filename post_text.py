@@ -295,7 +295,13 @@ _DOMAIN_START = r'(?:(?<![\w.+-])|(?<=\.\.))'
 _POST_URL_RE = re.compile(
     r'\b(?:https?://|www\.)\S+'
     r'|\bt\.me/\S+'
-    rf'|{_DOMAIN_START}[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|net|org|ru|io|tv|jp|me|one|gg|co|info|news)'
+    # Зоны из этого списка ловятся в любом регистре: «Evil.Shop» Telegram
+    # тоже сделает ссылкой, а модель по просьбе статьи может её вписать.
+    rf'|{_DOMAIN_START}[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|net|org|ru|io|tv|jp|me|one|gg|co|info|news'
+    r'|shop|store|site|online|xyz|app|club|biz|top|link|live|fun|space|website)\b'
+    r'(?:/\S*)?'
+    # Кириллические зоны: «пример.рф» Telegram тоже превращает в ссылку.
+    rf'|{_DOMAIN_START}[\w-]+(?:\.[\w-]+)*\.(?:рф|рус|онлайн|сайт|орг|ком|бел|укр|москва)(?![\w-])'
     r'(?:/\S*)?'
     # Доменные зоны не кончаются списком выше: .xyz, .site, .app, .club — та
     # же реклама. Зону берём любую, но только строчными латинскими буквами:
