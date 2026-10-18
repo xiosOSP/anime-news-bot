@@ -16987,6 +16987,11 @@ def _title_event_types(title: str) -> frozenset:
     return _ledger_event_types(norm, _title_tokens(title))
 
 
+# События, которые с одной картинкой в первые сутки — одна новость (см.
+# ImageHashes._other_event).
+_IMAGE_PACKAGE_EVENTS = frozenset({'announce', 'visual'})
+
+
 class ImageHashes:
     """Отпечатки картинок опубликованных постов. Ловит один и тот же анонс,
     пришедший с разных сайтов с разными заголовками (fuzzy-дедуп по тексту
@@ -17015,16 +17020,35 @@ class ImageHashes:
             logger.error(f"image_hashes не сохранён: {e}")
 
     @staticmethod
-    def _other_event(events: frozenset, old_title: str) -> bool:
+    def _other_event(events: frozenset, old_title: str, title: str = '',
+                     old_at: str = '') -> bool:
         """Тот же постер, но у новости другое событие («анонс» и «трейлер»).
 
         Официальный кадр студии кочует по всем новостям франшизы; совпадение
         картинки без совпадения события — не повтор, а новая новость. Если у
         одной из сторон событие в заголовке не названо, конфликта нет и
         решает картинка, как раньше.
+
+        Исключение — анонс и постер в первые сутки: анонс выходит вместе с
+        этим самым постером, и «Постер аниме «Тёпленько»» и через час
+        «Анонсировано аниме… (Тёпленько)» с той же картинкой — одна новость,
+        а вышли двумя постами (октябрь 2026). Дата и трейлер с тем же кадром
+        остаются отдельными новостями: в них есть что-то новое.
         """
         old = _title_event_types(old_title)
-        return bool(events and old and events != old)
+        if not (events and old and events != old):
+            return False
+        try:
+            age_hours = ((datetime.now(timezone.utc) - datetime.fromisoformat(old_at)).total_seconds()
+                         / 3600 if old_at else 0.0)
+        except (TypeError, ValueError):
+            age_hours = WORK_PACKAGE_HOURS + 1.0
+        new_classes = set(story_event_classes(title))
+        old_classes = set(story_event_classes(old_title))
+        if (age_hours <= WORK_PACKAGE_HOURS and new_classes and old_classes
+                and new_classes | old_classes <= _IMAGE_PACKAGE_EVENTS):
+            return False
+        return True
 
     def find_duplicate(self, fingerprint: str, title: str = '') -> Optional[dict]:
         """Ищет ранее опубликованную картинку, похожую на эту."""
@@ -17034,7 +17058,7 @@ class ImageHashes:
         for item in reversed(self._items):        # свежие сначала
             dist = _hash_distance(fingerprint, item.get('h', ''))
             if dist is not None and dist <= IMAGE_HASH_DISTANCE:
-                if self._other_event(events, item.get('t', '')):
+                if self._other_event(events, item.get('t', ''), title, str(item.get('at') or '')):
                     continue
                 return dict(item, distance=dist)
         return None
@@ -17056,7 +17080,8 @@ class ImageHashes:
                 continue
             dist = _hash_distance(fingerprint, pending_fp)
             if dist is not None and dist <= IMAGE_HASH_DISTANCE:
-                if self._other_event(events, pending.get('title', '')):
+                # Ждущая отправки картинка — та, что готовится прямо сейчас.
+                if self._other_event(events, pending.get('title', ''), title):
                     continue
                 return {'h': pending_fp, 't': pending.get('title', ''),
                         'distance': dist, 'pending': True}
@@ -17296,6 +17321,12 @@ WORK_KEYS_MAX = 24
 WORK_PACKAGE_HOURS = 24
 _WORK_PACKAGE_EVENTS = frozenset({'announce', 'visual', 'date', 'trailer'})
 _LATIN_PAREN_RE = re.compile(r'\(([A-Za-z][^()\n]{2,80})\)')
+# Русский перевод в скобках сразу после латинского имени или кавычек:
+# «Анонсировано аниме по манге NullMeta (Тёпленько)». Ключ давала только
+# латиница в скобках, и этот пост не совпал с вышедшим часом раньше «Постер
+# аниме «Тёпленько»» (октябрь 2026). Без латиницы перед скобкой русские
+# скобки — обычно пометка («(обновлено)»), а не название.
+_RU_PAREN_AFTER_NAME_RE = re.compile(r'(?<=[A-Za-z0-9»"”!?])\s*\(([А-ЯЁ][^()\n]{2,80})\)')
 
 
 # Площадки, студии, издатели и премии — не тайтлы, хотя стоят в тех же
@@ -17424,6 +17455,8 @@ def _work_identity_keys(news: dict, *, lookups: int = 0) -> list[str]:
     for title in dict.fromkeys(t for t in (str(news.get('title') or ''), _work_final_title(news)) if t):
         anchored |= {name.casefold() for name in story_anchored_work_names(title)}
         names += [m.group(1) for m in _LATIN_PAREN_RE.finditer(title)]
+        names += [m.group(1) for m in _RU_PAREN_AFTER_NAME_RE.finditer(title)
+                  if not all(is_rubric_word(w) for w in m.group(1).split())]
         # Имя без кавычек идёт до знака препинания: «аниме Оммёдзи Нуэ, премьера
         # летом» — после запятой уже не название.
         names += [name.split(',')[0] for name in story_explicit_work_names(title)]
