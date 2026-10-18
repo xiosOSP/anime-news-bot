@@ -24286,6 +24286,34 @@ def _llm_fatal_reason(status: int, body: str) -> Optional[dict]:
 # одна на всех, а провайдеров теперь трое: параметр вроде reasoning_effort
 # нужен одному и ломает запрос у другого. Кто не принял — тому больше не шлём.
 _llm_extra_ok: dict = {}
+# Значения, которые провайдер назвал сам: «`reasoning_effort` must be one of
+# `low`, `medium`, or `high`». LLM_EXTRA_PARAMS={"reasoning_effort":"none"}
+# писался под Mistral, а Groq на «none» отвечает 400. Раньше параметр снимался
+# целиком, gpt-oss-120b рассуждал в обычном режиме, тратил на рассуждения весь
+# лимит токенов и отдавал пустой ответ — пять таких подряд, и модель на паузе
+# (октябрь 2026). Теперь берём самое «лёгкое» из разрешённых значений.
+_llm_extra_override: dict = {}
+_LLM_ALLOWED_VALUES_RE = re.compile(r'`?([A-Za-z_][\w.]*)`?\s+must be one of\s+([^"\n}]{1,200})')
+_LLM_LIGHT_VALUES = ('none', 'minimal', 'low', 'disabled', 'off', 'false')
+
+
+def _llm_extra_fix_from_error(slot: str, body: str) -> bool:
+    """Подменяет значение параметра из LLM_EXTRA_PARAMS тем, что разрешил
+    провайдер. True — есть что повторить с новым значением."""
+    match = _LLM_ALLOWED_VALUES_RE.search(str(body or ''))
+    if not match:
+        return False
+    name = match.group(1)
+    current = _llm_extra_params(slot)
+    if name not in current:
+        return False
+    allowed = re.findall(r"[`'\"]([^`'\"]{1,40})[`'\"]", match.group(2))
+    if not allowed or str(current[name]) in allowed:
+        return False
+    choice = next((v for v in _LLM_LIGHT_VALUES if v in allowed), allowed[0])
+    _llm_extra_override.setdefault(slot, {})[name] = choice
+    logger.info('LLM: %s не принял %s=%r — повторяю с %r', slot, name, current[name], choice)
+    return True
 
 
 def _llm_extra_params(slot: str = '') -> dict:
@@ -24300,10 +24328,12 @@ def _llm_extra_params(slot: str = '') -> dict:
         return {}
     try:
         data = json.loads(raw)
-        return data if isinstance(data, dict) else {}
     except ValueError:
         logger.warning('LLM_EXTRA_PARAMS: не разобрался как JSON — игнорирую')
         return {}
+    if not isinstance(data, dict):
+        return {}
+    return {**data, **_llm_extra_override.get(slot, {})} if slot else data
 
 # Пауза, которую бот подобрал под каждого провайдера сам. Единая константа
 # означала, что предел провайдера бот узнаёт единственным способом — упираясь
@@ -24602,6 +24632,7 @@ def _llm_reset_provider_state(why: str) -> None:
     # поддерживаться, и начинать с ослабленного режима незачем.
     _llm_json_mode = True
     _llm_extra_ok.clear()
+    _llm_extra_override.clear()
     _llm_last_provider_error = ''
     logger.info('LLM: состояние провайдера сброшено (%s)', why)
     metrics.inc('anime_bot_llm_provider_reset_total')
@@ -24965,6 +24996,12 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
             _queue_admin_alert(f'🤖 Языковая модель отключена: {fatal["admin"]}\n'
                                f'HTTP {r.status_code}. Бот продолжает работать на DeepL/Google.')
             return None
+        if r.status_code in (400, 422) and _llm_extra_fix_from_error(slot, r.text):
+            # Отказ сам назвал параметр и допустимые значения — строгий JSON
+            # тут ни при чём, и снимать его было бы ошибкой.
+            _remember_provider_error(r.status_code, r.text)
+            metrics.inc('anime_bot_llm_extra_params_adjusted_total', labels={'slot': str(slot)})
+            return None
         if r.status_code in (400, 422) and _llm_json_mode:
             # Скорее всего провайдер не знает response_format — пробуем без него
             _llm_json_mode = False
@@ -24999,7 +25036,10 @@ def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_conf
                     _llm_last_usage_tokens = int(total_tokens)
             content = data['choices'][0]['message']['content']
             if not isinstance(content, str) or not content.strip():
-                raise ValueError('empty or non-text completion')
+                # finish_reason=length при пустом тексте — модель потратила
+                # весь лимит на рассуждения: это настройка, а не сбой сети.
+                finish = str(data['choices'][0].get('finish_reason') or '?')
+                raise ValueError(f'empty or non-text completion (finish_reason={finish})')
         except (ValueError, KeyError, IndexError, TypeError) as e:
             if not routed_task:
                 _llm_fail_streak += 1
@@ -25067,8 +25107,15 @@ def _llm_can_call() -> bool:
                     f'Отвечал {where} провайдер, модель '
                     f'<code>{html.escape(active_model or "?")}</code>.',
                 ]
-                if _llm_last_provider_error:
-                    pause_lines.append(f'Последний ответ: '
+                # Последняя ошибка — та, что открыла паузу. Ответ провайдера с
+                # кодом запоминается только при HTTP-отказе: после таймаутов и
+                # пустых ответов он устаревший, и раньше сообщение называло
+                # давно исправленный отказ вместо настоящей причины.
+                last = _llm_last_failure.get('detail') or ''
+                if last:
+                    pause_lines.append(f'Последняя ошибка: <code>{_escape_to_limit(last, 300)}</code>')
+                if _llm_last_provider_error and _llm_last_provider_error[:80] not in last:
+                    pause_lines.append(f'Последний ответ провайдера с кодом ошибки (мог быть раньше): '
                                        f'<code>{_escape_to_limit(_llm_last_provider_error, 300)}</code>')
                 pause_lines.append('Fallback DeepL/Google продолжает работать. Подробности — /llm.')
                 _queue_admin_alert('\n'.join(pause_lines))
@@ -25138,7 +25185,7 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: s
                     _queue_admin_alert(
                         f'💰 LLM budget использован на {int(100 * snap["tokens"] / max(1, _llm_token_budget()))}%. '
                         f'Осталось примерно {snap["remaining"]} tokens.')
-            previous = (_llm_candidate, _llm_json_mode, dict(_llm_extra_ok))
+            previous = (_llm_candidate, _llm_json_mode, dict(_llm_extra_ok), repr(_llm_extra_override))
             # Списываем ДО запроса: иначе два пути успели бы выйти за лимит,
             # пока первый ждёт ответа. Флаг «отказ ничего не стоил» относится
             # ровно к этой попытке, поэтому снимаем его заранее: прошлый отказ
@@ -25185,7 +25232,7 @@ async def _llm_call(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, task: s
                 metrics.inc('anime_bot_llm_route_fallback_total', labels={'task': task})
                 route_config = None
                 continue
-            if previous != (_llm_candidate, _llm_json_mode, dict(_llm_extra_ok)):
+            if previous != (_llm_candidate, _llm_json_mode, dict(_llm_extra_ok), repr(_llm_extra_override)):
                 continue
             if (not inline_retried and _llm_quota_left() > 0
                     and not _llm_fallback_configured()
