@@ -19,12 +19,15 @@ def _env(monkeypatch, tmp_path):
         ('LLM_BASE_URL', 'https://one.test/v1'), ('LLM_API_KEY', 'key-one-aaaa'),
         ('LLM_MODEL', 'model-one'), ('LLM_MODEL_ALTERNATES', ()),
         ('LLM_FALLBACK_API_KEY', ''), ('LLM_FAST_API_KEY', ''),
-        ('_llm_extra_ok', {}), ('_llm_candidate', ()), ('_llm_using_fallback', False),
+        ('_llm_extra_ok', {}), ('_llm_extra_override', {}), ('_llm_candidate', ()),
+        ('_llm_using_fallback', False),
         ('LLM_MIN_INTERVAL', 0), ('_llm_last_call', 0),
         ('_llm_lock', asyncio.Lock()), ('_llm_json_mode', False), ('_llm_fail_streak', 0),
         ('_llm_disabled_runtime', False), ('_llm_disabled_reason', ''),
         ('settings', bot.BotSettings(tmp_path / 's.json')),
         ('_queue_admin_alert', lambda _m: None),
+        ('_llm_circuit_until', 0.0), ('_llm_circuit_level', 0), ('_llm_last_failure', {}),
+        ('_llm_last_provider_error', ''),
     ):
         monkeypatch.setattr(bot, name, value)
     return monkeypatch
@@ -96,3 +99,72 @@ def test_provider_name_that_contradicts_the_address_is_flagged(_env):
     _env.setattr(bot, 'LLM_BASE_URL', 'https://api.orcarouter.ai/v1')
     preset_url = bot.LLM_PRESETS['mistral'][0]
     assert preset_url.rstrip('/') != bot._llm_slot_env('primary')[0].rstrip('/')
+
+
+GROQ_REFUSAL = ('{"error":{"message":"`reasoning_effort` must be one of `low`, `medium`, or `high`",'
+                '"type":"invalid_request_error"}}')
+
+
+def test_provider_named_values_replace_the_param(_env):
+    """Пересказ случая (октябрь 2026): «none» писали под Mistral, Groq его не
+    принимает. Без параметра gpt-oss рассуждал в полную силу, съедал лимит
+    токенов и отдавал пустой ответ. Берём самое лёгкое из разрешённых."""
+    sent = []
+
+    def post(url, **kwargs):
+        sent.append(kwargs.get('json') or {})
+        return _reply(400, GROQ_REFUSAL) if len(sent) == 1 else _reply(200)
+
+    _env.setattr(bot, '_llm_json_mode', True)
+    _env.setattr(bot.requests, 'post', post)
+    assert asyncio.run(bot._llm_call([{'role': 'user', 'content': 'hi'}], 100)) == 'готово'
+    assert [p.get('reasoning_effort') for p in sent] == ['none', 'low']
+    assert bot._llm_json_mode is True, 'строгий JSON сняли по чужой вине'
+    assert bot._llm_extra_params('primary') == {'reasoning_effort': 'low'}
+    assert bot._llm_extra_params('fallback') == {'reasoning_effort': 'none'}
+
+
+def test_allowed_value_already_sent_is_not_a_loop(_env):
+    bot._llm_extra_override['primary'] = {'reasoning_effort': 'low'}
+    assert not bot._llm_extra_fix_from_error('primary', GROQ_REFUSAL)
+
+
+def test_refusal_about_other_param_is_not_ours(_env):
+    body = '{"error":{"message":"`service_tier` must be one of `auto` or `flex`"}}'
+    assert not bot._llm_extra_fix_from_error('primary', body)
+    assert bot._llm_extra_override == {}
+
+
+def test_lightest_value_is_chosen(_env):
+    body = '{"error":{"message":"`reasoning_effort` must be one of `high`, `medium`, `minimal`"}}'
+    assert bot._llm_extra_fix_from_error('primary', body)
+    assert bot._llm_extra_params('primary') == {'reasoning_effort': 'minimal'}
+
+
+def test_empty_answer_names_finish_reason(_env):
+    r = _reply(200)
+    r.json.return_value = {'choices': [{'message': {'content': ''}, 'finish_reason': 'length'}]}
+    _env.setattr(bot.requests, 'post', lambda *a, **k: r)
+    assert bot._llm_request([{'role': 'user', 'content': 'hi'}], 100) is None
+    assert 'finish_reason=length' in bot._llm_last_failure['detail']
+
+
+def test_pause_alert_names_the_real_last_error(_env):
+    """В сообщении о паузе стоял давний отказ про reasoning_effort, хотя пять
+    ошибок подряд были пустыми ответами."""
+    alerts = []
+    _env.setattr(bot, '_queue_admin_alert', alerts.append)
+    _env.setattr(bot, '_llm_last_provider_error', 'HTTP 400: reasoning_effort must be one of')
+    _env.setattr(bot, '_llm_fail_streak', bot.LLM_FAIL_PAUSE_AFTER)
+    bot._llm_note_failure('bad_body', 'ValueError: empty or non-text completion (finish_reason=length)')
+    assert not bot._llm_can_call()
+    text = alerts[-1]
+    assert 'finish_reason=length' in text
+    assert text.index('finish_reason=length') < text.index('reasoning_effort')
+
+
+def test_provider_reset_forgets_adjusted_values(_env):
+    """Подобранное значение относилось к прежнему провайдеру."""
+    bot._llm_extra_override['primary'] = {'reasoning_effort': 'low'}
+    bot._llm_reset_provider_state('смена провайдера')
+    assert bot._llm_extra_params('primary') == {'reasoning_effort': 'none'}
