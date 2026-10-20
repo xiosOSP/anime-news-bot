@@ -13742,6 +13742,13 @@ _VISUAL_TO_POSTER = {'': 'постер', 'а': 'постера', 'у': 'пост
                      'ах': 'постерах'}
 
 
+# «Тизер-постер» — слово фанатских лент: подписчики просили писать просто
+# «постер» (октябрь 2026). Окончание остаётся за «постер»: «тизер-постера» →
+# «постера», «тизерный постер» → «постер».
+_TEASER_POSTER_RE = re.compile(
+    r'(?<![\w-])(т)изер(?:н(?:ый|ого|ому|ым|ом|ые|ых|ыми))?(?:-|\s+)постер', re.IGNORECASE)
+
+
 def _polish_post_text(text: str) -> str:
     """Последняя правка текста поста: жаргон и неразрывные дефисы.
 
@@ -13752,6 +13759,9 @@ def _polish_post_text(text: str) -> str:
     text = str(text or '').replace('\u2011', '-').replace('\u2010', '-')
     for pattern, repl in _JARGON_RULES[:2]:
         text = pattern.sub(repl, text)
+    text = _TEASER_POSTER_RE.sub(
+        lambda m: 'ПОСТЕР' if m.group(0).isupper() else ('П' if m.group(1).isupper() else 'п') + 'остер',
+        text)
 
     def visual(match: re.Match) -> str:
         adjective = match.group(0).split()[0]
@@ -25575,6 +25585,46 @@ def _with_about(text: str, news: dict) -> str:
     return f'{text.rstrip()}\n\n{about}'
 
 
+# «Дата выхода не указана» — не факт, а его отсутствие. Модель дописывала это
+# к пересказу заголовка, и отрицание «не» спасало пересказ от проверки на
+# повтор: «Тизер-постер к 5 сезону «…» опубликован, дата выхода не указана»
+# под заголовком «Появился тизер-постер 5 сезона «…»» (октябрь 2026).
+_EMPTY_CLAIM_CORE = (
+    r'(?:точн\w+\s+)?(?:дата|сроки?|время)\s+(?:выхода|премьеры|релиза|выпуска|показа|старта)'
+    r'(?:\s+[\w«»-]+){0,3}?\s+(?:пока\s+|ещё\s+|еще\s+)?'
+    r'(?:не\s+(?:указан|объявлен|назван|сообща|раскрыт|известн|уточн|определ|сообщ)\w*|неизвестн\w*'
+    r'|(?:станет|будет)\s+(?:известн|объявлен|назван)\w*\s+позже)')
+_EMPTY_CLAIM_SENTENCE_RE = re.compile(r'^\s*(?:а\s+|но\s+|однако\s+|при\s+этом\s+)?'
+                                      + _EMPTY_CLAIM_CORE + r'\s*[.!…]?\s*$', re.IGNORECASE)
+_EMPTY_CLAIM_CLAUSE_RE = re.compile(r'\s*[,;—–]\s*(?:а\s+|но\s+|однако\s+|при\s+этом\s+)?'
+                                    + _EMPTY_CLAIM_CORE + r'(?=\s*[.!?…]|\s*$)', re.IGNORECASE)
+
+
+def _drop_empty_claims(paragraph: str) -> str:
+    """Убирает фразы о том, чего не сообщили: «дата выхода пока не объявлена»."""
+    paragraph = str(paragraph or '').strip()
+    if not (_EMPTY_CLAIM_CLAUSE_RE.search(paragraph) or any(
+            _EMPTY_CLAIM_SENTENCE_RE.match(s) for s in _split_clauses(paragraph))):
+        return paragraph            # пересобирать нечего: «;» автора остаётся
+    kept = []
+    for sentence in _split_clauses(str(paragraph or '').strip()):
+        if _EMPTY_CLAIM_SENTENCE_RE.match(sentence):
+            continue
+        kept.append(_EMPTY_CLAIM_CLAUSE_RE.sub('', sentence))
+    return ' '.join(kept).strip()
+
+
+def _echo_view(title: str, text: str) -> str:
+    """Текст для сравнения с заголовком: без латинского имени в скобках после
+    названия, которое уже есть в заголовке. «Добро пожаловать в класс
+    превосходства» (Youkoso Jitsuryoku…) — то же название, а не новое имя."""
+    low_title = str(title or '').casefold()
+
+    def drop(match: re.Match) -> str:
+        return match.group(1) if match.group(2).casefold() in low_title else match.group(0)
+    return re.sub(r'(«([^»]{2,120})»)\s*\([A-Za-z][^()]{1,160}\)', drop, str(text or ''))
+
+
 def _drop_repetitive_paragraphs(title: str, paragraphs: list) -> list:
     """Убирает явные повторы; новые значимые слова сохраняют абзац.
 
@@ -25583,10 +25633,10 @@ def _drop_repetitive_paragraphs(title: str, paragraphs: list) -> list:
     seen = title
     kept = []
     for para in paragraphs:
-        para = _strip_title_echo(title, para)
+        para = _drop_empty_claims(_strip_title_echo(title, para))
         if not para.strip():
             continue
-        if _too_similar(seen, para):
+        if _too_similar(seen, _echo_view(title, para)):
             logger.info(f"✂️ Абзац-повтор убран: {para[:55]}")
             continue
         # Повтор чаще прячется в первой фразе абзаца, а не во всём абзаце:
@@ -25597,7 +25647,8 @@ def _drop_repetitive_paragraphs(title: str, paragraphs: list) -> list:
         if len(sentences) > 1 or _number_echo(title, para):
             fresh = []
             for sentence in sentences:
-                if _too_similar(seen, sentence) or _number_echo(title, sentence):
+                if (_too_similar(seen, _echo_view(title, sentence))
+                        or _number_echo(title, _echo_view(title, sentence))):
                     logger.info(f"✂️ Фраза-повтор убрана: {sentence[:55]}")
                     continue
                 fresh.append(sentence)
