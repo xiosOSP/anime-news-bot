@@ -59,3 +59,25 @@ def test_telegram_cdn_is_matched_by_host(url, expected):
 def test_direct_video_on_fake_cdn_needs_an_extension():
     assert bot._is_direct_video('https://cdn4.telesco.pe/file/abc')
     assert not bot._is_direct_video('https://cdn-telegram.org.example.com/file/abc')
+
+
+# ---------- ISSUE-04: счётчики переполнения очереди при сбое записи ----------
+
+def _queued(i):
+    return {'title': f'N{i}', 'link': f'https://example.com/{i}',
+            'images': ['https://img/x.jpg'], 'source': 'S', '_priority_score': i}
+
+
+def test_queue_overflow_counters_follow_the_durable_write(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(bot, 'settings', SimpleNamespace(require_image=False))
+    monkeypatch.setattr(bot, 'QUEUE_MAX_SIZE', 5)
+    q = bot.PostQueue(tmp_path / 'q.json')
+    assert asyncio.run(q.push_many([_queued(i) for i in range(5)])) == 5
+    with monkeypatch.context() as m:
+        m.setattr(q, '_save', lambda: False)
+        assert asyncio.run(q.push_many([_queued(i) for i in range(5, 8)])) == 0
+    assert (q.dropped_last_push, q.dropped_total, len(q._items)) == (0, 0, 5)
+    # Диск ожил — следующая запись проходит и считается как обычно.
+    assert asyncio.run(q.push_many([_queued(i) for i in range(5, 8)])) == 3
+    assert (q.dropped_last_push, q.dropped_total, len(q._items)) == (3, 3, 5)

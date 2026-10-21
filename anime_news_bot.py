@@ -4857,16 +4857,19 @@ class PostQueue:
                     existing_story_ids.add(story_registry_id)
                 added += 1
             dropped = self._trim_overflow_unlocked()
+            if not self._save():
+                # Очередь — durable handoff. Если новое состояние не записалось,
+                # не притворяемся, что кандидаты приняты: иначе crash потеряет их.
+                # Счётчики выброшенного тоже не трогаем: очередь откатилась, и
+                # ничего не выброшено (внешний аудит, октябрь 2026).
+                self._items = old_items
+                self.dropped_last_push = 0
+                return 0
             self.dropped_last_push = dropped
             if dropped:
                 self.dropped_total += dropped
                 metrics.inc('anime_bot_queue_dropped_total', dropped)
                 logger.info(f"📦 Очередь переполнена, выброшено {dropped} низкоприоритетных постов")
-            if not self._save():
-                # Очередь — durable handoff. Если новое состояние не записалось,
-                # не притворяемся, что кандидаты приняты: иначе crash потеряет их.
-                self._items = old_items
-                return 0
             return added
 
     def oldest(self) -> Optional[dict]:
