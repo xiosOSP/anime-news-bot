@@ -37,3 +37,25 @@ def test_successful_commit_does_not_alert(tmp_path, monkeypatch):
     assert asyncio.run(store.claim('https://example.com/2', 'Т'))
     assert asyncio.run(store.commit('https://example.com/2', 'Т'))
     assert not alerts
+
+
+# ---------- ISSUE-03: Telegram CDN по имени хоста, а не по подстроке ----------
+
+@pytest.mark.parametrize('url, expected', [
+    ('https://cdn4.telesco.pe/file/abc.mp4?token=x', True),
+    ('https://telesco.pe/file/abc', True),
+    ('https://cdn1.cdn-telegram.org/file/abc', True),
+    ('https://cdn-telegram.org:8443/file/abc', True),
+    ('https://cdn-telegram.org.example.com/file/abc', False),
+    ('https://telesco.pe.evil.test/x', False),
+    ('https://nottelesco.pe/x', False),
+    ('https://example.com/?u=telesco.pe', False),
+    ('not a url', False),
+])
+def test_telegram_cdn_is_matched_by_host(url, expected):
+    assert bot._download_needed_host(url) is expected
+
+
+def test_direct_video_on_fake_cdn_needs_an_extension():
+    assert bot._is_direct_video('https://cdn4.telesco.pe/file/abc')
+    assert not bot._is_direct_video('https://cdn-telegram.org.example.com/file/abc')

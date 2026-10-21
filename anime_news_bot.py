@@ -10740,6 +10740,18 @@ def _is_video_host(url: str) -> bool:
     return any(host == vh or host.endswith(f'.{vh}') for vh in VIDEO_HOSTS)
 
 
+# CDN, с которого t.me/s/ отдаёт фото и ролики каналов. Сверяем имя хоста
+# целиком или как поддомен: подстрока пропускала «cdn-telegram.org.example.com»
+# (внешний аудит, октябрь 2026). Сетевой дыры это не давало — качаем мы через
+# safe_http, — но чужой хост не должен считаться телеграмовским.
+_TG_CDN_DOMAINS = ('cdn-telegram.org', 'telesco.pe')
+
+
+def _is_tg_cdn_host(host: str) -> bool:
+    host = str(host or '').lower().rstrip('.')
+    return any(host == domain or host.endswith('.' + domain) for domain in _TG_CDN_DOMAINS)
+
+
 def _is_direct_video(url: str) -> bool:
     """Проверяет, что URL — прямая ссылка на видеофайл."""
     try:
@@ -10751,7 +10763,7 @@ def _is_direct_video(url: str) -> bool:
     except Exception:
         return False
     # Видео из t.me/s/ живут на cdn-telegram/telesco без расширения в пути
-    if 'cdn-telegram.org' in host or 'telesco.pe' in host:
+    if _is_tg_cdn_host(host):
         return True
     return path.endswith(DIRECT_VIDEO_EXTENSIONS)
 
@@ -18267,10 +18279,10 @@ def _download_needed_host(url) -> bool:
     if tg_account_mod.is_media_ref(url):
         return True                 # tgacc:// Telegram по ссылке не скачает
     try:
-        host = urlparse(url).netloc.lower()
+        host = urlparse(url).hostname or ''
     except Exception:
         return False
-    return 'cdn-telegram.org' in host or 'telesco.pe' in host
+    return _is_tg_cdn_host(host)
 
 
 async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Path]) -> bool:
