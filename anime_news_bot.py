@@ -4602,6 +4602,17 @@ class SentLinksStore:
                 meta['at'] = time.time()
                 self._reservations[norm_url] = meta
             logger.critical(f'Ledger commit не записан после успешной отправки: {norm_url[:100]}')
+            # Пост вышел, а история на диске его не знает. Повтора не будет:
+            # в этом процессе URL держит uncertain в памяти, а после рестарта —
+            # состояние sending, записанное до отправки. Но админ должен узнать
+            # о диске сейчас, а не из /health через неделю.
+            try:
+                _queue_admin_alert(
+                    '⚠️ Пост ушёл в Telegram, но история публикаций не записалась на диск '
+                    f'(<code>{html.escape(norm_url[:120])}</code>). Автоповтор заблокирован; '
+                    'проверь место и права на томе данных — /health.')
+            except NameError:
+                pass
             return False
 
     async def release(self, link: str, title: str = '') -> None:
