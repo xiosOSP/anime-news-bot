@@ -4602,6 +4602,17 @@ class SentLinksStore:
                 meta['at'] = time.time()
                 self._reservations[norm_url] = meta
             logger.critical(f'Ledger commit не записан после успешной отправки: {norm_url[:100]}')
+            # Пост вышел, а история на диске его не знает. Повтора не будет:
+            # в этом процессе URL держит uncertain в памяти, а после рестарта —
+            # состояние sending, записанное до отправки. Но админ должен узнать
+            # о диске сейчас, а не из /health через неделю.
+            try:
+                _queue_admin_alert(
+                    '⚠️ Пост ушёл в Telegram, но история публикаций не записалась на диск '
+                    f'(<code>{html.escape(norm_url[:120])}</code>). Автоповтор заблокирован; '
+                    'проверь место и права на томе данных — /health.')
+            except NameError:
+                pass
             return False
 
     async def release(self, link: str, title: str = '') -> None:
@@ -4846,16 +4857,19 @@ class PostQueue:
                     existing_story_ids.add(story_registry_id)
                 added += 1
             dropped = self._trim_overflow_unlocked()
+            if not self._save():
+                # Очередь — durable handoff. Если новое состояние не записалось,
+                # не притворяемся, что кандидаты приняты: иначе crash потеряет их.
+                # Счётчики выброшенного тоже не трогаем: очередь откатилась, и
+                # ничего не выброшено (внешний аудит, октябрь 2026).
+                self._items = old_items
+                self.dropped_last_push = 0
+                return 0
             self.dropped_last_push = dropped
             if dropped:
                 self.dropped_total += dropped
                 metrics.inc('anime_bot_queue_dropped_total', dropped)
                 logger.info(f"📦 Очередь переполнена, выброшено {dropped} низкоприоритетных постов")
-            if not self._save():
-                # Очередь — durable handoff. Если новое состояние не записалось,
-                # не притворяемся, что кандидаты приняты: иначе crash потеряет их.
-                self._items = old_items
-                return 0
             return added
 
     def oldest(self) -> Optional[dict]:
@@ -10729,6 +10743,18 @@ def _is_video_host(url: str) -> bool:
     return any(host == vh or host.endswith(f'.{vh}') for vh in VIDEO_HOSTS)
 
 
+# CDN, с которого t.me/s/ отдаёт фото и ролики каналов. Сверяем имя хоста
+# целиком или как поддомен: подстрока пропускала «cdn-telegram.org.example.com»
+# (внешний аудит, октябрь 2026). Сетевой дыры это не давало — качаем мы через
+# safe_http, — но чужой хост не должен считаться телеграмовским.
+_TG_CDN_DOMAINS = ('cdn-telegram.org', 'telesco.pe')
+
+
+def _is_tg_cdn_host(host: str) -> bool:
+    host = str(host or '').lower().rstrip('.')
+    return any(host == domain or host.endswith('.' + domain) for domain in _TG_CDN_DOMAINS)
+
+
 def _is_direct_video(url: str) -> bool:
     """Проверяет, что URL — прямая ссылка на видеофайл."""
     try:
@@ -10740,7 +10766,7 @@ def _is_direct_video(url: str) -> bool:
     except Exception:
         return False
     # Видео из t.me/s/ живут на cdn-telegram/telesco без расширения в пути
-    if 'cdn-telegram.org' in host or 'telesco.pe' in host:
+    if _is_tg_cdn_host(host):
         return True
     return path.endswith(DIRECT_VIDEO_EXTENSIONS)
 
@@ -18256,10 +18282,10 @@ def _download_needed_host(url) -> bool:
     if tg_account_mod.is_media_ref(url):
         return True                 # tgacc:// Telegram по ссылке не скачает
     try:
-        host = urlparse(url).netloc.lower()
+        host = urlparse(url).hostname or ''
     except Exception:
         return False
-    return 'cdn-telegram.org' in host or 'telesco.pe' in host
+    return _is_tg_cdn_host(host)
 
 
 async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Path]) -> bool:
