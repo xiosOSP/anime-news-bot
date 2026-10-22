@@ -29,6 +29,8 @@ class TestSilenceWatchdog:
     @pytest.fixture(autouse=True)
     def env(self, monkeypatch):
         monkeypatch.setattr(anime_news_bot, 'SOURCES', [('A', None), ('B', None)])
+        # Без ночной тишины: иначе исход зависел бы от часа запуска тестов.
+        monkeypatch.setattr(anime_news_bot, 'CHANNEL_QUIET_HOURS', '')
         monkeypatch.setattr(anime_news_bot, 'scheduled_posts', None)
         monkeypatch.setattr(anime_news_bot, 'pending_posts', None)
         monkeypatch.setattr(anime_news_bot, 'settings',

@@ -28499,6 +28499,43 @@ def _silence_hours() -> Optional[float]:
     return (datetime.now(timezone.utc) - last).total_seconds() / 3600
 
 
+def _quiet_overlap_hours(start_utc: datetime, end_utc: datetime) -> float:
+    """Сколько часов отрезка пришлось на ночную тишину канала."""
+    window = _quiet_window(CHANNEL_QUIET_HOURS)
+    if window is None or end_utc <= start_utc:
+        return 0.0
+    tz = _admin_tz()
+    start_local = start_utc.astimezone(tz)
+    end_local = end_utc.astimezone(tz)
+    begin, finish = window
+    total = 0.0
+    day = start_local.date() - timedelta(days=1)
+    while day <= end_local.date():
+        midnight = datetime(day.year, day.month, day.day, tzinfo=tz)
+        q_start = midnight + timedelta(minutes=begin)
+        # Окно через полночь (22:40–08:00) кончается уже завтра.
+        q_end = midnight + timedelta(days=0 if begin < finish else 1, minutes=finish)
+        overlap = (min(end_local, q_end) - max(start_local, q_start)).total_seconds()
+        if overlap > 0:
+            total += overlap
+        day += timedelta(days=1)
+    return total / 3600
+
+
+def _silence_active_hours() -> Optional[float]:
+    """Часы без публикаций, не считая ночной тишины канала.
+
+    Тишина 22:40–08:00 длиннее порога тревоги в 8 ч, и сторож каждое утро
+    сообщал о «8 ч без единой публикации», хотя бот просто ждал утра
+    (октябрь 2026). Ночь простоем не считается.
+    """
+    hours = _silence_hours()
+    if hours is None:
+        return None
+    now = datetime.now(timezone.utc)
+    return max(0.0, hours - _quiet_overlap_hours(now - timedelta(hours=hours), now))
+
+
 # Сторож эксплуатации: признаки поломки, которые раньше видны были только в
 # логах или в /health, куда смотрят, когда уже что-то заметили. Порог 0 —
 # сигнал выключен. Каждый сигнал приходит один раз и повторяется не чаще
@@ -28593,7 +28630,7 @@ async def _check_silence(bot: Bot) -> None:
     Ровно этот сценарий повторялся раньше — отложка, видео и картинки отваливались
     молча, и узнавали мы об этом только глазами."""
     global _silence_reported, _silence_retry_at
-    hours = _silence_hours()
+    hours = _silence_active_hours()
     if hours is None:
         _mark_published()            # первая отметка — точка отсчёта
         return
@@ -28606,7 +28643,9 @@ async def _check_silence(bot: Bot) -> None:
     try:
         delivered = await notify_admin(
             bot,
-            f'🔇 Тревога: {int(hours)} ч без единой публикации\n\n'
+            f'🔇 Тревога: {int(hours)} ч без единой публикации'
+            + (' (ночная тишина канала не в счёт)' if _quiet_window(CHANNEL_QUIET_HOURS) else '')
+            + '\n\n'
             f'Источников включено: {enabled}\n'
             f'В отложке: {len(scheduled_posts.all()) if scheduled_posts else 0}\n'
             f'Ждут решения в ветке: {len(pending_posts._items) if pending_posts else 0}\n\n'
