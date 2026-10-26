@@ -332,3 +332,25 @@ class TestSourceDiscoveryQueueCheck:
         result = await bot._run_source_discovery([])
 
         assert result['skipped'] == 'backpressure'
+
+
+@pytest.mark.asyncio
+async def test_full_thread_defers_weak_candidates_before_llm(monkeypatch):
+    """Ветка с полным запасом годных постов не тратит модель на слабых кандидатов
+    (октябрь 2026: в ветке копилось 150 постов, в канал уходила треть)."""
+    weak = [dict(_news(i), _priority_score=-50.0) for i in range(3)]
+    strong = dict(_news(9), _priority_score=500.0)
+    ctx = _common_cycle_stubs(monkeypatch, weak + [strong])
+    stock = MagicMock(_items={str(i): {} for i in range(5)})
+    stock.autopost_values.return_value = [10.0] * 5
+    monkeypatch.setattr(bot, 'pending_posts', stock)
+    monkeypatch.setattr(bot, 'THREAD_FULL_CANDIDATES', 5)
+    prefetch = AsyncMock()
+    monkeypatch.setattr(bot, '_llm_prefetch_for_cycle', prefetch)
+    sender = AsyncMock(return_value='sent')
+    monkeypatch.setattr(bot, 'send_news_to_thread', sender)
+
+    await bot._check_news_cycle(ctx)
+
+    assert [c.args[1]['title'] for c in sender.await_args_list] == ['News 9']
+    assert [n['title'] for n in prefetch.await_args.args[0]] == ['News 9']
