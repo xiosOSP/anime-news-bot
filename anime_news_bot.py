@@ -17334,6 +17334,11 @@ def _release_publish_reservations(news: dict) -> None:
 
 
 PENDING_POSTS_FILE = DATA_DIR / 'pending_posts.json'
+# Сколько пост ждёт решения в ветке. Было 7 дней, а автопостинг берёт посты не
+# старше настройки свежести (72 ч): всё, что старше, в канал само уже не уйдёт,
+# но лежало в ветке и набивало её до 150 постов (октябрь 2026). Сутки сверх
+# свежести оставлены, чтобы админ успел выложить пост кнопкой.
+PENDING_TTL_HOURS = max(24, min(24 * 14, _env_int('PENDING_TTL_HOURS', 96)))
 # Сколько раз автопостинг пробует отправить в канал один пост ветки и сколько
 # потом ждёт до следующей попытки (см. PendingPosts.mark_channel_failed).
 AUTOPOST_MAX_FAILS = 3
@@ -17690,6 +17695,65 @@ def _autopost_skip_reason(news: dict) -> str:
     return ''
 
 
+def _pending_count_text() -> str:
+    """«150 (годных для канала: 18)»: сколько ждёт в ветке и сколько из этого
+    автопостинг вообще может взять. Одна цифра пугала: в тревоге стояло «ждут
+    решения: 150», хотя большая часть — старые и отсеянные посты."""
+    if pending_posts is None:
+        return '0'
+    total = len(pending_posts._items)
+    if not total:
+        return '0'
+    try:
+        fit = sum(1 for _ in pending_posts._autopost_candidates(skip=_autopost_skip_reason))
+    except Exception:
+        return str(total)
+    return f'{total} (годных для канала: {fit})'
+
+
+# Сколько годных для канала постов в ветке считается «запасом». Пока запас
+# полон, в ветку идут только посты, которые вошли бы в эту лучшую пачку:
+# остальные канал всё равно не выпустит, а модель, перевод и загрузка медиа
+# тратились на них зря — около 60% постов ветки в канал не попадали (октябрь
+# 2026). 25 — примерно двое суток работы канала. 0 — без ограничения.
+THREAD_FULL_CANDIDATES = max(0, min(300, _env_int('THREAD_FULL_CANDIDATES', 25)))
+
+
+def _news_value_now(news: dict) -> float:
+    """Ценность новой новости по той же шкале, что и постов в ветке."""
+    fresh_ts = time.time()
+    published = news.get('published_parsed')
+    if published:
+        try:
+            fresh_ts = min(fresh_ts, datetime(*published[:6], tzinfo=timezone.utc).timestamp())
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return _autopost_value(news, fresh_ts)
+
+
+def _thread_admission(candidates: list[dict]) -> tuple[list[dict], int]:
+    """Кого пускать в ветку, когда запас годных постов полон.
+
+    Возвращает (пропущенные, сколько отложено). Срочные новости и обновления
+    уже вышедших сюжетов идут всегда. Отложенный кандидат ничего не теряет:
+    его не резервирует история публикаций, и следующий цикл оценит его снова.
+    """
+    if THREAD_FULL_CANDIDATES <= 0 or pending_posts is None or not candidates:
+        return candidates, 0
+    try:
+        values = pending_posts.autopost_values(skip=_autopost_skip_reason)
+    except Exception:
+        logger.exception('Ветка: не удалось оценить запас, пускаю всех')
+        return candidates, 0
+    if len(values) < THREAD_FULL_CANDIDATES:
+        return candidates, 0
+    bar = values[THREAD_FULL_CANDIDATES - 1]
+    admitted = [news for news in candidates
+                if news.get('_breaking_news') or news.get('_story_update_of')
+                or _news_value_now(news) > bar]
+    return admitted, len(candidates) - len(admitted)
+
+
 def _autopost_skip(news: dict) -> bool:
     """Пост ветки, который автопостинг пропускает: западное сверх лимита,
     тайтл, о котором канал уже писал, или медиа ждёт переподключения аккаунта."""
@@ -17824,11 +17888,28 @@ async def manual_channel_post_handler(update: Update, context: ContextTypes.DEFA
         logger.exception('Пост админа не запомнен для дедупа')
 
 
+# Сколько очков ценности пост теряет за час возраста при выборе в канал.
+# 0,5: анонс с трейлером и видео (на 8–10 очков ценнее рядовой новости) держит
+# первое место около 16–20 часов, потом уступает свежему.
+AUTOPOST_AGE_PENALTY_PER_HOUR = max(0.0, min(5.0, _env_float('AUTOPOST_AGE_PENALTY_PER_HOUR', 0.5)))
+
+
+def _autopost_value(news: dict, fresh_ts: float, now: Optional[float] = None) -> float:
+    """Ценность поста для канала сейчас: оценка при сборе минус возраст."""
+    try:
+        score = float(news.get('_priority_score') or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    if news.get('_breaking_news'):
+        score += 8.0
+    age_hours = max(0.0, ((now or time.time()) - float(fresh_ts or 0.0)) / 3600)
+    return score - AUTOPOST_AGE_PENALTY_PER_HOUR * age_hours
+
+
 class PendingPosts:
     """Посты, отправленные в ветку и ждущие решения админа (кнопки под постом).
     Хранится на диске: кнопки работают и после перезапуска бота."""
     MAX_ITEMS = 300
-    TTL_DAYS = 7
 
     def __init__(self, path: Path):
         self.path = path
@@ -17882,7 +17963,7 @@ class PendingPosts:
             return False
 
     def _cleanup(self) -> None:
-        cutoff = time.time() - self.TTL_DAYS * 86400
+        cutoff = time.time() - PENDING_TTL_HOURS * 3600
         def _ts(item: dict) -> float:
             try:
                 return float(item.get('ts', 0) or 0)
@@ -17891,8 +17972,21 @@ class PendingPosts:
         def protected(key, item):
             return (str(item.get('channel_state') or 'pending') in ('sending', 'uncertain')
                     or f'pending:{key}' in _publishing_now)
+        def kept_past_ttl(key, item):
+            # Срок не снимает только пост, который публикуется прямо сейчас.
+            # Пост с неизвестным результатом раньше жил вечно: защита от дубля
+            # держала его и через месяц. После срока его не возьмёт ни
+            # автопостинг (он старше свежести), ни очередь — держать незачем.
+            return (str(item.get('channel_state') or 'pending') == 'sending'
+                    or f'pending:{key}' in _publishing_now)
+        expired_uncertain = [k for k, v in self._items.items()
+                             if _ts(v) < cutoff and not kept_past_ttl(k, v)
+                             and str(v.get('channel_state') or '') == 'uncertain']
+        if expired_uncertain:
+            logger.info('Ветка: снято %d постов с неизвестным результатом старше %d ч',
+                        len(expired_uncertain), PENDING_TTL_HOURS)
         self._items = {k: v for k, v in self._items.items()
-                       if _ts(v) >= cutoff or protected(k, v)}
+                       if _ts(v) >= cutoff or kept_past_ttl(k, v)}
         if len(self._items) > self.MAX_ITEMS:
             overflow = len(self._items) - self.MAX_ITEMS
             candidates = [k for k, v in self._items.items() if not protected(k, v)]
@@ -18008,31 +18102,26 @@ class PendingPosts:
             logger.critical(f'Moderation channel_state uncertain не записан: {key}')
         return saved
 
-    def next_for_autopost(self, skip=None, reasons: Optional[dict] = None) -> Optional[tuple[str, dict]]:
-        """Самый свежий пост из ветки, ещё не ушедший в канал.
+    def _autopost_candidates(self, skip=None, reasons: Optional[dict] = None):
+        """Посты ветки, которые автопостинг может взять: (ключ, пост, ценность, свежесть, ts).
 
-        Раньше брался самый старый и без предела возраста: когда ветка получает
-        больше постов, чем канал успевает выпустить по интервалу, канал
-        публиковал новости недельной давности, а сегодняшние ждали. Теперь
-        посты старше настройки свежести (post_max_age_hours — по дате в
+        Посты старше настройки свежести (post_max_age_hours — по дате в
         источнике, если она известна, иначе по времени попадания в ветку)
-        пропускаются, а из остальных берётся самый свежий. Состояния sending
-        и uncertain пропускаются — такой пост уже кто-то публикует или его
-        результат неизвестен, и повторная отправка дала бы дубль в канале.
+        не годятся. Состояния sending и uncertain тоже: такой пост уже кто-то
+        публикует или его результат неизвестен, повтор дал бы дубль в канале.
         """
         try:
             max_age_hours = float(getattr(settings, 'post_max_age_hours', POST_MAX_AGE_HOURS)
                                   or POST_MAX_AGE_HOURS)
         except (TypeError, ValueError):
             max_age_hours = float(POST_MAX_AGE_HOURS)
-        cutoff = time.time() - max_age_hours * 3600
-        best_key: Optional[str] = None
-        best_rank: Optional[tuple[float, float]] = None
+        now = time.time()
+        cutoff = now - max_age_hours * 3600
 
         def count(reason: str) -> None:
             if reasons is not None:
                 reasons[reason] = reasons.get(reason, 0) + 1
-        for key, item in self._items.items():
+        for key, item in list(self._items.items()):
             if str(item.get('channel_state') or 'pending') != 'pending':
                 count('уже публикуется или результат неизвестен')
                 continue
@@ -18043,7 +18132,7 @@ class PendingPosts:
                     failed_at = float(item.get('channel_failed_at') or 0.0)
                 except (TypeError, ValueError):
                     failed_at = 0.0
-                if time.time() - failed_at < AUTOPOST_FAIL_COOLDOWN_SEC:
+                if now - failed_at < AUTOPOST_FAIL_COOLDOWN_SEC:
                     count('не ушёл три раза, ждёт')
                     continue
             try:
@@ -18062,12 +18151,32 @@ class PendingPosts:
                 if reason:
                     count(reason if isinstance(reason, str) else 'отсеян')
                     continue
-            rank = (fresh_ts, ts)
+            yield key, item, _autopost_value(item['news'], fresh_ts, now), fresh_ts, ts
+
+    def next_for_autopost(self, skip=None, reasons: Optional[dict] = None) -> Optional[tuple[str, dict]]:
+        """Самый ценный пост ветки с поправкой на свежесть, ещё не ушедший в канал.
+
+        Раньше брался самый старый и без предела возраста: канал публиковал
+        новости недельной давности, а сегодняшние ждали. Потом — самый свежий:
+        мелкая новость пятиминутной давности обгоняла важный анонс десятичасовой
+        (октябрь 2026). Теперь ценность — оценка при сборе (значимость, видео и
+        альбом, репутация источника) минус AUTOPOST_AGE_PENALTY_PER_HOUR за час
+        возраста. При равной ценности по-прежнему выигрывает свежий.
+        """
+        best_key: Optional[str] = None
+        best_rank: Optional[tuple[float, float, float]] = None
+        for key, _item, value, fresh_ts, ts in self._autopost_candidates(skip, reasons):
+            rank = (value, fresh_ts, ts)
             if best_rank is None or rank > best_rank:
                 best_key, best_rank = key, rank
         if best_key is None:
             return None
         return best_key, dict(self._items[best_key]['news'])
+
+    def autopost_values(self, skip=None) -> list[float]:
+        """Ценности годных для канала постов, по убыванию."""
+        return sorted((value for _k, _i, value, _f, _t in self._autopost_candidates(skip)),
+                      reverse=True)
 
     def uncertain_count(self) -> int:
         return sum(1 for item in self._items.values()
@@ -23208,6 +23317,15 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
             # растягивает цикл на минуты.
             thread_budget = (BACKPRESSURE_THREAD_MAX_PER_CYCLE
                              if feature_enabled('backpressure') else None)
+            # До пакетной подготовки: на отложенных не тратим ни модель, ни перевод.
+            fresh, thread_full_deferred = _thread_admission(fresh)
+            if thread_full_deferred:
+                backpressure_deferred += thread_full_deferred
+                backpressure_level = 'thread_full'
+                metrics.inc('anime_bot_backpressure_deferred_total', thread_full_deferred,
+                            {'level': 'thread_full'})
+                logger.info(f'Ветка: запас из {THREAD_FULL_CANDIDATES} годных постов полон, '
+                            f'отложено {thread_full_deferred} кандидатов слабее его')
             # Все эти кандидаты будут обработаны прямо сейчас, поэтому просить
             # у модели разбор по одному незачем: десять новостей — это десять
             # запросов, а бесплатные пулы столько не дают. Пачка делает ту же
@@ -23288,7 +23406,8 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                 # прошлых, и без этой строки «0» читалось как «в ветке пусто».
                 waiting = len(pending_posts._items) if pending_posts is not None else 0
                 if waiting:
-                    message += f"🗂 В ветке ждут решения: {waiting} (от прошлых проверок)\n"
+                    message += (f"🗂 В ветке ждут решения: {_pending_count_text()} "
+                                f"(от прошлых проверок)\n")
                 if backpressure_deferred:
                     message += (f"⏳ Отложено backpressure-ом: {backpressure_deferred} "
                                 f"({backpressure_level})\n")
@@ -28648,7 +28767,7 @@ async def _check_silence(bot: Bot) -> None:
             + '\n\n'
             f'Источников включено: {enabled}\n'
             f'В отложке: {len(scheduled_posts.all()) if scheduled_posts else 0}\n'
-            f'Ждут решения в ветке: {len(pending_posts._items) if pending_posts else 0}\n\n'
+            f'Ждут решения в ветке: {_pending_count_text()}\n\n'
             f'Обычно это значит: источники перестали отдавать новости, всё уходит '
             f'в дубли или отправка падает. Диагностика — /health и /logs.')
     except BaseException:
@@ -28931,7 +29050,7 @@ async def send_startup_report(app, brief: bool = False) -> None:
     lines.append('')
     lines.append('<b>Хранилища</b>')
     lines.append(f'  📅 Отложка: {len(scheduled_posts.all()) if scheduled_posts else 0}')
-    lines.append(f'  🗂 Ждут решения: {len(pending_posts._items) if pending_posts else 0}')
+    lines.append(f'  🗂 Ждут решения: {_pending_count_text()}')
     lines.append(f'  🔗 История ссылок: {len(sent_links._set) if sent_links else 0}')
     lines.append(f'  🧠 Помню тем за {SUBJECT_MEMORY_HOURS} ч: '
                  f'{len(recent_subjects) if recent_subjects else 0}')
@@ -29515,7 +29634,7 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
     sched_ripe = len(scheduled_posts.due()) if scheduled_posts is not None else 0
     lines.append(f'  📅 В отложке: {sched_total}'
                  + (f' (созрело: {sched_ripe})' if sched_ripe else ''))
-    lines.append(f'  🗂 Ждут решения в ветке: {len(pending_posts._items) if pending_posts else 0}')
+    lines.append(f'  🗂 Ждут решения в ветке: {_pending_count_text()}')
     if pending_posts is not None and len(pending_posts._items) >= pending_posts.MAX_ITEMS:
         lines.append('  ⚠️ Очередь ветки заполнена: новые кандидаты могут быть отклонены. Разберите старые посты.')
     lines.append(f'  🔗 История ссылок: {len(sent_links._set)}')

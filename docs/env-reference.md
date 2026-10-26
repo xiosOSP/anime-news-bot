@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 335 переменных. Почти все — точная настройка со значением
+Бот читает 338 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -354,6 +354,7 @@
 | `ADMIN_AUDIT_MAX_MB` | `4` | anime_news_bot.py |
 | `ADMIN_ID` | — | anime_news_bot.py |
 | `ALLOW_LEGACY_IDS` | — | anime_news_bot.py |
+| `AUTOPOST_AGE_PENALTY_PER_HOUR` | `0.5` | anime_news_bot.py |
 | `AUTO_CYCLE_RETRY_BASE_SEC` | `120` | anime_news_bot.py |
 | `AUTO_CYCLE_RETRY_MAX_SEC` | `900` | anime_news_bot.py |
 | `BACKUP_VERIFY_MAX_FILES` | `2000` | anime_news_bot.py |
@@ -407,6 +408,7 @@
 | `OPS_WRITE_FAILURES` | `3` | anime_news_bot.py |
 | `ORCAROUTER_API_KEY` | — | anime_news_bot.py |
 | `ORCAROUTER_MODEL` | — | anime_news_bot.py |
+| `PENDING_TTL_HOURS` | `96` | anime_news_bot.py |
 | `PORT` | `0` | anime_news_bot.py |
 | `POST_FORMAT_COMPACT_PERCENT` | `0.0` | anime_news_bot.py |
 | `POST_STYLE` | `rich` | anime_news_bot.py |
@@ -430,6 +432,7 @@
 | `TG_REWRITE_MAX_ATTEMPTS` | `48` | anime_news_bot.py |
 | `TG_REWRITE_REQUIRED` | `True` | anime_news_bot.py |
 | `TG_REWRITE_WAIT_SEC` | — | anime_news_bot.py |
+| `THREAD_FULL_CANDIDATES` | `25` | anime_news_bot.py |
 | `TOKENATOR_API_KEY` | — | anime_news_bot.py |
 | `TOKENATOR_MODEL` | — | anime_news_bot.py |
 | `TRANSLATION_DEFER_MAX_AGE_SEC` | `21600` | anime_news_bot.py |

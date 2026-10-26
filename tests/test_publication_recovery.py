@@ -17,7 +17,9 @@ def test_full_pending_queue_keeps_unresolved_or_active_publication(tmp_path, mon
     store = bot.PendingPosts(tmp_path / 'pending.json')
     monkeypatch.setattr(store, 'MAX_ITEMS', 1)
     key = store.add({'title': 'Old', 'link': 'https://example.com/old'})
-    store._items[key]['ts'] = 1
+    # Пост с неизвестным результатом защищён от переполнения, но не от срока
+    # хранения ветки: старше срока его не возьмёт уже ничто (октябрь 2026).
+    store._items[key]['ts'] = 1 if state != 'uncertain' else bot.time.time() - 3600
     if state == 'preparing':
         monkeypatch.setattr(bot, '_publishing_now', {f'pending:{key}'})
     else:
