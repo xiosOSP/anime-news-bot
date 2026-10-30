@@ -31,6 +31,7 @@ import copy
 import contextlib
 import time
 import difflib
+import unicodedata
 import faulthandler
 try:
     import fcntl  # POSIX: защищает DATA_DIR от одновременного запуска двух ботов
@@ -7517,15 +7518,23 @@ class WorkTitleResolver:
         self._about: dict[str, dict] = {}
         # Ключ записи → (ромадзи, русское имя): см. entry_names.
         self._by_key: dict[str, tuple[str, str]] = {}
+        # Ключ записи → латинские имена (ромадзи и английское): см. entry_aliases.
+        self._aliases_by_key: dict[str, list[str]] = {}
         self._lock = threading.RLock()
         self._last_request = 0.0
         self._dirty = False
         self._load()
 
-    @staticmethod
-    def _norm(value: str) -> str:
+    # Латиница с диакритикой: модель пишет ромадзи с макронами («Kizuguchi to
+    # hōtai»), Shikimori — без них («Houtai»). Раньше «ō» просто выпадала, и
+    # имя не сходилось ни с одной записью (октябрь 2026).
+    _LATIN_FOLD = str.maketrans('āáàâäãåēéèêëīíìîïōóòôöõūúùûüçñý',
+                                'aaaaaaaeeeeeiiiiioooooouuuuucny')
+
+    @classmethod
+    def _norm(cls, value: str) -> str:
         return re.sub(r'[^0-9a-zа-я\u3040-\u30ff\u4e00-\u9fff]+', '',
-                      str(value or '').casefold().replace('ё', 'е'))
+                      str(value or '').casefold().replace('ё', 'е').translate(cls._LATIN_FOLD))
 
     def _load(self) -> None:
         try:
@@ -7546,6 +7555,21 @@ class WorkTitleResolver:
         key = str(row.get('key') or '')
         if key and (row.get('name') or row.get('russian')):
             self._by_key[key] = (str(row.get('name') or ''), str(row.get('russian') or ''))
+        if key:
+            aliases = self._aliases_by_key.setdefault(key, [])
+            for alias in (row.get('name'), row.get('english')):
+                alias = str(alias or '').strip()
+                if alias and alias.casefold() not in (a.casefold() for a in aliases):
+                    aliases.append(alias)
+
+    def entry_aliases(self, key: str) -> list[str]:
+        """Латинские имена записи — ромадзи и английское — только из кеша.
+
+        Источник пишет «Frieren», модель — «Sousou no Frieren»: подстановка
+        русского названия должна узнать оба написания одного тайтла.
+        """
+        with self._lock:
+            return list(self._aliases_by_key.get(str(key or ''), ()))
 
     def entry_names(self, key: str) -> tuple[str, str]:
         """Ромадзи и русское имя записи Shikimori по её ключу — только из кеша.
@@ -7690,7 +7714,8 @@ class WorkTitleResolver:
         self._last_request = time.monotonic()
         try:
             response = requests.post(
-                self.url, json={'query': self.QUERY, 'variables': {'s': name}},
+                self.url, json={'query': self.QUERY,
+                                'variables': {'s': str(name).translate(self._LATIN_FOLD)}},
                 headers={'User-Agent': 'anime-news-bot (Telegram)',
                          'Content-Type': 'application/json'},
                 timeout=min(HTTP_TIMEOUT, 8), allow_redirects=False)
@@ -7707,6 +7732,7 @@ class WorkTitleResolver:
         with self._lock:
             row = {
                 'key': key, 'name': str((found or {}).get('name') or '')[:120],
+                'english': str((found or {}).get('english') or '')[:160],
                 'russian': re.sub(r'\s+', ' ', str((found or {}).get('russian') or '')).strip()[:160],
                 'rule': WORK_MATCH_RULE,
                 'at': datetime.now(timezone.utc).isoformat()}
@@ -7950,6 +7976,67 @@ def _annotate_work_keys(items: list[dict], *, budget: int = WORK_LOOKUP_PER_CYCL
             item['_work_titles_ru'] = pairs
     work_titles.flush()
     return marked
+
+
+# Сколько новых запросов к Shikimori можно сделать на одну новость после
+# ответа модели. Остальное — из кеша.
+LLM_TITLE_LOOKUPS = 3
+
+
+def _llm_named_works(news: dict) -> list[str]:
+    """Латинские имена тайтлов, которые назвала сама модель: subject и имена
+    в кавычках или после «аниме»/«манги» в первых строках пересказа.
+
+    Опознание при сборе берёт имя из заголовка источника и промахивается на
+    английских заголовках: «Sony Developing Live-Action Kaiju No. 8 Film»
+    давало «Sony Developing», «BLUE BOX Poster Exhibition» — само себя. Модель
+    название уже выделила; осталось спросить Shikimori.
+    """
+    names = [str(news.get('_llm_subject') or '')]
+    for line in str(news.get('_llm_text') or '').split('\n')[:3]:
+        names += story_explicit_work_names(line)
+    out: list[str] = []
+    for name in names:
+        name = _clean_work_name(name)
+        if (re.search(r'[A-Za-z]', name) and not re.search(r'[А-Яа-яЁё]', name)
+                and len(re.findall(r'\w', name)) >= 3
+                and name.casefold() not in (x.casefold() for x in out)):
+            out.append(name)
+    return out[:5]
+
+
+def _annotate_llm_titles(news: dict, budget: int = LLM_TITLE_LOOKUPS) -> None:
+    """Русские названия тайтлов, названных моделью, — в пары подстановки.
+
+    В сеть ходим только по аниме и манге: Shikimori знает аниме, и запрос о
+    «Мстителях» или GTA был бы пустой тратой. Из кеша — по любой теме.
+    """
+    if (work_titles is None or not _russian_titles_on()
+            or not feature_enabled('work_identity')):
+        return
+    network = str(news.get('_llm_topic') or '') in ('аниме', 'манга')
+    pairs = dict(news.get('_work_titles_ru') or {})
+    failures = 0
+    for name in _llm_named_works(news):
+        if name in pairs:
+            continue
+        key = work_titles.cached(name)
+        if key is None and network and budget > 0 and failures < 2:
+            budget -= 1
+            key = work_titles.lookup(name)
+            if key is None:
+                failures += 1
+        russian = work_titles.russian(name) if key else ''
+        if not russian or russian.casefold() == name.casefold():
+            continue
+        pairs[name] = russian
+        # Запасной ключ «name:…» (имя из кавычек источника) уступает записи
+        # Shikimori: «Раны и бинты» русского канала и есть «Wound & Bandage».
+        if not str(news.get('_work_key') or '').startswith('shiki:'):
+            news['_work_key'], news['_work_name'], news['_work_russian'] = key, name, russian
+    if pairs:
+        news['_work_titles_ru'] = pairs
+    work_titles.flush()
 
 
 def _cheap_noise(item: dict) -> bool:
@@ -13611,7 +13698,54 @@ def _work_title_pairs(news: dict) -> dict:
     original, russian = str(news.get('_work_name') or ''), str(news.get('_work_russian') or '')
     if original and russian and original.casefold() != russian.casefold():
         pairs.setdefault(original, russian)
+    # Другие латинские имена того же тайтла: источник пишет «Frieren», модель —
+    # «Sousou no Frieren», и второе оставалось в посте ромадзи (октябрь 2026).
+    key = str(news.get('_work_key') or '')
+    if russian and key.startswith('shiki:') and work_titles is not None:
+        for alias in work_titles.entry_aliases(key):
+            if alias.casefold() != russian.casefold() and len(re.findall(r'\w', alias)) >= 4:
+                pairs.setdefault(alias, russian)
     return pairs
+
+
+# Русское имя в кавычках после «аниме», «манги», «ранобэ»: русские каналы
+# переводят название каждый по-своему — «Раны и бинты», «Рана и бинт»,
+# «WOUND & BANDAGE» об одном тайтле за неделю (октябрь 2026).
+_RU_WORK_AFTER_ANCHOR_RE = re.compile(
+    r'(\b(?:аниме|манг[аиуеой]|ранобэ)(?:\s+по\s+(?:манге|ранобэ|новелле|комиксу))?\s+)'
+    r'«([^«»\n]{2,120})»', re.IGNORECASE)
+
+
+def _official_russian_name(text: str, news: dict) -> str:
+    """Чужой русский перевод опознанного тайтла → официальное название.
+
+    Только когда новость про один тайтл и сама модель назвала его предметом
+    новости (subject сводится к той же записи Shikimori): «режиссёр «X»
+    снимет аниме «Y»» не должно превратить Y в X.
+    """
+    official = str(news.get('_work_russian') or '').strip()
+    key = str(news.get('_work_key') or '')
+    subject = str(news.get('_llm_subject') or '').strip()
+    if not official or not key.startswith('shiki:') or not subject or work_titles is None:
+        return text
+    if {v for v in _work_title_pairs(news).values()} - {official}:
+        return text                 # в новости несколько тайтлов
+    if work_titles.cached(subject) != key:
+        return text
+    found = _RU_WORK_AFTER_ANCHOR_RE.findall(text)
+    if len({name.casefold() for _anchor, name in found}) != 1:
+        return text
+
+    def fix(match: re.Match) -> str:
+        name = match.group(2)
+        if (not re.search(r'[А-Яа-яЁё]', name) or name.casefold() == official.casefold()
+                or WorkTitleResolver._stem_key(name) == WorkTitleResolver._stem_key(official)):
+            return match.group(0)
+        other_key, _ = work_titles.cached_by_stem(name)
+        if other_key and other_key != key:
+            return match.group(0)
+        return f'{match.group(1)}«{official}»'
+    return _RU_WORK_AFTER_ANCHOR_RE.sub(fix, text)
 
 
 def _russify_titles(text: str, news: Optional[dict]) -> str:
@@ -13633,7 +13767,10 @@ def _russify_titles(text: str, news: Optional[dict]) -> str:
                   r'[^()（）\n\u0400-\u04ff]*[)）]', '', text)
     for original, russian in sorted(_work_title_pairs(news).items(), key=lambda kv: -len(kv[0])):
         cjk = bool(_CJK_LETTERS_RE.search(original))
-        body = re.escape(original) if cjk else r'(?<![\w])' + re.escape(original) + r'(?![\w])'
+        # Апостроф после имени — не закрывающая кавычка: «Frieren: Beyond
+        # Journey» внутри «Journey's End» давало «…» (Frieren: Beyond Journey)s End».
+        body = (re.escape(original) if cjk else
+                r'(?<![\w])' + re.escape(original) + r"(?![\w])(?!['’]\w)")
         # Кавычки — вместе с названием, но не пробелы вокруг: без кавычек
         # «сезон Grand Blue выйдет» не должно склеиться в «сезон«…»выйдет».
         pattern = re.compile(r'(?:[«"“\'『「]\s*)?' + body + r'(?:\s*[»"”\'』」])?',
@@ -13652,7 +13789,7 @@ def _russify_titles(text: str, news: Optional[dict]) -> str:
                 return f'«{russian}» ({original})'
             return f'«{russian}»'
         text = pattern.sub(replace, text)
-    return text
+    return _official_russian_name(text, news)
 
 
 _TITLE_TAG_RE = re.compile(r'\s*(?:\[[^\]\n]{1,25}\]|【[^】\n]{1,25}】)')
@@ -14011,6 +14148,23 @@ def _post_emoji(title: str, news: Optional[dict] = None) -> str:
     return _POST_TOPIC_EMOJI.get(str(news.get('_llm_topic') or ''), '✨')
 
 
+def _clean_head(first: str) -> str:
+    """Заголовок без невидимых символов в начале и с заглавной буквы.
+
+    В канал дважды ушли заголовки «🔥  постер ко 2 сезону…» и «🔥  официальный
+    арт…» (октябрь 2026): первое слово пропало, а перед вторым остался
+    невидимый символ, который strip() не снимает. Невидимое убираем, строчную
+    кириллицу в начале делаем заглавной — так заголовок хотя бы читается.
+    """
+    i = 0
+    while i < len(first) and (first[i].isspace() or unicodedata.category(first[i]) in ('Cf', 'Mn')):
+        i += 1
+    first = first[i:]
+    if first[:1] and ('а' <= first[0] <= 'я' or first[0] == 'ё'):
+        first = first[0].upper() + first[1:]
+    return first
+
+
 def _post_html(text: str, limit: int, news: Optional[dict] = None) -> str:
     """Готовый текст поста в разметке Telegram: эмодзи, жирный заголовок, абзац.
 
@@ -14024,7 +14178,7 @@ def _post_html(text: str, limit: int, news: Optional[dict] = None) -> str:
     prefix = f'{emoji} ' if emoji else ''
     plain = fit_to_limit(str(text).strip(), max(1, limit - len(prefix) - 2))
     first, _sep, rest = plain.partition('\n')
-    out = prefix + f'<b>{html.escape(first.strip())}</b>'
+    out = prefix + f'<b>{html.escape(_clean_head(first.strip()))}</b>'
     rest = rest.strip('\n')
     if rest:
         # Строка «о чём» — цитатой, как оформляет завязку владелец канала.
@@ -26652,6 +26806,10 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
                 (news.get('title') or '') + '\n' + (news.get('summary') or '')[:600])
             body = _append_release_date(body, date_str)
             news['_llm_text'] = body
+            try:
+                await asyncio.to_thread(_annotate_llm_titles, news)
+            except Exception:
+                logger.exception('Русские названия по ответу модели не подобраны')
             about = _checked_about(str(data.get('about') or ''), source_fact_text, body)
             if about:
                 news['_about'] = about
