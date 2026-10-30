@@ -132,8 +132,8 @@ def test_rate_frame_preprocessing_and_probabilities():
 def test_rate_frames_counts_frames_where_both_models_agree(monkeypatch):
     big = Session([[.005, .9, .095], [.011, .9, .089], [.009, .5, .491]])
     small = Session([[.25, .7, .05], [.1, .9, 0], [.26, .7, .04]])
-    sessions = iter([big, small])
-    monkeypatch.setattr(media, '_rating_session', lambda path: next(sessions))
+    by_path = dict(zip(PATHS, (big, small)))
+    monkeypatch.setattr(media, '_rating_session', lambda path: by_path[path])
     rating, small_rating, rated, hits, review_hits = media.rate_frames(
         [Image.new('RGB', (8, 8))] * 10, PATHS)
     assert rated == 3 and hits == 1  # .995/.75 да; .989 мало; .991/.74 мало
@@ -315,3 +315,25 @@ def test_one_confident_model_asks_a_human_but_never_punishes(monkeypatch):
     # Меньше половины кадров — не повод.
     scan, _ = opinion(monkeypatch, media.Scan('checked', frames=16), False, review=1)
     assert scan.status == 'checked'
+
+
+def test_big_model_is_not_loaded_when_the_small_one_is_calm(monkeypatch):
+    """Малая ниже порога на всех кадрах: ни санкции, ни ручной оценки быть не
+    может, и большую модель (≈150 МБ) не грузим — пик воркера втрое меньше."""
+    small = Session([[.9, .05, .05], [.8, .1, .1], [.7, .2, .1]])     # «не safe» ≤ .3
+    loaded = []
+
+    def session(path):
+        loaded.append(path)
+        return small
+    monkeypatch.setattr(media, '_rating_session', session)
+    rating, small_rating, rated, hits, review_hits = media.rate_frames(
+        [Image.new('RGB', (8, 8))] * 10, PATHS)
+    assert loaded == [PATHS[1]]
+    assert (rating, rated, hits, review_hits) == (0.0, 3, 0, 0)
+    assert small_rating == pytest.approx(.3)
+
+
+def test_lazy_threshold_is_below_every_rule():
+    assert media.LAZY_BIG_BELOW <= min(media.RATING_SMALL_MIN, media.REVIEW_SMALL_MIN,
+                                       media.REVIEW_BIG_WITH_SMALL)
