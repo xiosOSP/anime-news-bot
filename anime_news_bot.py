@@ -10275,7 +10275,7 @@ def _video_frame_bytes(url: str) -> Optional[bytes]:
             out = Path(tmp) / f'frame-{seek}.jpg'
             try:
                 subprocess.run([ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-f', 'mp4',
-                                '-ss', str(seek), '-i', str(src), '-frames:v', '1', '-q:v', '2',
+                                '-ss', str(seek), '-threads', '1', '-i', str(src), '-frames:v', '1', '-q:v', '2',
                                 str(out)], capture_output=True, timeout=20, check=False)
             except (OSError, subprocess.SubprocessError):
                 continue
@@ -11015,8 +11015,10 @@ def _normalize_video_file(path: Path, info: Optional[dict] = None) -> Path:
         return path
     out = path.with_name(path.stem + '.telegram.mp4')
     vf = f'scale=min({VIDEO_NORMALIZE_MAX_WIDTH}\\,iw):-2'
+    # Два потока x264: кадры те же, а пик ffmpeg на 1080p 224 → 169 МБ —
+    # контейнер с лимитом в 1 ГБ делит память с ботом и проверкой медиа.
     cmd = [ffmpeg, '-y', '-i', str(path), '-map', '0:v:0', '-map', '0:a:0?',
-           '-vf', vf, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', str(VIDEO_NORMALIZE_CRF),
+           '-vf', vf, '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', str(VIDEO_NORMALIZE_CRF),
            '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', str(out)]
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=180, check=False)
@@ -11071,7 +11073,8 @@ def _generate_video_thumbnail(path: Optional[Path]) -> Optional[bytes]:
     try:
         data = None
         for seek in seeks:
-            cmd = [ffmpeg, '-y', '-ss', f'{max(0.0, seek):.2f}', '-i', str(path), '-frames:v', '1',
+            # Один поток декодера: ради одного кадра пик ffmpeg 74 → 32 МБ на 1080p.
+            cmd = [ffmpeg, '-y', '-ss', f'{max(0.0, seek):.2f}', '-threads', '1', '-i', str(path), '-frames:v', '1',
                    '-vf', 'scale=320:320:force_original_aspect_ratio=decrease', '-q:v', '4', str(tmp)]
             proc = subprocess.run(cmd, capture_output=True, timeout=20, check=False)
             frame = tmp.read_bytes() if proc.returncode == 0 and tmp.exists() else None
@@ -14317,7 +14320,7 @@ def _shrink_video_to_limit(path: Optional[Path]) -> Optional[Path]:
     out = path.with_name(path.stem + '.small.mp4')
     cmd = [ffmpeg, '-y', '-i', str(path), '-map', '0:v:0', '-map', '0:a:0?',
            '-vf', f'scale=min({VIDEO_NORMALIZE_MAX_WIDTH}\\,iw):-2',
-           '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', f'{video_kbps}k',
+           '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-b:v', f'{video_kbps}k',
            '-maxrate', f'{video_kbps}k', '-bufsize', f'{video_kbps * 2}k',
            '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', str(out)]
     try:
