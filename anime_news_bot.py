@@ -18161,14 +18161,20 @@ class PendingPosts:
                 victims = sorted(candidates, key=lambda k: _ts(self._items[k]))[:overflow]
             for k in victims: del self._items[k]
 
-    def add(self, news: dict) -> str:
-        """Сохраняет пост, возвращает короткий ключ для callback-кнопок."""
+    def add(self, news: dict, *, staging: bool = False) -> str:
+        """Сохраняет пост, возвращает короткий ключ для callback-кнопок.
+
+        staging — пост ещё отправляется в ветку; в pending его переводит
+        mark_channel_pending после ответа Telegram. После рестарта staging
+        читается как pending (см. _load).
+        """
         old_items = dict(self._items)
         old_counter = self._counter
         self._counter += 1
         key = str(self._counter)
         clean = {k: v for k, v in news.items() if k != 'published_parsed'}
-        self._items[key] = {'news': clean, 'ts': time.time(), 'channel_state': 'pending'}
+        self._items[key] = {'news': clean, 'ts': time.time(),
+                            'channel_state': 'staging' if staging else 'pending'}
         # Дату публикации в источнике помним отдельно: published_parsed в JSON
         # не хранится, а по ней автопостинг отличает вчерашнюю новость от старой.
         published = news.get('published_parsed')
@@ -18276,7 +18282,11 @@ class PendingPosts:
             if reasons is not None:
                 reasons[reason] = reasons.get(reason, 0) + 1
         for key, item in list(self._items.items()):
-            if str(item.get('channel_state') or 'pending') != 'pending':
+            state = str(item.get('channel_state') or 'pending')
+            if state == 'staging':
+                count('ещё отправляется в ветку')
+                continue
+            if state != 'pending':
                 count('уже публикуется или результат неизвестен')
                 continue
             if not isinstance(item.get('news'), dict):
@@ -18614,6 +18624,13 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
         crop_plan = news.get('_media_crop_plan')
         photos = (await _resolve_photos_for_album(photos, crop_plan) if crop_plan
                   else await _resolve_photos_for_album(photos))
+        # Загрузка выбрасывает недоступные кадры, tgacc-ссылки и повторы. Без
+        # пересчёта уходил альбом из нуля или одного элемента: BadRequest, а
+        # при require_image — «failed» и повтор каждый цикл.
+        media_count = len(photos) + (1 if has_inline_video else 0)
+        if settings.require_image and media_count == 0:
+            logger.info(f"⊘ Пропускаю пост без медиа (require_image): {news['title'][:60]}")
+            return False
 
     # Caption для медиа. Telegram-лимит подписи — 1024 символа.
     caption = _post_html(text, TG_CAPTION_LIMIT, news)
@@ -18624,7 +18641,9 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     pending_key = None
     if pending_posts is not None:
         try:
-            pending_key = pending_posts.add(news)
+            # «staging» до ответа Telegram: автопостинг не возьмёт в канал пост,
+            # которого модераторы ещё не видят и который может не дойти до ветки.
+            pending_key = pending_posts.add(news, staging=True)
         except OverflowError:
             metrics.inc('anime_bot_moderation_value_rejected_total')
             logger.info(f"⊘ Модерационная очередь сохранила более сильные кандидаты: {news.get('title','')[:60]}")
@@ -18941,6 +18960,8 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
                 pending_posts.pop(pending_key)
             await stats.record_failed_send(source)
             return 'failed'
+        if pending_key and pending_posts is not None:
+            pending_posts.mark_channel_pending(pending_key)    # в ветке — теперь кандидат канала
 
         await sent_links.commit(link, title)
         committed = True
@@ -18953,6 +18974,9 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
         return 'sent'
     except DeliveryUncertain as e:
         logger.warning(f'Результат отправки в ветку неизвестен: {title[:60]} ({e})')
+        staged = news.pop('_pending_key', None)
+        if staged and pending_posts is not None:
+            pending_posts.mark_channel_pending(staged)     # как раньше: пост, скорее всего, в ветке
         if not committed:
             await sent_links.mark_uncertain(link)
             _commit_image_fingerprint(news)
@@ -22411,33 +22435,42 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
                 'результат. Отложить его нельзя: вышел бы дубль. Проверь канал; '
                 'если поста там нет — опубликуй кнопкой 📢.')
             raise ApplicationHandlerStop
-        user = update.effective_user
-        by = {'id': user.id,
-              'name': (user.full_name or user.username or str(user.id))} if user else None
-        try:
-            scheduled_posts.add(news, when, by=by)
-        except OverflowError:
+        # Место «публикуется» держим от записи в отложку до снятия поста из
+        # ветки: между ними идут правки сообщений в Telegram, и тик автопостинга
+        # успевал отправить ещё не снятый пост в канал — потом его выпускала и
+        # отложка (внешний разбор, октябрь 2026).
+        with _PublishGuard(f'pending:{key}') as sched_guard:
+            if not sched_guard.acquired:
+                context.user_data.pop('await_input', None)
+                await update.message.reply_text('Пост уже публикуется; отложить его сейчас нельзя.')
+                raise ApplicationHandlerStop
+            user = update.effective_user
+            by = {'id': user.id,
+                  'name': (user.full_name or user.username or str(user.id))} if user else None
+            try:
+                scheduled_posts.add(news, when, by=by)
+            except OverflowError:
+                context.user_data.pop('await_input', None)
+                await update.message.reply_text(
+                    f'⚠️ Отложка заполнена ({ScheduledPosts.MAX_ITEMS} постов). '
+                    'Сними или опубликуй часть записей через /scheduled; этот пост остаётся в модерации.')
+                raise ApplicationHandlerStop
+            except OSError as e:
+                context.user_data.pop('await_input', None)
+                logger.error(f'Не удалось сохранить отложенный пост: {e}')
+                await update.message.reply_text(
+                    '❌ Не удалось записать отложку на диск. Пост остаётся в модерации; '
+                    'проверь storage/volume и /health.')
+                raise ApplicationHandlerStop
+            if moderation_feedback is not None:
+                await asyncio.to_thread(moderation_feedback.record, 'scheduled', news, update.effective_user)
             context.user_data.pop('await_input', None)
-            await update.message.reply_text(
-                f'⚠️ Отложка заполнена ({ScheduledPosts.MAX_ITEMS} постов). '
-                'Сними или опубликуй часть записей через /scheduled; этот пост остаётся в модерации.')
-            raise ApplicationHandlerStop
-        except OSError as e:
-            context.user_data.pop('await_input', None)
-            logger.error(f'Не удалось сохранить отложенный пост: {e}')
-            await update.message.reply_text(
-                '❌ Не удалось записать отложку на диск. Пост остаётся в модерации; '
-                'проверь storage/volume и /health.')
-            raise ApplicationHandlerStop
-        if moderation_feedback is not None:
-            await asyncio.to_thread(moderation_feedback.record, 'scheduled', news, update.effective_user)
-        context.user_data.pop('await_input', None)
-        # Пометку ставим ДО pop: после удаления записи превью уже не найти
-        await _update_moderation_done(context.bot, key,
-                                      f'\n\n📅 В отложке на {_fmt_local(when)}')
-        pending_cleanup_ok = pending_posts.pop(key) is not None
-        if not pending_cleanup_ok:
-            logger.error('Модерация: пост %s добавлен в отложку, но pending cleanup не записался', key)
+            # Пометку ставим ДО pop: после удаления записи превью уже не найти
+            await _update_moderation_done(context.bot, key,
+                                          f'\n\n📅 В отложке на {_fmt_local(when)}')
+            pending_cleanup_ok = pending_posts.pop(key) is not None
+            if not pending_cleanup_ok:
+                logger.error('Модерация: пост %s добавлен в отложку, но pending cleanup не записался', key)
         logger.info(f"📅 Отложен пост «{news.get('title', '')[:60]}» на {_fmt_local(when)} "
                     f"(отложил: {(by or {}).get('name', '?')})")
         if user and user.id not in _all_admin_ids():
@@ -22462,6 +22495,9 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
             context.user_data.pop('await_input', None)
             await update.message.reply_text('Пост уже публикуется; изменить его сейчас нельзя.')
             raise ApplicationHandlerStop
+        # Копия: get() отдаёт сам сохранённый словарь, и при сбое записи откат
+        # в update_news возвращал бы уже изменённый текст.
+        news = dict(news)
         news['_edited_text'] = text
         if not pending_posts.update_news(key, news):
             context.user_data.pop('await_input', None)
@@ -23743,9 +23779,10 @@ async def _publish_one_from_queue_locked(bot_api) -> tuple[Optional[str], Option
             break
         await post_queue.ack_done(next_post)
         logger.info(f"Пост из очереди пропущен ({sent_result}): {next_post.get('title', '')[:60]}")
-    if sent_result == 'sent':
+    if sent_result in ('sent', 'uncertain'):
         # Отметку ставит сама отправка, а не только публикатор: иначе пост из
         # цикла сбора не сдвигал срок, и публикатор выкладывал следующий сразу.
+        # Неоднозначная доставка — тоже: пост, скорее всего, вышел.
         _mark_published_now()
     return sent_result, post_attempted
 
@@ -23804,6 +23841,13 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
             ok = await _prepare_and_send_channel_post(delivery, news)
         except DeliveryUncertain as e:
             pending_posts.mark_channel_uncertain(key)
+            # Пост, скорее всего, вышел (таймаут на загрузке ролика — частый
+            # случай). Без отметки следующий тик через минуту решал, что срок
+            # наступил, и в канале выходили два поста подряд.
+            _mark_published_now()
+            if feature_enabled('story_registry') and story_registry is not None:
+                await asyncio.to_thread(story_registry.mark_delivery, news,
+                                        published=True, uncertain=True)
             logger.warning('Автопостинг в канал: неоднозначная доставка (%s)', e)
             metrics.inc('anime_bot_publish_attempts_total',
                         labels={'mode': 'autopost', 'result': 'uncertain'})
@@ -23813,6 +23857,15 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
                 pending_posts.mark_channel_uncertain(key)
             raise
         except Exception:
+            if delivery.started:
+                # Сбой после первого обращения к Telegram (например, досылка
+                # фото): часть поста уже в канале, повтор дал бы дубль.
+                pending_posts.mark_channel_uncertain(key)
+                _mark_published_now()
+                logger.exception('Автопостинг в канал упал после начала отправки')
+                metrics.inc('anime_bot_publish_attempts_total',
+                            labels={'mode': 'autopost', 'result': 'uncertain'})
+                return 'uncertain'
             pending_posts.mark_channel_failed(key)
             logger.exception('Автопостинг в канал упал')
             metrics.inc('anime_bot_publish_attempts_total',
