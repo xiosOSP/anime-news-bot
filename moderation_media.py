@@ -289,6 +289,8 @@ REVIEW_SMALL_MIN = .80      # малая уверена, большая хотя
 REVIEW_SMALL_WITH_BIG = .30
 REVIEW_BIG_MIN = .99        # большая уверена, малая хотя бы сомневается
 REVIEW_BIG_WITH_SMALL = .40
+# Ниже этого у малой модели ни один порог выше не сработает (см. rate_frames).
+LAZY_BIG_BELOW = min(RATING_SMALL_MIN, REVIEW_SMALL_MIN, REVIEW_BIG_WITH_SMALL)
 COVERED_CLOSEUP_SCORE = .70
 COVERED_CLOSEUP_SHARE = .20
 
@@ -390,12 +392,23 @@ def rate_frames(frames, paths):
     if not frames or not paths:
         return 0.0, 0.0, 0, 0, 0
     picked = [frames[index] for index in sample_indices(len(frames), RATING_FRAMES)]
-    big, small = (_rating_session(path) for path in paths)
-    best = best_small = 0.0
+    big_path, small_path = paths
+    # Сначала малая модель. Если она ни на одном кадре не дотянула до
+    # LAZY_BIG_BELOW, ни санкции, ни ручной оценки не будет при любом ответе
+    # большой — и большую (≈150 МБ, пик воркера 594 МБ на ролике 1080p против
+    # ~220 МБ без неё) не грузим вовсе. Решения те же; в отчёт идёт rating 0.
+    small = _rating_session(small_path)
+    small_values = [rate_frame(small, frame) for frame in picked]
+    del small
+    best_small = max(small_values, default=0.0)
+    if best_small < LAZY_BIG_BELOW:
+        return 0.0, best_small, len(picked), 0, 0
+    big = _rating_session(big_path)
+    best = 0.0
     hits = review_hits = 0
-    for frame in picked:
-        value, value_small = rate_frame(big, frame), rate_frame(small, frame)
-        best, best_small = max(best, value), max(best_small, value_small)
+    for frame, value_small in zip(picked, small_values):
+        value = rate_frame(big, frame)
+        best = max(best, value)
         hits += int(value >= RATING_MIN and value_small >= RATING_SMALL_MIN)
         review_hits += int(review_hit(value, value_small))
     return best, best_small, len(picked), hits, review_hits
@@ -787,7 +800,10 @@ def clamp_worker_memory(memory_mb):
 def _invoke_worker(path, kind, timeout, explicit_threshold, suggestive_threshold,
                    memory_mb=WORKER_MEMORY_MB_DEFAULT, rating_paths=()):
     env = dict(os.environ, OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1',
-               MKL_NUM_THREADS='1', OPENCV_FFMPEG_CAPTURE_OPTIONS='protocol_whitelist;file',
+               # threads;1 — декодер видео в одном потоке: на ролике 1080p пик
+               # воркера падает с 594 до 412 МБ, кадры те же.
+               MKL_NUM_THREADS='1',
+               OPENCV_FFMPEG_CAPTURE_OPTIONS='protocol_whitelist;file|threads;1',
                # glibc заводит под каждый поток свою арену — до 8 на ядро, по 64 МБ
                # адресного пространства каждая. На четырёх ядрах это 2 ГБ, которые
                # никто не использует, но лимит адресного пространства съедают

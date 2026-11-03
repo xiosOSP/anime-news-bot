@@ -31,6 +31,7 @@ import copy
 import contextlib
 import time
 import difflib
+import unicodedata
 import faulthandler
 try:
     import fcntl  # POSIX: защищает DATA_DIR от одновременного запуска двух ботов
@@ -765,7 +766,7 @@ GOLDEN_DATASET_FILE = Path(__file__).with_name('golden') / 'editorial_cases.json
 STORY_UPDATE_LOOKBACK_DAYS = max(1, min(90, _env_int('STORY_UPDATE_LOOKBACK_DAYS', 21)))
 STORY_UPDATE_SIMILARITY = max(0.60, min(0.95, _env_float('STORY_UPDATE_SIMILARITY', 0.76)))
 REPLAY_BUFFER_MAX = max(20, min(2000, _env_int('REPLAY_BUFFER_MAX', 300)))
-DEFAULT_LLM_PROMPT_VERSION = 'editorial-v12-2026-10-12'
+DEFAULT_LLM_PROMPT_VERSION = 'editorial-v13-2026-11-03'
 LLM_PROMPT_VERSION = (_env('LLM_PROMPT_VERSION', DEFAULT_LLM_PROMPT_VERSION).strip()
                       or DEFAULT_LLM_PROMPT_VERSION)
 LLM_JUDGE_MAX_TOKENS = max(80, min(500, _env_int('LLM_JUDGE_MAX_TOKENS', 180)))
@@ -6003,13 +6004,14 @@ class BotStats:
                 self._dirty = False
 
     async def record_source_error(self, source: str) -> None:
-        """Источник упал при сборе."""
+        """Источник упал при сборе. Запись — одна за цикл (flush): при дюжине
+        упавших источников это была дюжина записей файла подряд."""
         async with self._lock:
             self._data['totals']['source_errors'] += 1
             entry = self._ensure_source_unlocked(source)
             entry['errors'] += 1
             self._add_event_unlocked('source_error', source)
-            await asyncio.to_thread(self._save)
+            await self._save_or_mark(False)
 
     async def record_published(self, source: str) -> None:
         """Пост опубликован в канал."""
@@ -7517,15 +7519,23 @@ class WorkTitleResolver:
         self._about: dict[str, dict] = {}
         # Ключ записи → (ромадзи, русское имя): см. entry_names.
         self._by_key: dict[str, tuple[str, str]] = {}
+        # Ключ записи → латинские имена (ромадзи и английское): см. entry_aliases.
+        self._aliases_by_key: dict[str, list[str]] = {}
         self._lock = threading.RLock()
         self._last_request = 0.0
         self._dirty = False
         self._load()
 
-    @staticmethod
-    def _norm(value: str) -> str:
+    # Латиница с диакритикой: модель пишет ромадзи с макронами («Kizuguchi to
+    # hōtai»), Shikimori — без них («Houtai»). Раньше «ō» просто выпадала, и
+    # имя не сходилось ни с одной записью (октябрь 2026).
+    _LATIN_FOLD = str.maketrans('āáàâäãåēéèêëīíìîïōóòôöõūúùûüçñý',
+                                'aaaaaaaeeeeeiiiiioooooouuuuucny')
+
+    @classmethod
+    def _norm(cls, value: str) -> str:
         return re.sub(r'[^0-9a-zа-я\u3040-\u30ff\u4e00-\u9fff]+', '',
-                      str(value or '').casefold().replace('ё', 'е'))
+                      str(value or '').casefold().replace('ё', 'е').translate(cls._LATIN_FOLD))
 
     def _load(self) -> None:
         try:
@@ -7546,6 +7556,21 @@ class WorkTitleResolver:
         key = str(row.get('key') or '')
         if key and (row.get('name') or row.get('russian')):
             self._by_key[key] = (str(row.get('name') or ''), str(row.get('russian') or ''))
+        if key:
+            aliases = self._aliases_by_key.setdefault(key, [])
+            for alias in (row.get('name'), row.get('english')):
+                alias = str(alias or '').strip()
+                if alias and alias.casefold() not in (a.casefold() for a in aliases):
+                    aliases.append(alias)
+
+    def entry_aliases(self, key: str) -> list[str]:
+        """Латинские имена записи — ромадзи и английское — только из кеша.
+
+        Источник пишет «Frieren», модель — «Sousou no Frieren»: подстановка
+        русского названия должна узнать оба написания одного тайтла.
+        """
+        with self._lock:
+            return list(self._aliases_by_key.get(str(key or ''), ()))
 
     def entry_names(self, key: str) -> tuple[str, str]:
         """Ромадзи и русское имя записи Shikimori по её ключу — только из кеша.
@@ -7690,7 +7715,8 @@ class WorkTitleResolver:
         self._last_request = time.monotonic()
         try:
             response = requests.post(
-                self.url, json={'query': self.QUERY, 'variables': {'s': name}},
+                self.url, json={'query': self.QUERY,
+                                'variables': {'s': str(name).translate(self._LATIN_FOLD)}},
                 headers={'User-Agent': 'anime-news-bot (Telegram)',
                          'Content-Type': 'application/json'},
                 timeout=min(HTTP_TIMEOUT, 8), allow_redirects=False)
@@ -7707,6 +7733,7 @@ class WorkTitleResolver:
         with self._lock:
             row = {
                 'key': key, 'name': str((found or {}).get('name') or '')[:120],
+                'english': str((found or {}).get('english') or '')[:160],
                 'russian': re.sub(r'\s+', ' ', str((found or {}).get('russian') or '')).strip()[:160],
                 'rule': WORK_MATCH_RULE,
                 'at': datetime.now(timezone.utc).isoformat()}
@@ -7950,6 +7977,67 @@ def _annotate_work_keys(items: list[dict], *, budget: int = WORK_LOOKUP_PER_CYCL
             item['_work_titles_ru'] = pairs
     work_titles.flush()
     return marked
+
+
+# Сколько новых запросов к Shikimori можно сделать на одну новость после
+# ответа модели. Остальное — из кеша.
+LLM_TITLE_LOOKUPS = 3
+
+
+def _llm_named_works(news: dict) -> list[str]:
+    """Латинские имена тайтлов, которые назвала сама модель: subject и имена
+    в кавычках или после «аниме»/«манги» в первых строках пересказа.
+
+    Опознание при сборе берёт имя из заголовка источника и промахивается на
+    английских заголовках: «Sony Developing Live-Action Kaiju No. 8 Film»
+    давало «Sony Developing», «BLUE BOX Poster Exhibition» — само себя. Модель
+    название уже выделила; осталось спросить Shikimori.
+    """
+    names = [str(news.get('_llm_subject') or '')]
+    for line in str(news.get('_llm_text') or '').split('\n')[:3]:
+        names += story_explicit_work_names(line)
+    out: list[str] = []
+    for name in names:
+        name = _clean_work_name(name)
+        if (re.search(r'[A-Za-z]', name) and not re.search(r'[А-Яа-яЁё]', name)
+                and len(re.findall(r'\w', name)) >= 3
+                and name.casefold() not in (x.casefold() for x in out)):
+            out.append(name)
+    return out[:5]
+
+
+def _annotate_llm_titles(news: dict, budget: int = LLM_TITLE_LOOKUPS) -> None:
+    """Русские названия тайтлов, названных моделью, — в пары подстановки.
+
+    В сеть ходим только по аниме и манге: Shikimori знает аниме, и запрос о
+    «Мстителях» или GTA был бы пустой тратой. Из кеша — по любой теме.
+    """
+    if (work_titles is None or not _russian_titles_on()
+            or not feature_enabled('work_identity')):
+        return
+    network = str(news.get('_llm_topic') or '') in ('аниме', 'манга')
+    pairs = dict(news.get('_work_titles_ru') or {})
+    failures = 0
+    for name in _llm_named_works(news):
+        if name in pairs:
+            continue
+        key = work_titles.cached(name)
+        if key is None and network and budget > 0 and failures < 2:
+            budget -= 1
+            key = work_titles.lookup(name)
+            if key is None:
+                failures += 1
+        russian = work_titles.russian(name) if key else ''
+        if not russian or russian.casefold() == name.casefold():
+            continue
+        pairs[name] = russian
+        # Запасной ключ «name:…» (имя из кавычек источника) уступает записи
+        # Shikimori: «Раны и бинты» русского канала и есть «Wound & Bandage».
+        if not str(news.get('_work_key') or '').startswith('shiki:'):
+            news['_work_key'], news['_work_name'], news['_work_russian'] = key, name, russian
+    if pairs:
+        news['_work_titles_ru'] = pairs
+    work_titles.flush()
 
 
 def _cheap_noise(item: dict) -> bool:
@@ -10188,7 +10276,7 @@ def _video_frame_bytes(url: str) -> Optional[bytes]:
             out = Path(tmp) / f'frame-{seek}.jpg'
             try:
                 subprocess.run([ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-f', 'mp4',
-                                '-ss', str(seek), '-i', str(src), '-frames:v', '1', '-q:v', '2',
+                                '-ss', str(seek), '-threads', '1', '-i', str(src), '-frames:v', '1', '-q:v', '2',
                                 str(out)], capture_output=True, timeout=20, check=False)
             except (OSError, subprocess.SubprocessError):
                 continue
@@ -10928,8 +11016,10 @@ def _normalize_video_file(path: Path, info: Optional[dict] = None) -> Path:
         return path
     out = path.with_name(path.stem + '.telegram.mp4')
     vf = f'scale=min({VIDEO_NORMALIZE_MAX_WIDTH}\\,iw):-2'
+    # Два потока x264: кадры те же, а пик ffmpeg на 1080p 224 → 169 МБ —
+    # контейнер с лимитом в 1 ГБ делит память с ботом и проверкой медиа.
     cmd = [ffmpeg, '-y', '-i', str(path), '-map', '0:v:0', '-map', '0:a:0?',
-           '-vf', vf, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', str(VIDEO_NORMALIZE_CRF),
+           '-vf', vf, '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', str(VIDEO_NORMALIZE_CRF),
            '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', str(out)]
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=180, check=False)
@@ -10984,7 +11074,8 @@ def _generate_video_thumbnail(path: Optional[Path]) -> Optional[bytes]:
     try:
         data = None
         for seek in seeks:
-            cmd = [ffmpeg, '-y', '-ss', f'{max(0.0, seek):.2f}', '-i', str(path), '-frames:v', '1',
+            # Один поток декодера: ради одного кадра пик ffmpeg 74 → 32 МБ на 1080p.
+            cmd = [ffmpeg, '-y', '-ss', f'{max(0.0, seek):.2f}', '-threads', '1', '-i', str(path), '-frames:v', '1',
                    '-vf', 'scale=320:320:force_original_aspect_ratio=decrease', '-q:v', '4', str(tmp)]
             proc = subprocess.run(cmd, capture_output=True, timeout=20, check=False)
             frame = tmp.read_bytes() if proc.returncode == 0 and tmp.exists() else None
@@ -13611,7 +13702,54 @@ def _work_title_pairs(news: dict) -> dict:
     original, russian = str(news.get('_work_name') or ''), str(news.get('_work_russian') or '')
     if original and russian and original.casefold() != russian.casefold():
         pairs.setdefault(original, russian)
+    # Другие латинские имена того же тайтла: источник пишет «Frieren», модель —
+    # «Sousou no Frieren», и второе оставалось в посте ромадзи (октябрь 2026).
+    key = str(news.get('_work_key') or '')
+    if russian and key.startswith('shiki:') and work_titles is not None:
+        for alias in work_titles.entry_aliases(key):
+            if alias.casefold() != russian.casefold() and len(re.findall(r'\w', alias)) >= 4:
+                pairs.setdefault(alias, russian)
     return pairs
+
+
+# Русское имя в кавычках после «аниме», «манги», «ранобэ»: русские каналы
+# переводят название каждый по-своему — «Раны и бинты», «Рана и бинт»,
+# «WOUND & BANDAGE» об одном тайтле за неделю (октябрь 2026).
+_RU_WORK_AFTER_ANCHOR_RE = re.compile(
+    r'(\b(?:аниме|манг[аиуеой]|ранобэ)(?:\s+по\s+(?:манге|ранобэ|новелле|комиксу))?\s+)'
+    r'«([^«»\n]{2,120})»', re.IGNORECASE)
+
+
+def _official_russian_name(text: str, news: dict) -> str:
+    """Чужой русский перевод опознанного тайтла → официальное название.
+
+    Только когда новость про один тайтл и сама модель назвала его предметом
+    новости (subject сводится к той же записи Shikimori): «режиссёр «X»
+    снимет аниме «Y»» не должно превратить Y в X.
+    """
+    official = str(news.get('_work_russian') or '').strip()
+    key = str(news.get('_work_key') or '')
+    subject = str(news.get('_llm_subject') or '').strip()
+    if not official or not key.startswith('shiki:') or not subject or work_titles is None:
+        return text
+    if {v for v in _work_title_pairs(news).values()} - {official}:
+        return text                 # в новости несколько тайтлов
+    if work_titles.cached(subject) != key:
+        return text
+    found = _RU_WORK_AFTER_ANCHOR_RE.findall(text)
+    if len({name.casefold() for _anchor, name in found}) != 1:
+        return text
+
+    def fix(match: re.Match) -> str:
+        name = match.group(2)
+        if (not re.search(r'[А-Яа-яЁё]', name) or name.casefold() == official.casefold()
+                or WorkTitleResolver._stem_key(name) == WorkTitleResolver._stem_key(official)):
+            return match.group(0)
+        other_key, _ = work_titles.cached_by_stem(name)
+        if other_key and other_key != key:
+            return match.group(0)
+        return f'{match.group(1)}«{official}»'
+    return _RU_WORK_AFTER_ANCHOR_RE.sub(fix, text)
 
 
 def _russify_titles(text: str, news: Optional[dict]) -> str:
@@ -13633,7 +13771,10 @@ def _russify_titles(text: str, news: Optional[dict]) -> str:
                   r'[^()（）\n\u0400-\u04ff]*[)）]', '', text)
     for original, russian in sorted(_work_title_pairs(news).items(), key=lambda kv: -len(kv[0])):
         cjk = bool(_CJK_LETTERS_RE.search(original))
-        body = re.escape(original) if cjk else r'(?<![\w])' + re.escape(original) + r'(?![\w])'
+        # Апостроф после имени — не закрывающая кавычка: «Frieren: Beyond
+        # Journey» внутри «Journey's End» давало «…» (Frieren: Beyond Journey)s End».
+        body = (re.escape(original) if cjk else
+                r'(?<![\w])' + re.escape(original) + r"(?![\w])(?!['’]\w)")
         # Кавычки — вместе с названием, но не пробелы вокруг: без кавычек
         # «сезон Grand Blue выйдет» не должно склеиться в «сезон«…»выйдет».
         pattern = re.compile(r'(?:[«"“\'『「]\s*)?' + body + r'(?:\s*[»"”\'』」])?',
@@ -13652,7 +13793,7 @@ def _russify_titles(text: str, news: Optional[dict]) -> str:
                 return f'«{russian}» ({original})'
             return f'«{russian}»'
         text = pattern.sub(replace, text)
-    return text
+    return _official_russian_name(text, news)
 
 
 _TITLE_TAG_RE = re.compile(r'\s*(?:\[[^\]\n]{1,25}\]|【[^】\n]{1,25}】)')
@@ -14011,6 +14152,23 @@ def _post_emoji(title: str, news: Optional[dict] = None) -> str:
     return _POST_TOPIC_EMOJI.get(str(news.get('_llm_topic') or ''), '✨')
 
 
+def _clean_head(first: str) -> str:
+    """Заголовок без невидимых символов в начале и с заглавной буквы.
+
+    В канал дважды ушли заголовки «🔥  постер ко 2 сезону…» и «🔥  официальный
+    арт…» (октябрь 2026): первое слово пропало, а перед вторым остался
+    невидимый символ, который strip() не снимает. Невидимое убираем, строчную
+    кириллицу в начале делаем заглавной — так заголовок хотя бы читается.
+    """
+    i = 0
+    while i < len(first) and (first[i].isspace() or unicodedata.category(first[i]) in ('Cf', 'Mn')):
+        i += 1
+    first = first[i:]
+    if first[:1] and ('а' <= first[0] <= 'я' or first[0] == 'ё'):
+        first = first[0].upper() + first[1:]
+    return first
+
+
 def _post_html(text: str, limit: int, news: Optional[dict] = None) -> str:
     """Готовый текст поста в разметке Telegram: эмодзи, жирный заголовок, абзац.
 
@@ -14024,7 +14182,7 @@ def _post_html(text: str, limit: int, news: Optional[dict] = None) -> str:
     prefix = f'{emoji} ' if emoji else ''
     plain = fit_to_limit(str(text).strip(), max(1, limit - len(prefix) - 2))
     first, _sep, rest = plain.partition('\n')
-    out = prefix + f'<b>{html.escape(first.strip())}</b>'
+    out = prefix + f'<b>{html.escape(_clean_head(first.strip()))}</b>'
     rest = rest.strip('\n')
     if rest:
         # Строка «о чём» — цитатой, как оформляет завязку владелец канала.
@@ -14163,7 +14321,7 @@ def _shrink_video_to_limit(path: Optional[Path]) -> Optional[Path]:
     out = path.with_name(path.stem + '.small.mp4')
     cmd = [ffmpeg, '-y', '-i', str(path), '-map', '0:v:0', '-map', '0:a:0?',
            '-vf', f'scale=min({VIDEO_NORMALIZE_MAX_WIDTH}\\,iw):-2',
-           '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', f'{video_kbps}k',
+           '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-b:v', f'{video_kbps}k',
            '-maxrate', f'{video_kbps}k', '-bufsize', f'{video_kbps * 2}k',
            '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', str(out)]
     try:
@@ -14658,6 +14816,26 @@ async def _prepare_news_for_send(news: dict, source: str,
     await _optimize_news_media(news)
     _assign_format_variant(news)
 
+    # Дедуп по картинке и по ролику — до модели: картинка уже скачана, id ролика
+    # известен, а вызов модели на повтор тратил лимит впустую (на бесплатном
+    # Groq это около 65 вызовов в сутки). Отпечатки держатся до конца отправки
+    # и снимаются _release_publish_reservations при любом исходе.
+    if apply_dedup:
+        dup_title = await _image_duplicate(news)
+        if dup_title:
+            logger.info(f"⊘ Картинка уже публиковалась («{dup_title[:40]}»): "
+                        f"{news.get('title', '')[:60]}")
+            if count_stats:
+                await stats.record_skipped('duplicate', source)
+            return 'skipped_dup'
+        dup_title = await _video_duplicate(news)
+        if dup_title:
+            logger.info(f"⊘ Ролик уже публиковался («{dup_title[:40]}»): "
+                        f"{news.get('title', '')[:60]}")
+            if count_stats:
+                await stats.record_skipped('duplicate', source)
+            return 'skipped_dup'
+
     # Модель: перевод, чистый текст, теги, отсев непрофильного и повторов
     enriched = await _llm_enrich(news, side_effects=llm_side_effects)
     if enriched == 'skip':
@@ -14750,23 +14928,6 @@ async def _prepare_news_for_send(news: dict, source: str,
 
     if not apply_dedup:
         return None
-
-    # Дедуп по картинке: один кадр с разных сайтов под разными заголовками
-    dup_title = await _image_duplicate(news)
-    if dup_title:
-        logger.info(f"⊘ Картинка уже публиковалась («{dup_title[:40]}»): "
-                    f"{news.get('title', '')[:60]}")
-        if count_stats:
-            await stats.record_skipped('duplicate', source)
-        return 'skipped_dup'
-
-    dup_title = await _video_duplicate(news)
-    if dup_title:
-        logger.info(f"⊘ Ролик уже публиковался («{dup_title[:40]}»): "
-                    f"{news.get('title', '')[:60]}")
-        if count_stats:
-            await stats.record_skipped('duplicate', source)
-        return 'skipped_dup'
 
     # Последняя проверка — на готовом тексте. Все предыдущие сравнивают исходные
     # заголовки, а одна новость с двух сайтов приходит разными формулировками
@@ -16731,10 +16892,10 @@ class ErrorFingerprintStore:
                 'first_seen': first_seen,
                 'last_seen': now.isoformat(),
             }
-            # Пишем первый случай и контрольные точки; подавленные ошибки не должны
-            # превращать throttling в fsync на каждом цикле.
-            if notify or count <= 2 or count % 5 == 0:
-                self._save()
+            # На диск — одной записью за цикл (flush в _flush_collection_stats):
+            # каждый упавший источник писал файл отдельно, до дюжины раз за цикл.
+            # Потеря при падении безвредна: это только подавление повторов.
+            self._dirty = True
         suppressed = max(0, count - 1)
         if not notify:
             metrics.inc('anime_bot_error_notifications_suppressed_total', labels={'scope': str(scope)[:80]})
@@ -16749,8 +16910,14 @@ class ErrorFingerprintStore:
             suppressed = sum(max(0, _safe_nonnegative_int(self._items[k].get('count')) - 1) for k in keys)
             for key in keys:
                 self._items.pop(key, None)
-            self._save()
+            self._dirty = True
             return suppressed
+
+    def flush(self) -> None:
+        with self._lock:
+            if getattr(self, '_dirty', False):
+                self._save()
+                self._dirty = False
 
     def snapshot(self) -> list[dict]:
         with self._lock:
@@ -18007,14 +18174,20 @@ class PendingPosts:
                 victims = sorted(candidates, key=lambda k: _ts(self._items[k]))[:overflow]
             for k in victims: del self._items[k]
 
-    def add(self, news: dict) -> str:
-        """Сохраняет пост, возвращает короткий ключ для callback-кнопок."""
+    def add(self, news: dict, *, staging: bool = False) -> str:
+        """Сохраняет пост, возвращает короткий ключ для callback-кнопок.
+
+        staging — пост ещё отправляется в ветку; в pending его переводит
+        mark_channel_pending после ответа Telegram. После рестарта staging
+        читается как pending (см. _load).
+        """
         old_items = dict(self._items)
         old_counter = self._counter
         self._counter += 1
         key = str(self._counter)
         clean = {k: v for k, v in news.items() if k != 'published_parsed'}
-        self._items[key] = {'news': clean, 'ts': time.time(), 'channel_state': 'pending'}
+        self._items[key] = {'news': clean, 'ts': time.time(),
+                            'channel_state': 'staging' if staging else 'pending'}
         # Дату публикации в источнике помним отдельно: published_parsed в JSON
         # не хранится, а по ней автопостинг отличает вчерашнюю новость от старой.
         published = news.get('published_parsed')
@@ -18122,7 +18295,11 @@ class PendingPosts:
             if reasons is not None:
                 reasons[reason] = reasons.get(reason, 0) + 1
         for key, item in list(self._items.items()):
-            if str(item.get('channel_state') or 'pending') != 'pending':
+            state = str(item.get('channel_state') or 'pending')
+            if state == 'staging':
+                count('ещё отправляется в ветку')
+                continue
+            if state != 'pending':
                 count('уже публикуется или результат неизвестен')
                 continue
             if not isinstance(item.get('news'), dict):
@@ -18460,6 +18637,13 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
         crop_plan = news.get('_media_crop_plan')
         photos = (await _resolve_photos_for_album(photos, crop_plan) if crop_plan
                   else await _resolve_photos_for_album(photos))
+        # Загрузка выбрасывает недоступные кадры, tgacc-ссылки и повторы. Без
+        # пересчёта уходил альбом из нуля или одного элемента: BadRequest, а
+        # при require_image — «failed» и повтор каждый цикл.
+        media_count = len(photos) + (1 if has_inline_video else 0)
+        if settings.require_image and media_count == 0:
+            logger.info(f"⊘ Пропускаю пост без медиа (require_image): {news['title'][:60]}")
+            return False
 
     # Caption для медиа. Telegram-лимит подписи — 1024 символа.
     caption = _post_html(text, TG_CAPTION_LIMIT, news)
@@ -18470,7 +18654,9 @@ async def _send_post_thread_split(bot: Bot, news: dict, video_file: Optional[Pat
     pending_key = None
     if pending_posts is not None:
         try:
-            pending_key = pending_posts.add(news)
+            # «staging» до ответа Telegram: автопостинг не возьмёт в канал пост,
+            # которого модераторы ещё не видят и который может не дойти до ветки.
+            pending_key = pending_posts.add(news, staging=True)
         except OverflowError:
             metrics.inc('anime_bot_moderation_value_rejected_total')
             logger.info(f"⊘ Модерационная очередь сохранила более сильные кандидаты: {news.get('title','')[:60]}")
@@ -18721,9 +18907,12 @@ async def _send_thread_media_then_text(bot, news, photos, has_inline_video, vide
 
     try:
         safe_text = _post_html(text, TG_TEXT_LIMIT, news)
-        await _tg_call_flood_safe(lambda: bot.send_message(
+        msg = await _tg_call_flood_safe(lambda: bot.send_message(
             chat_id=target, text=safe_text, parse_mode=ParseMode.HTML,
             disable_web_page_preview=True, reply_markup=reply_markup, **thread_kw))
+        # Кнопки живут на текстовом сообщении: без этого «✏️ Изменить» и пометки
+        # о публикации не находили, что править, и кнопки оставались.
+        _remember_preview(news.get('_pending_key'), msg)
         logger.info(f"🧵 {news['source']}: {news['title'][:60]} (медиа+текст раздельно)")
         return True
     except TelegramError as e:
@@ -18787,6 +18976,8 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
                 pending_posts.pop(pending_key)
             await stats.record_failed_send(source)
             return 'failed'
+        if pending_key and pending_posts is not None:
+            pending_posts.mark_channel_pending(pending_key)    # в ветке — теперь кандидат канала
 
         await sent_links.commit(link, title)
         committed = True
@@ -18799,6 +18990,9 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
         return 'sent'
     except DeliveryUncertain as e:
         logger.warning(f'Результат отправки в ветку неизвестен: {title[:60]} ({e})')
+        staged = news.pop('_pending_key', None)
+        if staged and pending_posts is not None:
+            pending_posts.mark_channel_pending(staged)     # как раньше: пост, скорее всего, в ветке
         if not committed:
             await sent_links.mark_uncertain(link)
             _commit_image_fingerprint(news)
@@ -20190,6 +20384,8 @@ async def _flush_collection_stats() -> None:
             await stats.flush()
         if replay_buffer is not None:
             await asyncio.to_thread(replay_buffer.flush)
+        if error_fingerprints is not None:
+            await asyncio.to_thread(error_fingerprints.flush)
     except Exception as e:
         logger.warning(f'Статистика сбора не записана: {type(e).__name__}: {e}')
 
@@ -22216,8 +22412,22 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
                 await update.message.reply_text('Этот пост уже публикуется; перенести его сейчас нельзя.')
                 context.user_data.pop('await_input', None)
                 raise ApplicationHandlerStop
-            scheduled_posts.reschedule(key, when)
+            # Результат прошлой отправки неизвестен: пост мог уже выйти, а
+            # перенос сбрасывал состояние в pending, и отложка выпускала его
+            # второй раз. Пусть человек сначала посмотрит канал.
+            if scheduled_posts.meta(key).get('state') == 'uncertain':
+                context.user_data.pop('await_input', None)
+                await update.message.reply_text(
+                    '❓ Этот пост уже отправлялся, но Telegram не подтвердил результат. '
+                    'Проверь канал: если поста там нет — опубликуй его из /scheduled.')
+                raise ApplicationHandlerStop
+            moved = scheduled_posts.reschedule(key, when)
         context.user_data.pop('await_input', None)
+        if not moved:
+            await update.message.reply_text(
+                '❌ Не удалось записать новое время на диск. Пост остался со старым; '
+                'проверь storage/volume и /health.')
+            raise ApplicationHandlerStop
         logger.info(f"📅 Пост перенесён на {_fmt_local(when)}")
         await update.message.reply_text(
             f'🕒 Перенёс на {_fmt_local(when)} — через {_human_delta(when)}.\n'
@@ -22257,33 +22467,42 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
                 'результат. Отложить его нельзя: вышел бы дубль. Проверь канал; '
                 'если поста там нет — опубликуй кнопкой 📢.')
             raise ApplicationHandlerStop
-        user = update.effective_user
-        by = {'id': user.id,
-              'name': (user.full_name or user.username or str(user.id))} if user else None
-        try:
-            scheduled_posts.add(news, when, by=by)
-        except OverflowError:
+        # Место «публикуется» держим от записи в отложку до снятия поста из
+        # ветки: между ними идут правки сообщений в Telegram, и тик автопостинга
+        # успевал отправить ещё не снятый пост в канал — потом его выпускала и
+        # отложка (внешний разбор, октябрь 2026).
+        with _PublishGuard(f'pending:{key}') as sched_guard:
+            if not sched_guard.acquired:
+                context.user_data.pop('await_input', None)
+                await update.message.reply_text('Пост уже публикуется; отложить его сейчас нельзя.')
+                raise ApplicationHandlerStop
+            user = update.effective_user
+            by = {'id': user.id,
+                  'name': (user.full_name or user.username or str(user.id))} if user else None
+            try:
+                scheduled_posts.add(news, when, by=by)
+            except OverflowError:
+                context.user_data.pop('await_input', None)
+                await update.message.reply_text(
+                    f'⚠️ Отложка заполнена ({ScheduledPosts.MAX_ITEMS} постов). '
+                    'Сними или опубликуй часть записей через /scheduled; этот пост остаётся в модерации.')
+                raise ApplicationHandlerStop
+            except OSError as e:
+                context.user_data.pop('await_input', None)
+                logger.error(f'Не удалось сохранить отложенный пост: {e}')
+                await update.message.reply_text(
+                    '❌ Не удалось записать отложку на диск. Пост остаётся в модерации; '
+                    'проверь storage/volume и /health.')
+                raise ApplicationHandlerStop
+            if moderation_feedback is not None:
+                await asyncio.to_thread(moderation_feedback.record, 'scheduled', news, update.effective_user)
             context.user_data.pop('await_input', None)
-            await update.message.reply_text(
-                f'⚠️ Отложка заполнена ({ScheduledPosts.MAX_ITEMS} постов). '
-                'Сними или опубликуй часть записей через /scheduled; этот пост остаётся в модерации.')
-            raise ApplicationHandlerStop
-        except OSError as e:
-            context.user_data.pop('await_input', None)
-            logger.error(f'Не удалось сохранить отложенный пост: {e}')
-            await update.message.reply_text(
-                '❌ Не удалось записать отложку на диск. Пост остаётся в модерации; '
-                'проверь storage/volume и /health.')
-            raise ApplicationHandlerStop
-        if moderation_feedback is not None:
-            await asyncio.to_thread(moderation_feedback.record, 'scheduled', news, update.effective_user)
-        context.user_data.pop('await_input', None)
-        # Пометку ставим ДО pop: после удаления записи превью уже не найти
-        await _update_moderation_done(context.bot, key,
-                                      f'\n\n📅 В отложке на {_fmt_local(when)}')
-        pending_cleanup_ok = pending_posts.pop(key) is not None
-        if not pending_cleanup_ok:
-            logger.error('Модерация: пост %s добавлен в отложку, но pending cleanup не записался', key)
+            # Пометку ставим ДО pop: после удаления записи превью уже не найти
+            await _update_moderation_done(context.bot, key,
+                                          f'\n\n📅 В отложке на {_fmt_local(when)}')
+            pending_cleanup_ok = pending_posts.pop(key) is not None
+            if not pending_cleanup_ok:
+                logger.error('Модерация: пост %s добавлен в отложку, но pending cleanup не записался', key)
         logger.info(f"📅 Отложен пост «{news.get('title', '')[:60]}» на {_fmt_local(when)} "
                     f"(отложил: {(by or {}).get('name', '?')})")
         if user and user.id not in _all_admin_ids():
@@ -22308,6 +22527,9 @@ async def awaiting_input_handler(update: Update, context: ContextTypes.DEFAULT_T
             context.user_data.pop('await_input', None)
             await update.message.reply_text('Пост уже публикуется; изменить его сейчас нельзя.')
             raise ApplicationHandlerStop
+        # Копия: get() отдаёт сам сохранённый словарь, и при сбое записи откат
+        # в update_news возвращал бы уже изменённый текст.
+        news = dict(news)
         news['_edited_text'] = text
         if not pending_posts.update_news(key, news):
             context.user_data.pop('await_input', None)
@@ -22631,6 +22853,13 @@ def _post_card(news: dict, meta: dict, *, countdown: bool = False,
 
 
 _sched_tick_count = 0
+# Посты отложки, опоздавшие из-за простоя бота. Вовремя созревший пост выходит
+# ровно когда его поставил админ, даже ночью. Опоздавшие же после перезапуска
+# выходили все разом и посреди ночной тишины: теперь — не ночью и по одному
+# раз в SCHEDULED_LATE_GAP_SEC.
+SCHEDULED_LATE_GRACE_SEC = 15 * 60
+SCHEDULED_LATE_GAP_SEC = 10 * 60
+_sched_late_sent_at = 0.0
 
 
 async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
@@ -22638,7 +22867,7 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
 
     Любая ошибка внутри ловится и уходит админу: раньше исключение молча убивало
     джоб, и посты навсегда зависали в отложке без единого сообщения."""
-    global _sched_tick_count
+    global _sched_tick_count, _sched_late_sent_at
     _sched_tick_count += 1
     # Пульс в лог: первый тик и далее каждые полчаса — видно, что джоб живёт
     if _sched_tick_count == 1 or _sched_tick_count % 30 == 0:
@@ -22663,6 +22892,12 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
             logger.info('Отложка: пост ждёт аккаунт Telegram: %s', str(news.get('title', ''))[:60])
             continue
         meta = scheduled_posts.meta(key)      # ДО pop — потом данных не будет
+        when = meta.get('at')
+        late = (isinstance(when, datetime)
+                and (datetime.now(timezone.utc) - when).total_seconds() > SCHEDULED_LATE_GRACE_SEC)
+        if late and (_channel_quiet_now()
+                     or time.time() - _sched_late_sent_at < SCHEDULED_LATE_GAP_SEC):
+            continue
         card = _post_card(news, meta)
         guard = _PublishGuard(f'sched:{key}')
         with guard:
@@ -22696,8 +22931,13 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
                 logger.exception(
                     f"Отложенный пост упал с ошибкой: {news.get('title', '')[:60]}")
 
+        if late and ok is not False:
+            _sched_late_sent_at = time.time()
         if ok:
             removed = scheduled_posts.pop(key)
+            # Интервал автопостинга считается и от отложки: иначе через минуту
+            # после отложенного поста автопостинг выпускал следующий.
+            _mark_published_now()
             if removed is None:
                 logger.error('Отложка: пост %s отправлен, но cleanup не записался', key)
                 await notify_admin(
@@ -22721,6 +22961,7 @@ async def publish_scheduled(context: ContextTypes.DEFAULT_TYPE):
                 f'📅 Опубликован отложенный пост\n\n{card}\n\n'
                 f'✅ Ушёл в канал {_fmt_local(datetime.now(timezone.utc))}')
         elif ok is None:
+            _mark_published_now()            # пост, скорее всего, вышел
             await notify_admin(
                 context.bot,
                 f'❓ Результат отправки отложенного поста неизвестен\n\n{card}\n\n'
@@ -23589,9 +23830,10 @@ async def _publish_one_from_queue_locked(bot_api) -> tuple[Optional[str], Option
             break
         await post_queue.ack_done(next_post)
         logger.info(f"Пост из очереди пропущен ({sent_result}): {next_post.get('title', '')[:60]}")
-    if sent_result == 'sent':
+    if sent_result in ('sent', 'uncertain'):
         # Отметку ставит сама отправка, а не только публикатор: иначе пост из
         # цикла сбора не сдвигал срок, и публикатор выкладывал следующий сразу.
+        # Неоднозначная доставка — тоже: пост, скорее всего, вышел.
         _mark_published_now()
     return sent_result, post_attempted
 
@@ -23650,6 +23892,13 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
             ok = await _prepare_and_send_channel_post(delivery, news)
         except DeliveryUncertain as e:
             pending_posts.mark_channel_uncertain(key)
+            # Пост, скорее всего, вышел (таймаут на загрузке ролика — частый
+            # случай). Без отметки следующий тик через минуту решал, что срок
+            # наступил, и в канале выходили два поста подряд.
+            _mark_published_now()
+            if feature_enabled('story_registry') and story_registry is not None:
+                await asyncio.to_thread(story_registry.mark_delivery, news,
+                                        published=True, uncertain=True)
             logger.warning('Автопостинг в канал: неоднозначная доставка (%s)', e)
             metrics.inc('anime_bot_publish_attempts_total',
                         labels={'mode': 'autopost', 'result': 'uncertain'})
@@ -23659,6 +23908,15 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
                 pending_posts.mark_channel_uncertain(key)
             raise
         except Exception:
+            if delivery.started:
+                # Сбой после первого обращения к Telegram (например, досылка
+                # фото): часть поста уже в канале, повтор дал бы дубль.
+                pending_posts.mark_channel_uncertain(key)
+                _mark_published_now()
+                logger.exception('Автопостинг в канал упал после начала отправки')
+                metrics.inc('anime_bot_publish_attempts_total',
+                            labels={'mode': 'autopost', 'result': 'uncertain'})
+                return 'uncertain'
             pending_posts.mark_channel_failed(key)
             logger.exception('Автопостинг в канал упал')
             metrics.inc('anime_bot_publish_attempts_total',
@@ -23671,6 +23929,12 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
         return 'failed'
 
     # Пост ушёл. Дальше — тот же учёт, что и при ручной публикации кнопкой.
+    # Пометка в ветке — до снятия записи (после неё превью уже не найти):
+    # модераторы видели кнопки под постом, который давно в канале.
+    try:
+        await _update_moderation_done(bot_api, key, '\n\n✅ Опубликовано в канал (автопостинг)')
+    except Exception:
+        logger.exception('Автопостинг: пометку в ветке поставить не удалось')
     pending_posts.pop(key)
     _mark_published_now()
     _mark_published()
@@ -25019,14 +25283,17 @@ def _llm_refund_call() -> None:
 
 def _estimate_llm_tokens(messages: list, max_tokens: int) -> int:
     """Conservative token estimate used only for local budget admission."""
-    chars = 0
+    latin = other = 0
     for message in messages or []:
-        if isinstance(message, dict):
-            chars += len(str(message.get('content') or ''))
-        else:
-            chars += len(str(message))
-    # 4 chars/token is intentionally rough; output reservation is fully counted.
-    return max(1, (chars + 3) // 4 + max(0, int(max_tokens)) + 32)
+        text = str(message.get('content') or '') if isinstance(message, dict) else str(message)
+        cyrillic = len(re.findall(r'[А-Яа-яЁё]', text))
+        other += cyrillic
+        latin += len(text) - cyrillic
+    # Латиница — около 4 символов на токен, кириллица — около 3,3 (замер на
+    # токенизаторе gpt-oss): по старой формуле «4 на всё» русский промпт
+    # занижался на пятую часть, и дневной бюджет кончался раньше срока.
+    # Выход резервируется целиком.
+    return max(1, (latin + 3) // 4 + (other * 10 + 32) // 33 + max(0, int(max_tokens)) + 32)
 
 
 def _llm_request(messages: list, max_tokens: int = LLM_MAX_TOKENS, *, route_config: Optional[tuple[str, str, str]] = None) -> Optional[str]:
@@ -26179,12 +26446,60 @@ LLM_BATCH_MAX_TOKENS = max(LLM_MAX_TOKENS, min(8000, LLM_MAX_TOKENS * LLM_BATCH_
 # часть новостной заметки, а больше для поста в 650 символов и не нужно.
 LLM_BATCH_ITEM_TEXT_MAX = max(500, min(8000, _env_int('LLM_BATCH_ITEM_TEXT_MAX', 2000)))
 
-# Кеш разборов живёт только в памяти процесса: на диск его класть незачем, а
-# после перезапуска старый ответ лучше не воскрешать — модель к тому времени
-# может быть уже другой (failover, /llmmodel).
+# Кеш разборов переживает перезапуск: в петле рестартов (октябрь 2026) каждый
+# старт заново оплачивал пачку в 6–7 тысяч токенов при суточном лимите в 200
+# тысяч. Модель к тому времени может быть уже другой, поэтому у записи есть
+# модель, и с диска берутся только записи той модели, что настроена сейчас.
 LLM_EDITORIAL_CACHE_MAX = max(20, min(2000, _env_int('LLM_EDITORIAL_CACHE_MAX', 400)))
 LLM_EDITORIAL_CACHE_TTL_SEC = max(60, min(86400, _env_int('LLM_EDITORIAL_CACHE_TTL_SEC', 6 * 3600)))
+LLM_EDITORIAL_CACHE_FILE = DATA_DIR / 'llm_editorial_cache.json'
+LLM_EDITORIAL_CACHE_SAVE_SEC = 120
 _llm_editorial_cache: dict = {}
+_llm_editorial_cache_state = {'loaded': False, 'dirty': False, 'saved_at': 0.0}
+
+
+def _llm_cache_model() -> str:
+    return str(LLM_MODEL or '')
+
+
+def _llm_editorial_cache_load() -> None:
+    """Один раз за процесс: свежие записи той же модели — в кеш памяти."""
+    if _llm_editorial_cache_state['loaded']:
+        return
+    _llm_editorial_cache_state['loaded'] = True
+    try:
+        raw = json.loads(LLM_EDITORIAL_CACHE_FILE.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return
+    if not isinstance(raw, dict) or not isinstance(raw.get('items'), dict):
+        return
+    now, model = time.time(), _llm_cache_model()
+    rows = []
+    for key, entry in raw['items'].items():
+        try:
+            fresh = now - float(entry.get('at') or 0) < LLM_EDITORIAL_CACHE_TTL_SEC
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if fresh and entry.get('model') == model and isinstance(entry.get('data'), dict):
+            rows.append((float(entry['at']), str(key), entry))
+    for _at, key, entry in sorted(rows)[-LLM_EDITORIAL_CACHE_MAX:]:
+        _llm_editorial_cache.setdefault(key, entry)
+
+
+def _llm_editorial_cache_flush(force: bool = False) -> None:
+    """Записать кеш разборов, если он менялся; не чаще раза в две минуты."""
+    state = _llm_editorial_cache_state
+    if not state['dirty']:
+        return
+    if not force and time.time() - state['saved_at'] < LLM_EDITORIAL_CACHE_SAVE_SEC:
+        return
+    try:
+        _atomic_write_json(LLM_EDITORIAL_CACHE_FILE,
+                           {'schema_version': 1, 'items': dict(_llm_editorial_cache)})
+        state['dirty'] = False
+        state['saved_at'] = time.time()
+    except (OSError, TypeError, ValueError) as e:
+        logger.warning(f'Кеш разборов модели не сохранён: {e}')
 
 
 def _llm_content_key(news: dict) -> str:
@@ -26211,6 +26526,7 @@ def _llm_editorial_cached(news: dict) -> Optional[dict]:
     решают другую задачу — не публиковать похожее дважды, и срабатывают уже
     ПОСЛЕ модели. Здесь же вопрос в том, платить ли за ответ, который уже есть.
     """
+    _llm_editorial_cache_load()
     entry = _llm_editorial_cache.get(_llm_content_key(news))
     if not isinstance(entry, dict):
         return None
@@ -26225,8 +26541,12 @@ def _llm_editorial_remember(news: dict, data: dict) -> None:
     data = _llm_editorial_data(data)
     if not data:
         return
+    _llm_editorial_cache_load()
     _bounded_cache_put(_llm_editorial_cache, _llm_content_key(news),
-                       {'at': time.time(), 'data': dict(data)}, LLM_EDITORIAL_CACHE_MAX)
+                       {'at': time.time(), 'model': _llm_cache_model(), 'data': dict(data)},
+                       LLM_EDITORIAL_CACHE_MAX)
+    _llm_editorial_cache_state['dirty'] = True
+    _llm_editorial_cache_flush()
 
 
 async def _llm_source_text(news: dict) -> str:
@@ -26377,7 +26697,14 @@ async def _llm_enrich_chunk(chunk: list) -> int:
     вторым комплектом правил, и они бы разъехались.
     """
     await _attach_work_about(chunk)
-    texts = [await _llm_source_text(news) for news in chunk]
+    # Статьи — по две одновременно: по очереди пачка из четырёх ждала до 4×60 с
+    # медленных сайтов, а больше двух сразу хостинг с одним ядром не тянет.
+    gate = asyncio.Semaphore(2)
+
+    async def source_text(news: dict) -> str:
+        async with gate:
+            return await _llm_source_text(news)
+    texts = list(await asyncio.gather(*(source_text(news) for news in chunk)))
     raw = await _llm_call([
         {'role': 'system', 'content': LLM_BATCH_SYSTEM_PROMPT},
         {'role': 'user', 'content': _llm_batch_payload(chunk, texts)},
@@ -26475,6 +26802,16 @@ async def _llm_prefetch_for_cycle(candidates: list, limit: Optional[int] = None)
         title = str(news.get('title') or '')
         if (sent_links is not None and not news.get('_story_update_of')
                 and sent_links.has_similar_title(title)):
+            continue
+        # Ссылка уже вышла или отсеяна, тот же ролик YouTube уже публиковался —
+        # ledger и дедуп ролика отсеют её сразу после модели. Место в пачке
+        # стоило бы токенов на пустое (проверки только читают, ничего не держат).
+        link = str(news.get('link') or '')
+        if sent_links is not None and link and (link in sent_links or sent_links.is_rejected(link)):
+            continue
+        video_id = _youtube_id(news.get('video') or '')
+        if (video_id and image_hashes is not None and getattr(settings, 'image_dedup', True)
+                and image_hashes.find_duplicate(f'v:{video_id}', title)):
             continue
         picked.append(news)
     return await _llm_enrich_batch(picked)
@@ -26652,6 +26989,10 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
                 (news.get('title') or '') + '\n' + (news.get('summary') or '')[:600])
             body = _append_release_date(body, date_str)
             news['_llm_text'] = body
+            try:
+                await asyncio.to_thread(_annotate_llm_titles, news)
+            except Exception:
+                logger.exception('Русские названия по ответу модели не подобраны')
             about = _checked_about(str(data.get('about') or ''), source_fact_text, body)
             if about:
                 news['_about'] = about
@@ -34330,6 +34671,7 @@ async def _post_shutdown(app: Application) -> None:
             source_yield.flush()
         if anilist is not None:
             anilist.flush()
+        _llm_editorial_cache_flush(force=True)
         await _flush_collection_stats()
     except Exception as e:
         logger.warning(f'Не удалось сбросить runtime-хранилища: {e}')

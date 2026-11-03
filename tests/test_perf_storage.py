@@ -158,6 +158,7 @@ async def test_collection_stats_are_written_once_per_cycle(tmp_path, monkeypatch
     replay = bot.ReplayBuffer(tmp_path / 'replay.json')
     monkeypatch.setattr(bot, 'stats', stats)
     monkeypatch.setattr(bot, 'replay_buffer', replay)
+    monkeypatch.setattr(bot, 'error_fingerprints', None)   # своя проверка — ниже
     writes = _count_writes(monkeypatch)
     for name in ('A', 'B', 'C'):
         await stats.record_collected(name, 3, save=False)
@@ -299,3 +300,23 @@ async def test_image_fingerprint_runs_off_the_event_loop(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, '_image_fingerprint', fingerprint)
     await bot._image_duplicate({'title': 'T', 'images': ['u']})
     assert seen['thread'] != main
+
+
+@pytest.mark.asyncio
+async def test_source_errors_are_written_once_per_cycle(tmp_path, monkeypatch):
+    """Дюжина упавших источников писала два файла по дюжине раз за цикл."""
+    stats = bot.BotStats(tmp_path / 'stats.json')
+    prints = bot.ErrorFingerprintStore(tmp_path / 'fp.json')
+    monkeypatch.setattr(bot, 'stats', stats)
+    monkeypatch.setattr(bot, 'replay_buffer', None)
+    monkeypatch.setattr(bot, 'error_fingerprints', prints)
+    writes = _count_writes(monkeypatch)
+    for name in ('A', 'B', 'C'):
+        await stats.record_source_error(name)
+        prints.record(f'source:{name}', 'HTTP 503')
+    prints.resolve_scope('source:A')
+    assert writes == []
+    await bot._flush_collection_stats()
+    assert sorted(writes) == ['fp.json', 'stats.json']
+    assert bot.BotStats(tmp_path / 'stats.json')._data['totals']['source_errors'] == 3
+    assert len(bot.ErrorFingerprintStore(tmp_path / 'fp.json').snapshot()) == 2
