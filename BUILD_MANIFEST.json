@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "2d6f5bb1ddd86d60883f74500b344db1c943a931",
-  "generated_at_utc": "2026-11-03T21:38:51.413699+00:00",
+  "git_commit": "e288fac5f7c52f2c75fa82a3c39e404d4f18fb2b",
+  "generated_at_utc": "2026-11-03T21:39:24.968788+00:00",
   "files": {
     ".claude/skills/find-skills/SKILL.md": {
       "sha256": "c00eeea0e13e74fe4a9d84ba0a8542205a1b736d65f13134fe1a6647eb14976f",
@@ -50,7 +50,7 @@
       "bytes": 73282
     },
     "docs/env-reference.md": {
-      "sha256": "66b7e3378793d05dd661be5840f0b0726b060a7c2fdbe6f0843df132e6a982f5",
+      "sha256": "a8d60d396e6f225106a9fa8d26d07924a58cb37ec4b04fee6bfc4de5a03648b9",
       "bytes": 22708
     },
     "docs/llm-providers.md": {
