@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "e288fac5f7c52f2c75fa82a3c39e404d4f18fb2b",
-  "generated_at_utc": "2026-11-03T21:39:24.968788+00:00",
+  "git_commit": "550204da8db97c09fcc8ec0abd2433038709f7c1",
+  "generated_at_utc": "2026-11-04T20:53:40.203433+00:00",
   "files": {
     ".claude/skills/find-skills/SKILL.md": {
       "sha256": "c00eeea0e13e74fe4a9d84ba0a8542205a1b736d65f13134fe1a6647eb14976f",
@@ -42,16 +42,16 @@
       "bytes": 33970
     },
     "anime_news_bot.py": {
-      "sha256": "593b750aa35fec135dcbeaac0729223c7676cc518c7f568dae86717763e2a69d",
-      "bytes": 1983552
+      "sha256": "118c68d45c4a2fc4675ccf1e28f6d0c4d407a9de0522afe5b74a9dbf77422db7",
+      "bytes": 1987959
     },
     "docs/chat-moderation.md": {
       "sha256": "b2338299309164ec952d18f4800fd028cab4d012363dac2bb7cadd3ee3651b5f",
       "bytes": 73282
     },
     "docs/env-reference.md": {
-      "sha256": "a8d60d396e6f225106a9fa8d26d07924a58cb37ec4b04fee6bfc4de5a03648b9",
-      "bytes": 22708
+      "sha256": "bf845ce32f350be6f42f1334e519eebbbd3bb10fe900bd03b935b21bb372f525",
+      "bytes": 22813
     },
     "docs/llm-providers.md": {
       "sha256": "d1c1df0a6123ee152672e4df6c446057db521bd45af04bf20a876d8816560fb3",
@@ -138,8 +138,8 @@
       "bytes": 2319
     },
     "tests/conftest.py": {
-      "sha256": "29ce0d494dcef162e4ac8bedab4300af6b6b4f17088ccdd586162405ecc51133",
-      "bytes": 10469
+      "sha256": "329128e30662deb1740b74d577e2249ef8d925df2ca546633e198334e1f2b10e",
+      "bytes": 10792
     },
     "tests/e2e/test_cli_contract.py": {
       "sha256": "d2458cec46557934a4a39383d91b6959ffb1f68793c687533a86b81e0a2b6fc8",
@@ -484,6 +484,10 @@
     "tests/test_log_timezone.py": {
       "sha256": "aedd9f18e3a0abe6104971ebd0a2f4f6e8e08a5a1313a8ac691b6336fb903fd1",
       "bytes": 2718
+    },
+    "tests/test_low_memory_mode_20261104.py": {
+      "sha256": "f69418cdb9bb96de845f38bd3d43ce9ae419ac5a43c5bb982ca1c75ff1ace4d2",
+      "bytes": 3534
     },
     "tests/test_low_risk_items.py": {
       "sha256": "e78d32900623ea202ebfd0a13932f074c982c78af083d2d8d870b44ad9ca4f9e",

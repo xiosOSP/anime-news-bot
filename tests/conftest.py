@@ -16,6 +16,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # данные во временную папку ДО импорта: пути считаются один раз при импорте.
 _TEST_DATA_DIR = tempfile.mkdtemp(prefix='anime-bot-tests-')
 os.environ['DATA_DIR'] = _TEST_DATA_DIR
+# Экономный режим по памяти зависит от лимита контейнера машины тестов:
+# на тесном раннере он выключил бы ролики, и тесты видео падали бы не из-за кода.
+os.environ.setdefault('LOW_MEMORY_MODE', 'off')
 
 import anime_news_bot as _bot
 
