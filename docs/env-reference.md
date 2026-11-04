@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 338 переменных. Почти все — точная настройка со значением
+Бот читает 340 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -393,6 +393,8 @@
 | `IMAGE_BYTES_CACHE_MAX_MB` | `48` | anime_news_bot.py |
 | `INSTANCE_LOCK_POLL_SEC` | `2.0` | anime_news_bot.py |
 | `INSTANCE_LOCK_WAIT_SEC` | `-1` | anime_news_bot.py |
+| `LOW_MEMORY_LIMIT_MB` | `600` | anime_news_bot.py |
+| `LOW_MEMORY_MODE` | `auto` | anime_news_bot.py |
 | `MAX_PHOTOS_PER_POST` | `6` | anime_news_bot.py |
 | `MISTRAL_API_KEY` | — | anime_news_bot.py |
 | `MISTRAL_MODEL` | — | anime_news_bot.py |

@@ -5338,7 +5338,9 @@ class BotSettings:
 
     @property
     def video_enabled(self) -> bool:
-        return self._data['video_enabled']
+        # В экономном режиме роликов нет при любой настройке: загрузка и ffmpeg
+        # не помещаются в лимит контейнера (см. _low_memory_mode).
+        return self._data['video_enabled'] and not _low_memory_mode()
 
     @video_enabled.setter
     def video_enabled(self, value: bool) -> None:
@@ -29487,6 +29489,59 @@ def _cgroup_memory_mb(root: Path = CGROUP_ROOT) -> dict:
     return out
 
 
+# Экономный режим по памяти. Бесплатный тариф Bothost — 256 МБ на контейнер
+# (Basic — 1 ГБ). Бот в покое занимает ~190 МБ, а процесс проверки медиа в чате
+# — ещё ~220 МБ, yt-dlp с deno и ffmpeg — по 100–200 МБ: любая гифка в чате или
+# ролик в новости выводили контейнер за лимит, и платформа убивала бота без
+# следа — 35 перезапусков подряд (ноябрь 2026). При тесном лимите эти две вещи
+# выключаются, остальное работает. auto — по лимиту контейнера; on/off — вручную.
+LOW_MEMORY_MODE = _env('LOW_MEMORY_MODE', 'auto').strip().lower()
+LOW_MEMORY_LIMIT_MB = max(128, min(4096, _env_int('LOW_MEMORY_LIMIT_MB', 600)))
+_low_memory_cache: dict = {}
+
+
+_libc = None
+
+
+def _tune_malloc() -> None:
+    """Не больше двух арен glibc на процесс — то же, что MALLOC_ARENA_MAX=2.
+
+    Бот работает в пяти с лишним потоках, и glibc заводит арену почти на
+    каждый: память, освобождённая в одной арене, другой не достаётся, и RSS
+    растёт без утечки. Воркеру медиа это уже ставится переменной окружения;
+    основному процессу — здесь, при старте. Не glibc (musl) — просто ничего.
+    """
+    global _libc
+    try:
+        import ctypes
+        _libc = ctypes.CDLL('libc.so.6')
+        _libc.mallopt(-8, 2)           # M_ARENA_MAX
+    except (OSError, AttributeError):
+        _libc = None
+
+
+def _malloc_trim() -> None:
+    """Вернуть системе память, которую Python уже освободил (после цикла сбора)."""
+    if _libc is None:
+        return
+    try:
+        _libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _low_memory_mode() -> bool:
+    """Тесно ли контейнеру: тогда без нейросетевой проверки медиа и без роликов."""
+    if LOW_MEMORY_MODE in ('on', 'true', '1', 'yes'):
+        return True
+    if LOW_MEMORY_MODE in ('off', 'false', '0', 'no'):
+        return False
+    if 'value' not in _low_memory_cache:
+        limit = _cgroup_memory_mb().get('max')
+        _low_memory_cache['value'] = bool(limit and limit < LOW_MEMORY_LIMIT_MB)
+    return _low_memory_cache['value']
+
+
 def _rss_mb() -> Optional[int]:
     """Сколько памяти занимает процесс, МБ. None — если не прочиталось."""
     try:
@@ -31075,6 +31130,8 @@ def _lifecycle_container_memory_line(life: dict) -> str:
     if 'max' in mem:
         parts.append(f'лимит {mem["max"]} МБ')
     line = 'Память контейнера: ' + (', '.join(parts) if parts else 'не читается')
+    if _low_memory_mode():
+        line += '\n🪫 Экономный режим: без проверки медиа в чате и без роликов (LOW_MEMORY_MODE)'
     if life.get('oom_kill_on_last_exit'):
         line += '\n💥 Прошлый процесс убит за нехватку памяти (OOM)'
     elif life.get('cgroup_oom_kills') is not None:
@@ -32389,7 +32446,9 @@ async def moderation_message_handler(update: Update, context: ContextTypes.DEFAU
             chat_moderation.find_blocked_media(attachment_key, sticker_set=sticker_set,
                                                chat_id=chat.id)
             if attachment_key or sticker_set else {})
-        if not blocked and MODERATION_MEDIA_ENABLED:
+        # В экономном режиме процесс детектора (~220 МБ) в лимит не влезает:
+        # чёрный список осуждённых медиа выше работает, нейросеть — нет.
+        if not blocked and MODERATION_MEDIA_ENABLED and not _low_memory_mode():
             media = await _moderation_media_scanner.check(context.bot, message)
             if media is not None and not (media.status == 'checked' and media.category == 'nsfw'):
                 # И file_id проверяем ещё раз: пока это медиа ждало детектор,
@@ -33818,6 +33877,7 @@ def _mark_auto_cycle_finished(result: str) -> None:
     data['last_auto_cycle_finished_at'] = datetime.now(timezone.utc).isoformat()
     data['last_auto_cycle_state'] = str(result or 'finished')[:80]
     data['auto_cycle_interrupted_streak'] = 0      # цикл дошёл до конца
+    _malloc_trim()                                 # до замера: иначе он завышен
     # Бот перезапускается именно во время цикла, а не по таймеру платформы.
     # Значит важно знать, чего цикл стоит по памяти: пик и прирост переживают
     # перезапуск и видны в /lifecycle, даже если процесс убили молча.
@@ -35307,6 +35367,7 @@ def _application_builder():
 def main():
     # Самый первый вывод — чтобы в логах хостинга было видно что процесс стартовал
     print("=== Запуск anime_news_bot ===", flush=True)
+    _tune_malloc()
     # Падение внутри библиотеки на C (onnxruntime, opencv, Pillow) убивает
     # процесс без traceback: в логе просто обрыв и новый запуск. faulthandler
     # печатает в stderr, в каком месте Python-кода это случилось.
@@ -35345,6 +35406,15 @@ def main():
     # the data lock and HEALTH_PORT. Retry the bind after the lock is ours.
     _start_health_server()
     _mark_lifecycle_start()
+    if _low_memory_mode():
+        limit = _cgroup_memory_mb().get('max')
+        note = f'лимит контейнера {limit} МБ' if limit else 'LOW_MEMORY_MODE=on'
+        logger.warning('🪫 Экономный режим по памяти (%s): ролики и проверка медиа в чате выключены', note)
+        _queue_admin_alert(
+            f'🪫 Памяти мало ({note}): бот работает в экономном режиме — без роликов в '
+            'постах (вместо них кадр) и без нейросетевой проверки картинок и гифок в чате. '
+            'Иначе платформа убивает бота при каждом ролике или гифке. На тарифе с 1 ГБ '
+            'режим выключится сам; вручную — LOW_MEMORY_MODE=off.')
     if feature_enabled('runtime_migrations'):
         migration = _migrate_runtime_schemas(DATA_DIR)
         if migration['changed']:
