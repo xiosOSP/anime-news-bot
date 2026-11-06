@@ -119,4 +119,4 @@ def test_lifecycle_start_names_oom(tmp_path, monkeypatch, before_state, oom_befo
 
 def test_main_enables_faulthandler():
     import inspect
-    assert 'faulthandler.enable()' in inspect.getsource(bot.main)
+    assert '_enable_crash_trace()' in inspect.getsource(bot.main)
