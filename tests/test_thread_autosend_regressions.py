@@ -44,6 +44,7 @@ def _common_cycle_stubs(monkeypatch, items, *, thread_mode=True, quiet=True,
     monkeypatch.setattr(bot, 'settings', _Settings(
         thread_mode=thread_mode,
         quiet_mode=quiet,
+        channel_autopost=True,
     ))
     monkeypatch.setattr(bot, 'sent_links', _NoHistory())
     monkeypatch.setattr(bot, 'collect_all_news', AsyncMock(return_value=(

@@ -191,13 +191,39 @@ NAMES = ['Альфа центавра', 'Бета версия', 'Гамма л�
 
 
 def test_network_failure_is_not_remembered_and_stops_the_cycle(shikimori):
-    """Сеть не ответила — ключа нет, новость склеится по-старому. Три отказа — хватит."""
+    """Сеть не ответила — ключа нет, новость склеится по-старому. После
+    первого отказа Shikimori не спрашиваем DOWN_PAUSE_SEC (ноябрь 2026): при
+    лежащем сервере каждый запрос ждал таймаута, и так каждая новость цикла."""
     import requests
     resolver = shikimori(requests.ConnectionError('down'))
     items = [{'title': f'Постер к аниме «{name}»', 'link': f'https://x/{i}'} for i, name in enumerate(NAMES)]
     assert bot._annotate_work_keys(items) == 0
-    assert len(shikimori.calls) == 3
+    assert len(shikimori.calls) == 1
     assert resolver.cached(NAMES[0]) is None
+
+
+def test_shikimori_is_asked_again_after_the_pause(shikimori):
+    import requests
+    resolver = shikimori(requests.ConnectionError('down'))
+    assert resolver.lookup('Grand Blue') is None
+    assert resolver.lookup('Grand Blue') is None
+    assert len(shikimori.calls) == 1
+    resolver._down_until = 0.0              # пауза вышла
+    resolver.lookup('Grand Blue')
+    assert len(shikimori.calls) == 2
+
+
+def test_flush_is_throttled_but_forced_on_shutdown(tmp_path, monkeypatch):
+    resolver = bot.WorkTitleResolver(tmp_path / 'wt.json')
+    writes = []
+    monkeypatch.setattr(bot, '_atomic_write_json', lambda p, d, **k: writes.append(p))
+    for i in range(3):
+        resolver._items[str(i)] = {'key': '', 'at': 'x'}
+        resolver._dirty = True
+        resolver.flush()
+    assert len(writes) == 1
+    resolver.flush(force=True)
+    assert len(writes) == 2
 
 
 def test_lookup_budget_per_cycle(shikimori):

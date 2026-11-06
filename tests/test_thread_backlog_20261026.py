@@ -67,7 +67,7 @@ def test_post_being_published_is_never_dropped(tmp_path, monkeypatch):
 
 @pytest.fixture
 def fresh_window(monkeypatch):
-    monkeypatch.setattr(bot, 'settings', NS(post_max_age_hours=72))
+    monkeypatch.setattr(bot, 'settings', NS(post_max_age_hours=72, channel_autopost=True))
 
 
 def test_valuable_post_beats_a_slightly_fresher_minor_one(tmp_path, fresh_window):
@@ -180,3 +180,11 @@ def test_old_source_date_lowers_the_new_post(full_thread):
     old = {'title': 'Старая в источнике', 'link': 'https://n/3', '_priority_score': 9.0,
            'published_parsed': time.gmtime(time.time() - 20 * 3600)}
     assert bot._thread_admission([old]) == ([], 1)
+
+
+def test_thread_only_mode_admits_everyone(full_thread, monkeypatch):
+    """Без автопоста запас сам не убывает: слабую новость нельзя откладывать
+    до устаревания, иначе модераторы её так и не увидят."""
+    monkeypatch.setattr(bot, 'settings', NS(post_max_age_hours=72, channel_autopost=False))
+    weak = {'title': 'Слабая', 'link': 'https://n/2', '_priority_score': 3.0}
+    assert bot._thread_admission([weak]) == ([weak], 0)

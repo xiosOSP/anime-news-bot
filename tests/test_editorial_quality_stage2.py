@@ -38,6 +38,7 @@ def test_entity_memory_manual_alias_is_reused(tmp_path):
 def test_story_update_prefix_keeps_original_capitalization(monkeypatch):
     monkeypatch.setattr(bot, 'editorial_glossary', None)
     monkeypatch.setattr(bot, 'entity_memory', None)
+    monkeypatch.setattr(bot, 'POST_STYLE', 'plain')     # в rich пометку несёт значок 🔄
     news = {'_story_update_of': 'abc'}
     assert bot._apply_editorial_rules('MAPPA показала трейлер.', news).startswith('Обновление: MAPPA')
 
