@@ -8399,7 +8399,9 @@ def _apply_editorial_rules(text: str, news: Optional[dict] = None) -> str:
         out = editorial_glossary.apply(out)
     if feature_enabled('entity_memory') and entity_memory is not None:
         out = entity_memory.apply(out)
-    if news and news.get('_story_update_of') and out:
+    # В оформлении rich обновление видно по значку 🔄 (_post_emoji): текстовая
+    # пометка давала «🔄 Обновление: Слух: …» — две метки подряд перед фактом.
+    if news and news.get('_story_update_of') and out and POST_STYLE != 'rich':
         first, sep, rest = out.partition('\n')
         if not first.casefold().startswith(('обновление:', 'update:')):
             first = 'Обновление: ' + first
@@ -13399,6 +13401,9 @@ _ANNIVERSARY_SOFT_RE = re.compile(
     r'\bгодовщин\w*|\b\d{1,3}[-\u2010\u2011]?лети(?:ем|е|ю|я)\b|'
     r'\b(?:сегодня|отмечает|празднует)\s+(?:свой\s+)?(?:день\s+рождени|юбилей)|'
     r'\bс\s+(?:днём|днем)\s+рождения\b|'
+    # «Официальный арт к дню рождения Дофламинго» ушёл в канал (октябрь 2026):
+    # дни рождения персонажей выкладывают админы.
+    r'\bко?\s+дню\s+рождения\b|\bв\s+(?:честь\s+дня|день)\s+рождения\b|'
     r'\bhappy\s+birthday\b|\b\d{1,3}(?:st|nd|rd|th)\s+anniversary\b|\bturns\s+\d{1,3}\b|'
     r'\bcelebrat\w*\s+(?:its\s+)?\d{1,3}(?:\s+years|th)\b',
     re.IGNORECASE)
@@ -13998,6 +14003,9 @@ def _polish_post_text(text: str) -> str:
     рисует вместо дефиса пустой квадрат.
     """
     text = str(text or '').replace('\u2011', '-').replace('\u2010', '-')
+    # Знаки ударения («Сакамо́то», «кита́ми»): модель ставит их из словарей,
+    # в посте они выглядят опечаткой и ломают поиск по каналу.
+    text = text.replace('\u0301', '').replace('\u0300', '')
     for pattern, repl in _JARGON_RULES[:2]:
         text = pattern.sub(repl, text)
     text = _TEASER_POSTER_RE.sub(
@@ -14008,7 +14016,239 @@ def _polish_post_text(text: str) -> str:
         adjective = match.group(0).split()[0]
         noun = _VISUAL_TO_POSTER.get((match.group(2) or '').lower(), 'постер')
         return f'{adjective} {noun}'
-    return _JARGON_RULES[2][0].sub(visual, text)
+    text = _JARGON_RULES[2][0].sub(visual, text)
+    return _polish_jargon_more(text)
+
+
+# Жаргон, который модель всё ещё переносит из лент (посты ноября 2026):
+# «Анонсировано тизер-визуал и тизер-PV», «Выдали постер», «Manga Sakamoto
+# Holidays», «Spin-off манги», «адаптация light novel».
+# «Визуал» — постер, только когда речь о материале: «тизер-визуал», «новый
+# визуал», «трейлер и визуал». «Улучшить визуал» — это графика, не постер.
+_BARE_VISUAL_RE = re.compile(
+    r'(?<![\w-])(тизер-|тизерн(?:ый|ого|ому|ым|ом|ые|ых|ыми)\s+)?([Вв])изуал'
+    r'(а|у|ом|е|ы|ов|ам|ами|ах)?(?![\w-])')
+_VISUAL_MATERIAL_RE = re.compile(r'(?:трейлер|тизер|постер|промо-ролик|ролик|PV|кадр)', re.IGNORECASE)
+_VISUAL_ADJECTIVE_RE = re.compile(
+    r'(?:нов|официальн|коллаборативн|праздничн|перв|финальн|специальн|юбилейн)\w*\s+$', re.IGNORECASE)
+
+
+def _visual_is_material(match: re.Match) -> bool:
+    """«Визуал» — постер, только когда речь о материале: «тизер-визуал»,
+    «новый визуал», «трейлер и визуал». «Улучшить визуал» — это графика."""
+    if match.group(1):
+        return True
+    before = match.string[max(0, match.start() - 40):match.start()]
+    after = match.string[match.end():match.end() + 40]
+    return bool(_VISUAL_ADJECTIVE_RE.search(before)
+                or re.match(r'\s+и\s+(?:\w+\s+)?' + _VISUAL_MATERIAL_RE.pattern, after, re.IGNORECASE)
+                or re.search(_VISUAL_MATERIAL_RE.pattern + r'\w*\s+и\s+$', before, re.IGNORECASE))
+
+
+_TEASER_PV_RE = re.compile(r'(?<![\w-])([Тт])изер-PV(?![\w-])')
+# «Manga Plus», «Manga UP!» — названия сервисов, их не переводим.
+_LATIN_MANGA_RE = re.compile(r'(?<![\w-])Manga(?=\s+[A-Z])(?!\s+(?:Plus|PLUS|UP|Up|Mogura|Corner|Planet)\b)')
+_SPIN_OFF_RE = re.compile(r'(?<![\w-])([Ss])pin-off(?![\w-])')
+_LIGHT_NOVEL_RE = re.compile(r'(?<![\w-])light[- ]novels?(?![\w-])', re.IGNORECASE)
+_DOUBLE_GUILLEMETS_RE = re.compile(r'««([^«»\n]+)»»')
+_HASHTAG_LINE_RE = re.compile(r'^\s*#[\w-]+(?:\s+#[\w-]+)*\s*$')
+# Римская цифра, набранная строчной «l»: «GTA Vl».
+_ROMAN_L_RE = re.compile(r'\b([A-Z]{2,6}) V(l{1,2})\b')
+# Кириллица капсом: «Манга ВЕДЬМ НАДЗОР достигнет финала». Два слова и
+# больше или одно длинное: короткие сокращения (США, МВД, ТВ) не трогаем.
+# Одно слово — только название в кавычках («АБДУКЦИЯ»): капс посреди фразы
+# бывает и выделением, его не трогаем.
+_CAPS_CYR_RUN_RE = re.compile(
+    r'(?<![\w-])[А-ЯЁ]{2,}(?:[ \-][А-ЯЁ]{2,})+(?![\w-])|(?<=«)[А-ЯЁ]{5,}(?=»)')
+_HOMOGLYPH_TO_CYR = str.maketrans('aeopcxyAEOPCXBKMHT', 'аеорсхуАЕОРСХВКМНТ')
+_HOMOGLYPH_TO_LAT = str.maketrans('аеорсхуАЕОРСХВКМНТ', 'aeopcxyAEOPCXBKMHT')
+
+
+def _fix_homoglyphs(text: str) -> str:
+    """Слово из двух алфавитов («Тeпленько» с латинской e) — в один.
+
+    На вид разницы нет, но поиск по каналу и проверка повторов видят два
+    разных слова."""
+    def fix(match: re.Match) -> str:
+        word = match.group(0)
+        cyr = len(re.findall(r'[А-Яа-яЁё]', word))
+        lat = len(re.findall(r'[A-Za-z]', word))
+        if not cyr or not lat:
+            return word
+        fixed = word.translate(_HOMOGLYPH_TO_CYR if cyr >= lat else _HOMOGLYPH_TO_LAT)
+        # Остались буквы чужого алфавита без двойника — слово не трогаем.
+        if re.search(r'[A-Za-z]', fixed) and re.search(r'[А-Яа-яЁё]', fixed):
+            return word
+        return fixed
+    return re.sub(r'[A-Za-zА-Яа-яЁё]+', fix, text)
+
+
+# Род существительного, с которым согласуется глагол в начале заголовка.
+# Только именительный падеж: «Вышел постер», а не «Вышел постера» — слово не
+# в списке значит «не уверены», и заголовок не трогаем.
+_TITLE_NOUN_GENDER = {
+    **dict.fromkeys((
+        'сезон', 'постер', 'трейлер', 'тизер', 'фильм', 'сериал', 'мультфильм', 'мультсериал',
+        'кроссовер', 'спин-офф', 'арт', 'кадр', 'том', 'проект', 'ремейк', 'ремастер', 'ролик',
+        'клип', 'опенинг', 'эндинг', 'дубляж', 'каст', 'анонс', 'релиз', 'выпуск', 'эпизод',
+        'спешл', 'спэшл', 'перезапуск', 'сиквел', 'приквел', 'лайв-экшен', 'лайв-экшн', 'концерт',
+        'саундтрек', 'сингл', 'альбом', 'комикс', 'фестиваль', 'показ', 'предпоказ', 'дизайн',
+        'тираж', 'финал', 'арк', 'фанбук', 'артбук', 'ивент', 'коллаб'), 'm'),
+    **dict.fromkeys((
+        'адаптация', 'экранизация', 'манга', 'манхва', 'маньхуа', 'игра', 'глава', 'дата',
+        'премьера', 'выставка', 'коллаборация', 'заставка', 'обложка', 'иллюстрация', 'песня',
+        'часть', 'версия', 'трансляция', 'арка', 'книга', 'новелла', 'кампания', 'акция',
+        'озвучка', 'фигурка', 'презентация', 'демонстрация', 'трилогия', 'франшиза'), 'f'),
+    **dict.fromkeys(('аниме', 'продолжение', 'ранобэ', 'шоу', 'видео', 'интервью',
+                     'обновление', 'событие', 'издание', 'мероприятие'), 'n'),
+    **dict.fromkeys(('кадры', 'арты', 'постеры', 'трейлеры', 'тизеры', 'подробности', 'детали',
+                     'ролики', 'обложки'), 'pl'),
+}
+# Материалы, которые публикуют, а не «анонсируют»: «Объявлен постер» → «Опубликован».
+_TITLE_VISUAL_NOUNS = frozenset(('постер', 'постеры', 'арт', 'арты', 'тизер', 'тизеры', 'трейлер',
+                                 'трейлеры', 'кадр', 'кадры', 'обложка', 'обложки', 'иллюстрация',
+                                 'ролик', 'ролики'))
+# Винительный после «Выдали»: «Выдали дату» → «Объявлена дата».
+_GAVE_ACCUSATIVE = {'дату': 'дата', 'обложку': 'обложка', 'иллюстрацию': 'иллюстрация',
+                    'заставку': 'заставка', 'премьеру': 'премьера'}
+_PARTICIPLE_STEMS = ('анонсирован', 'объявлен', 'опубликован', 'показан', 'представлен',
+                     'выпущен', 'запущен', 'подтвержд', 'раскрыт', 'обнародован', 'назван',
+                     'продл', 'утвержд', 'запланирован', 'выдан')
+_PAST_FORMS = {
+    'вышел': ('вышел', 'вышла', 'вышло', 'вышли'),
+    'появился': ('появился', 'появилась', 'появилось', 'появились'),
+    'стартовал': ('стартовал', 'стартовала', 'стартовало', 'стартовали'),
+}
+_GENDER_INDEX = {'m': 0, 'f': 1, 'n': 2, 'pl': 3}
+
+
+def _participle_forms(word: str) -> Optional[tuple]:
+    """Краткое причастие во всех родах: («Анонсирован», …) или None."""
+    low = word.casefold()
+    for stem in _PARTICIPLE_STEMS:
+        if stem in ('подтвержд', 'продл', 'утвержд'):
+            base = stem + ('ен' if stem != 'продл' else 'ен')
+            if low.replace('ё', 'е') in (base, base + 'а', base + 'о', base + 'ы'):
+                return (stem + 'ён', base + 'а', base + 'о', base + 'ы')
+        elif low in (stem, stem + 'а', stem + 'о', stem + 'ы'):
+            return (stem, stem + 'а', stem + 'о', stem + 'ы')
+    for forms in _PAST_FORMS.values():
+        if low in forms:
+            return forms
+    return None
+
+
+def _agree_adjective(word: str, gender: str) -> str:
+    """«третья» → «третий», «новая» → «новый», «1-й» → «1-я» под род слова."""
+    low = word.casefold()
+    m = re.fullmatch(r'(\d+)-(?:й|я|е|ой|ая|ое|ые)', low)
+    if m:
+        return f"{m.group(1)}-{'йяее'[_GENDER_INDEX[gender]]}"
+    if low in ('третий', 'третья', 'третье', 'третьи'):
+        out = ('третий', 'третья', 'третье', 'третьи')[_GENDER_INDEX[gender]]
+    else:
+        m = re.fullmatch(r'([а-яё]{2,}?)(ый|ой|ий|ая|яя|ое|ее|ые|ие)', low)
+        if not m or m.group(2) in ('яя', 'ее'):
+            return word                  # мягкая основа («синий») — без догадок
+        base, ending = m.groups()
+        current = {'ый': 'm', 'ой': 'm', 'ий': 'm', 'ая': 'f', 'ое': 'n', 'ые': 'pl', 'ие': 'pl'}[ending]
+        if current == gender:
+            return word                  # уже согласовано: «ключевой» не станет «ключевый»
+        if base[-1] in 'кгх':
+            endings = ('ий', 'ая', 'ое', 'ие')
+        elif base in ('втор', 'молод', 'золот', 'ключев', 'миров', 'игров', 'боев', 'ролев',
+                      'основн', 'цветн'):
+            endings = ('ой', 'ая', 'ое', 'ые')
+        elif base[-1] in 'жшчщ':
+            return word
+        else:
+            endings = ('ый', 'ая', 'ое', 'ые')
+        out = base + endings[_GENDER_INDEX[gender]]
+    return out[:1].upper() + out[1:] if word[:1].isupper() else out
+
+
+_TITLE_MODIFIER_RE = re.compile(r'(?:\d+-?(?:й|я|е|ой|ая|ое|ые)?|трет(?:ий|ья|ье|ьи)'
+                                r'|[а-яё]+(?:ый|ой|ий|ая|яя|ое|ее|ые|ие))',
+                                re.IGNORECASE)
+
+
+def _agree_title_verb(title: str) -> str:
+    """Глагол в начале заголовка — в роде и числе подлежащего.
+
+    Модель пишет «Анонсировано аниме-адаптация», «Анонсирована третья сезон»,
+    «Вышел постер и трейлер», «Выдали постер» (посты канала, ноябрь 2026).
+    Правим, только когда подлежащее точно опознано: слово из списка в
+    именительном падеже, перед ним — не больше трёх определений.
+    """
+    m = re.match(r'^(\W*)([А-ЯЁа-яё]+)(\s+)(.*)$', title, re.S)
+    if not m:
+        return title
+    lead, verb, space, rest = m.groups()
+    words = rest.split(' ')
+    gave = verb.casefold() in ('выдали', 'выдан', 'выдана', 'выдано', 'выданы')
+    forms = _participle_forms(verb) if not gave else ('опубликован', 'опубликована',
+                                                       'опубликовано', 'опубликованы')
+    if forms is None:
+        return title
+    i = 0
+    while i < len(words) and i < 3 and _TITLE_MODIFIER_RE.fullmatch(words[i].strip(',.:')) \
+            and words[i].strip(',.:').casefold() not in _TITLE_NOUN_GENDER:
+        i += 1
+    if i >= len(words):
+        return title
+    noun_raw = words[i]
+    noun = noun_raw.rstrip(',.:;').casefold()
+    if gave and noun in _GAVE_ACCUSATIVE:
+        noun = _GAVE_ACCUSATIVE[noun]
+        words[i] = noun + noun_raw[len(noun_raw.rstrip(',.:;')):]
+        forms = ('объявлен', 'объявлена', 'объявлено', 'объявлены')
+    gender = _TITLE_NOUN_GENDER.get(noun.split('-')[-1] if noun not in _TITLE_NOUN_GENDER else noun)
+    if gender is None:
+        return title
+    # «постер и трейлер» — подлежащих два, глагол во множественном.
+    if not noun_raw.endswith((',', '.', ':', ';')) and i + 2 < len(words) and words[i + 1] == 'и':
+        j = i + 2
+        while j < len(words) and j < i + 4 and _TITLE_MODIFIER_RE.fullmatch(words[j].strip(',.:')) \
+                and words[j].strip(',.:').casefold() not in _TITLE_NOUN_GENDER:
+            j += 1
+        second = words[j].rstrip(',.:;').casefold() if j < len(words) else ''
+        if _TITLE_NOUN_GENDER.get(second.split('-')[-1] if second not in _TITLE_NOUN_GENDER else second):
+            gender = 'pl'
+    if forms[0] in ('анонсирован', 'объявлен') and noun in _TITLE_VISUAL_NOUNS:
+        forms = ('опубликован', 'опубликована', 'опубликовано', 'опубликованы')
+    adj_gender = _TITLE_NOUN_GENDER.get(noun.split('-')[-1] if noun not in _TITLE_NOUN_GENDER else noun)
+    for k in range(i):
+        words[k] = _agree_adjective(words[k], adj_gender)
+    new_verb = forms[_GENDER_INDEX[gender]]
+    new_verb = new_verb[:1].upper() + new_verb[1:] if verb[:1].isupper() else new_verb
+    return lead + new_verb + space + ' '.join(words)
+
+
+def _polish_jargon_more(text: str) -> str:
+    text = _fix_homoglyphs(text)
+    def poster(m: re.Match) -> str:
+        if not _visual_is_material(m):
+            return m.group(0)
+        upper = (m.group(1) or m.group(2))[:1].isupper()
+        return ('П' if upper else 'п') + _VISUAL_TO_POSTER.get(m.group(3) or '', 'постер')[1:]
+    text = _BARE_VISUAL_RE.sub(poster, text)
+    # «промо-ролик (PV)» после замены PV — «промо-ролик (промо-ролик)».
+    text = re.sub(r'(?<![\w-])([\w-]{3,}) \(\1\)', r'\1', text)
+    text = _TEASER_PV_RE.sub(lambda m: m.group(1) + 'изер', text)
+    if re.search(r'[А-Яа-яЁё]', text):
+        text = _LATIN_MANGA_RE.sub('Манга', text)
+        text = _SPIN_OFF_RE.sub(lambda m: ('С' if m.group(1) == 'S' else 'с') + 'пин-офф', text)
+        text = _LIGHT_NOVEL_RE.sub('ранобэ', text)
+    text = _DOUBLE_GUILLEMETS_RE.sub(r'«\1»', text)
+    text = _ROMAN_L_RE.sub(lambda m: f'{m.group(1)} V' + 'I' * len(m.group(2)), text)
+    text = _CAPS_CYR_RUN_RE.sub(lambda m: m.group(0)[0] + m.group(0)[1:].lower(), text)
+    # Хэштег источника отдельной строкой («#НовостиWeeklyJump»): свои теги
+    # бот дописывает после этой правки (_with_tags), чужие — шум.
+    lines = [line for line in text.split('\n') if not _HASHTAG_LINE_RE.match(line)]
+    if len(lines) != text.count('\n') + 1:
+        text = re.sub(r'\n{3,}', '\n\n', '\n'.join(lines)).strip('\n')
+    first, sep, rest = text.partition('\n')
+    return _agree_title_verb(first) + sep + rest
 
 
 def _tame_caps_latin(text: str) -> str:
@@ -14213,10 +14453,15 @@ _POST_LEADING_EMOJI = re.compile(r'^[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u
 
 def _post_emoji(title: str, news: Optional[dict] = None) -> str:
     """Эмодзи перед заголовком: по типу события от модели, иначе по словам."""
-    if title.casefold().startswith(('обновление:', 'update:')):
-        return '🔄'
     news = news or {}
+    if title.casefold().startswith(('обновление:', 'update:')) or news.get('_story_update_of'):
+        return '🔄'
     kind = str(news.get('_llm_kind') or '')
+    topic = str(news.get('_llm_topic') or '')
+    # «📺 Игра «Атака Титанов 3» получит 70 часов геймплея», «📺 Вышла 1-я глава
+    # манги»: 📺 — значок показа. Релиз игры и манги — значком темы.
+    if kind == 'релиз' and topic in ('игры', 'манга'):
+        return _POST_TOPIC_EMOJI[topic]
     for name, emoji in _POST_KIND_EMOJI:
         if kind == name:
             return emoji
@@ -14256,6 +14501,9 @@ def _post_html(text: str, limit: int, news: Optional[dict] = None) -> str:
     prefix = f'{emoji} ' if emoji else ''
     plain = fit_to_limit(str(text).strip(), max(1, limit - len(prefix) - 2))
     first, _sep, rest = plain.partition('\n')
+    if emoji == '🔄':
+        # Пометка из старых постов ветки и от модели: значок уже её говорит.
+        first = re.sub(r'^\s*(?:обновление|update)\s*:\s*', '', first, flags=re.IGNORECASE)
     out = prefix + f'<b>{html.escape(_clean_head(first.strip()))}</b>'
     rest = rest.strip('\n')
     if rest:
@@ -17596,6 +17844,7 @@ AUTOPOST_FAIL_COOLDOWN_SEC = 2 * 3600
 # WORK_REPEAT_HOURS, считая и посты админов. Кнопка админа это не трогает.
 WORK_REPEAT_HOURS = max(0, min(168, _env_int('WORK_REPEAT_HOURS', 36)))
 WORK_MEMORY_FILE = DATA_DIR / 'recent_works.json'
+WORK_ALIASES_FILE = DATA_DIR / 'work_aliases.json'
 WORK_KEYS_MAX = 24
 # Анонс, постер, дата и трейлер в первые сутки — одна новость в нескольких
 # пересказах («анонсировано» у админа и «постер и тизер» у бота в тот же день).
@@ -17795,6 +18044,13 @@ def _work_identity_keys(news: dict, *, lookups: int = 0) -> list[str]:
         short = value.casefold() in anchored
         add('ru:' + _work_name_key(value, short=short) if _work_name_key(value, short=short) else '')
         add('rs:' + _work_stem_key(value, short=short) if _work_stem_key(value, short=short) else '')
+        # «Death Stranding: Выход смерти: Изоляция» — латинская голова у
+        # смешанного имени. Как главная часть она встречает полное латинское
+        # имя другого поста («Death Stranding»), но не такую же голову.
+        head = re.split(r'\s*:\s*', value, maxsplit=1)[0]
+        if head != value and re.fullmatch(r"[A-Za-z0-9'’!?.\- ]+", head):
+            main = _work_name_key(head)
+            add('main:' + main if len(main) >= 7 else '')
     return keys[:WORK_KEYS_MAX]
 
 
@@ -17911,17 +18167,127 @@ def _work_numbers(news: dict) -> set:
     return set(story_work_numbers(_work_final_title(news) or str(news.get('title') or '')))
 
 
+# Пары «русское название (латинское)» из текстов постов: «Опасности в моём
+# сердце» (Boku no Kokoro no Yabai Yatsu), NullMeta (Тёпленько).
+_PAIR_RU_LAT_RE = re.compile(r'«([^«»\n]{2,80})»\s*\(([A-Za-z][^()\n]{2,80})\)')
+_PAIR_LAT_RU_RE = re.compile(
+    r"([A-Za-z0-9][A-Za-z0-9'’!?.:\-]*(?:\s+[A-Za-z0-9'’!?.:\-]+){0,8})\s*\(([А-ЯЁ][^()\n]{2,80})\)")
+
+
+class WorkAliases:
+    """Какие латинские и русские имена — один тайтл.
+
+    «Reincarnated as a Sword II» и «О моём перерождении в меч» — два поста о
+    втором сезоне за 14 часов (ноябрь 2026): ключи у них разные, и повтор
+    прошёл. Пары берём только явные — из скобок рядом с названием и из
+    Shikimori, — а не все имена поста: в подборке их несколько, и связь
+    склеила бы разные тайтлы.
+    """
+    MAX_PAIRS = 3000
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._pairs: dict[str, float] = {}          # «ключ_а|ключ_б» → когда видели
+        self._index: dict[str, set] = {}
+        self._lock = threading.Lock()
+        self._dirty = False
+        try:
+            if path.exists():
+                raw = json.loads(path.read_text(encoding='utf-8'))
+                if isinstance(raw, dict):
+                    self._pairs = {str(k): float(v) for k, v in raw.items() if '|' in str(k)}
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning(f'work_aliases не загружен: {e}')
+        self._reindex()
+
+    def _reindex(self) -> None:
+        index: dict[str, set] = {}
+        for pair in self._pairs:
+            a, _, b = pair.partition('|')
+            index.setdefault(a, set()).add(b)
+            index.setdefault(b, set()).add(a)
+        self._index = index
+
+    def learn(self, pairs) -> None:
+        """pairs — (русское, латинское) названия."""
+        added = False
+        now = time.time()
+        with self._lock:
+            for russian, latin in pairs:
+                ru = _work_name_key(russian)
+                lat = _work_name_key(latin)
+                if not ru or not lat or ru == lat:
+                    continue
+                pair = f'ru:{ru}|name:{lat}'
+                added |= pair not in self._pairs
+                self._pairs[pair] = now
+            if not added:
+                return
+            if len(self._pairs) > self.MAX_PAIRS:
+                keep = sorted(self._pairs.items(), key=lambda kv: kv[1])[-self.MAX_PAIRS:]
+                self._pairs = dict(keep)
+            self._reindex()
+            self._dirty = True
+
+    def expand(self, keys) -> list[str]:
+        """Ключи плюс их пары: латинскому имени — русское и наоборот."""
+        keys = list(keys or ())
+        with self._lock:
+            extra = [other for key in keys for other in sorted(self._index.get(key, ()))]
+        return list(dict.fromkeys(keys + extra))
+
+    def flush(self) -> None:
+        with self._lock:
+            if not self._dirty:
+                return
+            snapshot = dict(self._pairs)
+            self._dirty = False
+        try:
+            _atomic_write_json(self.path, snapshot)
+        except OSError as e:
+            with self._lock:
+                self._dirty = True
+            logger.warning(f'work_aliases не сохранён: {e}')
+
+
+def _work_title_pairs_in(news: dict) -> list[tuple[str, str]]:
+    """Явные пары (русское, латинское) из поста и из Shikimori."""
+    pairs: list[tuple[str, str]] = []
+    for text in (news.get('_llm_text'), news.get('title'), news.get('summary')):
+        text = str(text or '')
+        pairs += [(m.group(1), m.group(2)) for m in _PAIR_RU_LAT_RE.finditer(text)]
+        pairs += [(m.group(2), m.group(1)) for m in _PAIR_LAT_RU_RE.finditer(text)]
+    for original, russian in _work_title_pairs(news).items():
+        if re.search(r'[A-Za-z]', original) and not re.search(r'[А-Яа-яЁё]', original):
+            pairs.append((russian, original))
+    # Латиница с обеих сторон или кириллица в «латинском» — не пара.
+    return [(ru, lat) for ru, lat in pairs
+            if re.search(r'[А-Яа-яЁё]', ru) and not re.search(r'[А-Яа-яЁё]', lat)]
+
+
+def _work_keys_with_aliases(keys) -> list[str]:
+    return work_aliases.expand(keys) if work_aliases is not None else list(keys or ())
+
+
 def _work_remember(news: dict, by: str, *, lookups: int = 0) -> None:
     """Запомнить вышедший пост — бота или админа — вместе с его событием."""
     if work_memory is None:
         return
+    if work_aliases is not None:
+        try:
+            work_aliases.learn(_work_title_pairs_in(news))
+            work_aliases.flush()
+        except Exception as e:
+            logger.debug(f'пары названий не записаны: {e}')
     keys = list(dict.fromkeys([*(news.get('_work_keys') or ()),
                                *_work_identity_keys(news, lookups=lookups)]))
-    work_memory.remember(keys, _work_final_title(news) or str(news.get('title') or ''), by,
+    work_memory.remember(_work_keys_with_aliases(keys),
+                         _work_final_title(news) or str(news.get('title') or ''), by,
                          events=_work_events(news), numbers=_work_numbers(news))
 
 
 work_memory: Optional['WorkMemory'] = None
+work_aliases: Optional[WorkAliases] = None
 
 
 def _work_repeat_hit(news: dict) -> Optional[dict]:
@@ -17932,7 +18298,8 @@ def _work_repeat_hit(news: dict) -> Optional[dict]:
     # Ключи, посчитанные при отправке в ветку, плюс свежие: кеш тайтлов с тех
     # пор мог узнать запись, а у поста, ждущего в ветке, ключи старой версии.
     keys = list(dict.fromkeys([*(news.get('_work_keys') or ()), *_work_identity_keys(news)]))
-    return work_memory.seen(keys, WORK_REPEAT_HOURS, _work_events(news), _work_numbers(news))
+    return work_memory.seen(_work_keys_with_aliases(keys), WORK_REPEAT_HOURS,
+                            _work_events(news), _work_numbers(news))
 
 
 def _work_repeat_blocks(news: dict) -> bool:
@@ -20146,6 +20513,13 @@ def _topic_affinity(news: dict) -> float:
 WESTERN_DAILY_MAX = max(0, min(50, _env_int('WESTERN_DAILY_MAX', 1)))
 
 
+_GAME_SCREEN_RE = re.compile(
+    r'\bэкранизац\w*|\bреалити-шоу\b|\bлайв-?экш[еэ]?н\w*|'
+    r'\b(?:фильм\w*|сериал\w*|мультсериал\w*|мультфильм\w*|шоу)\s+по\s+(?:игр\w*|мотивам|вселенн\w*|франшиз\w*)|'
+    r'\b(?:film|movie|series|tv\s+show)\s+adaptation\b|\blive-action\b',
+    re.IGNORECASE)
+
+
 def _is_western_screen(news: dict) -> bool:
     """Новость про западное кино/сериал/комикс без связи с аниме.
 
@@ -20156,6 +20530,12 @@ def _is_western_screen(news: dict) -> bool:
         return False
     topic = str(news.get('_llm_topic') or '')
     if topic in ('кино', 'комиксы'):
+        return True
+    # Экранизация игры — кино, хоть модель и ставит ей тему «игры»: «Сценарий
+    # экранизации Gears of War готов», «Лайв-экшн сериал по PUBG» шли мимо
+    # суточного лимита (ноябрь 2026).
+    if topic == 'игры' and _GAME_SCREEN_RE.search(
+            str(news.get('_llm_text') or '').split('\n', 1)[0] or str(news.get('title') or '')):
         return True
     return str(news.get('source') or '') in GENERAL_TOPIC_SOURCES and topic not in ('игры', '')
 
@@ -26026,6 +26406,10 @@ _ECHO_STOP = {
     # Ссылка на источник — не факт: «По словам продюсера…», «…ожидается к концу
     # года» под заголовком «…подтвердил, что решение будет принято» (октябрь 2026).
     'slova', 'ojida', 'zayav', 'zayavi', 'soobsi', 'otmet', 'utoc',
+    # «Демонстрация аниме-адаптации ранобэ стартует в январе» под «В январе
+    # начнётся демонстрация аниме по ранобэ…»: «стартует» — тот же «выйдет»,
+    # «адаптация» — то же «аниме по …».
+    'start', 'adapt',
 }
 
 
@@ -26086,21 +26470,61 @@ def _checked_about(about: str, source: str, body: str) -> str:
     return about
 
 
+# Темы, у которых строки «о чём» нет: «Серия шутеров Call of Duty.», «Мультфильм
+# о падении и возрождении рыцаря.» ничего не добавляют. Завязку цитатой админы
+# канала пишут к аниме и манге.
+ABOUT_TOPICS_OFF = ('игры', 'кино', 'комиксы', 'прочее')
+# Доля основ строки «о чём», уже стоящих в посте, с которой она — повтор
+# (без слов названия тайтла). На постах канала (ноябрь 2026): пересказы
+# абзаца выше дают 0.42–0.78, новые завязки — 0–0.36. Сравнение «нет новых
+# слов» (_too_similar) пропускало почти всё: пересказ всегда другими словами.
+ABOUT_ECHO_SHARE = 0.4
+
+
 def _about_line(news: dict) -> str:
     """Что показать строкой «о чём»: фраза модели, иначе начало справки Shikimori."""
+    if str(news.get('_llm_topic') or '') in ABOUT_TOPICS_OFF:
+        return ''
     about = str(news.get('_about') or '').strip()
-    if about:
-        return about
-    if news.get('_llm_text') or news.get('_edited_text'):
-        return ''               # модель справку видела и решила, что она не нужна
-    text = str(_work_about(news).get('text') or '')
-    return _extract_sentences(text, max_sentences=1, max_len=ABOUT_MAX) if text else ''
+    if not about:
+        if news.get('_llm_text') or news.get('_edited_text'):
+            return ''           # модель справку видела и решила, что она не нужна
+        text = str(_work_about(news).get('text') or '')
+        about = _extract_sentences(text, max_sentences=1, max_len=ABOUT_MAX) if text else ''
+    # Та же чистка, что у текста поста: строка дописывается после неё, и
+    # «Девушка‑агент» с неразрывным дефисом и «Сакамо́то» с ударением шли в канал.
+    return _polish_post_text(about) if about else ''
+
+
+def _about_repeats(text: str, about: str) -> bool:
+    """Строка «о чём» пересказывает то, что в посте уже есть."""
+    if about in text or _too_similar(text, about):
+        return True
+    # Название тайтла в завязке — не повтор: «История об охотнике…» под
+    # заголовком об аниме «Охотник и ведьма» несёт новое.
+    names = set()
+    for match in _DIGEST_QUOTED_RE.finditer(text):
+        names |= _content_stems(match.group(1))
+    stems = _content_stems(about) - names
+    return bool(stems) and len(stems & _content_stems(text)) / len(stems) >= ABOUT_ECHO_SHARE
+
+
+def _about_names_other_work(text: str, about: str, news: dict) -> bool:
+    """В строке «о чём» — тайтл, которого в посте нет.
+
+    Пост о постере «Дыши или цвети» вышел с цитатой «Аниме-сериал по манге
+    «Ночь дурака»» (ноябрь 2026): справка пришла от другого тайтла новости.
+    Читатель видит два разных названия и не понимает, о чём пост.
+    """
+    known = ' '.join([str(text), str(news.get('_work_russian') or ''), str(news.get('_work_name') or ''),
+                      *map(str, _work_title_pairs(news).values())]).casefold()
+    return any(match.group(1).casefold() not in known for match in _DIGEST_QUOTED_RE.finditer(about))
 
 
 def _with_about(text: str, news: dict) -> str:
     """Дописывает строку «о чём» отдельным абзацем: в посте она станет цитатой."""
     about = _about_line(news)
-    if not about or about in text or _too_similar(text, about):
+    if not about or _about_repeats(text, about) or _about_names_other_work(text, about, news):
         return text
     return f'{text.rstrip()}\n\n{about}'
 
@@ -26109,11 +26533,22 @@ def _with_about(text: str, news: dict) -> str:
 # к пересказу заголовка, и отрицание «не» спасало пересказ от проверки на
 # повтор: «Тизер-постер к 5 сезону «…» опубликован, дата выхода не указана»
 # под заголовком «Появился тизер-постер 5 сезона «…»» (октябрь 2026).
+# То же списком: «однако в объявлении не указаны каст, студия и дата выхода»,
+# «детали кастинга, студии и даты выхода не раскрыты» (ноябрь 2026).
+_EMPTY_CLAIM_ITEM = (r'(?:каст\w*|студи\w*|дат\w*(?:\s+(?:выхода|премьеры|релиза|выпуска|показа|старта))?'
+                     r'|срок\w*|подробност\w*|режисс\w*|актёр\w*|актер\w*|состав\w*)')
+_EMPTY_CLAIM_LIST = (r'(?:детали\s+)?' + _EMPTY_CLAIM_ITEM
+                     + r'(?:(?:\s*,\s*|\s+и\s+)' + _EMPTY_CLAIM_ITEM + r'){0,5}')
+_EMPTY_CLAIM_NOT = r'не\s+(?:указан|объявлен|назван|сообща|раскрыт|известн|уточн|определ|сообщ)\w*'
 _EMPTY_CLAIM_CORE = (
-    r'(?:точн\w+\s+)?(?:дата|сроки?|время)\s+(?:выхода|премьеры|релиза|выпуска|показа|старта)'
-    r'(?:\s+[\w«»-]+){0,3}?\s+(?:пока\s+|ещё\s+|еще\s+)?'
-    r'(?:не\s+(?:указан|объявлен|назван|сообща|раскрыт|известн|уточн|определ|сообщ)\w*|неизвестн\w*'
-    r'|(?:станет|будет)\s+(?:известн|объявлен|назван)\w*\s+позже)')
+    # «Дата 4 сезона пока не объявлена», «дата не указана»: «выхода» модель
+    # пишет не всегда, и такие фразы оставались в посте.
+    r'(?:(?:точн\w+\s+)?(?:дата|сроки?|время)(?:\s+[\w«»-]+){0,3}?\s+(?:пока\s+|ещё\s+|еще\s+)?'
+    r'(?:' + _EMPTY_CLAIM_NOT + r'|неизвестн\w*'
+    r'|(?:станет|будет)\s+(?:известн|объявлен|назван)\w*\s+позже)'
+    r'|(?:в\s+(?:объявлении|анонсе|сообщении)\s+)?(?:пока\s+|ещё\s+|еще\s+)?'
+    + _EMPTY_CLAIM_NOT + r'\s+' + _EMPTY_CLAIM_LIST +
+    r'|' + _EMPTY_CLAIM_LIST + r'\s+(?:пока\s+|ещё\s+|еще\s+)?(?:' + _EMPTY_CLAIM_NOT + r'|неизвестн\w*))')
 _EMPTY_CLAIM_SENTENCE_RE = re.compile(r'^\s*(?:а\s+|но\s+|однако\s+|при\s+этом\s+)?'
                                       + _EMPTY_CLAIM_CORE + r'\s*[.!…]?\s*$', re.IGNORECASE)
 _EMPTY_CLAIM_CLAUSE_RE = re.compile(r'\s*[,;—–]\s*(?:а\s+|но\s+|однако\s+|при\s+этом\s+)?'
@@ -26145,6 +26580,26 @@ def _echo_view(title: str, text: str) -> str:
     return re.sub(r'(«([^»]{2,120})»)\s*\([A-Za-z][^()]{1,160}\)', drop, str(text or ''))
 
 
+# После повтора-начала идёт самостоятельная часть фразы, а не придаточное:
+# «Показан новый трейлер, в котором…» без начала не читается.
+_DEPENDENT_START_RE = re.compile(
+    r'^(?:котор\w*|где|когда|что|чтобы|как|и|а|но|или|в|во|на|с|со|по|из|у|от|к|ко|о|об|при|для|за|'
+    r'под|над|если|хотя|пока|после|ведь|поэтому|так|также|причём|причем|однако|ранее|сам\w*|его|её|их|'
+    r'он|она|оно|они|это|этот|эта|эти|который|чей|чья|чьё)\b', re.IGNORECASE)
+
+
+def _drop_echo_lead_clause(seen: str, sentence: str) -> str:
+    """«Показан новый трейлер, аниме выйдет в январе 2027 года» под
+    заголовком «Вышел новый трейлер аниме «…»»: начало до запятой — пересказ,
+    после неё — факт. Оставляем факт, если он читается сам по себе."""
+    head, sep, tail = sentence.partition(', ')
+    if not sep or len(head.split()) > 6 or len(tail.split()) < 3 or _DEPENDENT_START_RE.match(tail):
+        return sentence
+    if not _too_similar(seen, head):
+        return sentence
+    return tail[:1].upper() + tail[1:]
+
+
 def _drop_repetitive_paragraphs(title: str, paragraphs: list) -> list:
     """Убирает явные повторы; новые значимые слова сохраняют абзац.
 
@@ -26164,15 +26619,20 @@ def _drop_repetitive_paragraphs(title: str, paragraphs: list) -> list:
         # и абзац целиком сохранялся вместе с пересказом заголовка. Проверяем
         # и по фразам; фраза с новым словом или числом остаётся.
         sentences = _split_clauses(para.strip())
-        if len(sentences) > 1 or _number_echo(title, para):
+        # Латинское имя в скобках после названия из заголовка — не новое имя:
+        # без _echo_view «(Shangri-La Frontier)» спасало повтор с теми же датами.
+        if len(sentences) > 1 or _number_echo(title, _echo_view(title, para)):
             fresh = []
             for sentence in sentences:
                 if (_too_similar(seen, _echo_view(title, sentence))
                         or _number_echo(title, _echo_view(title, sentence))):
                     logger.info(f"✂️ Фраза-повтор убрана: {sentence[:55]}")
                     continue
-                fresh.append(sentence)
-                seen += '\n' + sentence
+                trimmed = _drop_echo_lead_clause(seen, sentence)
+                if trimmed != sentence:
+                    logger.info(f"✂️ Начало фразы-повтор убрано: {sentence[:55]}")
+                fresh.append(trimmed)
+                seen += '\n' + trimmed
             if not fresh:
                 continue
             if len(fresh) < len(sentences):
@@ -26180,6 +26640,10 @@ def _drop_repetitive_paragraphs(title: str, paragraphs: list) -> list:
                 # иначе «;» автора превращалась бы в точку без причины.
                 para = ' '.join(fresh)
         else:
+            trimmed = _drop_echo_lead_clause(seen, para)
+            if trimmed != para:
+                logger.info(f"✂️ Начало фразы-повтор убрано: {para[:55]}")
+                para = trimmed
             seen += '\n' + para
         kept.append(para)
     return kept
@@ -26193,6 +26657,11 @@ _NUMBER_ECHO_FILLER = frozenset(_stem_norm(stem) for stem in {
     'film', 'filma', 'filme', 'filmo', 'filmu', 'seria', 'serii', 'seriu', 'serie',
     'sobra', 'zarab', 'previ', 'sosta', 'start', 'vihod', 'sbori', 'sboro', 'nabra',
     'prine', 'vsego', 'okolo', 'bolee', 'menee', 'pocti',
+    # «Размер игры объявлен в 212 ГБ…» под «GTA VI будет весить 212 ГБ…»,
+    # «Сериал из 6 эпизодов уже доступен на платформе CHILL» под «…доступен на
+    # CHILL: 6 серий» (ноябрь 2026): род предмета и площадки — не новый факт.
+    'razme', 'igra', 'igri', 'igru', 'epizo', 'platf', 'plani', 'dostu',
+    'posle', 'final', 'reliz',
 })
 
 
@@ -35400,7 +35869,7 @@ def _init_globals() -> None:
     не затрагивая реальные данные пользователя."""
     global sent_links, translator, post_queue, settings, stats, anilist, pending_posts, moderation_feedback
     global editorial_rules, editorial_glossary, entity_memory, story_history, replay_buffer, story_registry, source_yield, work_titles
-    global work_memory
+    global work_memory, work_aliases
     global error_fingerprints, llm_budget, admin_audit, experiments, adaptive_publishing, analytics_store
     if sent_links is None:
         sent_links = SentLinksStore(SENT_LINKS_FILE)
@@ -35481,6 +35950,8 @@ def _init_globals() -> None:
         story_history = PublishedStoryStore(PUBLISHED_STORIES_FILE)
     if work_memory is None:
         work_memory = WorkMemory(WORK_MEMORY_FILE)
+    if work_aliases is None:
+        work_aliases = WorkAliases(WORK_ALIASES_FILE)
     if story_registry is None:
         story_registry = StoryRegistry(STORY_REGISTRY_FILE)
     if work_titles is None:
