@@ -191,26 +191,48 @@ NAMES = ['Альфа центавра', 'Бета версия', 'Гамма л�
 
 
 def test_network_failure_is_not_remembered_and_stops_the_cycle(shikimori):
-    """Сеть не ответила — ключа нет, новость склеится по-старому. После
-    первого отказа Shikimori не спрашиваем DOWN_PAUSE_SEC (ноябрь 2026): при
-    лежащем сервере каждый запрос ждал таймаута, и так каждая новость цикла."""
+    """Сеть не ответила — ключа нет, новость склеится по-старому. После трёх
+    отказов подряд Shikimori не спрашиваем DOWN_PAUSE_SEC: при лежащем сервере
+    каждый запрос ждал таймаута, и так каждая новость цикла."""
     import requests
     resolver = shikimori(requests.ConnectionError('down'))
     items = [{'title': f'Постер к аниме «{name}»', 'link': f'https://x/{i}'} for i, name in enumerate(NAMES)]
     assert bot._annotate_work_keys(items) == 0
-    assert len(shikimori.calls) == 1
+    assert len(shikimori.calls) == 3
     assert resolver.cached(NAMES[0]) is None
+    assert resolver.status()['paused_sec'] > 0
+
+
+def test_one_timeout_does_not_pause_shikimori(shikimori):
+    """Пауза после первого же таймаута на пять минут оставляла без русских
+    названий все посты этих минут: за три дня в канал ушло семь заголовков
+    на ромадзи (ноябрь 2026). Пауза — только после DOWN_AFTER отказов подряд."""
+    import requests
+    answers = [requests.ConnectionError('down'), [GRAND_BLUE], requests.Timeout('slow'),
+               requests.Timeout('slow')]
+    resolver = shikimori(lambda _name: answers.pop(0))
+    assert resolver.lookup('Grand Blue') is None
+    assert resolver.status()['paused_sec'] == 0
+    assert resolver.lookup('Grand Blue') == 'shiki:37105'      # спросили снова — и ответ есть
+    assert resolver.status()['fail_streak'] == 0               # успех обнуляет счёт
+    assert resolver.lookup('Другое имя') is None
+    assert resolver.lookup('Другое имя') is None
+    assert resolver.status()['paused_sec'] == 0                # два отказа после успеха — ещё не пауза
+    assert resolver.status()['last_error'] == 'Timeout'
+    assert len(shikimori.calls) == 4
 
 
 def test_shikimori_is_asked_again_after_the_pause(shikimori):
     import requests
     resolver = shikimori(requests.ConnectionError('down'))
+    for _ in range(resolver.DOWN_AFTER):
+        assert resolver.lookup('Grand Blue') is None
     assert resolver.lookup('Grand Blue') is None
-    assert resolver.lookup('Grand Blue') is None
-    assert len(shikimori.calls) == 1
+    assert len(shikimori.calls) == resolver.DOWN_AFTER         # на паузе запрос не уходит
     resolver._down_until = 0.0              # пауза вышла
     resolver.lookup('Grand Blue')
-    assert len(shikimori.calls) == 2
+    assert len(shikimori.calls) == resolver.DOWN_AFTER + 1
+    assert resolver.status()['paused_sec'] > 0                 # проба не удалась — пауза снова
 
 
 def test_flush_is_throttled_but_forced_on_shutdown(tmp_path, monkeypatch):

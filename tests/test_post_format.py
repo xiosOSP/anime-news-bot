@@ -137,7 +137,7 @@ def test_rich_post_has_emoji_bold_title_and_blank_line():
     ('Стартует показ', {}, '📺'),
     ('Новость дня', {'_llm_topic': 'игры'}, '🎮'),
     ('Новость дня', {}, '✨'),
-    ('Обновление: перенос', {}, '🔄'),
+    ('Вышел тизер', {'_story_update_of': 'abc'}, '🎬'),      # обновление — обычным значком
     ('Новость', {'_llm_kind': 'трейлер'}, '🎬'),
 ])
 def test_emoji_follows_the_event(title, news, emoji):

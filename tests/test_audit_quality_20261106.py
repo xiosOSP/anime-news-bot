@@ -156,16 +156,20 @@ def test_correct_titles_are_untouched(title):
 
 # ---------- значок и пометка обновления ----------
 
-def test_story_update_is_shown_by_emoji_not_text(monkeypatch):
+def test_story_update_has_no_label_and_the_usual_emoji(monkeypatch):
+    """Значок 🔄 и пометку «Обновление:» админы стирали с постов руками
+    (ноябрь 2026): обновление выходит с обычным значком события."""
     monkeypatch.setattr(bot, 'POST_STYLE', 'rich')
     monkeypatch.setattr(bot, 'editorial_glossary', None)
     monkeypatch.setattr(bot, 'entity_memory', None)
     news = {'_story_update_of': 'abc'}
     text = bot._apply_editorial_rules('Слух: бюджет фильма превысил 100 млн.', news)
     assert not text.startswith('Обновление')
-    assert bot._post_html(text, 1024, news).startswith('🔄 <b>Слух: бюджет')
+    assert bot._post_html(text, 1024, news).startswith('👀 <b>Слух: бюджет')
     # Пометка из поста, ждавшего в ветке со старой версии, тоже снимается.
-    assert bot._post_html('Обновление: вышел трейлер.', 1024, news).startswith('🔄 <b>Вышел трейлер.')
+    assert bot._post_html('Обновление: вышел трейлер.', 1024, news).startswith('🎬 <b>Вышел трейлер.')
+    assert bot._post_html('🔄 Обновление: вышел трейлер.', 1024, news).startswith('🎬 <b>Вышел трейлер.')
+    assert bot._post_html('Обновление:', 1024, news) == '✨ <b>Обновление:</b>'   # пустым заголовок не станет
 
 
 @pytest.mark.parametrize('topic, emoji', [('игры', '🎮'), ('манга', '📚'), ('аниме', '📺')])
