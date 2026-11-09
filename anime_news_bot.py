@@ -7550,6 +7550,13 @@ class WorkTitleResolver:
         # 8 с на каждого: при лежащем сервере новость ждала до ~30 с, и так
         # каждая новость цикла.
         self._down_until = 0.0
+        # Сбои подряд и когда был последний ответ — для /health: по ним видно,
+        # почему в канал пошли названия на ромадзи.
+        self._fail_streak = 0
+        self._fail_since = 0.0
+        self._last_ok_at = 0.0
+        self._last_error = ''
+        self._last_error_at = 0.0
         self._saved_at = 0.0
         self._dirty = False
         self._load()
@@ -7651,10 +7658,35 @@ class WorkTitleResolver:
             self._last_request = time.monotonic()
             return True
 
-    def _went_down(self) -> None:
-        self._down_until = time.monotonic() + self.DOWN_PAUSE_SEC
+    # Пауза — только после нескольких сбоев подряд. Раньше хватало одного
+    # таймаута, и пять минут не опознавался ни один тайтл: за три дня в канал
+    # ушло семь постов с названием на ромадзи и два повтора, которые не
+    # склеились с русским названием того же тайтла (ноябрь 2026).
+    DOWN_AFTER = 3
+    DOWN_PAUSE_SEC = 120
 
-    DOWN_PAUSE_SEC = 300
+    def _went_down(self, why: str = '') -> None:
+        if not self._fail_streak:
+            self._fail_since = time.time()
+        self._fail_streak += 1
+        self._last_error = str(why or 'нет ответа')[:80]
+        self._last_error_at = time.time()
+        if self._fail_streak >= self.DOWN_AFTER:
+            self._down_until = time.monotonic() + self.DOWN_PAUSE_SEC
+
+    def _came_up(self) -> None:
+        self._fail_streak = 0
+        self._fail_since = 0.0
+        self._last_ok_at = time.time()
+
+    def status(self) -> dict:
+        """Отвечает ли Shikimori: для /health и разбора «почему ромадзи»."""
+        return {'fail_streak': self._fail_streak,
+                'failing_sec': int(time.time() - self._fail_since) if self._fail_streak else 0,
+                'paused_sec': max(0, int(self._down_until - time.monotonic())),
+                'last_ok_at': self._last_ok_at,
+                'last_error': self._last_error,
+                'last_error_at': self._last_error_at}
 
     def cached(self, name: str) -> Optional[str]:
         """Ключ тайтла из кеша: строка (пустая — «не нашли»), None — не спрашивали."""
@@ -7776,18 +7808,23 @@ class WorkTitleResolver:
                          'Content-Type': 'application/json'},
                 timeout=(3, min(HTTP_TIMEOUT, 8)), allow_redirects=False)
             if response.status_code != 200:
-                if response.status_code == 429 or response.status_code >= 500:
-                    self._went_down()
+                # В счёт идёт любой неответ, не только 429 и 5xx: переезд
+                # сайта (301) или отказ хостингу (403) — тоже «не отвечает»,
+                # и без счёта посты ждали бы названия при каждом сборе.
+                self._went_down(f'HTTP {response.status_code}')
                 return None
             data = response.json()
             candidates = (data.get('data') or {}).get('animes')
-        except requests.RequestException:
-            self._went_down()
+        except requests.RequestException as e:
+            self._went_down(type(e).__name__)
             return None
         except (ValueError, AttributeError):
+            self._went_down('ответ не JSON')
             return None
         if not isinstance(candidates, list):
+            self._went_down('в ответе нет списка')
             return None
+        self._came_up()
         found = self._accept(name, candidates)
         key = f"shiki:{found['id']}" if found else ''
         with self._lock:
@@ -7838,15 +7875,15 @@ class WorkTitleResolver:
                          'Content-Type': 'application/json'},
                 timeout=(3, min(HTTP_TIMEOUT, 8)), allow_redirects=False)
             if response.status_code != 200:
-                if response.status_code == 429 or response.status_code >= 500:
-                    self._went_down()
+                self._went_down(f'HTTP {response.status_code}')
                 return {}
             animes = (response.json().get('data') or {}).get('animes')
-        except requests.RequestException:
-            self._went_down()
+        except requests.RequestException as e:
+            self._went_down(type(e).__name__)
             return {}           # сеть молчит — без справки, в кеш не пишем
         except (ValueError, AttributeError):
             return {}
+        self._came_up()
         row = animes[0] if isinstance(animes, list) and animes and isinstance(animes[0], dict) else {}
         text = _shikimori_plain(row.get('description'))
         genres = [str(g.get('russian') or '').strip() for g in (row.get('genres') or [])
@@ -8088,6 +8125,7 @@ def _annotate_llm_titles(news: dict, budget: int = LLM_TITLE_LOOKUPS) -> None:
     network = str(news.get('_llm_topic') or '') in ('аниме', 'манга')
     pairs = dict(news.get('_work_titles_ru') or {})
     failures = 0
+    unanswered = False
     for name in _llm_named_works(news):
         if name in pairs:
             continue
@@ -8097,6 +8135,8 @@ def _annotate_llm_titles(news: dict, budget: int = LLM_TITLE_LOOKUPS) -> None:
             key = work_titles.lookup(name)
             if key is None:
                 failures += 1
+        if key is None and network:
+            unanswered = True       # Shikimori не ответил: это не «тайтла нет»
         russian = work_titles.russian(name) if key else ''
         if not russian or russian.casefold() == name.casefold():
             continue
@@ -8107,6 +8147,12 @@ def _annotate_llm_titles(news: dict, budget: int = LLM_TITLE_LOOKUPS) -> None:
             news['_work_key'], news['_work_name'], news['_work_russian'] = key, name, russian
     if pairs:
         news['_work_titles_ru'] = pairs
+    # Отметка для _prepare_news_for_send: пост с ромадзи в заголовке подождёт
+    # следующего цикла, а не уйдёт в канал как есть.
+    if unanswered:
+        news['_title_lookup_failed'] = True
+    else:
+        news.pop('_title_lookup_failed', None)
     work_titles.flush()           # не чаще раза в FLUSH_EVERY_SEC
 
 
@@ -8282,11 +8328,18 @@ class PublishedStoryStore:
         old_title = str(best.get('title') or '')
         old_summary = str(best.get('summary') or '')
         old_nums = _story_numbers({'title': f'{old_title} {old_summary}'})
-        number_change = bool(new_nums - old_nums)
         new_date = extract_release_date_from_text(
             f"{news.get('title') or ''}\n{str(news.get('summary') or '')[:600]}")
         old_date = extract_release_date_from_text(f'{old_title}\n{old_summary[:600]}')
-        date_change = bool(new_date and new_date != old_date)
+        date_known = bool(new_date) and _date_already_reported(
+            new_date, old_date, f'{old_title}\n{old_summary[:600]}')
+        date_change = bool(new_date) and not date_known
+        fresh_nums = new_nums - old_nums
+        if date_known:
+            # Год при уже известном месяце — не новый номер: «…April 2027
+            # premiere» после «…premiere in April».
+            fresh_nums -= set(re.findall(r'\d+', new_date))
+        number_change = bool(fresh_nums)
         # Род события прошлой новости — по заголовку И тексту: «Reveals Main
         # Cast» с текстом «…premiere in 2027» уже сообщала дату, и «Main Cast,
         # 2027 Release Date» от другого сайта ничего нового не несёт.
@@ -8399,14 +8452,50 @@ def _apply_editorial_rules(text: str, news: Optional[dict] = None) -> str:
         out = editorial_glossary.apply(out)
     if feature_enabled('entity_memory') and entity_memory is not None:
         out = entity_memory.apply(out)
-    # В оформлении rich обновление видно по значку 🔄 (_post_emoji): текстовая
-    # пометка давала «🔄 Обновление: Слух: …» — две метки подряд перед фактом.
+    # В оформлении rich пометки нет вовсе: её и значок 🔄 админы канала
+    # стирали с постов руками (ноябрь 2026). Читателю важен сам факт.
     if news and news.get('_story_update_of') and out and POST_STYLE != 'rich':
         first, sep, rest = out.partition('\n')
         if not first.casefold().startswith(('обновление:', 'update:')):
             first = 'Обновление: ' + first
         out = first + (sep + rest if sep else '')
     return out
+
+
+_MONTH_MENTION = {
+    1: r'январ', 2: r'феврал', 3: r'\bмарт', 4: r'апрел', 5: r'\bма[йяе]\b', 6: r'июн',
+    7: r'июл', 8: r'\bавгуст', 9: r'сентябр', 10: r'октябр', 11: r'ноябр', 12: r'декабр'}
+_SEASON_MENTION = {'весна': r'весн|\bspring\b|春', 'лето': r'\bлет[оа]м?\b|\bsummer\b|夏',
+                   'осень': r'осен|\bfall\b|\bautumn\b|秋', 'зима': r'\bзим|\bwinter\b|冬'}
+
+
+def _date_already_reported(new_date: str, old_date: str, old_text: str) -> bool:
+    """Дата новой новости уже была в прошлой — пусть и без года.
+
+    «Премьера в апреле» и «апрель 2027» — одна дата: год дописал другой
+    источник. Раньше это считалось новой датой, пост получал отметку
+    обновления и обходил сравнение заголовков: «Постер и трейлер…» и «Премьера
+    запланирована на апрель 2027 года» о том же тайтле вышли с разницей в
+    сутки (ноябрь 2026). Другая дата в прошлой новости — это перенос, новость.
+    """
+    if not new_date or new_date == old_date:
+        return True
+    if old_date:
+        # «12 августа» и «12 августа 2026» — тот же день.
+        return new_date.startswith(old_date + ' ') or old_date.startswith(new_date + ' ')
+    match = re.fullmatch(r'([а-яё]+) \d{4}', new_date)
+    if not match:
+        return False
+    low = str(old_text or '').casefold()
+    word = match.group(1)
+    for number, name in RU_MONTHS_NOM.items():
+        if name == word:
+            english = '|'.join(k for k, v in _EN_MONTHS.items() if v == number)
+            # «may» — ещё и глагол: месяцем считаем только после предлога.
+            english = rf'\b(?:{english})\b' if number != 5 else r'\b(?:in|this|next|for|by) may\b'
+            return bool(re.search(rf'{english}|{_MONTH_MENTION[number]}|(?<!\d){number}月', low))
+    season = _SEASON_MENTION.get(word)
+    return bool(season and re.search(season, low))
 
 
 def _annotate_story_updates(items: list[dict]) -> list[dict]:
@@ -13448,9 +13537,27 @@ _ANNIVERSARY_FORWARD_RE = re.compile(
     re.IGNORECASE)
 
 
+# Поздравительная картинка к юбилею — не событие: «Новая иллюстрация к
+# 20-летию аниме «Код Гиас»» ушла в канал (ноябрь 2026), хотя юбилеи
+# выкладывают админы. «Показали», «опубликован», «revealed» о картинке новости
+# не делают; делает то, что к юбилею выходит: фильм, проект, выставка, сезон.
+_ANNIVERSARY_ART_RE = re.compile(
+    r'иллюстрац|\bарт(?:ы|а|ом|ов)?\b|рисун\w*|визуал|постер|открытк|'
+    r'illustration|artwork|\bart\b|visual|poster', re.IGNORECASE)
+_ANNIVERSARY_REAL_EVENT_RE = re.compile(
+    r'анонс|announc|трейлер|trailer|тизер|teaser|выйдет|выпуст|покажут|проведут|пройд[её]т|'
+    r'коллаборац|collab|выставк|exhibit|концерт|concert|sequel|сиквел|продолжени|экраниз|'
+    r'adaptation|\bseason\b|сезон|фильм|\bfilm\b|movie|проект|project|\bwill\s+\w+',
+    re.IGNORECASE)
+
+
 def _anniversary_is_news(title: str) -> bool:
     """Юбилей в заголовке, но новость есть: новое событие к юбилею или впереди."""
-    if _ANNIVERSARY_FOR_RE.search(title) or _ANNIVERSARY_FORWARD_RE.search(title):
+    if _ANNIVERSARY_FORWARD_RE.search(title):
+        return True
+    if _ANNIVERSARY_ART_RE.search(title) and not _ANNIVERSARY_REAL_EVENT_RE.search(title):
+        return False
+    if _ANNIVERSARY_FOR_RE.search(title):
         return True
     if _ANNIVERSARY_RETRO_RE.search(title):
         return False
@@ -13592,6 +13699,17 @@ def _self_promo(title: str, source: str) -> bool:
     own = re.sub(r'[^0-9a-zа-яё]+', '', source.casefold())
     named = re.sub(r'[^0-9a-zа-яё]+', '', match.group(1).casefold())
     return bool(own and named and (own in named or named in own))
+
+
+def _final_headline_anniversary(news: dict) -> bool:
+    """Юбилей или день рождения в заголовке, каким пост выйдет в канал.
+
+    Фильтр сбора видит заголовок источника — английский или японский
+    («20周年記念イラスト»), и юбилей в нём узнаёт не всегда. В пересказе модели
+    он уже по-русски: проверяем ещё раз тем же правилом.
+    """
+    title = _work_final_title(news)
+    return bool(title and _ANNIVERSARY_SOFT_RE.search(title) and not _anniversary_is_news(title))
 
 
 def matches_keywords(news: dict) -> bool:
@@ -13845,31 +13963,52 @@ def _russify_titles(text: str, news: Optional[dict]) -> str:
     # Иероглиф ищем заглядыванием вперёд, а пробелы — только с начала их
     # серии: два «*» подряд и \s* с каждой позиции давали перебор на длинном
     # тексте без закрывающей скобки.
-    text = _CJK_PAREN_RE.sub('', text)
+    text = _CJK_PAREN_RE.sub('', text).replace('\x00', '')
+    # Готовые куски прячем за метками до конца прохода. У тайтла в парах два
+    # имени — «Yuru Camp△» и «Yuru Camp», — и второе находило себя внутри
+    # только что поставленных скобок: «…» («Лагерь на свежем воздухе»△)
+    # (ноябрь 2026).
+    kept: list[str] = []
+
+    def keep(value: str) -> str:
+        kept.append(value)
+        return f'\x00{len(kept) - 1}\x00'
+    lowered = text.casefold()
+    shown: set = set()          # русские названия, уже поставленные в текст
     for original, russian in sorted(_work_title_pairs(news).items(), key=lambda kv: -len(kv[0])):
         cjk = bool(_CJK_LETTERS_RE.search(original))
         # Апостроф после имени — не закрывающая кавычка: «Frieren: Beyond
         # Journey» внутри «Journey's End» давало «…» (Frieren: Beyond Journey)s End».
+        # Значок после имени («Yuru Camp△») — часть названия, а не текста.
         body = (re.escape(original) if cjk else
-                r'(?<![\w])' + re.escape(original) + r"(?![\w])(?!['’]\w)")
+                r'(?<![\w])' + re.escape(original) + r"[△▽☆★♡♥♪]*(?![\w])(?!['’]\w)")
         # Кавычки — вместе с названием, но не пробелы вокруг: без кавычек
         # «сезон Grand Blue выйдет» не должно склеиться в «сезон«…»выйдет».
-        pattern = re.compile(r'(?:[«"“\'『「]\s*)?' + body + r'(?:\s*[»"”\'』」])?',
+        pattern = re.compile(r'(?:[«"“\'『「]\s*)?(?P<name>' + body + r')(?:\s*[»"”\'』」])?',
                              0 if cjk else re.IGNORECASE)
         # Русское название уже в тексте (модель сделала как надо): оригинал
         # в скобках рядом с ним оставляем, остальные упоминания — по-русски.
-        seen = [russian.casefold() in text.casefold()]
+        seen = [russian.casefold() in lowered or russian.casefold() in shown]
 
         def replace(match, russian=russian, original=original, cjk=cjk, seen=seen):
             before = match.string[:match.start()].rstrip()
-            if not cjk and before.endswith('(') and match.string[match.end():].lstrip().startswith(')'):
-                return match.group(0)
+            after = match.string[match.end():]
+            if not cjk and before.endswith('(') and after.lstrip().startswith(')'):
+                return keep(match.group(0))
             first = not seen[0]
             seen[0] = True
+            shown.add(russian.casefold())
+            # Название кончается точкой («…Kokuhaku shitemita.»), и она же
+            # закрывала заголовок: вместе с названием пропадала и точка.
+            tail = ''
+            if (original[-1:] in '.!?' and not russian.endswith(original[-1:])
+                    and re.match(r'[ \t]*(?:\n|$)', after)):
+                tail = original[-1]
             if first and not cjk and len(original) <= 30:
-                return f'«{russian}» ({original})'
-            return f'«{russian}»'
+                return keep(f'«{russian}» ({match.group("name").rstrip(".")})') + tail
+            return keep(f'«{russian}»') + tail
         text = pattern.sub(replace, text)
+    text = re.sub(r'\x00(\d+)\x00', lambda m: kept[int(m.group(1))], text)
     return _official_russian_name(text, news)
 
 
@@ -14235,6 +14374,8 @@ def _polish_jargon_more(text: str) -> str:
     # «промо-ролик (PV)» после замены PV — «промо-ролик (промо-ролик)».
     text = re.sub(r'(?<![\w-])([\w-]{3,}) \(\1\)', r'\1', text)
     text = _TEASER_PV_RE.sub(lambda m: m.group(1) + 'изер', text)
+    # «AI-арт с Торфинном» (ноябрь 2026): в русском тексте — «ИИ-арт».
+    text = re.sub(r'(?<![\w-])AI-(?=[а-яё])', 'ИИ-', text)
     if re.search(r'[А-Яа-яЁё]', text):
         text = _LATIN_MANGA_RE.sub('Манга', text)
         text = _SPIN_OFF_RE.sub(lambda m: ('С' if m.group(1) == 'S' else 'с') + 'пин-офф', text)
@@ -14448,14 +14589,13 @@ _POST_TITLE_EMOJI = (
     (re.compile(r'\bигр[аыуе]?\b|видеоигр|Steam|PlayStation|Nintendo|Xbox', re.I), '🎮'),
     (re.compile(r'премьер|стартует|выйдет|вышел|вышла|релиз', re.I), '📺'),
 )
+_UPDATE_LABEL_RE = re.compile(r'^(?:🔄\s*)?(?:обновление|update)\s*:\s*', re.IGNORECASE)
 _POST_LEADING_EMOJI = re.compile(r'^[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF]')
 
 
 def _post_emoji(title: str, news: Optional[dict] = None) -> str:
     """Эмодзи перед заголовком: по типу события от модели, иначе по словам."""
     news = news or {}
-    if title.casefold().startswith(('обновление:', 'update:')) or news.get('_story_update_of'):
-        return '🔄'
     kind = str(news.get('_llm_kind') or '')
     topic = str(news.get('_llm_topic') or '')
     # «📺 Игра «Атака Титанов 3» получит 70 часов геймплея», «📺 Вышла 1-я глава
@@ -14496,14 +14636,15 @@ def _post_html(text: str, limit: int, news: Optional[dict] = None) -> str:
     """
     if POST_STYLE != 'rich' or not str(text or '').strip():
         return _escape_to_limit(text, limit)
-    head = str(text).lstrip().split('\n', 1)[0]
+    # Пометка «Обновление:» из старых постов ветки и от модели — долой: значок
+    # 🔄 и её саму админы стирали с постов руками. Обновление сюжета выходит
+    # с обычным значком события — трейлер, анонс, дата.
+    text = _UPDATE_LABEL_RE.sub('', str(text).lstrip(), count=1) or str(text).lstrip()
+    head = text.split('\n', 1)[0]
     emoji = '' if _POST_LEADING_EMOJI.match(head) else _post_emoji(head, news)
     prefix = f'{emoji} ' if emoji else ''
-    plain = fit_to_limit(str(text).strip(), max(1, limit - len(prefix) - 2))
+    plain = fit_to_limit(text.strip(), max(1, limit - len(prefix) - 2))
     first, _sep, rest = plain.partition('\n')
-    if emoji == '🔄':
-        # Пометка из старых постов ветки и от модели: значок уже её говорит.
-        first = re.sub(r'^\s*(?:обновление|update)\s*:\s*', '', first, flags=re.IGNORECASE)
     out = prefix + f'<b>{html.escape(_clean_head(first.strip()))}</b>'
     rest = rest.strip('\n')
     if rest:
@@ -15183,6 +15324,26 @@ async def _prepare_news_for_send(news: dict, source: str,
         # ссылка осталась бы занятой и второго шанса не получила.
         logger.info('⏸ Пост отложен до живой модели: %s', str(news.get('title', ''))[:60])
         metrics.inc('anime_bot_llm_deferred_total')
+        return 'deferred'
+
+    # Юбилеи и дни рождения выкладывают админы. Пост, выбранный админом
+    # кнопкой (apply_dedup=False), не трогаем.
+    if (apply_dedup and settings.local_noise_filter and _final_headline_anniversary(news)):
+        logger.info('⊘ Юбилей в заголовке пересказа: %s', _work_final_title(news)[:60])
+        metrics.inc('anime_bot_noise_skips_total', labels={'reason': 'годовщина и ностальгия'})
+        if count_stats:
+            await stats.record_skipped('filtered', source)
+        return 'skipped_filter'
+
+    # Shikimori не ответил на имя тайтла, которое назвала модель: пост вышел бы
+    # с ромадзи в заголовке и не склеился бы с русским названием того же
+    # тайтла. Ответ модели лежит в кеше, так что следующий цикл повторит только
+    # запрос к Shikimori. Пост, выбранный админом (apply_dedup=False), не ждёт.
+    if (apply_dedup and news.get('_title_lookup_failed') and _title_wait_makes_sense()
+            and await asyncio.to_thread(_title_defer_news, news)):
+        logger.info('⏸ Пост отложен: Shikimori не ответил, название осталось бы '
+                    'на ромадзи — %s', str(news.get('title', ''))[:60])
+        metrics.inc('anime_bot_title_lookup_deferred_total')
         return 'deferred'
 
     # Лимит только для автопубликации: тему знает модель, поэтому проверка
@@ -18096,16 +18257,26 @@ class WorkMemory:
         except OSError as e:
             logger.error(f'recent_works не сохранён: {e}')
 
-    def seen(self, keys, hours: float, events=None, numbers=None) -> Optional[dict]:
+    def seen(self, keys, hours: float, events=None, numbers=None,
+             born: Optional[float] = None) -> Optional[dict]:
         """Последний пост о том же тайтле и том же событии за ``hours`` часов.
 
         events=None — не сравнивать события (любой пост о тайтле).
+        born — когда проверяемый пост попал в ветку. Окна считаются от этого
+        момента, а не от «сейчас»: повтор ждал в ветке, пока окно истечёт, и
+        выходил сразу после — через 24 ч 02 мин и через 38 ч после первого
+        поста о тайтле (ноябрь 2026). Пост, который был повтором, когда
+        пришёл, повтором и остаётся.
         """
         wanted = {str(k) for k in keys or () if k}
         if not wanted or hours <= 0:
             return None
         now = time.time()
-        edge = now - hours * 3600
+        try:
+            born = min(now, float(born)) if born else now
+        except (TypeError, ValueError):
+            born = now
+        edge = born - hours * 3600
         # Части ключей — один раз, а не на каждую из 600 записей: проверка
         # повтора идёт для каждого поста ветки в цикле событий, и с 150 постами
         # она занимала ~130 мс за проход (замер, ноябрь 2026).
@@ -18124,7 +18295,7 @@ class WorkMemory:
                     continue
                 if events is None or 'events' not in row or _work_events_related(
                         set(events), set(row.get('events') or ()), set(numbers or ()),
-                        set(row.get('nums') or ()), (now - at) / 3600, row.get('by')):
+                        set(row.get('nums') or ()), max(0.0, born - at) / 3600, row.get('by')):
                     return dict(row)
         return None
 
@@ -18299,7 +18470,8 @@ def _work_repeat_hit(news: dict) -> Optional[dict]:
     # пор мог узнать запись, а у поста, ждущего в ветке, ключи старой версии.
     keys = list(dict.fromkeys([*(news.get('_work_keys') or ()), *_work_identity_keys(news)]))
     return work_memory.seen(_work_keys_with_aliases(keys), WORK_REPEAT_HOURS,
-                            _work_events(news), _work_numbers(news))
+                            _work_events(news), _work_numbers(news),
+                            born=news.get('_thread_ts'))
 
 
 def _work_repeat_blocks(news: dict) -> bool:
@@ -18795,7 +18967,9 @@ class PendingPosts:
                 count(f'старше {max_age_hours:g} ч')
                 continue
             if skip is not None:
-                reason = skip(item['news'])
+                # Время попадания в ветку — проверке повтора тайтла: см.
+                # WorkMemory.seen. В сохранённый пост поле не пишем.
+                reason = skip({**item['news'], '_thread_ts': ts} if ts else item['news'])
                 if reason:
                     count(reason if isinstance(reason, str) else 'отсеян')
                     continue
@@ -26588,12 +26762,22 @@ _DEPENDENT_START_RE = re.compile(
     r'он|она|оно|они|это|этот|эта|эти|который|чей|чья|чьё)\b', re.IGNORECASE)
 
 
+_PARTICIPLE_START_RE = re.compile(
+    r'^\w+(?:вш|ущ|ющ|ащ|ящ|енн|ённ|анн|янн)(?:ий|ая|ее|ие|ый|ое|ые|ого|ей|их|ую|ой|ым|им|ом|ем|ся)\w*\b',
+    re.IGNORECASE)
+
+
 def _drop_echo_lead_clause(seen: str, sentence: str) -> str:
     """«Показан новый трейлер, аниме выйдет в январе 2027 года» под
     заголовком «Вышел новый трейлер аниме «…»»: начало до запятой — пересказ,
     после неё — факт. Оставляем факт, если он читается сам по себе."""
     head, sep, tail = sentence.partition(', ')
     if not sep or len(head.split()) > 6 or len(tail.split()) < 3 or _DEPENDENT_START_RE.match(tail):
+        return sentence
+    # «Профсоюз, представляющий работников Arkane, заявляет…»: до запятой —
+    # подлежащее, после — причастный оборот. Без начала выходило
+    # «Представляющий работников Arkane, заявляет…» (ноябрь 2026).
+    if len(head.split()) < 2 or _PARTICIPLE_START_RE.match(tail):
         return sentence
     if not _too_similar(seen, head):
         return sentence
@@ -26719,6 +26903,21 @@ def _drop_source_meta(paragraphs: list) -> list:
     return kept
 
 
+def _close_sentence(paragraph: str) -> str:
+    """Точка в конце абзаца, если модель её не поставила.
+
+    «Продолжение сериала выйдет в апреле 2027 года» без точки под заголовком
+    с точкой (ноябрь 2026). Строку из хэштегов, ссылку и строку, которая
+    кончается знаком или эмодзи, не трогаем.
+    """
+    text = str(paragraph or '').rstrip()
+    last_line = text.rsplit('\n', 1)[-1]
+    if (not text or not re.search(r'[0-9A-Za-zА-Яа-яЁё»)]$', text)
+            or _HASHTAG_LINE_RE.match(last_line) or re.search(r'(?:https?://|t\.me/)\S*$', last_line)):
+        return paragraph
+    return text + '.'
+
+
 def _split_clauses(text: str) -> list[str]:
     """Фразы абзаца; фраза с «;» делится ещё и по нему.
 
@@ -26750,8 +26949,33 @@ _ECHO_TIME_WORD_RE = re.compile(
     r'октябр\w*|ноябр\w*|декабр\w*|весн\w*|лет[оа]м?|осен\w*|зим\w*)\b')
 
 
+# Порядковые числительные словом: «7 эпизод … перенесён на 16 ноября» и под
+# ним «Премьера седьмого эпизода отложена до 16 ноября» — один факт, а
+# «седьмого» выглядело новым словом (ноябрь 2026).
+_ORDINAL_WORD_RE = re.compile(
+    r'\b(перв|втор|трет|четв[её]рт|пят|шест|седьм|восьм|девят|десят|одиннадцат|двенадцат)'
+    r'(?:ый|ий|ой|ая|ья|ое|ье|ого|ьего|ому|ьему|ым|ьим|ом|ьем|ую|ью|ей|ьей|ые|ьи|ых|ьих)\b',
+    re.IGNORECASE)
+_ORDINAL_DIGIT = {'перв': '1', 'втор': '2', 'трет': '3', 'четверт': '4', 'пят': '5', 'шест': '6',
+                  'седьм': '7', 'восьм': '8', 'девят': '9', 'десят': '10', 'одиннадцат': '11',
+                  'двенадцат': '12'}
+
+
+def _ordinals_as_digits(text: str) -> str:
+    return _ORDINAL_WORD_RE.sub(
+        lambda m: _ORDINAL_DIGIT[m.group(1).casefold().replace('ё', 'е')], str(text or ''))
+
+
+# Род предмета вместо названия — не факт: «Анонсирован второй сезон
+# аниме-сериала» под заголовком с названием тайтла.
+_ECHO_GENERIC = frozenset(_content_stems('сериал сериала проект проекта тайтл тайтла новинка новинки'))
+# Перенос теми же словами: «перенесён», «отложен», «сдвинут».
+_ECHO_SHIFT = frozenset(_content_stems('перенесён перенос отложен отложена сдвинут сдвинута отсрочен'))
+
+
 def _too_similar(a: str, b: str) -> bool:
     """Only discard an echo with no new content; overlap alone loses facts."""
+    a, b = _ordinals_as_digits(a), _ordinals_as_digits(b)
     wa, wb = _content_stems(a), _content_stems(b)
     if not wa or not wb:
         return False
@@ -26763,7 +26987,9 @@ def _too_similar(a: str, b: str) -> bool:
         return found | {_stem_norm(w[:5]) for w in _ECHO_TIME_WORD_RE.findall(text.lower())}
     if not details(b).issubset(details(a)):
         return False
-    new = wb - wa
+    new = wb - wa - _ECHO_GENERIC
+    if wa & _ECHO_SHIFT:
+        new -= _ECHO_SHIFT
     if not new:
         return True
     # Одно новое обычное слово в длинной фразе — пересказ, а не факт: «По
@@ -26975,6 +27201,61 @@ def _untranslated_defer_news(news: dict) -> bool:
             key, seen, TRANSLATION_DEFER_MAX_ATTEMPTS, TRANSLATION_DEFER_MAX_AGE_SEC)
         news['_translation_defer_attempts'] = attempts
         return wait
+
+
+# Сколько раз и сколько времени пост ждёт ответа Shikimori о названии тайтла.
+# Дольше ждать незачем: новость стареет, а название на ромадзи — не ошибка
+# в факте. Четыре цикла сбора покрывают обычную заминку сервера.
+TITLE_DEFER_MAX_ATTEMPTS = 4
+TITLE_DEFER_MAX_AGE_SEC = 2 * 3600
+# Shikimori молчит дольше этого — это не заминка, а отказ (сервер лежит или
+# хостинг до него не достаёт). Ждать его каждым постом значило бы задержать
+# на час-два все новости об аниме: посты идут как есть.
+TITLE_DEFER_OUTAGE_SEC = 30 * 60
+_title_deferral_store = None
+
+
+def _title_wait_makes_sense() -> bool:
+    return (work_titles is not None
+            and work_titles.status()['failing_sec'] < TITLE_DEFER_OUTAGE_SEC)
+
+
+def _title_defer_news(news: dict) -> bool:
+    """Можно ли ещё раз отложить пост ради русского названия. Счёт переживает рестарт."""
+    global _title_deferral_store
+    with _llm_deferral_lock:
+        key = normalize_url(str(news.get('link') or '')) or str(news.get('title') or '')[:120]
+        if not key:
+            return False
+        path = DATA_DIR / 'news_title_deferrals.json'
+        if _title_deferral_store is None or _title_deferral_store.path != path:
+            _title_deferral_store = NewsDeferralStore(path)
+        seen = _safe_nonnegative_int(news.get('_title_defer_attempts', 0))
+        wait, attempts = _title_deferral_store.reserve(
+            key, seen, TITLE_DEFER_MAX_ATTEMPTS, TITLE_DEFER_MAX_AGE_SEC)
+        news['_title_defer_attempts'] = attempts
+        return wait
+
+
+def _work_titles_health_line() -> str:
+    """Строка /health: отвечает ли Shikimori, откуда берутся русские названия."""
+    if work_titles is None or not feature_enabled('work_identity'):
+        return ''
+    state = work_titles.status()
+    now = time.time()
+
+    def ago(ts: float) -> str:
+        minutes = max(0, int((now - ts) // 60))
+        return f'{minutes} мин назад' if minutes < 120 else f'{minutes // 60} ч назад'
+    ok = f'последний ответ {ago(state["last_ok_at"])}' if state['last_ok_at'] else \
+        'ответов после запуска не было'
+    if not state['fail_streak']:
+        return f'  📚 Shikimori (названия тайтлов): {ok}'
+    line = (f'  ⚠️ Shikimori (названия тайтлов): сбоев подряд {state["fail_streak"]} '
+            f'({html.escape(state["last_error"])}, {ago(state["last_error_at"])}); {ok}')
+    if state['paused_sec']:
+        line += f'; пауза ещё {state["paused_sec"]} с'
+    return line
 
 
 def _llm_defer_news(news: dict) -> bool:
@@ -27280,7 +27561,14 @@ async def _llm_enrich_chunk(chunk: list) -> int:
 
     async def source_text(news: dict) -> str:
         async with gate:
-            return await _llm_source_text(news)
+            try:
+                return await _llm_source_text(news)
+            except Exception:
+                # Одна статья, на которой споткнулся разбор страницы, не должна
+                # оставлять без модели всю пачку: берём описание из ленты.
+                logger.exception('Текст статьи для модели не получен: %s',
+                                 str(news.get('title') or '')[:60])
+                return str(news.get('summary') or '')[:3500]
     texts = list(await asyncio.gather(*(source_text(news) for news in chunk)))
     raw = await _llm_call([
         {'role': 'system', 'content': LLM_BATCH_SYSTEM_PROMPT},
@@ -27558,6 +27846,7 @@ async def _llm_enrich(news: dict, *, side_effects: bool = True,
                 body = _trim_paragraphs(new_summary)
                 paragraphs = _drop_source_meta(_drop_repetitive_paragraphs(
                     new_title, [p for p in re.split(r'\n\s*\n', body) if p.strip()]))
+                paragraphs = [_close_sentence(p) for p in paragraphs]
                 if paragraphs:
                     parts.append('\n\n'.join(paragraphs))
             body = '\n\n'.join(p for p in parts if p)
@@ -30563,6 +30852,9 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
     lines.append('  🎯 Confidence scoring: ' + ('ВКЛ' if feature_enabled('confidence_scoring') else 'выкл'))
     lines.append('  📏 /metrics: ' + ('ВКЛ' if feature_enabled('metrics') else 'выкл'))
     lines.append('  🧾 JSONL events: ' + ('ВКЛ' if feature_enabled('structured_logging') else 'выкл'))
+    titles_line = _work_titles_health_line()
+    if titles_line:
+        lines.append(titles_line)
 
     # --- Медиа ---
     lines.append('')
