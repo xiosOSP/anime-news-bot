@@ -158,6 +158,17 @@ _TG_TRAILING_TAGS_RE = re.compile(
     rf'(?P<tags>(?:[\s|,·•/]*{_TG_HASHTAG})+)[\s|,·•/]*$')
 
 
+# Хвост из хэштегов ищем только в конце строки. По всей строке регулярка
+# пробует каждое место после точки или кавычки и каждый раз идёт до конца:
+# на строке из четырёх тысяч кавычек (предел сообщения Telegram) это полсекунды
+# стоящего бота на одну строку чужого поста.
+_TG_TAGS_WINDOW = 1000
+
+
+def _tg_trailing_tags(line: str):
+    return _TG_TRAILING_TAGS_RE.search(line, max(0, len(line) - _TG_TAGS_WINDOW))
+
+
 def tg_source_hashtags(full_text: str) -> list[str]:
     """Рубрики, которыми канал сам пометил пост, — в нижнем регистре, без «#».
 
@@ -166,7 +177,7 @@ def tg_source_hashtags(full_text: str) -> list[str]:
     """
     tags: list[str] = []
     for line in str(full_text or '').split('\n'):
-        tail = _TG_TRAILING_TAGS_RE.search(line.strip())
+        tail = _tg_trailing_tags(line.strip())
         if tail:
             tags += [tag[1:].casefold() for tag in re.findall(_TG_HASHTAG, tail.group('tags'))]
     return list(dict.fromkeys(tags))
@@ -174,7 +185,7 @@ def tg_source_hashtags(full_text: str) -> list[str]:
 
 def _tg_strip_trailing_tags(line: str) -> str:
     line = line.strip()
-    tail = _TG_TRAILING_TAGS_RE.search(line)
+    tail = _tg_trailing_tags(line)
     return line[:tail.start('tags')].rstrip() if tail else line
 
 
@@ -332,8 +343,10 @@ _LEADIN_BEFORE_RE = re.compile(
 
 # Союзы И предлоги: «Аниме про» — такой же обрывок, как «Аниме и», но предлоги
 # в списке отсутствовали, и хвост доезжал до поста.
+# Разделители — только с начала их серии: иначе на длинной строке из тире и
+# пробелов регулярка пробует каждое место заново (секунда на 8 тысяч знаков).
 _TRAILING_CONNECTOR_RE = re.compile(
-    r'[\s,;:—–-]*\b(?:и|а|но|или|же|что|чтобы|как|где|когда|'
+    r'(?<![\s,;:—–-])[\s,;:—–-]*\b(?:и|а|но|или|же|что|чтобы|как|где|когда|'
     r'про|при|об|обо|о|для|из|изо|от|ото|до|без|через|под|над|перед|между|'
     r'к|ко|с|со|у|во|во время|в|на|по|за|the|and|or|but|'
     r'with|for|of|to|in|on|at|by|from)\s*$', re.IGNORECASE)
@@ -475,7 +488,8 @@ _SENTENCE_END_RE = re.compile(
     r'(?<!\s\d)[.!?](?=\s+[«"„“A-ZА-ЯЁ]|\s*$)|[。！？]')
 
 
-_ELLIPSIS_TAIL_RE = re.compile(r'\s*(?:…|\.{2,})\s*$')
+# Пробелы и точки — только с начала своей серии: см. _TRAILING_CONNECTOR_RE.
+_ELLIPSIS_TAIL_RE = re.compile(r'(?<!\s)\s*(?:…|(?<!\.)\.{2,})\s*$')
 
 
 # Граница части предложения, после которой остаётся осмысленный кусок.

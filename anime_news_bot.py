@@ -14015,7 +14015,10 @@ def _russify_titles(text: str, news: Optional[dict]) -> str:
     return _official_russian_name(text, news)
 
 
-_TITLE_TAG_RE = re.compile(r'\s*(?:\[[^\]\n]{1,25}\]|【[^】\n]{1,25}】)')
+# Пробелы — только с начала их серии: «\s*» с каждой позиции длинной строки
+# пробелов и табуляций давало квадратичный перебор (1,8 с на 18 тысяч знаков),
+# а заголовок источника бывает каким угодно.
+_TITLE_TAG_RE = re.compile(r'(?<!\s)\s*(?:\[[^\]\n]{1,25}\]|【[^】\n]{1,25}】)')
 
 
 def _tidy_title_line(text: str) -> str:
@@ -14026,7 +14029,7 @@ def _tidy_title_line(text: str) -> str:
     """
     first, sep, rest = text.partition('\n')
     tidy = _TITLE_TAG_RE.sub('', first).rstrip()
-    tidy = re.sub(r'\s*!+$', '.', tidy)
+    tidy = re.sub(r'(?<!\s)\s*!+$', '.', tidy)
     return (tidy or first) + sep + rest
 
 
