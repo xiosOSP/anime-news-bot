@@ -172,3 +172,70 @@ def test_about_line_stays_when_the_body_has_no_plot(monkeypatch, text):
     monkeypatch.setattr(bot, 'settings', None)
     about = 'Наблюдательная ученица помогает детективу раскрывать преступления и становится его напарницей.'
     assert bot._with_about(text, _about_news(about)).endswith('\n\n' + about)
+
+
+# ---------- чистка заголовка не виснет на длинной строке пробелов ----------
+
+@pytest.mark.parametrize('text, expected', [
+    ('[Интервью] Заголовок!', ' Заголовок.'),
+    ('Заголовок [Новость]   !', 'Заголовок.'),
+    ('Заголовок  【速報】 дальше', 'Заголовок дальше'),
+    ('Заголовок   !!\nТекст!', 'Заголовок.\nТекст!'),
+    ('[Тег]\nтекст', '[Тег]\nтекст'),
+])
+def test_title_tidy_keeps_its_behaviour(text, expected):
+    assert bot._tidy_title_line(text) == expected
+
+
+@pytest.mark.parametrize('line', ['\t \t' * 20000, ' ' * 60000 + 'x', '\t \t' * 20000 + '?'])
+def test_title_tidy_is_fast_on_a_long_run_of_spaces(line):
+    """«\\s*» с каждой позиции — квадратичный перебор: 60 тысяч пробелов и
+    табуляций в заголовке источника останавливали бота на 20 секунд."""
+    started = time.perf_counter()
+    bot._tidy_title_line(line)
+    assert time.perf_counter() - started < 1.0
+
+
+# ---------- разбор чужого текста не виснет на длинных сериях знаков ----------
+
+@pytest.mark.parametrize('line, expected', [
+    ('Вышел трейлер. #аниме #трейлер', 'Вышел трейлер.'),
+    ('«Ледяная стена» #аниме', '«Ледяная стена»'),
+    ('Пост про #аниме и мангу', 'Пост про #аниме и мангу'),          # тег посреди фразы — часть текста
+    ('#календарь', ''),
+])
+def test_trailing_hashtags_are_still_stripped(line, expected):
+    import post_text
+    assert post_text._tg_strip_trailing_tags(line) == expected
+
+
+@pytest.mark.parametrize('text, expected', [
+    ('Сериал выйдет в январе. Студия пока не названа и', 'Сериал выйдет в январе.'),
+    ('Сериал выйдет...', ''),
+    ('Премьера в январе.', 'Премьера в январе.'),
+    ('Сериал снят человеком, чьё имя длинное и', ''),
+])
+def test_unfinished_tail_is_still_dropped(text, expected):
+    import post_text
+    assert post_text._drop_unfinished_tail(text) == expected
+
+
+@pytest.mark.parametrize('name, text', [
+    ('_tg_strip_trailing_tags', '"' * 60000),
+    ('_tg_strip_trailing_tags', '. ' * 30000),
+    ('_drop_unfinished_tail', '- ' * 30000 + ' z'),
+    ('_drop_unfinished_tail', 'a' + ' ' * 60000 + 'z'),
+    ('_drop_unfinished_tail', '..' * 30000 + ' z'),
+])
+def test_foreign_text_helpers_are_fast_on_long_runs(name, text):
+    """Каждая из этих строк останавливала бота на десятки секунд: регулярка
+    пробовала каждое место длинной серии знаков и каждый раз шла до конца."""
+    import post_text
+    started = time.perf_counter()
+    getattr(post_text, name)(text)
+    assert time.perf_counter() - started < 1.0
+
+
+def test_source_hashtags_are_read_from_the_end_of_a_long_line():
+    import post_text
+    assert post_text.tg_source_hashtags('x' * 5000 + '. #арт #календарь') == ['арт', 'календарь']
