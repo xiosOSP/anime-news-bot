@@ -156,7 +156,7 @@ async def test_quiet_mode_names_llm_deferral_instead_of_generic_filter(monkeypat
     monkeypatch.setattr(bot, 'send_news_to_thread', AsyncMock(return_value='deferred'))
     await bot._check_news_cycle(ctx)
     text = bot.notify_admin.await_args.args[1]
-    assert 'Ждут модель: 1' in text
+    assert 'Ждут модель, перевод или название тайтла: 1' in text
     assert 'прочее 1' not in text
 
 

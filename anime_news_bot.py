@@ -7557,7 +7557,10 @@ class WorkTitleResolver:
         self._last_ok_at = 0.0
         self._last_error = ''
         self._last_error_at = 0.0
-        self._saved_at = 0.0
+        # Минус бесконечность, а не 0: time.monotonic() отсчитывается от
+        # загрузки машины, и в первые две минуты её работы кеш не записывался
+        # вовсе — «с прошлой записи прошло меньше FLUSH_EVERY_SEC».
+        self._saved_at = float('-inf')
         self._dirty = False
         self._load()
 
@@ -15225,6 +15228,43 @@ async def _send_channel_post(bot: Bot, news: dict, video_file: Optional[Path] = 
         return await _send_post(bot, news, CHANNEL_ID, video_file)
 
 
+LATE_TITLE_RECHECK_SEC = 600
+
+
+async def _late_title_lookup(news: dict) -> bool:
+    """Ещё одна попытка узнать русское название — перед самой публикацией.
+
+    Пост попадает в ветку с тем названием, какое удалось узнать при сборе, и
+    лежит там часами. «Pen to Wappa to Jijitsu-kon» вышел в канал наутро с
+    ромадзи, хотя Shikimori к тому времени давно отвечал (ноябрь 2026).
+    Известные имена берутся из кеша без сети, так что обычный пост этот шаг
+    не замедляет. True — название нашлось только сейчас.
+    """
+    if news.get('_edited_text') or work_titles is None or not news.get('_llm_text'):
+        return False
+    # Отметка со временем, а не флаг: автопостинг и общий путь отправки зовут
+    # проверку подряд, второй раз за минуту спрашивать незачем; а пост,
+    # который не ушёл и остался в ветке, при следующей попытке спросит снова.
+    try:
+        if time.time() - float(news.get('_late_title_checked') or 0) < LATE_TITLE_RECHECK_SEC:
+            return False
+    except (TypeError, ValueError):
+        pass
+    news['_late_title_checked'] = time.time()
+    before = dict(news.get('_work_titles_ru') or {})
+    try:
+        await asyncio.to_thread(_annotate_llm_titles, news, 2)
+    except Exception:
+        logger.exception('Русское название перед публикацией не подобрано')
+        return False
+    found = dict(news.get('_work_titles_ru') or {}) != before
+    if found:
+        logger.info('📚 Русское название нашлось перед публикацией: %s',
+                    str(news.get('title', ''))[:60])
+        metrics.inc('anime_bot_late_title_found_total')
+    return found
+
+
 async def _prepare_and_send_channel_post(bot: Bot, news: dict) -> bool:
     """Единый media-путь для ручной и отложенной публикации.
 
@@ -15233,6 +15273,7 @@ async def _prepare_and_send_channel_post(bot: Bot, news: dict) -> bool:
     """
     video_file = None
     try:
+        await _late_title_lookup(news)
         file_id = news.get('_telegram_video_file_id')
         if not (isinstance(file_id, str) and file_id.strip()):
             video_file = await _prepare_video_file(news)
@@ -24325,7 +24366,9 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                         detail.append(f'фильтр {filter_n}')
                     deferred_n = skipped_reasons.get('deferred', 0)
                     if deferred_n:
-                        message += f'⏳ Ждут модель: {deferred_n}. Кандидаты не отмечены опубликованными.\n'
+                        # Причин отсрочки три: модель, переводчик и Shikimori.
+                        message += (f'⏳ Ждут модель, перевод или название тайтла: {deferred_n}. '
+                                    f'Вернутся в следующей проверке.\n')
                     other_n = skipped_count - dup_n - filter_n - deferred_n
                     if other_n:
                         detail.append(f'прочее {other_n}')
@@ -24546,6 +24589,18 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
         _note_empty_slot(reasons, len(pending_posts._items))
         return None
     key, news = row
+    if await _late_title_lookup(news):
+        # С русским названием у поста новые ключи тайтла: он мог оказаться
+        # повтором того, что канал уже выпустил под этим названием. Проверяем
+        # ещё раз и сохраняем название — следующий тик увидит его сам.
+        stored = {k: v for k, v in news.items() if k != '_late_title_checked'}
+        pending_posts.update_news(key, stored)
+        thread_ts = (pending_posts._items.get(key) or {}).get('ts')
+        reason = _autopost_skip_reason({**stored, '_thread_ts': thread_ts} if thread_ts else stored)
+        if reason:
+            logger.info('⊘ Автопостинг: после уточнения названия — %s: %s', reason,
+                        str(news.get('title', ''))[:60])
+            return None
     with _PublishGuard(f'pending:{key}') as guard:
         if not guard.acquired:
             return None                  # этот пост прямо сейчас публикует человек
@@ -26695,10 +26750,27 @@ def _about_names_other_work(text: str, about: str, news: dict) -> bool:
     return any(match.group(1).casefold() not in known for match in _DIGEST_QUOTED_RE.finditer(about))
 
 
+# Текст поста уже рассказал завязку: «Аниме адаптирует мангу о
+# старшекласснице, помогающей следователю…», «Сериал расскажет о наёмнике…».
+# Строка «о чём» под ним говорила то же другими словами («История следует за
+# ученицей, которая помогает детективу…»), и сравнение по словам повтора не
+# видело (ноябрь 2026). Заголовок не считаем: «аниме о Красной Шапочке» в нём —
+# название темы, а не завязка.
+_BODY_PLOT_RE = re.compile(
+    r'\b(?:манг\w+|аниме|сериал\w*|ранобэ|фильм\w*|роман\w*|новелл\w+|истори\w+|сюжет\w*)\s+'
+    r'(?:о|об|обо|про)\s+\w{3,}|\b(?:рассказыва\w+|расскаж\w+|повеству\w+)\s+(?:о|об|обо|про)\s',
+    re.IGNORECASE)
+
+
+def _body_tells_plot(text: str) -> bool:
+    return bool(_BODY_PLOT_RE.search(str(text or '').partition('\n')[2]))
+
+
 def _with_about(text: str, news: dict) -> str:
     """Дописывает строку «о чём» отдельным абзацем: в посте она станет цитатой."""
     about = _about_line(news)
-    if not about or _about_repeats(text, about) or _about_names_other_work(text, about, news):
+    if (not about or _about_repeats(text, about) or _about_names_other_work(text, about, news)
+            or _body_tells_plot(text)):
         return text
     return f'{text.rstrip()}\n\n{about}'
 

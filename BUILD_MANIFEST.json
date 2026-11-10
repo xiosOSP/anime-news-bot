@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "d7b7649ef171650d92977446e94ef9807f6ef95b",
-  "generated_at_utc": "2026-11-09T22:28:37.496322+00:00",
+  "git_commit": "bec51a37fa00f3758037ffaeae7f4d0a996ba016",
+  "generated_at_utc": "2026-11-10T05:37:34.957021+00:00",
   "files": {
     ".claude/skills/find-skills/SKILL.md": {
       "sha256": "c00eeea0e13e74fe4a9d84ba0a8542205a1b736d65f13134fe1a6647eb14976f",
@@ -42,8 +42,8 @@
       "bytes": 33970
     },
     "anime_news_bot.py": {
-      "sha256": "cf80bfb3774352e5ebd621ac439d647e1f69c6219c171a0e257f224ed6a2a90d",
-      "bytes": 2050127
+      "sha256": "81e391675de377c6151b27e37dbc453aa8ade0a8a252db774c8c8aff987786a3",
+      "bytes": 2055006
     },
     "docs/chat-moderation.md": {
       "sha256": "b2338299309164ec952d18f4800fd028cab4d012363dac2bb7cadd3ee3651b5f",
@@ -224,6 +224,10 @@
     "tests/test_audit_20261109.py": {
       "sha256": "4b357474bd25d54fd1a4e56aaeb7045c677844e90de80b9b630e8d7a952be8a8",
       "bytes": 25664
+    },
+    "tests/test_audit_20261110.py": {
+      "sha256": "add92f35612ca2be3a22a6eb7d5861b8ed3b023b8b1dfdf6581408f5fc73715e",
+      "bytes": 9363
     },
     "tests/test_audit_findings.py": {
       "sha256": "bec45e7f784624fb2983d9bb4db8aa6782a3eff42f68b49aa2d8eeca7ad50cb9",
@@ -906,8 +910,8 @@
       "bytes": 4156
     },
     "tests/test_thread_autosend_regressions.py": {
-      "sha256": "43f636eac85e7cefa40fb98d0c123e4220287074c7043319a0dbd060ab6d10cc",
-      "bytes": 15907
+      "sha256": "7c5764ed197617c5f74522c25953dd84db4d7b5c877a043adf6e40198dfb54a0",
+      "bytes": 15960
     },
     "tests/test_thread_backlog_20261026.py": {
       "sha256": "fffd25750d0baca333e3e6e6ca9320f3a735ec8943b21df2c642facdf959ac16",
@@ -942,8 +946,8 @@
       "bytes": 14699
     },
     "tests/test_work_identity.py": {
-      "sha256": "d9db638c0e7ce0595dae1db253dfc3df8c72891d13be9eef0dab7ab2904cdead",
-      "bytes": 19113
+      "sha256": "e020f5b4dbb5593caee6e96580adb858e7e7a8bd70b761b5f7128cfddd05609f",
+      "bytes": 19752
     },
     "tests/test_work_repeat.py": {
       "sha256": "1ca1e985225b5561c1d46f186bad89d4edda7c7f68e843998c779780aac0494b",

@@ -248,6 +248,18 @@ def test_flush_is_throttled_but_forced_on_shutdown(tmp_path, monkeypatch):
     assert len(writes) == 2
 
 
+def test_first_flush_is_written_on_a_freshly_booted_machine(tmp_path, monkeypatch):
+    """time.monotonic() идёт от загрузки машины: при нуле в «времени прошлой
+    записи» первые две минуты кеш не писался. Так упал прогон CI на свежем
+    раннере (ноябрь 2026)."""
+    monkeypatch.setattr(bot.time, 'monotonic', lambda: 5.0)
+    resolver = bot.WorkTitleResolver(tmp_path / 'wt.json')
+    resolver._items['x'] = {'key': '', 'at': 'x'}
+    resolver._dirty = True
+    resolver.flush()
+    assert (tmp_path / 'wt.json').exists()
+
+
 def test_lookup_budget_per_cycle(shikimori):
     shikimori([])
     items = [{'title': f'Постер к аниме «{name}»', 'link': f'https://x/{i}'} for i, name in enumerate(NAMES)]
