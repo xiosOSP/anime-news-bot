@@ -239,3 +239,28 @@ def test_foreign_text_helpers_are_fast_on_long_runs(name, text):
 def test_source_hashtags_are_read_from_the_end_of_a_long_line():
     import post_text
     assert post_text.tg_source_hashtags('x' * 5000 + '. #арт #календарь') == ['арт', 'календарь']
+
+
+# ---------- по постам недели 10–15 ноября ----------
+
+@pytest.mark.parametrize('title, emoji', [
+    ('Релиз игры может стать переломным моментом для индустрии.', '🎮'),   # «моментом» — не «том»
+    ('Вышел 15 том.', '📚'),
+    ('Опубликована 174 глава.', '📚'),
+])
+def test_book_emoji_needs_the_whole_word(title, emoji):
+    assert bot._post_emoji(title, {}) == emoji
+
+
+def test_plot_starting_with_a_number_is_still_a_plot(monkeypatch):
+    monkeypatch.setattr(bot, 'settings', None)
+    text = ('В январе 2027 запустят аниме «Когда наскучат забавы».\n\n'
+            'История о 30-летнем мужчине, который в новом мире становится туристом.')
+    about = 'Мужчина средних лет после смерти попадает в иной мир и решает исследовать его как турист.'
+    assert bot._with_about(text, _about_news(about)) == text
+
+
+def test_animo_typo_is_fixed():
+    assert bot._polish_post_text('В январе запустят анимо «Наследник ветра».') == \
+        'В январе запустят аниме «Наследник ветра».'
+    assert bot._polish_post_text('Студия Анимо-Про открылась.') == 'Студия Анимо-Про открылась.'
