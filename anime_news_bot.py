@@ -404,9 +404,42 @@ def _fresh_store_counter() -> int:
 # чистом Python и были в 1,5–3 раза крупнее.
 JSON_PRETTY_MAX_CHARS = 64 * 1024
 
+# orjson сериализует в 5–6 раз быстрее C-кодировщика json: заполненное
+# хранилище модерации (7 МБ) — 9 мс вместо 52 (замер, ноябрь 2026). Пишется
+# оно на каждое предупреждение, и всё это время цикл событий стоит. Библиотеки
+# может не оказаться (хостинг не поставил колесо) — тогда пишем как раньше.
+try:
+    import orjson
+except ImportError:
+    orjson = None
+# Ключи-числа — строками, как у json. Даты и dataclass orjson умеет сам, а
+# json — нет: пусть такие значения падают так же, как падали, а не молча
+# меняют формат файла.
+_ORJSON_OPTIONS = ((orjson.OPT_NON_STR_KEYS | orjson.OPT_PASSTHROUGH_DATETIME
+                    | orjson.OPT_PASSTHROUGH_DATACLASS) if orjson is not None else 0)
+
+
+def _json_bytes(value) -> bytes:
+    """JSON одной строкой в UTF-8: orjson, а что ему не по силам — обычным json.
+
+    Не по силам ему целые больше 64 бит, подклассы float и значения, которые
+    json тоже не пишет (тогда json и поднимет ту же ошибку, что раньше).
+    Различие одно: NaN и бесконечность orjson пишет как null, а json — как
+    NaN, которого нет в стандарте JSON. В данных бота их нет.
+    """
+    if orjson is not None:
+        try:
+            return orjson.dumps(value, option=_ORJSON_OPTIONS)
+        except TypeError:           # orjson.JSONEncodeError — подкласс TypeError
+            pass
+    return json.dumps(value, ensure_ascii=False).encode('utf-8')
+
 
 def _write_json(f, data, indent: Optional[int] = None) -> None:
-    """JSON быстрым C-кодировщиком.
+    """JSON быстрым кодировщиком в двоичный файл.
+
+    Файл двоичный: orjson отдаёт готовый UTF-8, и через текстовый файл он
+    декодировался бы в строку, чтобы тут же закодироваться обратно.
 
     json.dump(..., f) всегда идёт через кодировщик на чистом Python — C-версию
     использует только json.dumps. На заполненном хранилище модерации это сотни
@@ -414,24 +447,24 @@ def _write_json(f, data, indent: Optional[int] = None) -> None:
     пик памяти — самый крупный раздел, а не весь файл целиком.
     """
     if isinstance(data, dict) and data:
-        chunks = [json.dumps({key: value}, ensure_ascii=False)[1:-1] for key, value in data.items()] \
+        chunks = [_json_bytes({key: value})[1:-1] for key, value in data.items()] \
             if indent is not None else None
         if chunks is not None:
             if sum(len(c) for c in chunks) <= JSON_PRETTY_MAX_CHARS:
-                f.write(json.dumps(data, ensure_ascii=False, indent=indent))
+                f.write(json.dumps(data, ensure_ascii=False, indent=indent).encode('utf-8'))
             else:
-                f.write('{' + ','.join(chunks) + '}')
+                f.write(b'{' + b','.join(chunks) + b'}')
             return
-        f.write('{')
+        f.write(b'{')
         for index, (key, value) in enumerate(data.items()):
             if index:
-                f.write(',')
-            f.write(json.dumps({key: value}, ensure_ascii=False)[1:-1])
-        f.write('}')
+                f.write(b',')
+            f.write(_json_bytes({key: value})[1:-1])
+        f.write(b'}')
         return
-    text = json.dumps(data, ensure_ascii=False)
+    text = _json_bytes(data)
     if indent is not None and len(text) <= JSON_PRETTY_MAX_CHARS:
-        text = json.dumps(data, ensure_ascii=False, indent=indent)
+        text = json.dumps(data, ensure_ascii=False, indent=indent).encode('utf-8')
     f.write(text)
 
 
@@ -451,7 +484,7 @@ def _atomic_write_json(path: Path, data, *, indent: Optional[int] = None) -> Non
         _note_write_failure(path, e)
         raise
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        with os.fdopen(fd, 'wb') as f:
             _write_json(f, data, indent)
             f.flush()
             os.fsync(f.fileno())

@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "9f2d10b477fcb28665cccd711a42d219d414ccd5",
-  "generated_at_utc": "2026-11-17T08:11:52.386987+00:00",
+  "git_commit": "dfea5bcbfad0ec743c3299e76836235d8b3ec86d",
+  "generated_at_utc": "2026-11-17T21:21:13.366567+00:00",
   "files": {
     ".claude/skills/find-skills/SKILL.md": {
       "sha256": "c00eeea0e13e74fe4a9d84ba0a8542205a1b736d65f13134fe1a6647eb14976f",
@@ -42,8 +42,8 @@
       "bytes": 33970
     },
     "anime_news_bot.py": {
-      "sha256": "c0c0b9a6d0352afabfab04b9d6c0c819a0c8aca394c5d9851df8377e376e9f28",
-      "bytes": 2059606
+      "sha256": "b1ae98f0296202731af9a0fecc8fc482c23faf4d304fd907ec45e0d5895f75d5",
+      "bytes": 2061760
     },
     "docs/chat-moderation.md": {
       "sha256": "b2338299309164ec952d18f4800fd028cab4d012363dac2bb7cadd3ee3651b5f",
@@ -122,8 +122,8 @@
       "bytes": 333
     },
     "requirements.txt": {
-      "sha256": "42adeb2ca50c2f987b638c73ceeed0cddb74229bf4cea3704b24ed43af326376",
-      "bytes": 4165
+      "sha256": "f6cc8da84b5da9e9b7d894873d3bf98a8cd9572fefd5231b3e69f9c1d689e348",
+      "bytes": 4411
     },
     "runtime.txt": {
       "sha256": "22fa90cd1f8121c0165c6df911d1ea71452a179460fbe371834bb792ba42f6c9",
@@ -226,8 +226,8 @@
       "bytes": 25664
     },
     "tests/test_audit_20261110.py": {
-      "sha256": "4004ba3a34f1d9eb585bab8615046055464187feae396515e7a850248f7df7f5",
-      "bytes": 19762
+      "sha256": "efe8f20705c1f175ca3023d6e7d9f8aba069153ce8ae4a41d193ce07e53f99ae",
+      "bytes": 23140
     },
     "tests/test_audit_findings.py": {
       "sha256": "bec45e7f784624fb2983d9bb4db8aa6782a3eff42f68b49aa2d8eeca7ad50cb9",
@@ -682,8 +682,8 @@
       "bytes": 6351
     },
     "tests/test_ops_alerts.py": {
-      "sha256": "633a2d7310124c730ecabdaf62dc09630928b3baa115d508397fe74ac52feede",
-      "bytes": 9459
+      "sha256": "990688e7c50ebc27b19ec18a0830a07dfd848451d78c7b14dcbb4c62bade31f2",
+      "bytes": 9517
     },
     "tests/test_optimizations.py": {
       "sha256": "ad706d593d629f0350113b5ffb02b2b6a6a76e5157ff34528dde2f56db27d375",
@@ -698,8 +698,8 @@
       "bytes": 4517
     },
     "tests/test_perf_storage.py": {
-      "sha256": "7fcaeb1685a4a9c2efc903ec32980345869d014ee8cb4627b26d4f90b891b18e",
-      "bytes": 13890
+      "sha256": "6df1794f51e89e0fe9c8866ca9aeccc983cf20098cf060e4c7ea69e50ff94f7d",
+      "bytes": 13991
     },
     "tests/test_photo_quality.py": {
       "sha256": "02401fc02bf53d6488edd1c48df33a837d2bc986227a5252da4c377dcac65725",

@@ -40,14 +40,15 @@ def test_dump_streams_by_section_with_the_fast_encoder(tmp_path, monkeypatch):
         raise AssertionError('медленный json.dump')
     monkeypatch.setattr(bot.json, 'dump', slow)
     sections = []
-    real = bot.json.dumps
+    real = bot._json_bytes
 
-    def spy(obj, **kw):
+    def spy(obj):
         sections.append(obj)
-        return real(obj, **kw)
-    monkeypatch.setattr(bot.json, 'dumps', spy)
+        return real(obj)
+    monkeypatch.setattr(bot, '_json_bytes', spy)
     bot._atomic_write_json(tmp_path / 'm.json', {'users': {'a': 1}, 'log': [1, 2]})
     assert sections == [{'users': {'a': 1}}, {'log': [1, 2]}]
+    assert json.loads((tmp_path / 'm.json').read_text(encoding='utf-8')) == {'users': {'a': 1}, 'log': [1, 2]}
 
 
 def test_unserialisable_data_leaves_the_old_file(tmp_path):

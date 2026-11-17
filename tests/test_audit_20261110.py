@@ -356,3 +356,72 @@ def test_story_update_needs_the_real_similarity_not_its_bound(tmp_path, monkeypa
     old = {'title': 'teaser character Frieren anime season studio'}
     assert _story_similarity_bound(news, old) >= bot.STORY_UPDATE_SIMILARITY > _story_similarity(news, old)
     assert store.classify_update(news) is None
+
+
+# ---------- оптимизация: запись JSON через orjson ----------
+
+def _roundtrip(tmp_path, data, indent=None):
+    path = tmp_path / 'x.json'
+    bot._atomic_write_json(path, data, indent=indent)
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+@pytest.mark.parametrize('use_orjson', [True, False])
+@pytest.mark.parametrize('data', [
+    {'schema_version': 1, 'items': {'1': {'title': 'Аниме «Ледяная стена» 🎬', 'ts': 1.5e-7}}},
+    {5: 'ключ-число', True: 'да', None: 'нет', 'text': 'ctrl \x01 и "кавычки" \\  '},
+    {'big': 2 ** 70, 'neg': -2 ** 65, 'max53': 2 ** 53 + 1},        # больше 64 бит — запасной json
+    [1, (2, 3), {'a': [None, False]}],
+])
+def test_written_json_reads_back_the_same(tmp_path, monkeypatch, data, use_orjson):
+    """orjson пишет в 5–6 раз быстрее, но данные на диске — те же, что у json,
+    и без библиотеки бот пишет как раньше."""
+    if not use_orjson:
+        monkeypatch.setattr(bot, 'orjson', None)
+    assert _roundtrip(tmp_path, data) == json.loads(json.dumps(data, ensure_ascii=False))
+
+
+def test_float_subclass_falls_back_to_json(tmp_path):
+    class Score(float):
+        pass
+    assert _roundtrip(tmp_path, {'score': Score(2.25)}) == {'score': 2.25}
+
+
+@pytest.mark.parametrize('value', [object(), {1, 2}, __import__('datetime').datetime(2026, 11, 17)])
+def test_values_json_cannot_write_still_fail(tmp_path, value):
+    """Даты orjson умеет сам, а json — нет: такое значение должно падать, как
+    раньше, а не молча менять формат файла."""
+    path = tmp_path / 'x.json'
+    bot._atomic_write_json(path, {'a': 1})
+    with pytest.raises(TypeError):
+        bot._atomic_write_json(path, {'a': 2, 'b': value})
+    assert json.loads(path.read_text(encoding='utf-8')) == {'a': 1}
+
+
+def test_small_pretty_files_keep_their_layout(tmp_path):
+    """Настройки читают глазами: маленький файл с отступами — тот же, что от json."""
+    data = {'quiet_hours': '22:40-08:00', 'channel': '@Fubuki61', 'admins': [1, 2]}
+    path = tmp_path / 'settings.json'
+    bot._atomic_write_json(path, data, indent=2)
+    assert path.read_text(encoding='utf-8') == json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def test_large_store_uses_orjson(tmp_path, monkeypatch):
+    calls = []
+    real = bot.orjson.dumps
+
+    def spy(value, **kw):
+        calls.append(1)
+        return real(value, **kw)
+    monkeypatch.setattr(bot.orjson, 'dumps', spy)
+    _roundtrip(tmp_path, {'users': {'a': 1}, 'log': [1, 2]})
+    assert len(calls) == 2                      # по разделу за раз: пик памяти — один раздел
+
+
+def test_number_keys_do_not_need_the_slow_fallback(monkeypatch):
+    """Ключи-числа (id чатов и участников) — обычное дело в хранилищах: им
+    запасной json не нужен."""
+    def slow(*_a, **_k):
+        raise AssertionError('запасной json для обычных данных')
+    monkeypatch.setattr(bot.json, 'dumps', slow)
+    assert json.loads(bot._json_bytes({-100: {7: 'warn'}, True: None})) == {'-100': {'7': 'warn'}, 'true': None}
