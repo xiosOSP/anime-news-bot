@@ -320,6 +320,28 @@ def _story_update_anchor(news_or_title) -> set[str]:
     return {t for t in _story_tokens(news_or_title) if t not in _STORY_UPDATE_GENERIC}
 
 
+def _story_similarity_bound(a, b) -> float:
+    """Верхняя граница _story_similarity без SequenceMatcher.
+
+    Те же шаги, только вместо сходства строк подставлена его наибольшая
+    возможная величина, 1.0. Нужна там, где ответ важен лишь выше порога:
+    если граница до него не дотягивает, считать сходство строк незачем.
+    """
+    title_a, title_b = _story_title_of(a), _story_title_of(b)
+    ta, tb = _story_tokens_cached(title_a), _story_tokens_cached(title_b)
+    if not ta or not tb:
+        return 0.0
+    nums_a, nums_b = _story_numbers_cached(title_a), _story_numbers_cached(title_b)
+    if nums_a and nums_b and nums_a != nums_b:
+        return 0.0
+    common = ta & tb
+    if len(common) < 2:
+        return 0.0
+    jaccard = len(common) / max(1, len(ta | tb))
+    containment = len(common) / max(1, min(len(ta), len(tb)))
+    return max(jaccard, 0.55 * containment + 0.45)
+
+
 def _story_similarity(a: dict, b: dict) -> float:
     """Консервативная близость двух заголовков для cross-source clustering."""
     title_a, title_b = _story_title_of(a), _story_title_of(b)
