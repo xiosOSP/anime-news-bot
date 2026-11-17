@@ -28,6 +28,7 @@ import sysconfig
 import tempfile
 import zipfile
 import copy
+import concurrent.futures
 import contextlib
 import time
 import difflib
@@ -122,6 +123,7 @@ from news_stories import (
     _story_media,
     _story_numbers,
     _story_similarity,
+    _story_similarity_bound,
     _story_title_of,
     _story_tokens,
     _story_tokens_cached,
@@ -4100,6 +4102,16 @@ class SentLinksStore:
         self.history_lost = False
         self.restored_from = ''
         self._lastgood_at = 0.0
+        # Запись файла (около 800 КБ JSON и fsync) — в своём потоке: она шла в
+        # цикле событий на каждом шаге каждой новости — резерв, отправка,
+        # фиксация, отказ, — и на медленном диске хостинга бот всё это время
+        # не отвечал на кнопки. Поток один, поэтому записи идут строго по
+        # очереди, и на диск не попадёт старый снимок после нового. Общий пул
+        # не годится: снимок снимается под _state_lock, и потоки-читатели,
+        # ждущие этот замок, могли бы занять все места пула, а запись ждала
+        # бы места — бот встал бы намертво.
+        self._writer = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix='sent-links-write')
         self._load()
         if (self.path.exists() and not self.history_lost
                 and not getattr(self, '_read_failed', False)):
@@ -4272,19 +4284,47 @@ class SentLinksStore:
         # json.dump идёт по снимку, снятому под замком: живые словари в это
         # время может читать поток, и сериализация не должна их видеть.
         with self._state_lock:
-            snapshot = {
-                'schema_version': 1,
-                'urls': list(self._urls),
-                'titles': list(self._titles),
-                'recent': [[ts, norm, sorted(tokens)] for ts, norm, tokens in self._recent_titles],
-                'reservations': {k: dict(v) for k, v in self._reservations.items()},
-                'rejected': {k: dict(v) for k, v in self._rejected.items()},
-                'prep_crashes': {k: dict(v) for k, v in self._prep_crashes.items()},
-            }
-            if self.history_lost:
-                # Пауза переживает рестарт: иначе пустая, но уже читаемая
-                # история молча снимала бы её при следующем запуске.
-                snapshot['history_lost'] = True
+            snapshot = self._snapshot_unlocked()
+        return self._write_snapshot(snapshot)
+
+    async def _save_async(self) -> bool:
+        """То же, что _save, но запись — в потоке-писателе журнала.
+
+        Снимок — здесь, под замком, который транзакция уже держит; потоку
+        достаются готовые копии, замок ему не нужен. Отмену не пропускаем
+        внутрь: запись всё равно дойдёт до диска, и вызывающий должен узнать
+        её итог раньше, чем отпустит замок транзакции.
+        """
+        if getattr(self, '_read_failed', False):
+            return False
+        with self._state_lock:
+            snapshot = self._snapshot_unlocked()
+        future = asyncio.get_running_loop().run_in_executor(
+            self._writer, self._write_snapshot, snapshot)
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            await asyncio.wait({future})
+            raise
+
+    def _snapshot_unlocked(self) -> dict:
+        """Копия состояния для записи; зовётся под _state_lock."""
+        snapshot = {
+            'schema_version': 1,
+            'urls': list(self._urls),
+            'titles': list(self._titles),
+            'recent': [[ts, norm, sorted(tokens)] for ts, norm, tokens in self._recent_titles],
+            'reservations': {k: dict(v) for k, v in self._reservations.items()},
+            'rejected': {k: dict(v) for k, v in self._rejected.items()},
+            'prep_crashes': {k: dict(v) for k, v in self._prep_crashes.items()},
+        }
+        if self.history_lost:
+            # Пауза переживает рестарт: иначе пустая, но уже читаемая
+            # история молча снимала бы её при следующем запуске.
+            snapshot['history_lost'] = True
+        return snapshot
+
+    def _write_snapshot(self, snapshot: dict) -> bool:
         try:
             _atomic_write_json(self.path, snapshot)
             if (not self.history_lost
@@ -4503,7 +4543,7 @@ class SentLinksStore:
         norm_title = normalize_title(title)
         async with self._locked():
             if self._purge_transient_unlocked():
-                self._save()
+                await self._save_async()
             if norm_url in self._url_set or norm_url in self._rejected:
                 return False
             # Внешняя pre-check недостаточна: две coroutine могут одновременно
@@ -4525,7 +4565,7 @@ class SentLinksStore:
             # должен узнать его, а нормализованный ключ склеен в одно слово.
             self._reservations[norm_url] = {'title': norm_title, 'at': time.time(), 'state': 'claimed',
                                             'display': str(title or '')[:120]}
-            if not self._save():
+            if not await self._save_async():
                 # Без durable claim запрещаем физическую публикацию: иначе после
                 # рестарта тот же URL снова станет новым и может задублироваться.
                 self._reservations.pop(norm_url, None)
@@ -4545,7 +4585,7 @@ class SentLinksStore:
             old_at = meta.get('at')
             meta['state'] = 'sending'
             meta['at'] = time.time()
-            if not self._save():
+            if not await self._save_async():
                 meta['state'] = old_state
                 meta['at'] = old_at
                 logger.error(f'Ledger sending-state не записан; Telegram API не вызываю: {norm_url[:100]}')
@@ -4561,7 +4601,7 @@ class SentLinksStore:
                 return False
             meta['state'] = 'uncertain'
             meta['at'] = time.time()
-            saved = self._save()
+            saved = await self._save_async()
             if not saved:
                 logger.critical(f'Не удалось записать uncertain delivery: {norm_url[:100]}')
             return saved
@@ -4590,7 +4630,7 @@ class SentLinksStore:
             self._recent_titles.clear()
             self._reservations.clear()
             self._rejected.clear()
-            if not self._save():
+            if not await self._save_async():
                 self._urls = old_urls
                 self._url_set = old_url_set
                 self._titles = old_titles
@@ -4608,7 +4648,7 @@ class SentLinksStore:
         async with self._locked():
             meta = self._reservations.pop(norm_url, None)
             self._prep_crashes.pop(norm_url, None)
-            if self._save():
+            if await self._save_async():
                 return True
             if meta is not None:
                 meta = dict(meta)
@@ -4641,7 +4681,7 @@ class SentLinksStore:
             self._prep_crashes.pop(norm_url, None)
             saved_title = str(meta.get('title') or norm_title)
             self._remove_unlocked(norm_url, saved_title)
-            if not self._save():
+            if not await self._save_async():
                 # Старый файл на диске всё равно содержит reservation. Не даём
                 # текущему процессу считать URL новым, пока storage неисправен.
                 self._add_unlocked(norm_url, saved_title, save=False)
@@ -4665,7 +4705,7 @@ class SentLinksStore:
                 oldest = sorted(self._rejected, key=lambda k: float(self._rejected[k].get('at', 0)))
                 for key in oldest[:-800]:
                     self._rejected.pop(key, None)
-            self._save()
+            await self._save_async()
 
     def _add_unlocked(self, norm_url: str, norm_title: str, *, save: bool = True) -> None:
         if norm_url not in self._url_set:
@@ -8298,21 +8338,33 @@ class PublishedStoryStore:
             except (ValueError, TypeError):
                 continue
             old_subject = EntityMemory._key(old.get('subject') or '')
-            sim = _story_similarity(news, {'title': old.get('title', '')})
-            nums_old_title = _story_numbers({'title': old.get('title', '')})
+            old_title_only = {'title': old.get('title', '')}
+            # Сходство — наибольшее из сходства заголовков и «надбавок» за общие
+            # якоря, предмет и id истории. Надбавки дешёвые, а сходство
+            # заголовков (difflib) — главная цена всей сверки: 200 новостей
+            # цикла против 300 историй занимали секунду с лишним (замер, ноябрь
+            # 2026). Считаем его, только когда оно может изменить ответ: строка
+            # должна дотянуть до порога и обогнать лучшую найденную.
+            bump = 0.0
+            nums_old_title = _story_numbers(old_title_only)
             nums_new_title = new_nums
             if not (nums_old_title and nums_new_title and nums_old_title != nums_new_title):
                 a_anchor = new_anchor
-                b_anchor = _story_update_anchor({'title': old.get('title', '')})
+                b_anchor = _story_update_anchor(old_title_only)
                 common_anchor = a_anchor & b_anchor
                 if len(common_anchor) >= 2:
                     containment = len(common_anchor) / max(1, min(len(a_anchor), len(b_anchor)))
                     if containment >= 0.66:
-                        sim = max(sim, 0.80)
+                        bump = 0.80
             if new_subject and old_subject and new_subject == old_subject:
-                sim = max(sim, 0.90)
+                bump = max(bump, 0.90)
             elif str(news.get('_story_id') or '') and news.get('_story_id') == old.get('story_id'):
-                sim = max(sim, 0.94)
+                bump = max(bump, 0.94)
+            bound = _story_similarity_bound(news, old_title_only)
+            cap = max(bound, bump)
+            if cap <= best_score or cap < STORY_UPDATE_SIMILARITY:
+                continue
+            sim = bump if bound <= bump else max(_story_similarity(news, old_title_only), bump)
             if sim > best_score:
                 best, best_score = old, sim
         if best is None or best_score < STORY_UPDATE_SIMILARITY:
@@ -21283,7 +21335,9 @@ async def collect_all_news() -> tuple[list[dict], list[str], list[str]]:
         await asyncio.to_thread(source_yield.flush)
     await _flush_collection_stats()
     all_news = await _apply_active_verification(all_news)
-    all_news = _annotate_story_updates(all_news)
+    # Сверка с историей сюжетов — тоже в потоке: каждая новость цикла против
+    # трёхсот историй, на хостинге это секунды стоящего бота.
+    all_news = await asyncio.to_thread(_annotate_story_updates, all_news)
     all_news = _annotate_editorial_automation(all_news)
     all_news = _prioritize_news(all_news)
     return all_news, stats_lines, errors

@@ -264,7 +264,10 @@ async def test_sent_links_clear_rolls_back_on_storage_failure(tmp_path, monkeypa
     st = bot.SentLinksStore(tmp_path / 'sent.json')
     assert await st.claim('https://example.com/a', 'Title A') is True
     assert st.has_title('Title A') is True
-    monkeypatch.setattr(st, '_save', lambda: False)
+    # Сбой самой записи файла: через неё идут и _save, и запись в потоке.
+    def disk_full(*_a, **_k):
+        raise OSError('disk full')
+    monkeypatch.setattr(bot, '_atomic_write_json', disk_full)
     assert await st.clear() is False
     assert 'https://example.com/a' in st
     assert st.has_title('Title A') is True

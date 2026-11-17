@@ -2,8 +2,8 @@
   "schema": 1,
   "python_target": "3.11",
   "content_normalization": "UTF-8 text uses LF; binary files are unchanged",
-  "git_commit": "87fe6879ce081c5f71256df5e5e634950cea2ae2",
-  "generated_at_utc": "2026-11-16T09:19:12.586071+00:00",
+  "git_commit": "9f2d10b477fcb28665cccd711a42d219d414ccd5",
+  "generated_at_utc": "2026-11-17T08:11:52.386987+00:00",
   "files": {
     ".claude/skills/find-skills/SKILL.md": {
       "sha256": "c00eeea0e13e74fe4a9d84ba0a8542205a1b736d65f13134fe1a6647eb14976f",
@@ -42,8 +42,8 @@
       "bytes": 33970
     },
     "anime_news_bot.py": {
-      "sha256": "a690d6b9aedaca1da08b0f3d3cc4a36cd577547a939067228a18658058a10916",
-      "bytes": 2055761
+      "sha256": "c0c0b9a6d0352afabfab04b9d6c0c819a0c8aca394c5d9851df8377e376e9f28",
+      "bytes": 2059606
     },
     "docs/chat-moderation.md": {
       "sha256": "b2338299309164ec952d18f4800fd028cab4d012363dac2bb7cadd3ee3651b5f",
@@ -102,8 +102,8 @@
       "bytes": 15486
     },
     "news_stories.py": {
-      "sha256": "adc8e4834d4454baeda8e4857245002431368754ec342214f615cf4f1cc601a2",
-      "bytes": 48885
+      "sha256": "be170a4e608dbf71c0f7fbe6906f08e6fecd3d7b32c6b0a0735d037cfefa9439",
+      "bytes": 49958
     },
     "post_text.py": {
       "sha256": "4b401cce85bacd21869775f23bd810c8fdde562401e744696396df85173a6123",
@@ -154,8 +154,8 @@
       "bytes": 6843
     },
     "tests/test_30_round_audit.py": {
-      "sha256": "ffee15af0f03cf15696166b68640bc911d0c02fadacfcbd8f8c7b069b31a60b5",
-      "bytes": 10135
+      "sha256": "abf45825d35ec14b3c589d6be60290b6561365d2d57e4035b268393490cfb84d",
+      "bytes": 10331
     },
     "tests/test_adaptive_publishing_stage9.py": {
       "sha256": "d2a981ae9d0350f609c49685eaea7f5144a7745ebe32381e4343f6e838a2c95a",
@@ -226,8 +226,8 @@
       "bytes": 25664
     },
     "tests/test_audit_20261110.py": {
-      "sha256": "58827d45e03ccecd38f056bc014bd21d09a1f9b47fde403b65e3824dff11bf58",
-      "bytes": 14251
+      "sha256": "4004ba3a34f1d9eb585bab8615046055464187feae396515e7a850248f7df7f5",
+      "bytes": 19762
     },
     "tests/test_audit_findings.py": {
       "sha256": "bec45e7f784624fb2983d9bb4db8aa6782a3eff42f68b49aa2d8eeca7ad50cb9",

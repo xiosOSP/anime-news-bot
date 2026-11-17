@@ -5,6 +5,7 @@
 времени давно отвечал. Пример пересказан.
 """
 import asyncio
+import json
 import time
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, MagicMock
@@ -264,3 +265,94 @@ def test_animo_typo_is_fixed():
     assert bot._polish_post_text('В январе запустят анимо «Наследник ветра».') == \
         'В январе запустят аниме «Наследник ветра».'
     assert bot._polish_post_text('Студия Анимо-Про открылась.') == 'Студия Анимо-Про открылась.'
+
+
+# ---------- оптимизация: запись журнала и сверка с историей вне цикла событий ----------
+
+def test_ledger_transactions_write_in_the_ledger_thread(tmp_path, monkeypatch):
+    """Журнал публикаций (сотни КБ и fsync) писался в цикле событий на каждом
+    шаге каждой новости. Запись идёт в своём потоке, а итог — тот же."""
+    import threading
+    store = bot.SentLinksStore(tmp_path / 'sent.json')
+    writers = []
+    real = bot._atomic_write_json
+
+    def spy(path, data, **kw):
+        writers.append(threading.current_thread().name)
+        return real(path, data, **kw)
+    monkeypatch.setattr(bot, '_atomic_write_json', spy)
+
+    async def flow():
+        assert await store.claim('https://e.com/1', 'Заголовок один') is True
+        assert await store.mark_sending('https://e.com/1') is True
+        assert await store.commit('https://e.com/1', 'Заголовок один') is True
+        assert await store.claim('https://e.com/2', 'Заголовок два') is True
+        await store.reject('https://e.com/2', 'Заголовок два', 'skipped_dup')
+    asyncio.run(flow())
+    assert writers and all(name.startswith('sent-links-write') for name in writers)
+    again = bot.SentLinksStore(tmp_path / 'sent.json')
+    assert 'https://e.com/1' in again and again.is_rejected('https://e.com/2')
+
+
+def test_ledger_claim_is_rolled_back_when_the_write_fails(tmp_path, monkeypatch):
+    store = bot.SentLinksStore(tmp_path / 'sent.json')
+
+    def disk_full(*_a, **_k):
+        raise OSError('disk full')
+    monkeypatch.setattr(bot, '_atomic_write_json', disk_full)
+    assert asyncio.run(store.claim('https://e.com/3', 'Заголовок три')) is False
+    assert 'https://e.com/3' not in store and not store.has_title('Заголовок три')
+
+
+def test_ledger_writes_keep_their_order(tmp_path):
+    """Записи идут строго по очереди: на диске — последнее состояние."""
+    store = bot.SentLinksStore(tmp_path / 'sent.json')
+
+    async def many():
+        await asyncio.gather(*(store.claim(f'https://e.com/n{i}', f'Новость номер {i}') for i in range(25)))
+    asyncio.run(many())
+    on_disk = json.loads((tmp_path / 'sent.json').read_text(encoding='utf-8'))
+    assert len(on_disk['reservations']) == 25
+
+
+def test_cycle_checks_story_updates_off_the_event_loop():
+    """Сверка каждой новости цикла с тремястами историями занимала секунды
+    стоящего бота: она должна идти в потоке, как склейка рядом."""
+    import inspect
+    source = inspect.getsource(bot.collect_all_news)
+    assert 'await asyncio.to_thread(_annotate_story_updates, all_news)' in source
+    assert '\n    all_news = _annotate_story_updates(all_news)' not in source
+
+
+def test_story_update_bound_never_undercuts_the_similarity():
+    """Граница — не меньше настоящего сходства: иначе пропуск difflib менял бы ответ."""
+    import random
+    from news_stories import _story_similarity, _story_similarity_bound
+    random.seed(5)
+    words = 'Frieren Oshi Kaiju season trailer poster anime manga сезон трейлер аниме 2 3 Ледяная стена'.split()
+    for _ in range(3000):
+        a = {'title': ' '.join(random.choice(words) for _ in range(random.randint(1, 8)))}
+        b = {'title': ' '.join(random.choice(words) for _ in range(random.randint(1, 8)))}
+        assert _story_similarity_bound(a, b) >= _story_similarity(a, b) - 1e-12
+    # Почти одинаковые заголовки — граница здесь впритык к сходству.
+    for a, b in (('Frieren season 2 trailer revealed', 'Frieren season 2 trailer revealed today'),
+                 ('Вышел трейлер аниме Ледяная стена', 'Вышел трейлер аниме Ледяная стена 2027'),
+                 ('Kaiju No 8 movie poster', 'Kaiju No 8 movie poster')):
+        assert _story_similarity_bound({'title': a}, {'title': b}) >= \
+            _story_similarity({'title': a}, {'title': b}) - 1e-12
+
+
+def test_story_update_needs_the_real_similarity_not_its_bound(tmp_path, monkeypatch):
+    """Граница сходства только решает, считать ли difflib. Заголовки из тех же
+    слов в другом порядке проходят по границе (0,82), а по-настоящему похожи
+    на 0,44 — обновлением сюжета такой пост не становится."""
+    monkeypatch.setitem(bot.FEATURE_FLAGS, 'story_updates', True)
+    store = bot.PublishedStoryStore(tmp_path / 'stories.json')
+    store.record({'title': 'teaser character Frieren anime season studio', 'summary': '',
+                  'link': 'https://a/1'})
+    news = {'title': 'season premiere visual trailer anime teaser', 'summary': 'Premieres in April 2027.',
+            'link': 'https://b/2'}
+    from news_stories import _story_similarity, _story_similarity_bound
+    old = {'title': 'teaser character Frieren anime season studio'}
+    assert _story_similarity_bound(news, old) >= bot.STORY_UPDATE_SIMILARITY > _story_similarity(news, old)
+    assert store.classify_update(news) is None
