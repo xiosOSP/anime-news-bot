@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>РофлКазино</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎰</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="login" class="login">
+  <div class="login-card">
+    <div class="logo big">🎰 Рофл<span>Казино</span></div>
+    <p class="muted">Демо-счёт, ненастоящие рубли. Только для своих.</p>
+    <input id="nick" maxlength="16" placeholder="Твой ник" autocomplete="off">
+    <button id="loginBtn" class="btn primary wide">Войти</button>
+    <div id="loginErr" class="err"></div>
+  </div>
+</div>
+
+<div id="app" class="app hidden">
+  <header class="top">
+    <div class="logo">🎰 Рофл<span>Казино</span></div>
+    <nav id="tabs" class="tabs">
+      <button data-tab="crash">📈 Краш 1×1</button>
+      <button data-tab="mines">💣 Мины</button>
+      <button data-tab="towers">🗼 Башни</button>
+      <button data-tab="roulette">🎡 Рулетка</button>
+      <button data-tab="plane">✈️ Самолётик</button>
+      <button data-tab="cases">📦 Кейсы</button>
+    </nav>
+    <div class="wallet">
+      <div class="me-name" id="meName"></div>
+      <div class="balance" id="balance">0 ₽</div>
+      <button class="btn small" id="refillBtn" title="Демо-пополнение">+10 000 ₽</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <main id="main">
+      <section class="tab" id="tab-crash"></section>
+      <section class="tab" id="tab-mines"></section>
+      <section class="tab" id="tab-towers"></section>
+      <section class="tab" id="tab-roulette"></section>
+      <section class="tab" id="tab-plane"></section>
+      <section class="tab" id="tab-cases"></section>
+    </main>
+    <aside class="side">
+      <div class="panel">
+        <h3>Игроки</h3>
+        <div id="players"></div>
+        <div class="transfer">
+          <select id="trTo"></select>
+          <input id="trAmount" type="number" min="1" placeholder="₽">
+          <button class="btn small" id="trBtn">Перевести</button>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>Чат</h3>
+        <div id="chat" class="chat"></div>
+        <form id="chatForm" class="chat-form"><input id="chatInput" maxlength="200" placeholder="Напиши другу..." autocomplete="off"><button class="btn small">➤</button></form>
+      </div>
+      <div class="panel">
+        <h3>События</h3>
+        <div id="feed" class="feed"></div>
+      </div>
+    </aside>
+  </div>
+</div>
+<div id="toasts" class="toasts"></div>
+<script src="/socket.io/socket.io.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
