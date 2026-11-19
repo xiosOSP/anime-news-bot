@@ -107,6 +107,21 @@ async def test_one_broken_thread_item_does_not_abort_batch(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_unwritable_history_stops_the_batch_and_is_reported(monkeypatch):
+    """История не пишется: это не «дубль» и не повод перебирать остальных
+    кандидатов — каждый упрётся в тот же диск. Об отказе — в отчёте цикла,
+    даже в тихом режиме (внешний аудит, ноябрь 2026)."""
+    ctx = _common_cycle_stubs(monkeypatch, [_news(i) for i in range(3)], quiet=True)
+    sender = AsyncMock(side_effect=['sent', 'storage', 'sent'])
+    monkeypatch.setattr(bot, 'send_news_to_thread', sender)
+    await bot._check_news_cycle(ctx)
+    assert sender.await_count == 2
+    assert 'failed=1' in bot._runtime_health['last_check_result']
+    text = bot.notify_admin.await_args.args[1]
+    assert 'Не удалось отправить: 1' in text and 'Уже были' not in text
+
+
+@pytest.mark.asyncio
 async def test_quiet_mode_explains_zero_sent_after_filtering(monkeypatch):
     items = [_news(i) for i in range(3)]
     ctx = _common_cycle_stubs(monkeypatch, items, quiet=True)

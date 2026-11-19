@@ -60,6 +60,8 @@ def fake(tmp_path, monkeypatch):
     outside = tmp_path / 'secret.mp4'
     outside.write_bytes(b'not yours')
     monkeypatch.setenv('FAKE_OUTSIDE', str(outside))
+    # Окружение процесса — по списку (child_env): свои пути подделке передаём явно.
+    monkeypatch.setattr(video_download, 'CHILD_ENV_KEEP', ('FAKE_PID_FILE', 'FAKE_OUTSIDE'))
     out = tmp_path / 'videos'
     out.mkdir()
     return out

@@ -11,13 +11,19 @@ import pytest
 import anime_news_bot as bot
 
 
-def _zip_bytes(files):
+def _zip_bytes(files, *, manifest=False):
+    """manifest — дописать опись, как это делает сборщик бэкапа бота."""
+    import hashlib
     buf = io.BytesIO()
+    entries = {}
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
         for name, payload in files:
             if isinstance(payload, str):
                 payload = payload.encode('utf-8')
             zf.writestr(name, payload)
+            entries[name] = (len(payload), hashlib.sha256(payload).hexdigest())
+        if manifest:
+            zf.writestr(bot.BACKUP_MANIFEST_NAME, bot._backup_manifest(entries))
     return buf.getvalue()
 
 
@@ -83,10 +89,10 @@ def test_backup_restore_materializes_and_loads_core_stores(tmp_path):
         ('scheduled_posts.json', json.dumps({'schema_version': 1, 'counter': 0, 'items': {}})),
         ('pending_posts.json', json.dumps({'schema_version': 1, 'counter': 0, 'items': {}})),
         ('analytics_events.json', json.dumps({'schema_version': 1, 'events': []})),
-    ])
+    ], manifest=True)
     result = bot._restore_backup_archive(data, tmp_path / 'restore')
     assert result['ok'] is True
-    assert result['restored'] == 6
+    assert result['restored'] == 7          # шесть хранилищ и опись
     selftest = bot._backup_restore_selftest(data)
     assert selftest['ok'] is True
     assert set(selftest['stores']) == {'sent_links', 'queue', 'settings', 'scheduled', 'pending', 'analytics'}

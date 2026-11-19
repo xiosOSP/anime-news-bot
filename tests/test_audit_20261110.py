@@ -300,7 +300,7 @@ def test_ledger_claim_is_rolled_back_when_the_write_fails(tmp_path, monkeypatch)
     def disk_full(*_a, **_k):
         raise OSError('disk full')
     monkeypatch.setattr(bot, '_atomic_write_json', disk_full)
-    assert asyncio.run(store.claim('https://e.com/3', 'Заголовок три')) is False
+    assert asyncio.run(store.claim('https://e.com/3', 'Заголовок три')) is bot.LEDGER_UNAVAILABLE
     assert 'https://e.com/3' not in store and not store.has_title('Заголовок три')
 
 

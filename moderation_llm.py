@@ -4,6 +4,7 @@ from collections import OrderedDict
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -14,6 +15,21 @@ import time
 from urllib.parse import urlsplit
 
 import httpx
+
+
+def _loopback(host) -> bool:
+    """Адрес на этой же машине. Только туда ключ и реплики чата можно слать по http.
+
+    По http на чужой адрес и ключ в заголовке Authorization, и до пяти реплик
+    участников чата шли бы открытым текстом (внешний аудит, ноябрь 2026).
+    """
+    host = str(host or '').strip('[]').lower()
+    if host == 'localhost':
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 class ChatModelClient:
@@ -58,8 +74,9 @@ class ChatModelClient:
             url = urlsplit(self.base_url)
             # Accessing port validates malformed/non-numeric and out-of-range ports.
             port = url.port
-            return bool(self.api_key and self.model and url.scheme in ('https', 'http')
-                        and url.hostname and not url.username and not url.password
+            return bool(self.api_key and self.model and url.hostname
+                        and (url.scheme == 'https' or (url.scheme == 'http' and _loopback(url.hostname)))
+                        and not url.username and not url.password
                         and not url.query and not url.fragment and port != 0)
         except ValueError:
             return False
@@ -83,6 +100,7 @@ class ChatModelClient:
                 os.unlink(name)
 
     def _reserve(self, tokens):
+        """Списать запрос и оценку токенов. Отвечает днём списания или False."""
         with self._lock:
             if self._storage_error:
                 self.last_error = 'storage'
@@ -104,12 +122,18 @@ class ChatModelClient:
                 self.last_error = 'storage'
                 self._storage_error = True
                 return False
-            return True
+            return self._state['day']
 
-    def _reconcile(self, reserved, used):
+    def _reconcile(self, reserved, used, day=None):
         if not isinstance(used, int) or isinstance(used, bool) or used < 0:
             return
         with self._lock:
+            # Ответ пришёл уже в новые сутки (или статистика их открыла, пока
+            # шёл запрос): резерв принадлежит прошлому дню, а его счётчик уже
+            # сброшен. Поправка в новый день записала бы туда чужие токены
+            # без единого запроса (внешний аудит, ноябрь 2026).
+            if day is not None and self._state['day'] != day:
+                return
             previous = dict(self._state)
             self._state['tokens'] = max(0, self._state['tokens'] - reserved + used)
             try:
@@ -214,12 +238,13 @@ class ChatModelClient:
             reserved = len(serialized.encode('utf-8')) // 3 + max_tokens
             # Only an unsupported JSON option may cause a second attempt.
             for _ in range(2):
-                if not await asyncio.to_thread(self._reserve, reserved):
+                day = await asyncio.to_thread(self._reserve, reserved)
+                if not day:
                     return None
                 self._last_request = time.monotonic()
                 result = await self._http(messages, max_tokens)
                 if result.get('text'):
-                    await asyncio.to_thread(self._reconcile, reserved, result.get('tokens'))
+                    await asyncio.to_thread(self._reconcile, reserved, result.get('tokens'), day)
                     self._failures = 0
                     if self.last_error != 'storage':
                         self.last_error = ''

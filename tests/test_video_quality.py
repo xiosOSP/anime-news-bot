@@ -139,6 +139,8 @@ def fake(tmp_path, monkeypatch):
     (lib / 'yt_dlp.py').write_text(FAKE_YT_DLP, encoding='utf-8')
     monkeypatch.setenv('PYTHONPATH', str(lib))
     monkeypatch.setenv('FAKE_OPTS_FILE', str(tmp_path / 'opts.json'))
+    # Окружение процесса — по списку (child_env): свой путь подделке передаём явно.
+    monkeypatch.setattr(video_download, 'CHILD_ENV_KEEP', ('FAKE_OPTS_FILE',))
     out = tmp_path / 'videos'
     out.mkdir()
     return out

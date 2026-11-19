@@ -4101,6 +4101,30 @@ def _ledger_same_core(norm: str, tokens, old_norm: str, old_tokens, common: str 
                              common)
 
 
+class _LedgerUnavailable:
+    """Ответ claim(): резерв не записан на диск. Это не дубль.
+
+    Раньше claim() отвечал False и на дубль, и на отказ диска, и новость при
+    отказе диска уходила из очереди как «уже публиковалась» (внешний аудит,
+    ноябрь 2026): сбой хранилища прятался в счётчике дублей. Значение ложное,
+    поэтому прежние проверки «if not claim(...)» по-прежнему не публикуют.
+    """
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return 'LEDGER_UNAVAILABLE'
+
+
+LEDGER_UNAVAILABLE = _LedgerUnavailable()
+# Версия формата sent_links.json, которую понимает этот код. Файл новее —
+# от более свежей версии бота (откат): читать и переписывать его нельзя,
+# иначе пропадут поля, о которых этот код не знает.
+SENT_LINKS_SCHEMA = 1
+
+
 class SentLinksStore:
     """История публикаций + короткоживущие транзакционные резервирования.
 
@@ -4135,6 +4159,7 @@ class SentLinksStore:
         self.history_lost = False
         self.restored_from = ''
         self._lastgood_at = 0.0
+        self._cancel_after_write = False     # см. _locked и _save_async
         # Запись файла (около 800 КБ JSON и fsync) — в своём потоке: она шла в
         # цикле событий на каждом шаге каждой новости — резерв, отправка,
         # фиксация, отказ, — и на медленном диске хостинга бот всё это время
@@ -4155,11 +4180,21 @@ class SentLinksStore:
     # лежит на диске, поэтому восстановиться автоматически было не из чего.
     LASTGOOD_EVERY_SEC = 3600
 
-    def accept_lost_history(self) -> bool:
-        """Владелец решил продолжить с тем, что есть: пауза снимается."""
-        with self._state_lock:
+    async def accept_lost_history(self) -> bool:
+        """Владелец решил продолжить с тем, что есть: пауза снимается.
+
+        Только вместе с записью. Раньше флаг снимался до записи и при отказе
+        диска не возвращался: владелец читал «Пауза НЕ снята», а автопубликация
+        уже шла. И это обычная транзакция: синхронная запись в цикле событий
+        могла вклиниться в чужую, ждущую потока-писателя, и тогда на диск
+        после неё лёг бы старый снимок.
+        """
+        async with self._locked():
             self.history_lost = False
-        return self._save()
+            if await self._save_async():
+                return True
+            self.history_lost = True
+            return False
 
     def _lastgood_path(self) -> Path:
         return self.path.with_name(self.path.name + '.lastgood')
@@ -4212,7 +4247,16 @@ class SentLinksStore:
         """asyncio-замок сериализует транзакции, threading-замок — читателей из потоков."""
         async with self._lock:
             with self._state_lock:
+                self._cancel_after_write = False
                 yield
+                # Отмену, пришедшую во время записи, _save_async придержал:
+                # транзакция дошла до конца — запись и, при отказе диска, откат.
+                # Теперь отменяемся. Иначе отмена при отказе диска пропускала
+                # откат, и память расходилась с диском, а следующая удачная
+                # запись уносила это расхождение на диск (аудит, ноябрь 2026).
+                if self._cancel_after_write:
+                    self._cancel_after_write = False
+                    raise asyncio.CancelledError()
 
     def _load(self, restoring: bool = False) -> None:
         if not self.path.exists():
@@ -4228,6 +4272,27 @@ class SentLinksStore:
                 self._save()
                 return
             if not isinstance(data, dict):
+                # Корректный JSON, но не история (`null`, число, строка). Раньше
+                # загрузка тихо выходила с пустой историей: пауза «история
+                # потеряна» не включалась, а конструктор затирал этим файлом
+                # проверенную копию .lastgood. Это та же порча, что битый JSON.
+                raise ValueError(f'в файле не история, а {type(data).__name__}')
+            version = data.get('schema_version', SENT_LINKS_SCHEMA)
+            if (not isinstance(version, int) or isinstance(version, bool)
+                    or version > SENT_LINKS_SCHEMA):
+                # Файл записала более новая версия бота. Пустая история —
+                # повторы, а перезапись — потеря её полей: запись отключена,
+                # публикации стоят (claim отвечает LEDGER_UNAVAILABLE).
+                self._read_failed = True
+                logger.error(f'{self.path.name}: формат {version!r} новее поддерживаемого '
+                             f'{SENT_LINKS_SCHEMA}; запись истории отключена')
+                try:
+                    _queue_admin_alert(
+                        f'⛔ История публикаций записана более новой версией бота (формат '
+                        f'{html.escape(str(version))[:20]}). Этот код её не понимает: публикации '
+                        'остановлены, файл не тронут. Верните новую версию бота.')
+                except NameError:
+                    pass
                 return
             self.history_lost = bool(data.get('history_lost'))
             self._urls = list(dict.fromkeys(
@@ -4323,10 +4388,11 @@ class SentLinksStore:
     async def _save_async(self) -> bool:
         """То же, что _save, но запись — в потоке-писателе журнала.
 
-        Снимок — здесь, под замком, который транзакция уже держит; потоку
-        достаются готовые копии, замок ему не нужен. Отмену не пропускаем
-        внутрь: запись всё равно дойдёт до диска, и вызывающий должен узнать
-        её итог раньше, чем отпустит замок транзакции.
+        Только внутри ``async with self._locked()``. Снимок — здесь, под
+        замком, который транзакция уже держит; потоку достаются готовые копии,
+        замок ему не нужен. Отмена до конца записи не доходит: запись всё
+        равно ляжет на диск, и транзакция должна по её итогу сделать откат.
+        Отменится она после, в _locked.
         """
         if getattr(self, '_read_failed', False):
             return False
@@ -4334,11 +4400,16 @@ class SentLinksStore:
             snapshot = self._snapshot_unlocked()
         future = asyncio.get_running_loop().run_in_executor(
             self._writer, self._write_snapshot, snapshot)
-        try:
-            return await asyncio.shield(future)
-        except asyncio.CancelledError:
-            await asyncio.wait({future})
-            raise
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError:
+                if future.cancelled():      # поток-писатель остановлен: записи не было
+                    break
+                self._cancel_after_write = True
+        if future.cancelled() or future.exception() is not None:
+            return False
+        return bool(future.result())
 
     def _snapshot_unlocked(self) -> dict:
         """Копия состояния для записи; зовётся под _state_lock."""
@@ -4571,7 +4642,11 @@ class SentLinksStore:
             return self._has_similar_title_unlocked(title, window_hours, skip)
 
     async def claim(self, link: str, title: str = '', *, check_similar: bool = False) -> bool:
-        """Атомарно резервирует URL/заголовок на время подготовки и отправки."""
+        """Атомарно резервирует URL/заголовок на время подготовки и отправки.
+
+        True — зарезервировано; False — дубль; LEDGER_UNAVAILABLE (тоже ложное)
+        — резерв не записан на диск, новость не дубль и должна дождаться диска.
+        """
         norm_url = normalize_url(link)
         norm_title = normalize_title(title)
         async with self._locked():
@@ -4604,7 +4679,7 @@ class SentLinksStore:
                 self._reservations.pop(norm_url, None)
                 self._remove_unlocked(norm_url, norm_title)
                 logger.error(f'Ledger claim не записан на диск, публикация заблокирована: {norm_url[:100]}')
-                return False
+                return LEDGER_UNAVAILABLE
             return True
 
     async def mark_sending(self, link: str) -> bool:
@@ -13175,6 +13250,16 @@ def get_filmix() -> list[dict]:
     soup = BeautifulSoup(page_text, 'html.parser')
     news_list: list[dict] = []
     seen: set[str] = set()
+    # Превью — другая ссылка на тот же адрес с <img> внутри. Ищем сравнением
+    # адресов, а не селектором a[href="{href}"]: адрес пришёл со страницы, и
+    # кавычка в нём дописывала к селектору что угодно — от ошибки разбора до
+    # селектора, на котором парсер считает минутами (CVE-2026-126191 и
+    # CVE-2026-126193 у Soup Sieve; внешний аудит, ноябрь 2026).
+    previews: dict = {}
+    for anchor in soup.find_all('a', href=True):
+        picture = anchor.find('img', src=True)
+        if picture is not None:
+            previews.setdefault(str(anchor.get('href') or ''), picture)
     for a in soup.select('h2 a[href*="/mnews/"], h3 a[href*="/mnews/"]'):
         href = a.get('href', '')
         if not re.search(r'/mnews/\d+-', href):
@@ -13184,9 +13269,8 @@ def get_filmix() -> list[dict]:
         if link in seen or len(title) < 10:
             continue
         seen.add(link)
-        # Превью: другая ссылка на тот же адрес с <img> внутри
         images: list[str] = []
-        img = soup.select_one(f'a[href="{href}"] img[src]')
+        img = previews.get(href)
         if img:
             norm = _normalize_image_url(img['src'], link)
             if norm:
@@ -15209,6 +15293,7 @@ async def _send_post_fallback(
 ) -> bool:
     """Если media group не прошла — шлём первый медиа-объект с caption, остальные следом без."""
     thread_kw = {'message_thread_id': thread_id} if thread_id is not None else {}
+    lost_extras = 0
     try:
         sent_first = False
         if has_inline_video:
@@ -15227,11 +15312,12 @@ async def _send_post_fallback(
                     **video_thumb_kw, **thread_kw,
                 )
             sent_first = True
-            for ph in photos[:9]:
+            extras = photos[:9]
+            for ph in extras:
                 try:
                     await bot.send_photo(chat_id=target, photo=ph, **thread_kw)
                 except TelegramError:
-                    pass
+                    lost_extras += 1
                 await asyncio.sleep(0.3)
         elif photos:
             try:
@@ -15254,14 +15340,23 @@ async def _send_post_fallback(
                     **thread_kw,
                 )
             sent_first = True
-            for ph in photos[1:10]:
+            extras = photos[1:10]
+            for ph in extras:
                 try:
                     await bot.send_photo(chat_id=target, photo=ph, **thread_kw)
                 except TelegramError:
-                    pass
+                    lost_extras += 1
                 await asyncio.sleep(0.3)
         if sent_first:
             logger.info(f"📩 {news['source']}: {news['title'][:60]} (одиночными)")
+            if lost_extras:
+                # Пост вышел — это успех, повторять его нельзя. Но часть фото
+                # не дошла, и раньше об этом не знал никто (аудит, ноябрь 2026).
+                news['_media_partial'] = {'planned': len(extras) + 1,
+                                          'sent': len(extras) + 1 - lost_extras}
+                metrics.inc('anime_bot_media_partial_total')
+                logger.warning('📩 Пост вышел без %d из %d вложений: %s', lost_extras,
+                               len(extras) + 1, str(news.get('title') or '')[:60])
             return True
         # Совсем не получилось — текст
         await bot.send_message(
@@ -15565,6 +15660,30 @@ async def _prepare_news_for_send(news: dict, source: str,
     return None
 
 
+_ledger_unavailable_alert_at = 0.0
+LEDGER_UNAVAILABLE_ALERT_EVERY_SEC = 3600
+
+
+def _note_ledger_unavailable(title: str) -> None:
+    """История публикаций не принимает запись: новость ждёт, админ узнаёт.
+
+    Раньше это был «дубль»: новость уходила из очереди, а сбой диска тонул в
+    счётчике пропущенных повторов. Предупреждение — не чаще раза в час: при
+    лежащем диске оно иначе шло бы на каждую новость цикла.
+    """
+    global _ledger_unavailable_alert_at
+    logger.error('⛔ История публикаций не записывается — новость ждёт диска: %s',
+                 str(title or '')[:60])
+    metrics.inc('anime_bot_ledger_unavailable_total')
+    now = time.time()
+    if now - _ledger_unavailable_alert_at >= LEDGER_UNAVAILABLE_ALERT_EVERY_SEC:
+        _ledger_unavailable_alert_at = now
+        _queue_admin_alert(
+            '⛔ История публикаций не записывается на диск — публикации стоят, новости '
+            'ждут (они не потеряны и не считаются повторами). Проверьте место и права '
+            'на томе данных — /health.')
+
+
 async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool = True,
                     bypass_history_checks: bool = False,
                     apply_dedup: bool = True,
@@ -15595,7 +15714,11 @@ async def send_news(bot: Bot, news: dict, chat_id=None, *, track_history: bool =
         if is_story_update:
             suffix = hashlib.sha256(normalize_url(link).encode('utf-8', errors='ignore')).hexdigest()[:8]
             ledger_title = f'{title} [story-update:{suffix}]'
-        if not await sent_links.claim(link, ledger_title, check_similar=not is_story_update):
+        claimed = await sent_links.claim(link, ledger_title, check_similar=not is_story_update)
+        if claimed is LEDGER_UNAVAILABLE:
+            _note_ledger_unavailable(title)
+            return 'storage'
+        if not claimed:
             if is_channel:
                 await stats.record_skipped('duplicate', source)
             return 'skipped_dup'
@@ -19718,7 +19841,12 @@ async def send_news_to_thread(bot: Bot, news: dict) -> str:
     if is_story_update:
         suffix = hashlib.sha256(normalize_url(link).encode('utf-8', errors='ignore')).hexdigest()[:8]
         ledger_title = f'{title} [story-update:{suffix}]'
-    if not await sent_links.claim(link, ledger_title, check_similar=not is_story_update):
+    claimed = await sent_links.claim(link, ledger_title, check_similar=not is_story_update)
+    if claimed is LEDGER_UNAVAILABLE:
+        # Ссылка не попала в историю: следующий цикл соберёт новость снова.
+        _note_ledger_unavailable(title)
+        return 'storage'
+    if not claimed:
         await stats.record_skipped('duplicate', source)
         return 'skipped_dup'
 
@@ -23004,6 +23132,12 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(
                 "❓ Telegram не подтвердил результат. Автоповтор отключён — проверь канал.",
                 show_alert=True)
+        elif result == 'storage':
+            returned = await post_queue.defer(next_post)
+            await query.answer("⛔ История публикаций не записывается на диск. "
+                               + ("Пост вернул в очередь" if returned else
+                                  "Пост оставлен в работе: очередь тоже не записалась")
+                               + " — проверь /health.", show_alert=True)
         elif result == 'deferred':
             # Пост ждёт модель или переводчик — его возвращают в очередь, как
             # делает автопубликатор. Раньше он попадал в ветку «пропущен» ниже
@@ -24178,6 +24312,10 @@ async def check_news(context: ContextTypes.DEFAULT_TYPE):
         _runtime_health['last_check_result'] = 'paused: история публикаций потеряна (/historyok)'
         metrics.inc('anime_bot_check_skipped_total', labels={'reason': 'history_lost'})
         return
+    if _instance_unguarded_reason():
+        _runtime_health['last_check_result'] = 'paused: блокировка экземпляра не взята'
+        metrics.inc('anime_bot_check_skipped_total', labels={'reason': 'instance_unguarded'})
+        return
     if _check_news_lock.locked():
         logger.info("⏭ Пропускаю автопроверку — предыдущая ещё идёт")
         metrics.inc('anime_bot_check_skipped_total', labels={'reason': 'overlap'})
@@ -24405,7 +24543,7 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                            source=news.get('source'), confidence=news.get('_confidence_score'))
                 if result == 'sent':
                     sent_count += 1
-                elif result == 'failed':
+                elif result in ('failed', 'storage'):
                     failed_count += 1
                 elif result == 'uncertain':
                     uncertain_count += 1
@@ -24416,6 +24554,10 @@ async def _check_news_cycle(context: ContextTypes.DEFAULT_TYPE):
                         new_skipped_count += 1
                         if result != 'skipped_dup':
                             new_problem_skips += 1
+                if result == 'storage':
+                    # История не пишется: остальные кандидаты упрутся в то же.
+                    # В историю они не попали — следующий цикл соберёт их снова.
+                    break
                 # Пауза нужна только после пути, который мог обратиться к
                 # Telegram. Дубликаты/фильтр физически ничего не отправляют и
                 # раньше зря растягивали цикл на минуты.
@@ -24600,6 +24742,12 @@ async def _publish_one_from_queue_locked(bot_api) -> tuple[Optional[str], Option
             if not await post_queue.defer(next_post):
                 break
             continue
+        if sent_result == 'storage':
+            # История не пишется — это не дубль и не ошибка отправки: пост
+            # возвращается в очередь без траты попыток, а дальше не идём —
+            # следующий упёрся бы в тот же диск.
+            await post_queue.defer(next_post)
+            break
         if sent_result == 'failed':
             requeued = await post_queue.requeue_failed(next_post)
             if requeued is True:
@@ -24672,7 +24820,8 @@ async def _autopost_one_from_thread(bot_api) -> Optional[str]:
     и этот автопубликатор не могут отправить один пост дважды: кто первым
     занял состояние, тот и публикует.
     """
-    if (pending_posts is None or _history_paused() or _channel_quiet_now()
+    if (pending_posts is None or _history_paused() or _instance_unguarded_reason()
+            or _channel_quiet_now()
             or not await _channel_autopost_due()):
         return None
     # Пост ветки модель уже разобрала, тема известна: западное кино сверх
@@ -24777,7 +24926,7 @@ async def publisher_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     прошлой публикации прошёл настроенный интервал. Решение о времени берётся
     из того же ``settings.last_publish_at``, что и раньше.
     """
-    if (settings is None or post_queue is None or _history_paused()
+    if (settings is None or post_queue is None or _history_paused() or _instance_unguarded_reason()
             or not settings.auto_enabled or not feature_enabled('independent_publisher')):
         return
     if settings.publish_mode == 'both':
@@ -29886,7 +30035,7 @@ async def historyok_command(update, context: ContextTypes.DEFAULT_TYPE):
     if not _history_paused():
         await update.message.reply_text('История публикаций в порядке, пауза не стоит.')
         return
-    if not sent_links.accept_lost_history():
+    if not await sent_links.accept_lost_history():
         await update.message.reply_text(
             '⚠️ Пауза НЕ снята: история не записалась на диск (проверьте место и '
             'права на DATA_DIR).')
@@ -30611,12 +30760,31 @@ def _rss_mb() -> Optional[int]:
     return None
 
 
+# Опись внутри архива бэкапа: какие файлы были в DATA_DIR, их размер и
+# SHA-256 и какие не прочитались. Без неё проверка восстановления принимала
+# архив из одного вспомогательного файла: хранилище, которое не прочиталось
+# при сборке, ничем не отличалось от ещё не созданного (внешний аудит, ноябрь 2026).
+BACKUP_MANIFEST_NAME = '_backup_manifest.json'
+
+
 def _data_files() -> list[Path]:
     """Все файлы данных бота (для бэкапа и отчёта о размерах)."""
     try:
-        return sorted(p for p in DATA_DIR.glob('*.json') if p.is_file())
+        # Опись из восстановленного архива — не данные: в новый бэкап её не берём.
+        return sorted(p for p in DATA_DIR.glob('*.json')
+                      if p.is_file() and p.name != BACKUP_MANIFEST_NAME)
     except OSError:
         return []
+
+
+def _backup_manifest(entries: dict, unreadable=()) -> bytes:
+    """Опись архива: {имя: (размер, sha256)} и список непрочитанных файлов."""
+    return json.dumps({
+        'schema_version': 1,
+        'files': {name: {'size': int(size), 'sha256': str(digest)}
+                  for name, (size, digest) in sorted(entries.items())},
+        'unreadable': sorted(str(name) for name in unreadable),
+    }, ensure_ascii=False).encode('utf-8')
 
 
 TELEGRAM_DOCUMENT_LIMIT = 49 * 1024 * 1024   # боту Telegram отдаёт до 50 МБ
@@ -30923,6 +31091,11 @@ async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
     if _history_paused():
         lines[1:1] = ['⛔ Автопубликация на паузе: история публикаций потеряна, копии нет. '
                       'Верните sent_links.json из бэкапа или /historyok — продолжить без неё.', '']
+    if _instance_unguarded_reason():
+        lines[1:1] = ['⛔ Автопубликация остановлена: не создаётся файл блокировки экземпляра '
+                      f'({html.escape(_instance_unguarded_reason())}). Второй экземпляр на том же '
+                      'томе выложил бы те же посты. Проверьте права и место на томе данных '
+                      'и перезапустите бота.', '']
     lines.append(_job_line(context, 'anime_news_check', 'Автопроверка новостей'))
     lines.append(_job_line(context, 'scheduled_publish', 'Публикация отложки'))
     lines.append(_job_line(context, 'daily_backup', 'Ежедневный бэкап'))
@@ -31186,11 +31359,38 @@ def _verify_backup_archive(data: bytes) -> dict:
                     except (UnicodeDecodeError, ValueError) as e:
                         result['errors'].append(f'invalid json {name[:80]}: {type(e).__name__}')
             result['files'] = sum(1 for x in infos if not x.is_dir())
+            if not result['errors'] and BACKUP_MANIFEST_NAME in seen_names:
+                result['manifest'] = True
+                result['errors'].extend(_backup_manifest_issues(zf, seen_names))
     except (zipfile.BadZipFile, OSError, RuntimeError) as e:
         result['errors'].append(f'{type(e).__name__}: {e}')
         return result
     result['ok'] = not result['errors']
     return result
+
+
+def _backup_manifest_issues(zf, names: set) -> list[str]:
+    """Чем архив расходится со своей описью. Пусто — совпадает."""
+    try:
+        manifest = json.loads(zf.read(BACKUP_MANIFEST_NAME).decode('utf-8'))
+        files = manifest.get('files') if isinstance(manifest, dict) else None
+        if not isinstance(files, dict):
+            return ['опись архива повреждена']
+    except (KeyError, UnicodeDecodeError, ValueError):
+        return ['опись архива не читается']
+    issues = [f'файл не прочитан при сборке: {str(name)[:80]}'
+              for name in manifest.get('unreadable') or ()]
+    for name, meta in files.items():
+        if name not in names:
+            issues.append(f'нет файла из описи: {str(name)[:80]}')
+            continue
+        raw = zf.read(name)
+        if (not isinstance(meta, dict) or len(raw) != meta.get('size')
+                or hashlib.sha256(raw).hexdigest() != meta.get('sha256')):
+            issues.append(f'файл не совпал с описью: {str(name)[:80]}')
+    for name in sorted(names - set(files) - {BACKUP_MANIFEST_NAME}):
+        issues.append(f'файла нет в описи: {str(name)[:80]}')
+    return issues
 
 
 def _restore_backup_archive(data: bytes, target_dir: Path, *, overwrite: bool = False) -> dict:
@@ -31202,7 +31402,8 @@ def _restore_backup_archive(data: bytes, target_dir: Path, *, overwrite: bool = 
     be materialized as files without path traversal or symlink tricks.
     """
     check = _verify_backup_archive(data)
-    result = {'ok': False, 'restored': 0, 'errors': list(check.get('errors') or [])}
+    result = {'ok': False, 'restored': 0, 'errors': list(check.get('errors') or []),
+              'manifest': bool(check.get('manifest'))}
     if not check.get('ok'):
         return result
     root = Path(target_dir)
@@ -31263,6 +31464,11 @@ def _backup_restore_selftest(data: bytes) -> dict:
             if not restored.get('ok'):
                 result['errors'].extend(restored.get('errors') or [])
                 return result
+            # Проверяем только свежие архивы бота, а в них опись есть всегда.
+            # Без неё не отличить «хранилища ещё нет» от «не прочиталось».
+            if not restored.get('manifest'):
+                result['errors'].append('в архиве нет описи файлов')
+                return result
             # Parsing all JSON again catches extraction/encoding problems. Then
             # instantiate critical stores to exercise their real migration/load
             # paths without ever touching production DATA_DIR.
@@ -31283,7 +31489,13 @@ def _backup_restore_selftest(data: bytes) -> dict:
             for label, filename, cls in loaders:
                 path = root / filename
                 if path.exists():
-                    cls(path)
+                    store = cls(path)
+                    # История, которая поднялась только из копии или встала на
+                    # паузу, — это не восстановление: бот с ней повторил бы посты.
+                    if label == 'sent_links' and (store.history_lost or store.restored_from
+                                                  or getattr(store, '_read_failed', False)):
+                        result['errors'].append('история публикаций в архиве не читается')
+                        return result
                     result['stores'].append(label)
             result['ok'] = True
     except Exception as e:
@@ -31359,10 +31571,16 @@ async def _run_chaos_selftest(rounds: int = CHAOS_SELFTEST_ROUNDS, *, seed: int 
                  f'first={first["changed"]}, second={second["changed"]}')
 
             # Invariant 5: backup can be extracted and actual stores can load it.
+            # Архив — как у настоящего бэкапа, с описью: без неё проверка
+            # восстановления не отличит пропавшее хранилище от несозданного.
             backup_buf = io.BytesIO()
+            entries = {}
             with zipfile.ZipFile(backup_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for path in sorted(schema_root.glob('*.json')):
-                    zf.write(path, arcname=path.name)
+                    raw = path.read_bytes()
+                    zf.writestr(path.name, raw)
+                    entries[path.name] = (len(raw), hashlib.sha256(raw).hexdigest())
+                zf.writestr(BACKUP_MANIFEST_NAME, _backup_manifest(entries))
             restore = _backup_restore_selftest(backup_buf.getvalue())
             note('backup_restore', bool(restore.get('ok')),
                  f'restored={restore.get("restored")}, errors={restore.get("errors")}')
@@ -31439,13 +31657,24 @@ def _build_backup_archive() -> Optional[tuple[bytes, str]]:
     if not files:
         return None
     buf = io.BytesIO()
+    entries: dict = {}
+    unreadable: list[str] = []
     try:
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
             for path in files:
+                # По одному файлу: в памяти — один файл и сам архив, а не все сразу.
                 try:
-                    zf.write(path, arcname=path.name)
+                    raw = path.read_bytes()
                 except OSError as e:
-                    logger.warning(f"Бэкап: {path.name} не добавлен ({e})")
+                    # Не пропускаем молча: файл попадёт в опись как непрочитанный,
+                    # и проверка восстановления забракует архив.
+                    logger.warning(f"Бэкап: {path.name} не прочитан ({e})")
+                    unreadable.append(path.name)
+                    continue
+                zf.writestr(path.name, raw)
+                entries[path.name] = (len(raw), hashlib.sha256(raw).hexdigest())
+                del raw
+            zf.writestr(BACKUP_MANIFEST_NAME, _backup_manifest(entries, unreadable))
     except Exception as e:
         logger.error(f"Бэкап: архив не собрался ({e})")
         return None
@@ -34665,6 +34894,12 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ============== SINGLE-INSTANCE GUARD ==============
 _instance_lock_handle = None
 _lifecycle_started = False
+# Почему не взята блокировка экземпляра; пусто — взята (или ОС её не умеет).
+_instance_unguarded = ''
+
+
+def _instance_unguarded_reason() -> str:
+    return _instance_unguarded
 
 
 def _acquire_instance_lock(wait_seconds: Optional[float] = None) -> None:
@@ -34675,7 +34910,7 @@ def _acquire_instance_lock(wait_seconds: Optional[float] = None) -> None:
     relaunched by the platform.  No lifecycle/runtime file is written before
     this function succeeds.
     """
-    global _instance_lock_handle
+    global _instance_lock_handle, _instance_unguarded
     if _instance_lock_handle is not None:
         return
     if fcntl is None:
@@ -34692,7 +34927,11 @@ def _acquire_instance_lock(wait_seconds: Optional[float] = None) -> None:
         # так переходят в режим «не сохраняю» (см. /health), поэтому работаем
         # без защиты от второго экземпляра, но громко.
         logger.error(f'⚠️ Не создать файл блокировки {path}: {e}. Защита от второго '
-                     'экземпляра отключена; данные, скорее всего, не сохраняются.')
+                     'экземпляра отключена; автопубликация остановлена.')
+        # Запуск не обрываем (иначе вечный цикл перезапусков), но и сами не
+        # публикуем: без блокировки второй экземпляр на том же томе выложил
+        # бы те же посты (внешний аудит, ноябрь 2026). Команды работают.
+        _instance_unguarded = f'{type(e).__name__}: {e}'[:160]
         return
     started = time.monotonic()
     next_log = started

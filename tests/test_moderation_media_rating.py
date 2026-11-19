@@ -222,6 +222,30 @@ def test_models_download_once_and_are_verified(tmp_path, monkeypatch):
     assert len(opened) == 1
 
 
+def test_cached_model_of_the_right_size_but_other_bytes_is_fetched_again(tmp_path, monkeypatch):
+    """Подмена или порча одного байта при прежнем размере: раньше такой файл
+    принимался без проверки (внешний аудит, ноябрь 2026)."""
+    fake_models(monkeypatch)
+    (tmp_path / 'one.onnx').write_bytes(b'model-bytez')       # та же длина, другой байт
+    opened = []
+
+    def opener(request, timeout):
+        opened.append(request.full_url)
+        return io.BytesIO(b'model-bytes')
+    paths = media.ensure_rating_models(tmp_path, opener=opener)
+    assert paths == (tmp_path / 'one.onnx',) and paths[0].read_bytes() == b'model-bytes'
+    assert len(opened) == 1
+
+
+def test_unreadable_cached_model_is_fetched_again(tmp_path, monkeypatch):
+    fake_models(monkeypatch)
+    (tmp_path / 'one.onnx').write_bytes(b'model-bytes')
+    monkeypatch.setattr(media, '_file_sha256', lambda path: (_ for _ in ()).throw(OSError('io')))
+    opened = []
+    media.ensure_rating_models(tmp_path, opener=lambda r, timeout: opened.append(1) or io.BytesIO(b'model-bytes'))
+    assert opened == [1]
+
+
 @pytest.mark.parametrize('payload', [b'model-bytez', b'model', b'model-bytes-and-more'])
 def test_tampered_or_truncated_model_is_rejected(tmp_path, monkeypatch, payload):
     fake_models(monkeypatch)
