@@ -21,6 +21,11 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+# Имена, которые загрузчик пропускает в дочерний процесс сверх обычных (см.
+# child_env). Пусто: процессу хватает своих. Тесты передают так пути своему
+# поддельному yt-dlp.
+CHILD_ENV_KEEP: tuple = ()
+
 
 def file_stem(url: str) -> str:
     """Имя файла: читаемый хвост URL + случайный суффикс на КАЖДУЮ загрузку.
@@ -127,6 +132,8 @@ async def download_isolated(url: str, out_dir: Path, *, fmt: str, max_mb: int,
                             ffmpeg: Optional[str] = None, meta: Optional[dict] = None,
                             ) -> tuple[Optional[Path], str]:
     """Загрузка в дочернем процессе; по истечении timeout процесс убивается."""
+    # Импорт здесь: дочерний процесс — этот же файл, и окружение ему собирать незачем.
+    from child_env import child_env
     stem = file_stem(url)
     job = {'url': url, 'out_dir': str(out_dir), 'stem': stem, 'fmt': fmt,
            'max_mb': max_mb, 'max_duration': max_duration, 'extensions': list(extensions),
@@ -135,6 +142,9 @@ async def download_isolated(url: str, out_dir: Path, *, fmt: str, max_mb: int,
         sys.executable, str(Path(__file__).resolve()),
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
+        # Без BOT_TOKEN, ключей моделей и сессии аккаунта: процесс разбирает
+        # чужие страницы и ролики. Сеть ему нужна — прокси и сертификаты оставляем.
+        env=child_env(network=True, keep=CHILD_ENV_KEEP),
         start_new_session=hasattr(os, 'killpg'))
     try:
         out, _ = await asyncio.wait_for(proc.communicate(json.dumps(job).encode()), timeout)

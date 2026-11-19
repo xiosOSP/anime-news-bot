@@ -254,7 +254,8 @@ class TestBackup:
         monkeypatch.setattr(anime_news_bot, 'settings', MagicMock(tz_offset=3))
         data, name = anime_news_bot._build_backup_archive()
         names = zipfile.ZipFile(io.BytesIO(data)).namelist()
-        assert set(names) == {'bot_settings.json', 'sent_links.json'}
+        # Плюс опись: что было в DATA_DIR и с какими контрольными суммами.
+        assert set(names) == {'bot_settings.json', 'sent_links.json', anime_news_bot.BACKUP_MANIFEST_NAME}
         assert name.startswith('anime_bot_backup_') and name.endswith('.zip')
 
     def test_empty_dir_returns_none(self, tmp_path, monkeypatch):

@@ -73,7 +73,7 @@ async def test_pause_survives_a_restart_until_the_owner_decides(tmp_path, alerts
     store = bot.SentLinksStore(path)
     await store.claim(LINK, 'Some anime news title')    # любая запись на диск
     assert bot.SentLinksStore(path).history_lost       # пустой, но читаемый файл паузу не снял
-    assert store.accept_lost_history()
+    assert await store.accept_lost_history()
     assert not bot.SentLinksStore(path).history_lost
 
 
@@ -104,7 +104,7 @@ def test_lost_history_is_never_copied_over_the_good_one(tmp_path, alerts):
 
 @pytest.fixture
 def paused(monkeypatch):
-    monkeypatch.setattr(bot, 'sent_links', NS(history_lost=True, accept_lost_history=lambda: True))
+    monkeypatch.setattr(bot, 'sent_links', NS(history_lost=True, accept_lost_history=AsyncMock(return_value=True)))
 
 
 @pytest.mark.asyncio
@@ -127,7 +127,10 @@ async def test_paused_bot_does_not_collect_or_publish(paused, monkeypatch):
 @pytest.mark.asyncio
 async def test_only_the_owner_lifts_the_pause(paused, monkeypatch):
     accept = []
-    bot.sent_links.accept_lost_history = lambda: accept.append(1) or True
+    async def accept_once():
+        accept.append(1)
+        return True
+    bot.sent_links.accept_lost_history = accept_once
     deny = AsyncMock()
     monkeypatch.setattr(bot, 'deny_access', deny)
     reply = AsyncMock()
@@ -142,7 +145,7 @@ async def test_only_the_owner_lifts_the_pause(paused, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_failed_write_keeps_the_pause_and_says_so(paused):
-    bot.sent_links.accept_lost_history = lambda: False
+    bot.sent_links.accept_lost_history = AsyncMock(return_value=False)
     reply = AsyncMock()
     await bot.historyok_command(NS(effective_user=NS(id=bot.ADMIN_ID),
                                    message=NS(reply_text=reply)), None)

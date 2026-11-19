@@ -448,7 +448,8 @@ def test_scheduled_overflow_never_discards_earliest_posts(tmp_path, monkeypatch)
 async def test_ledger_fails_closed_when_claim_cannot_be_persisted(tmp_path, monkeypatch):
     store = bot.SentLinksStore(tmp_path / 'links.json')
     monkeypatch.setattr(bot, '_atomic_write_json', lambda *_a, **_k: (_ for _ in ()).throw(OSError('disk full')))
-    assert await store.claim('https://e/disk', 'Disk full claim') is False
+    # Отказ диска — не дубль: отдельный ответ, тоже ложный (публикации нет).
+    assert await store.claim('https://e/disk', 'Disk full claim') is bot.LEDGER_UNAVAILABLE
     assert 'https://e/disk' not in store
     assert not store._reservations
 

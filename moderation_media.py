@@ -295,6 +295,16 @@ COVERED_CLOSEUP_SCORE = .70
 COVERED_CLOSEUP_SHARE = .20
 
 
+def _file_sha256(path) -> str:
+    """SHA-256 файла кусками по мегабайту: модель целиком в память не берём."""
+    import hashlib
+    digest = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def ensure_rating_models(directory, *, timeout=600, opener=None):
     """Скачать классификаторы рисунка один раз; вернуть пути или текст ошибки.
 
@@ -312,9 +322,18 @@ def ensure_rating_models(directory, *, timeout=600, opener=None):
     paths = []
     for name, spec in RATING_MODELS.items():
         target = directory / spec['file']
+        # Уже скачанный файл сверяем не только по размеру: подменённая или
+        # побитая модель той же длины проходила, хотя обещание выше — «не
+        # запустится» (внешний аудит, ноябрь 2026). Зовут нас раз за запуск и
+        # в потоке, так что секунды на хеш никого не задерживают.
         if target.is_file() and target.stat().st_size == spec['size']:
-            paths.append(target)
-            continue
+            try:
+                intact = _file_sha256(target) == spec['sha256']
+            except OSError:
+                intact = False
+            if intact:
+                paths.append(target)
+                continue
         partial = target.with_name(target.name + '.part')
         digest = hashlib.sha256()
         received = 0
@@ -799,7 +818,11 @@ def clamp_worker_memory(memory_mb):
 
 def _invoke_worker(path, kind, timeout, explicit_threshold, suggestive_threshold,
                    memory_mb=WORKER_MEMORY_MB_DEFAULT, rating_paths=()):
-    env = dict(os.environ, OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1',
+    # Только нужные переменные, без сети: воркер разбирает чужие картинки и
+    # видео, и ни токены, ни сессия Telegram-аккаунта ему не нужны (см. child_env).
+    # Импорт здесь: сам воркер запускается этим же файлом и его не требует.
+    from child_env import child_env
+    env = child_env(network=False, extra=dict(OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1',
                # threads;1 — декодер видео в одном потоке: на ролике 1080p пик
                # воркера падает с 594 до 412 МБ, кадры те же.
                MKL_NUM_THREADS='1',
@@ -812,15 +835,11 @@ def _invoke_worker(path, kind, timeout, explicit_threshold, suggestive_threshold
                MALLOC_ARENA_MAX='2',
                # OpenCV поднимает пул потоков по числу ядер — и каждый поток
                # тянет за собой свою арену.
-               OPENCV_NUM_THREADS='1')
+               OPENCV_NUM_THREADS='1'))
     env[WORKER_MEMORY_ENV] = str(clamp_worker_memory(memory_mb))
     env.pop(RATING_ENV, None)
     if rating_paths:
         env[RATING_ENV] = os.pathsep.join(str(item) for item in rating_paths)
-    # Classifier never needs bot tokens, provider keys or cloud credentials.
-    for name in list(env):
-        if any(part in name.upper() for part in ('TOKEN', 'SECRET', 'PASSWORD', 'KEY', 'CREDENTIAL')):
-            env.pop(name, None)
     flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
     return subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), str(path), kind,
