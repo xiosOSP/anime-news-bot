@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 
 from packaging.requirements import Requirement
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 # yt-dlp нужен свежий: YouTube ломает старые версии за недели. Версии его
@@ -31,8 +32,16 @@ def raw_lines():
 
 
 def requirements(python_version: str = None):
-    """Строки, действующие на данном Python (по умолчанию — на текущем)."""
-    env = {'python_version': python_version} if python_version else None
+    """Строки, действующие на данном Python (по умолчанию — на текущем).
+
+    Версия — «3.11» или точная «3.11.4»: часть пакетов выбирается по точной
+    (python_full_version), и без неё маркер взял бы версию того Python, на
+    котором идут тесты.
+    """
+    env = None
+    if python_version:
+        full = python_version if python_version.count('.') >= 2 else python_version + '.99'
+        env = {'python_version': '.'.join(full.split('.')[:2]), 'python_full_version': full}
     for line in raw_lines():
         req = Requirement(line)
         if req.marker is None or req.marker.evaluate(env):
@@ -104,6 +113,16 @@ def test_each_python_gets_exactly_one_version_of_numpy_and_onnxruntime():
         assert {'numpy', 'onnxruntime'} <= set(chosen), python
     assert pins('3.10')['numpy'].startswith('2.2.')
     assert pins('3.11')['numpy'] != pins('3.10')['numpy']
+
+
+@pytest.mark.parametrize('python, expected', [
+    ('3.10.14', '2.10.0'), ('3.11.0', '2.10.0'), ('3.11.4', '2.10.0'),
+    ('3.11.5', '4.0'), ('3.11.14', '4.0'), ('3.12.7', '4.0'), ('3.13.1', '4.0'),
+])
+def test_soupsieve_follows_the_exact_python_version(python, expected):
+    """4.0 закрывает CVE-2026-126190…126193, но ставится только на 3.11.5+.
+    Условие по «3.11» дало бы 4.0 на 3.11.0–3.11.4, и сборка на хостинге упала бы."""
+    assert pins(python)['soupsieve'] == expected
 
 
 def test_installed_versions_are_the_pinned_ones():
