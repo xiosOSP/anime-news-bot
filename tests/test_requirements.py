@@ -116,7 +116,7 @@ def test_each_python_gets_exactly_one_version_of_numpy_and_onnxruntime():
 
 
 @pytest.mark.parametrize('python, expected', [
-    ('3.10.14', '2.10.0'), ('3.11.0', '2.10.0'), ('3.11.4', '2.10.0'),
+    ('3.10.14', '2.10'), ('3.11.0', '2.10'), ('3.11.4', '2.10'),
     ('3.11.5', '4.0'), ('3.11.14', '4.0'), ('3.12.7', '4.0'), ('3.13.1', '4.0'),
 ])
 def test_soupsieve_follows_the_exact_python_version(python, expected):

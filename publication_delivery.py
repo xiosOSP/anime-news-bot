@@ -33,3 +33,31 @@ class PublicationBot:
             return await method(*args, **kwargs)
 
         return send
+
+
+class SentRecorder:
+    """Запоминает, что ответил Telegram на отправку: какие сообщения ушли.
+
+    Нужен, чтобы бот знал номер и текст своего поста в канале и потом мог
+    сравнить его с правкой админа (см. post_feedback). На отправку не влияет:
+    ответ возвращается как есть.
+    """
+
+    def __init__(self, bot):
+        self._bot = bot
+        self.messages = []
+
+    def __getattr__(self, name):
+        method = getattr(self._bot, name)
+        if name not in PublicationBot.METHODS:
+            return method
+
+        async def send(*args, **kwargs):
+            result = await method(*args, **kwargs)
+            if isinstance(result, (list, tuple)):
+                self.messages.extend(result)
+            elif result is not None:
+                self.messages.append(result)
+            return result
+
+        return send
