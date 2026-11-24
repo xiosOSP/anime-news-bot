@@ -2,7 +2,7 @@
 
 <!-- Файл собран из кода: python tools/env_reference.py. Руками не править. -->
 
-Бот читает 340 переменных. Почти все — точная настройка со значением
+Бот читает 341 переменных. Почти все — точная настройка со значением
 по умолчанию: задавать их нужно, только если дефолт не подошёл.
 
 ## Без чего бот не работает как задумано
@@ -111,6 +111,7 @@
 | `FEATURE_MEDIA_SMART_CROP` | `True` | anime_news_bot.py |
 | `FEATURE_METRICS` | `True` | anime_news_bot.py |
 | `FEATURE_PERCEPTUAL_MEDIA_DEDUP` | `True` | anime_news_bot.py |
+| `FEATURE_POST_FEEDBACK` | `True` | anime_news_bot.py |
 | `FEATURE_REPLAY` | `True` | anime_news_bot.py |
 | `FEATURE_RUNTIME_MIGRATIONS` | `True` | anime_news_bot.py |
 | `FEATURE_SHADOW_MODE` | `False` | anime_news_bot.py |

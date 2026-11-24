@@ -139,7 +139,8 @@ from moderation_media import (MediaScanner, ensure_rating_models, hashes_match,
 from moderation_llm import ChatModelClient
 from news_deferral import NewsDeferralStore
 import tg_account as tg_account_mod
-from publication_delivery import PublicationBot
+from publication_delivery import PublicationBot, SentRecorder
+from post_feedback import ChannelPostLog, week_key, weekly_digest
 from telegram import (
     Bot,
     BotCommand,
@@ -691,6 +692,8 @@ FEATURE_FLAGS = {
     'editorial_glossary': _env_bool('FEATURE_EDITORIAL_GLOSSARY', True),
     'entity_memory': _env_bool('FEATURE_ENTITY_MEMORY', True),
     'llm_judge': _env_bool('FEATURE_LLM_JUDGE', False),
+    # Разбор правок админов в канале и недельная сводка владельцу (post_feedback).
+    'post_feedback': _env_bool('FEATURE_POST_FEEDBACK', True),
     'story_updates': _env_bool('FEATURE_STORY_UPDATES', True),
     'replay': _env_bool('FEATURE_REPLAY', True),
     'golden_dataset': _env_bool('FEATURE_GOLDEN_DATASET', True),
@@ -772,6 +775,8 @@ DOCTOR_MIN_FREE_MB = max(32, _env_int('DOCTOR_MIN_FREE_MB', 256))
 EDITORIAL_GLOSSARY_FILE = DATA_DIR / 'editorial_glossary.json'
 ENTITY_MEMORY_FILE = DATA_DIR / 'entity_memory.json'
 PUBLISHED_STORIES_FILE = DATA_DIR / 'published_stories.json'
+# Посты бота в канале и правки админов к ним (см. post_feedback).
+CHANNEL_POSTS_FILE = DATA_DIR / 'channel_posts.json'
 STORY_REGISTRY_FILE = DATA_DIR / 'story_registry.json'
 SOURCE_YIELD_FILE = DATA_DIR / 'source_yield.json'
 STORY_REGISTRY_MAX = max(200, min(10000, _env_int('STORY_REGISTRY_MAX', 2500)))
@@ -8604,6 +8609,7 @@ editorial_rules: Optional['EditorialRulesStore'] = None
 editorial_glossary: Optional['EditorialGlossary'] = None
 entity_memory: Optional['EntityMemory'] = None
 story_history: Optional['PublishedStoryStore'] = None
+channel_posts: Optional[ChannelPostLog] = None
 replay_buffer: Optional['ReplayBuffer'] = None
 
 
@@ -15411,8 +15417,109 @@ async def _send_channel_post(bot: Bot, news: dict, video_file: Optional[Path] = 
     непредсказуемыми. Один lock оставляет подготовку параллельной, а сам publish
     — строго последовательным.
     """
+    recorder = SentRecorder(bot)
     async with _channel_send_lock:
-        return await _send_post(bot, news, CHANNEL_ID, video_file)
+        sent = await _send_post(recorder, news, CHANNEL_ID, video_file)
+    if sent:
+        try:
+            await asyncio.to_thread(_remember_channel_message, news, recorder.messages)
+        except Exception:
+            logger.exception('Пост в канале не запомнен для разбора правок')
+    return sent
+
+
+def _remember_channel_message(news: dict, messages: list) -> bool:
+    """Номер и текст поста в канале — чтобы потом сравнить с правкой админа.
+
+    Текст берём из ответа Telegram, а не из своей заготовки: правку админа
+    Telegram пришлёт в том же виде, и сравнивать надо одно с другим.
+    """
+    if channel_posts is None or not feature_enabled('post_feedback'):
+        return False
+    for message in messages:
+        text = getattr(message, 'caption', None) or getattr(message, 'text', None)
+        message_id = getattr(message, 'message_id', None)
+        if isinstance(message_id, int) and isinstance(text, str) and text.strip():
+            return channel_posts.record_post(message_id, text, {
+                'story_id': str(news.get('_story_id') or ''),
+                'topic': str(news.get('_llm_topic') or ''),
+                'kind': str(news.get('_llm_kind') or ''),
+                'source': str(news.get('source') or ''),
+                'about': _about_line(news),
+            })
+    return False
+
+
+# Недельная сводка: понедельник, после этого часа по времени админа.
+WEEKLY_DIGEST_WEEKDAY = 0
+WEEKLY_DIGEST_HOUR = 11
+
+
+def _weekly_digest_tech_lines() -> list[str]:
+    """Техническое состояние для сводки — то, что видно без модели и сети."""
+    lines = []
+    titles = _work_titles_health_line()
+    if titles:
+        lines.append(html.unescape(titles.strip()))
+    now = time.monotonic()
+    disk = [row for row in list(_disk_write_failures) if now - row[0] <= 7 * 86400]
+    if disk:
+        lines.append(f'Сбоев записи на диск: {len(disk)}, последний — {disk[-1][1]} (с последнего запуска)')
+    if source_health is not None and settings is not None:
+        silent = [name for name, _ in SOURCES if settings.is_source_enabled(name)
+                  and (source_health.silent_hours(name) or 0) >= 24]
+        if silent:
+            lines.append(f'Молчат больше суток: {len(silent)} — ' + ', '.join(silent[:5]))
+    if _history_paused():
+        lines.append('⛔ Автопубликация на паузе: история публикаций потеряна (/historyok)')
+    if _instance_unguarded_reason():
+        lines.append('⛔ Автопубликация остановлена: нет блокировки экземпляра (/health)')
+    return lines
+
+
+def _weekly_digest_text() -> str:
+    posts, edits = channel_posts.window(7)
+    return weekly_digest(posts, edits, _weekly_digest_tech_lines(), now=_local_now())
+
+
+async def weekly_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Раз в неделю — сводка владельцу: что правили админы, ромадзи, сбои.
+
+    Задача крутится ежечасно и срабатывает один раз за неделю, в понедельник
+    после WEEKLY_DIGEST_HOUR. Не дошла — неделя не отмечается, следующий час
+    попробует снова.
+    """
+    if channel_posts is None or not feature_enabled('post_feedback'):
+        return
+    now = _local_now()
+    if now.weekday() != WEEKLY_DIGEST_WEEKDAY or now.hour < WEEKLY_DIGEST_HOUR:
+        return
+    week = week_key(now)
+    if channel_posts.digest_week() == week:
+        return
+    text = await asyncio.to_thread(_weekly_digest_text)
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=text)
+    except TelegramError as e:
+        logger.warning('Недельная сводка не дошла: %s', type(e).__name__)
+        return
+    await asyncio.to_thread(channel_posts.mark_digest_week, week)
+
+
+async def channel_post_edit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Админ поправил пост в канале: если это пост бота — запоминаем, что изменилось."""
+    message = getattr(update, 'edited_channel_post', None)
+    if (message is None or channel_posts is None or not feature_enabled('post_feedback')
+            or not _is_our_channel(getattr(message, 'chat', None))):
+        return
+    text = str(getattr(message, 'text', None) or getattr(message, 'caption', None) or '')
+    message_id = getattr(message, 'message_id', None)
+    if not isinstance(message_id, int):
+        return
+    event = await asyncio.to_thread(channel_posts.record_edit, message_id, text)
+    if event:
+        logger.info('✏️ Админ поправил пост бота %s: %s', message_id, ', '.join(event['changes']))
+        metrics.inc('anime_bot_admin_edits_total')
 
 
 LATE_TITLE_RECHECK_SEC = 600
@@ -23996,6 +24103,7 @@ HELP_SECTIONS: tuple = (
     ('📊 Состояние бота', (
         ('status', 'что сейчас происходит'),
         ('health', 'сводка: задачи, источники, данные, память, диск'),
+        ('digest', 'неделя бота: что правили админы, названия латиницей, сбои'),
         ('doctor', 'самодиагностика и проверка прав в Telegram'),
         ('stats', 'статистика публикаций и источников'),
         ('logs', 'последние строки лога: /logs [слово]'),
@@ -31083,6 +31191,15 @@ async def reliability_command(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def digest_command(update, context: ContextTypes.DEFAULT_TYPE):
+    """Сводка за последние 7 дней — сейчас, не дожидаясь понедельника."""
+    if channel_posts is None:
+        await update.message.reply_text('Журнал постов ещё не готов.')
+        return
+    await update.message.reply_text(await asyncio.to_thread(_weekly_digest_text))
+
+
+@admin_only
 async def health_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Сводка о состоянии бота: джобы, источники, данные, память, диск."""
     lines = ['🩺 <b>Состояние бота</b>', '', '<b>Фоновые задачи</b>']
@@ -36459,6 +36576,11 @@ async def setup_bot_commands(app: Application) -> None:
         publish_scheduled, interval=60, first=15, name='scheduled_publish',
         job_kwargs=JOB_KWARGS,
     )
+    # Недельная сводка владельцу: проверяем раз в час, срабатывает раз в неделю
+    app.job_queue.run_repeating(
+        weekly_digest_job, interval=3600, first=300, name='weekly_digest',
+        job_kwargs=JOB_KWARGS,
+    )
     # Ежедневный бэкап: проверяем раз в час, срабатывает один раз в сутки
     app.job_queue.run_repeating(
         daily_backup_job, interval=3600, first=120, name='daily_backup',
@@ -36566,7 +36688,7 @@ def _init_globals() -> None:
     не затрагивая реальные данные пользователя."""
     global sent_links, translator, post_queue, settings, stats, anilist, pending_posts, moderation_feedback
     global editorial_rules, editorial_glossary, entity_memory, story_history, replay_buffer, story_registry, source_yield, work_titles
-    global work_memory, work_aliases
+    global work_memory, work_aliases, channel_posts
     global error_fingerprints, llm_budget, admin_audit, experiments, adaptive_publishing, analytics_store
     if sent_links is None:
         sent_links = SentLinksStore(SENT_LINKS_FILE)
@@ -36647,6 +36769,8 @@ def _init_globals() -> None:
         story_history = PublishedStoryStore(PUBLISHED_STORIES_FILE)
     if work_memory is None:
         work_memory = WorkMemory(WORK_MEMORY_FILE)
+    if channel_posts is None:
+        channel_posts = ChannelPostLog(CHANNEL_POSTS_FILE, writer=_atomic_write_json)
     if work_aliases is None:
         work_aliases = WorkAliases(WORK_ALIASES_FILE)
     if story_registry is None:
@@ -36819,6 +36943,7 @@ def main():
     app.add_handler(CommandHandler("backup", backup_command, block=False))
     app.add_handler(CommandHandler("historyok", historyok_command))
     app.add_handler(CommandHandler("health", health_command))
+    app.add_handler(CommandHandler("digest", digest_command))
     app.add_handler(CommandHandler("doctor", doctor_command))
     app.add_handler(CommandHandler("features", features_command))
     app.add_handler(CommandHandler("videocheck", videocheck_command, block=False))
@@ -36903,6 +37028,12 @@ def main():
     # выше канальные посты пропускают, а группа модерации их и не ждёт.
     app.add_handler(
         MessageHandler(filters.UpdateType.CHANNEL_POST, manual_channel_post_handler, block=False),
+        group=2,
+    )
+    # Правки постов в канале — в разбор качества (post_feedback). Та же группа:
+    # обработчик выше ловит только новые посты, правки достаются этому.
+    app.add_handler(
+        MessageHandler(filters.UpdateType.EDITED_CHANNEL_POST, channel_post_edit_handler, block=False),
         group=2,
     )
     # Модерация чата: группа 1 — после всех служебных обработчиков, чтобы
